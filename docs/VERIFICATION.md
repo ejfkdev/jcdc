@@ -147,6 +147,43 @@ shouldBeInitialized/Reference），暴露出更深层的残余问题：
   `Integer.toString` 冗余但可编译；`IntegerCache`/`StringUTF16` 仍为 jdk17/21
   阻塞。已验证稳定基线在 master（代码 commit b5d0a7f）。
 
+### SESE 从零重写进展（`rewrite-sese` 分支，`JCDC_SESE` 门控，默认关）
+
+按上述结论，已把结构化器按 SESE/支配树区域分解**从零重写**为
+`crates/decompiler/src/sese.rs`（每块经 `consumed` 集 + `reachable_within`
+恰好结构化一次；真后支配 follow；自然循环来自回边）。里程碑 3 的三个提交：
+
+- **5e336542** 异常边循环成员：try-in-loop 的 handler 回边经异常边纳入循环
+  成员（`exc_preds`），成员回溯止于 header，body 递归期同步 `loops_stack`
+  → 修复 `SecureRandom.getInstanceStrong`（try 不再被甩出循环）。
+- **f305b23c** 共享尾 follow：`convergent_merge`（从所有分支/case 目标
+  **前向**可达、不在 stop、未 consumed 的最近块）在 ipdom=None 时作 follow；
+  前向可达**不穿越** `loop_stack` 中的 header（仅经回边/下一轮迭代可达的合流
+  不算）→ 修复 `Legacy6`（`if(a==2&&b==2)break outer` 的共享尾）、`EnumSwitch`
+  （循环内 switch 的共享 `++i` 尾）、`ControlFlow.nestedLoops`（不误造跨
+  `continue` 的 follow）。`stop-entry-Goto`：区域 ENTRY 即 stop 块时发
+  `Goto{entry}`→break/continue，而非空分支丢失出口。
+- **108bda02** try-finally 尾 return：try body 经内联/复制的 finally 副本到达
+  尾 return，`reachable_within`（仅常规 succ）会漏掉它 → 放宽 loop-top break
+  与 try 后 `next`，结构化未 consumed、在 universe、非 stop 的前向尾块
+  → 修复 `Exceptions.nestedTry`（finally 后的 `return sb.toString()`）。
+
+**当前 SESE 状态**：features **全 release 全绿**（r8/9/11/17/21/26，
+runBad=[]，含 Exceptions）；cargo test 39 绿；rt.jar 全量冒烟 **12608 文件 /
+0 panic / 0 error / 0 hang / exit=0**（~19min，约为 walk 的 1.9×——
+convergent_merge 每条件做可达性）。`SecureRandom` try-in-loop 正确。
+
+**仍门控、未作默认的原因**：`Integer.toString(int,radix)`/`IntegerCache`
+共享尾复合-if 仍坏——真 ipdom + convergent_merge 对不对称 `if(radix<2||radix>36)`
+链产生空 `if(radix<=36){}` 分支 + 丢 while 后尾 + 丢方法 `radix=10` 尾（不可
+重编译）。放宽 loop-exit/cond/switch 的 `reach.contains(&f)` 反而更差（尾后泄出
+`return toString(i)`），已回退。这与 root-cause-A 是**同一张力**：walk 的 BFS
+最近汇合 follow 能处理 Integer 却错于 `if(A||B) then; tail`；SESE 真 ipdom 修了
+后者却错于 Integer 的复合-if 链。彻底修复需一个同时满足两者的 follow 启发式，
+工作量大，**延期**。在 ③ 修复且冒烟提速前，SESE 保持门控，master=walk 为出货
+基线。里程碑 3 状态：① try-in-loop 异常边 完成；② finally/TWR 平价 完成；
+③ 共享尾复合-if（Integer）延期。
+
 
 
 
