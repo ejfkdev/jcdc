@@ -168,21 +168,65 @@ shouldBeInitialized/Reference），暴露出更深层的残余问题：
   与 try 后 `next`，结构化未 consumed、在 universe、非 stop 的前向尾块
   → 修复 `Exceptions.nestedTry`（finally 后的 `return sb.toString()`）。
 
-**当前 SESE 状态**：features **全 release 全绿**（r8/9/11/17/21/26，
-runBad=[]，含 Exceptions）；cargo test 39 绿；rt.jar 全量冒烟 **12608 文件 /
-0 panic / 0 error / 0 hang / exit=0**（~19min，约为 walk 的 1.9×——
-convergent_merge 每条件做可达性）。`SecureRandom` try-in-loop 正确。
+- **step 4（cf17817a）循环成员/出口三分离 + 支配守卫**：
+  ① 成员收集只认**真回边**（`u→h` 且 h 支配 u；此前任何入边都算，
+  `Integer.toString` 的 pre-loop 守卫块 blk10→header 把整个外围链吞进成员集）；
+  ② `exits`（全成员出边）只用于 **break 归约**（resolve_goto 找最外层含目标
+  的循环 → 带标签 break），循环后续用 **natural_follow（header 自身出口）**
+  ——此前 `exits.first()` 可能是 body 内 if 跳去的远处 early-return，续走检查
+  失败静默丢尾（Integer post-while 尾丢失的真正根因）；do-while（底测环，
+  header 无外出边）回退到全成员出口；③ convergent_merge 拒绝**真支配另一
+  目标**的候选（祖先汇合=fixup 块，`if(A||B) fixup;` 形态保持 follow=None →
+  分支自然走 + copy_walk 复制，与 walk 同形）。
+- **step 5（22fa2570）cm 守卫补全 + 纯 continue 分支 + 自 break 丢弃**：
+  ④ cm 再拒「自身是分支目标且被**兄弟目标**严格支配」的候选（fixup 支配
+  subtree 头：选头会孤立 fixup → `radix=10` 前多出无条件 subtree）；
+  ⑤ `reaches_within` 不穿越 stop 块，且**起点在 stop 中的分支视为离开区域**
+  （C2 经 fixup-stop 一跳"到达"subtree 的伪汇合）；⑥ consumed 检查里指向
+  循环 header 的 Goto **无条件发射**（此前 parts 为空时塌缩成 Empty ——
+  `StringUTF16.codePointCount` 两个 `continue` 全丢、循环尾无条件执行）；
+  ⑦ convert：`extract_compound_do_while` 提出的 exit 若是循环**自身无名
+  break** 则丢弃（do-while 条件假已出口，环外重发 break 是游离语句/编译错；
+  walk 与 SESE 同享此修复）。
+- **step 6（sibling-target 优先）多块条件链**：jdk8 `Random.internalNextInt`
+  （fix-⑥ 目标）在 SESE 回退——旋转自环 header（body+c1 融合、自回边）+
+  第二测试块 c2 构成多块条件链；两个 cond 的 cm 候选都被支配守卫（各自
+  正确地）拒绝 → follow=None → 测试嵌套成 If → `extract_trailing_do_while`
+  在内层 if/else 上误触发 → 环外游离 `break`/`continue` + 丢 `return r`。
+  修复：cm 在通用扫描前**优先兄弟分支目标**——若某 target 被其余所有
+  target 前向可达，它就是条件链的下一测试块（H1 分支的汇合就是 H2 本身），
+  选它把循环体摊平成 `if(c1)continue; if(c2)continue; else exit;` ——恰是
+  `extract_compound_do_while`/CLASSIFY2 折叠消费的形状（walk 侧机器无需改）。
+  Legacy6 不受影响（其 fall 目标即共享尾，兄弟可达它 → 兄弟不是汇合）。
+  `internalNextInt` 现与 walk **逐字节一致**（do-while 折叠 `||` 条件 + return）。
 
-**仍门控、未作默认的原因**：`Integer.toString(int,radix)`/`IntegerCache`
-共享尾复合-if 仍坏——真 ipdom + convergent_merge 对不对称 `if(radix<2||radix>36)`
-链产生空 `if(radix<=36){}` 分支 + 丢 while 后尾 + 丢方法 `radix=10` 尾（不可
-重编译）。放宽 loop-exit/cond/switch 的 `reach.contains(&f)` 反而更差（尾后泄出
-`return toString(i)`），已回退。这与 root-cause-A 是**同一张力**：walk 的 BFS
-最近汇合 follow 能处理 Integer 却错于 `if(A||B) then; tail`；SESE 真 ipdom 修了
-后者却错于 Integer 的复合-if 链。彻底修复需一个同时满足两者的 follow 启发式，
-工作量大，**延期**。在 ③ 修复且冒烟提速前，SESE 保持门控，master=walk 为出货
-基线。里程碑 3 状态：① try-in-loop 异常边 完成；② finally/TWR 平价 完成；
-③ 共享尾复合-if（Integer）延期。
+**当前 SESE 状态（step 5 后）**：features **全 release 全绿**（r8/9/11/17/21/26，
+56/56，SESE 与 walk 双路都绿）；cargo test 39 绿；`Integer.toString(int,radix)`
+达 walk 形态（else-if 链 + 单 `radix=10` + 完整复制子树，全路径 return，语义
+精确；3 份复制 vs walk 2 份——按平价标准可接受）；`codePointCount` 三份复制
+均保留 `continue`；`doWhile`/`Legacy6`/`nestedLoops`/`EnumSwitch` 与 walk 同形；
+`internalNextLong` = walk 减两处冗余 return；jdk8 `internalNextInt` 与 walk
+逐字节一致（step 6）；`SecureRandom` try-in-loop 正确。
+**corpus 定点：SESE 修复了三个 walk 基线阻塞**——jdk26 `Class.toGenericString`
+（游离 break → 干净 do-while）、jdk11/17 `Integer$IntegerCache`（walk 无条件
+分配语义错 → SESE archived 分支 `return;`（static-init 内合法）跳过分配，
+每路径恰好一次 final 赋值，可编译且语义精确）、`StringUTF16.codePointCount`
+（walk 语义对，SESE 曾丢 continue，现修复）。仍共同阻塞：`sun.security.util.Debug`
+hexDigits final 多次赋值（copy_walk 复制含 final 赋值的共享尾；walk 2 份 /
+SESE 3 份，同类同坏）、`List.sort` 裸 cast（root cause D，泛型还原，与结构化器
+无关）。
+
+**step 6 后全量冒烟**：rt.jar 12608 文件 / 0 panic / 0 error / 0 hang /
+exit=0，888s（~14.8min，约为 walk ~10min 的 1.5×；step 4/5 的守卫剪枝使
+其比 step 3 时的 ~19min 更快）。
+
+**门控状态**：里程碑 3 全部完成——① try-in-loop 异常边；② finally/TWR 平价；
+③ 共享尾复合-if（Integer.toString walk 平价 + IntegerCache 语义修复 +
+internalNextInt walk 逐字节一致）。SESE 现「不劣于 walk 且修复三个 corpus
+定点阻塞（toGenericString/IntegerCache/codePointCount）」；剩余共同阻塞
+（Debug final-copy、List.sort 泛型 root cause D）非 SESE 特有。翻转默认为
+SESE 的剩余门槛：corpus **家族级重编译**证据（进行中，releases 11/17/26）
+与冒烟速度取舍（1.5× walk）。
 
 
 
