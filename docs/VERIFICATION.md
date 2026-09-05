@@ -220,6 +220,19 @@ SESE 3 份，同类同坏）、`List.sort` 裸 cast（root cause D，泛型还�
 exit=0，888s（~14.8min，约为 walk ~10min 的 1.5×；step 4/5 的守卫剪枝使
 其比 step 3 时的 ~19min 更快）。
 
+**未定义标签家族的量化**（新证据，walk/SESE 全量对比，精确正则扫描
+`break L<n>`/`continue L<n>` 无对应 `L<n>:` 定义）：walk **60** 个文件、
+SESE **43** 个、共同 26、walk-only 34（SESE 修复）、SESE-only 17。根源是
+RawGoto 兜底：`resolve_goto` 无法把跳转归约为 break/continue/fallthrough
+时 printer 把 `Stmt::Goto(blockid)` 印成 `break L<blockid>`，而标签从未
+发射（pending_labels 死代码）。典型：`Pattern.clazz` 的**环体中部汇合块**
+（所有 case-break 与自环出口汇入 blk39，其流经增量块回到环顶）——jump
+目标既非 header（非 continue）也不在 exits（非 break）→ RawGoto；walk
+（break L37）与 SESE（break L39）**同样失败**，属两结构化器共同的
+「非结构化跳转」深水区家族；冒烟只测 jcdc 自身错误，不测可重编译性，
+故该家族此前从未被量化。SESE 净值更优（43<60），翻转门槛不含此项，
+但两路都值得后续专项（复活标签发射或 hub 区域化）。
+
 **门控状态**：里程碑 3 全部完成——① try-in-loop 异常边；② finally/TWR 平价；
 ③ 共享尾复合-if（Integer.toString walk 平价 + IntegerCache 语义修复 +
 internalNextInt walk 逐字节一致）。SESE 现「不劣于 walk 且修复三个 corpus
