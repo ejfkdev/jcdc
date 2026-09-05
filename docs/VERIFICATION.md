@@ -229,7 +229,10 @@ features 56/56 双路绿；cargo test 绿。仍共同阻塞：`List.sort` 裸 ca
 
 **step 6 后全量冒烟**：rt.jar 12608 文件 / 0 panic / 0 error / 0 hang /
 exit=0，888s（~14.8min，约为 walk ~10min 的 1.5×；step 4/5 的守卫剪枝使
-其比 step 3 时的 ~19min 更快）。
+其比 step 3 时的 ~19min 更快）。**最终二进制（aa6ab069）双路冒烟**：
+SESE 12608/0/0/exit=0/1029s，walk 12608/0/0/exit=0/1031s——同机同负载下
+两路等速（此前 1.5× 差值主要为机器负载噪声）；Debug `hexDigits` 双路
+冒烟产物各恰 1 次赋值；未定义标签计数不变（walk 60 / SESE 43，见下）。
 
 **未定义标签家族的量化**（新证据，walk/SESE 全量对比，精确正则扫描
 `break L<n>`/`continue L<n>` 无对应 `L<n>:` 定义）：walk **60** 个文件、
