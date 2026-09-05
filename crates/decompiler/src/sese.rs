@@ -242,7 +242,19 @@ impl<'a> Structurer<'a> {
             if deep || guard > ctx.universe.len() * 4 + 64 {
                 break;
             }
-            if stop.contains(&cur) || !ctx.universe.contains(&cur) || !reach.contains(&cur) {
+            // A try body reaches its tail through inlined/duplicated finally
+            // copies, so reachable_within (normal succ only) can miss the
+            // post-finally continuation even though it is a legitimate forward
+            // tail (unconsumed, in-universe, not a stop). Structure it anyway;
+            // monotonicity is preserved by the consumed check below (a block
+            // owned by a sibling is consumed -> Goto, never re-structured).
+            let forward_tail = !reach.contains(&cur)
+                && ctx.universe.contains(&cur)
+                && !ctx.consumed.contains(&cur)
+                && !stop.contains(&cur);
+            if !forward_tail
+                && (stop.contains(&cur) || !ctx.universe.contains(&cur) || !reach.contains(&cur))
+            {
                 // A region whose ENTRY is itself a stop block was branched-to
                 // deliberately (a cond branch / `break` to a loop exit, or a
                 // jump to an enclosing follow). Emit Goto{entry} so the
@@ -351,15 +363,20 @@ impl<'a> Structurer<'a> {
                     parts.push(try_region);
                     let gend = self.groups[gi].end;
                     let next = self.cfg.blocks.iter().find(|nb| {
+                        let is_term = matches!(
+                            self.results[nb.id].term,
+                            Term::Return(_) | Term::Throw(_)
+                        );
                         nb.start >= gend
                             && ctx.universe.contains(&nb.id)
                             && !stop.contains(&nb.id)
-                            && !self.handler_group.contains_key(&nb.id)
-                            && (!ctx.consumed.contains(&nb.id)
-                                || matches!(
-                                    self.results[nb.id].term,
-                                    Term::Return(_) | Term::Throw(_)
-                                ))
+                            // A handler block is normally skipped (it belongs to
+                            // the try's catch/finally), but a handler that is a
+                            // shared return/throw is the method tail the finally
+                            // copy jumps to — the normal (try-completes) path
+                            // must still return it (nestedTry's lost return).
+                            && (!self.handler_group.contains_key(&nb.id) || is_term)
+                            && (!ctx.consumed.contains(&nb.id) || is_term)
                     });
                     match next {
                         // A consumed shared terminator right after the try is
@@ -371,6 +388,14 @@ impl<'a> Structurer<'a> {
                             break;
                         }
                         Some(nb) => {
+                            // Continue at the try's forward continuation even
+                            // when it is not in this region's `reach` set: a
+                            // try body reaches its tail through inlined/duplicated
+                            // finally copies, so reachable_within (normal succ
+                            // only) can miss the post-finally return block. The
+                            // block is unconsumed and forward (start >= gend), so
+                            // structuring it is monotone and recovers the tail
+                            // return (nestedTry's `return sb.toString()`).
                             cur = nb.id;
                             continue;
                         }
