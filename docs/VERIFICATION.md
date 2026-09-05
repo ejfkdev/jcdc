@@ -129,16 +129,19 @@ shouldBeInitialized/Reference），暴露出更深层的残余问题：
   （≤300 块用精确后支配树、精确 ipdom 为虚出口即分支发散时回退 BFS 最近汇合 +
   resolve_goto 增补「流向某外层循环 exit 即 break 之」+ 有界共享尾）——**features
   全 8 release 转绿**（重编译+运行一致，6 修复保留，`Legacy6.loops` 的
-  break-outer 正确带标签），但**全 rt.jar 冒烟仍挂死**（~2492 文件处，xerces
-  `XMLEntityManager` 一带）：发散回退只覆盖 ipdom=虚出口的情形，**具体（concrete）
-  真后支配 follow 仍会驱动 walk 病态重入**，有界共享尾也兜不住；且 corpus 阻塞
-  只是**平移**未消除（jdk9/11 移到 `Provider.java` 缺返回、jdk26 仍是
+  break-outer 正确带标签），但**全 rt.jar 冒烟过不去**：一是精确后支配树是
+  O(n²)/scope，比 BFS 慢约 15×（media/sound 包 15s vs <1s），复杂类单方法即
+  >120s，整 jar 实际跑不完；二是把 walk 主循环护栏从 10 万收紧到
+  `64×universe+1024`（合法 walk 每块只 claim 一次=O(n)，故不误伤 features，
+  实测 features 仍全绿）后，发散虽被 bound，O(n²) 慢仍在。且 corpus 阻塞只是
+  **平移**未消除（jdk9/11 移到 `Provider.java` 缺返回、jdk26 仍是
   `Class.toGenericString` 游离 break、jdk17/21 仍 `IntegerCache`）。⑥ 已提交在
-  `rewrite-structurer` 分支（`JCDC_RW` 环境变量门控，默认关），**不可作为默认
-  发布**。**结论**：BFS「最近汇合」follow 语义是整条下游（`classify_loop`、
-  `extract_compound_do_while`、`convert` 的 break/continue/标签归约）赖以成立的
-  承重假设；真后支配 follow 无法增量并入，混合方案能让 features 绿却过不了全量
-  冒烟。彻底修复必须把 `walk` + `convert` + 循环分类一起按 SESE/支配树区域分解
+  `rewrite-structurer` 分支（`JCDC_RW` 门控，默认关；含 visit-cap，commit
+  a3598aa6），**不可作为默认发布**。**结论**：BFS「最近汇合」follow 语义是整条
+  下游（`classify_loop`、`extract_compound_do_while`、`convert` 的
+  break/continue/标签归约）赖以成立的承重假设；真后支配 follow 无法增量并入，
+  混合方案能让 features 绿却过不了全量冒烟（慢 + 残余发散）。彻底修复必须把
+  `walk` + `convert` + 循环分类一起按 SESE/支配树区域分解
   **从零重写**成对任意合法 follow 都单调收敛的结构（非补丁、非门控混合），工作量
   与回归风险都很大，属跨会话专项。当前 master **保留近似 + 记录为限制**：
   `Integer.toString` 冗余但可编译；`IntegerCache`/`StringUTF16` 仍为 jdk17/21
