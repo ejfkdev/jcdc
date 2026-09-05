@@ -67,12 +67,24 @@ impl<'a> Structurer<'a> {
                 }
             }
         }
+        // Exception-edge predecessors: handler -> protected blocks. A protected
+        // block reaches its handler only on a throw (an exception edge, not a
+        // normal pred), so when the handler loops back to the header, the
+        // protected block is part of the loop too. Without this, a
+        // `while(..){ try{ return }catch{ ..loop.. } }` drops the try out of
+        // the loop (the SecureRandom.getInstanceStrong regression).
+        let mut exc_preds: HashMap<usize, Vec<usize>> = HashMap::new();
+        for e in &self.cfg.exc_edges {
+            if universe.contains(&e.from) && universe.contains(&e.to) {
+                exc_preds.entry(e.to).or_default().push(e.from);
+            }
+        }
         let mut loop_members: HashMap<usize, HashSet<usize>> = HashMap::new();
         for &h in loop_headers.iter() {
             let mut members: HashSet<usize> = HashSet::new();
             members.insert(h);
             // Collect every back-edge source for h, then walk predecessors
-            // within the universe until reaching h.
+            // (normal AND exception) within the universe until reaching h.
             let mut stack: Vec<usize> = Vec::new();
             for &u in universe.iter() {
                 if self.cfg.blocks[u].succ.contains(&h) && (u != h || self.cfg.blocks[h].succ.contains(&h)) {
@@ -85,6 +97,13 @@ impl<'a> Structurer<'a> {
                 for &p in &self.cfg.blocks[b].pred {
                     if universe.contains(&p) && members.insert(p) {
                         stack.push(p);
+                    }
+                }
+                if let Some(xp) = exc_preds.get(&b) {
+                    for &p in xp {
+                        if members.insert(p) {
+                            stack.push(p);
+                        }
                     }
                 }
             }
