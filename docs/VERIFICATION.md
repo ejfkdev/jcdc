@@ -113,18 +113,22 @@ shouldBeInitialized/Reference），暴露出更深层的残余问题：
   导致方法尾重复（`Integer.toString`/`IntegerCache.<clinit>`，后者还令 final
   字段疑似二次赋值）或守卫链展平（`StringUTF16.replace`）。
   **第一性原理**：follow 的正确定义是 entry 的直接后支配者；近似在不对称
-  分支（短路条件）下必错。**彻底修复的障碍（本轮已系统性验证）**：把 follow
-  改成真后支配者后，`walk` 的区域分解会不收敛——四种实现都失败：①完整后
-  支配树（哨兵虚出口 + 反向 CHK，O(n²)×每 COND，巨方法直接卡死）②真后支配
-  旁路过滤 ③仅拒绝「后继即候选」（含 self-loop 与 ≤300 块门控）④在 ③ 之上
-  再把 walk 主循环护栏收紧到 `O(universe)`——④ 虽消除了挂死，却让 features
-  **全 release 重编译失败**（收紧的护栏把正常方法的结构化也截断了）。根因：
-  `walk` 的共享尾复制（`!can_reach_cfg(f,cur)` 那条用全新 claimed 重走的
-  路径）在 follow 改道后指数级重入，且其收敛性**隐含依赖「follow=最近汇合」
-  这一近似**。安全修复需先把 `walk` 改造成对任意合法 follow 都单调收敛（如
-  基于 SESE 单入口单出口区域 / 支配树的重结构化），属结构性重写而非补丁，故
-  本轮**保留近似 + 记录为限制**（`Integer.toString` 冗余但可编译；
-  `IntegerCache`/`StringUTF16` 仍为 jdk17/21 阻塞）。
+  分支（短路条件）下必错。**彻底修复的障碍（已在 git `refactor-sese-walk`
+  分支系统验证）**：把 follow 改成真后支配者后，整条结构化管线失效——五种
+  实现都失败：①完整后支配树（哨兵虚出口 + 反向 CHK，O(n²)×每 COND，巨方法
+  卡死）②真后支配旁路过滤 ③仅拒绝「后继即候选」（含 self-loop 与 ≤300 块
+  门控）④③ + walk 主循环护栏收紧到 O(universe)（消除挂死但 features 全 release
+  重编译失败）⑤**完整后支配树（≤300 块、按 scope 缓存）+ 共享尾复制改走有界
+  `copy_walk`（COPY_DEPTH=4，单调收敛、doCommands/闭包均不挂）**——⑤ 解决了
+  挂死，却仍令 **features 全 8 release `recompile_ok=false`** 且
+  `internalNextInt` 复合 do-while 回退。**结论**：BFS「最近汇合」follow 语义
+  是整条下游（`classify_loop`、`extract_compound_do_while`、`convert` 的
+  break/continue 归约）赖以成立的承重假设，真后支配 follow 无法增量并入；
+  彻底修复必须把 `walk` + `convert` + 循环分类一起按 SESE/支配树区域分解
+  **从零重写**（非补丁），工作量与回归风险都很大。当前**保留近似 + 记录为
+  限制**：`Integer.toString` 冗余但可编译；`IntegerCache`/`StringUTF16` 仍为
+  jdk17/21 阻塞。重构前的稳定基线已提交（commit b5d0a7f）。
+
 
 
 - **泛型方法实参的捕获/裸类型还原**（jdk11 `List.sort`）：原始
