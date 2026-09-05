@@ -86,11 +86,17 @@ impl<'a> Structurer<'a> {
         for &h in loop_headers.iter() {
             let mut members: HashSet<usize> = HashSet::new();
             members.insert(h);
-            // Collect every back-edge source for h, then walk predecessors
-            // (normal AND exception) within the universe until reaching h.
+            // Collect every TRUE back-edge source for h (u -> h where h
+            // dominates u; without the dominance check a forward entry edge
+            // like a pre-loop init guard -> header pollutes the member set
+            // and the whole enclosing chain gets swallowed, Integer blk10),
+            // then walk predecessors (normal AND exception) within the
+            // universe until reaching h.
             let mut stack: Vec<usize> = Vec::new();
             for &u in universe.iter() {
-                if self.cfg.blocks[u].succ.contains(&h) && (u != h || self.cfg.blocks[h].succ.contains(&h)) {
+                let is_self_loop = u == h && self.cfg.blocks[h].succ.contains(&h);
+                let is_back_edge = u != h && idom.dominates(h, u);
+                if self.cfg.blocks[u].succ.contains(&h) && (is_self_loop || is_back_edge) {
                     if members.insert(u) {
                         stack.push(u);
                     }
@@ -179,6 +185,18 @@ impl<'a> Structurer<'a> {
             if stop.contains(&x) || ctx.consumed.contains(&x) {
                 continue;
             }
+            // A candidate that properly DOMINATES ANOTHER branch target is an ancestor
+            // confluence (a fixup block the branches jump back/up to, e.g.
+            // `if (A || B) radix = 10;` where the fixup dominates the cond),
+            // not a follow: choosing it empties a branch and loses the
+            // post-fixup continuation (Integer.toString). Such shapes need
+            // follow=None so the branches are walked naturally and the
+            // re-reached continuation is duplicated by copy_walk (walk
+            // parity). A genuine shared tail may BE one target (the fall
+            // branch, Legacy6 TAIL) but never dominates the OTHER one.
+            if targets.iter().any(|&t| t != x && ctx.idom.dominates(x, t)) {
+                continue;
+            }
             if targets.iter().all(|&t| self.reaches_within(ctx, t, x, stop)) {
                 best = Some(x);
                 best_start = xs;
@@ -229,11 +247,22 @@ impl<'a> Structurer<'a> {
         stop: &HashSet<usize>,
         ctx: &mut SeseCtx,
     ) -> Region {
+        let reach = reachable_within(self.cfg, entry, stop);
+        self.sese_region_with_scope(entry, stop, reach, ctx)
+    }
+
+    /// Region walk with an explicit scope (`reach`). Normally the scope is
+    /// reachable_within(entry, stop); loop bodies pass the same set computed
+    /// once at the loop site so nested walks/copies share one bound.
+    fn sese_region_with_scope(
+        &mut self,
+        entry: usize,
+        stop: &HashSet<usize>,
+        reach: HashSet<usize>,
+        ctx: &mut SeseCtx,
+    ) -> Region {
         ctx.depth += 1;
         let deep = ctx.depth > 400;
-        // Blocks this region may consume: reachable from entry without stepping
-        // on `stop`. Anything outside is a boundary -> Goto.
-        let reach = reachable_within(self.cfg, entry, stop);
         let mut parts: Vec<Region> = Vec::new();
         let mut cur = entry;
         let mut guard = 0usize;
@@ -290,9 +319,19 @@ impl<'a> Structurer<'a> {
                     // Shared non-terminator reached from a divergent sibling
                     // (e.g. the continuation after `if (A && B) return X;`):
                     // copy_walk re-structures it inline, COPY_DEPTH-bounded so
-                    // nested shared chains stay monotone (no divergence). Falls
-                    // back to a Goto when the cap is hit or it loops back.
-                    match self.copy_walk(cur, stop, &[], usize::MAX) {
+                    // nested shared chains stay monotone (no divergence). The
+                    // copy is additionally barred from leaving THIS region's
+                    // scope: reachable_within(copy) must not pick up blocks the
+                    // enclosing walk could never consume (that is how the
+                    // post-loop tail vanished from a copied loop branch).
+                    // Falls back to a Goto when the cap is hit or it loops back.
+                    let mut cstop: HashSet<usize> = stop.iter().copied().collect();
+                    for &u in ctx.universe.iter() {
+                        if !reach.contains(&u) {
+                            cstop.insert(u);
+                        }
+                    }
+                    match self.copy_walk(cur, &cstop, &[], usize::MAX) {
                         Some(r) => parts.push(r),
                         None => {
                             if !parts.is_empty() {
@@ -407,6 +446,10 @@ impl<'a> Structurer<'a> {
                 ctx.loop_headers.contains(&cur) && !self.handler_group.contains_key(&cur);
             if is_header {
                 let members = ctx.loop_members.get(&cur).cloned().unwrap_or_default();
+                // exits = EVERY member's out-edges leaving the loop: the
+                // break-resolution set (a `break outer` from deep in the body
+                // targets one of these; resolve_goto maps a Goto to the
+                // OUTERMOST loop whose exits contain it -> labeled break).
                 let mut exits: Vec<usize> = Vec::new();
                 for &m in members.iter() {
                     for &s in &self.cfg.blocks[m].succ {
@@ -417,6 +460,19 @@ impl<'a> Structurer<'a> {
                     }
                 }
                 exits.sort_by_key(|e| self.cfg.blocks[*e].start);
+                // natural_follow = the HEADER's own exits (the condition's
+                // fall-out): where straight-line flow continues after the
+                // loop. Other members' exits are body breaks and must NOT be
+                // the continuation -- exits.first() over all members could be
+                // a far-away early-return the body region never reaches,
+                // silently dropping the post-loop tail (Integer.toString).
+                let mut natural_follow: Vec<usize> = Vec::new();
+                for &s in &self.cfg.blocks[cur].succ {
+                    if !members.contains(&s) && ctx.universe.contains(&s) {
+                        natural_follow.push(s);
+                    }
+                }
+                natural_follow.sort_by_key(|e| self.cfg.blocks[*e].start);
                 // Body: structure from the header; the loop's exits and the
                 // enclosing stop bound it. The header is the body entry and is
                 // NOT in the body stop (the back edge re-targets it -> Goto ->
@@ -437,7 +493,17 @@ impl<'a> Structurer<'a> {
                 // `continue` (Goto{header}) instead of re-walking it as a new
                 // nested loop (the catch-handler `while(true)` duplication).
                 self.loops_stack.push(header);
-                let body = self.sese_region(header, &body_stop, ctx);
+                // The loop tail (back-edge source -> header) is reachable
+                // from the header WITHOUT stepping on an exit only through
+                // the body, so reachable_within(header, body_stop) always
+                // contains every member; blocks of divergent shapes (a
+                // pre-loop init guard whose branches rejoin after the loop,
+                // Integer.toString blk9/10) are correctly NOT members. Pass
+                // this exact set as the body sub-scope so nested copy_walks
+                // (which bound their region by reachable_within) cannot lose
+                // the post-loop tail.
+                let body_scope = reachable_within(self.cfg, header, &body_stop);
+                let body = self.sese_region_with_scope(header, &body_stop, body_scope, ctx);
                 self.loops_stack.pop();
                 ctx.loop_stack.pop();
                 if is_header {
@@ -447,9 +513,9 @@ impl<'a> Structurer<'a> {
                     ctx.consumed.insert(m);
                 }
                 parts.push(Region::Loop { header, body: Box::new(body), members, exits: exits.clone() });
-                // Continue after the loop at its primary exit (if it is within
-                // this region's reach and not an enclosing stop).
-                match exits.first().copied() {
+                // Continue after the loop at the header's natural exit (if it
+                // is within this region's reach and not an enclosing stop).
+                match natural_follow.first().copied() {
                     Some(f) if !stop.contains(&f) && reach.contains(&f) && !ctx.consumed.contains(&f) => {
                         cur = f;
                         continue;
@@ -473,14 +539,15 @@ impl<'a> Structurer<'a> {
                         }
                     }
                     let (fall, taken) = (succs[0], succs[1]);
-                    // True follow = immediate post-dominator. When that is None
-                    // the branches diverge to different terminals — but they may
-                    // still reconverge on a shared in-region continuation while
-                    // one path leaves (a loop `break` -> exit, or return/throw).
-                    // convergent_merge recovers that shared follow (the loop
-                    // tail after `if (a==2 && b==2) break outer;`), without
-                    // which the tail folds into one branch and the other falls
-                    // through empty -> infinite loop (Legacy6).
+                    // Follow = true immediate post-dominator; when None (the
+                    // branches diverge to different terminals) fall back to
+                    // convergent_merge, which recovers a shared loop tail
+                    // (Legacy6 `if (a==2 && b==2) break outer;`) but REFUSES
+                    // candidates dominating a branch target — ancestor
+                    // confluentes like `if (A || B) fixup;` (Integer.toString)
+                    // keep follow=None so the branches are walked naturally
+                    // and the re-reached continuation is duplicated by
+                    // copy_walk (walk-parity shape).
                     let follow = self
                         .sese_ipdom(ctx, cur)
                         .filter(|f| ctx.universe.contains(f) && !stop.contains(f))
