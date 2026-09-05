@@ -170,11 +170,16 @@ impl<'a> Structurer<'a> {
         if targets.is_empty() {
             return None;
         }
+        // Floor = the branch block's own position, NOT max(target starts): a
+        // branch target may sit EARLIER in the layout than the branch (a
+        // backward jump to a fixup, Integer.toString C1 -> FIXUP), and a
+        // max-of-targets floor then hides the true nearest confluence and
+        // lets a far block inside the branch body be chosen as follow.
         let floor = targets
             .iter()
-            .map(|&t| self.cfg.blocks[t].start as usize)
+            .filter_map(|&t| self.cfg.blocks[t].pred.iter().map(|&p| self.cfg.blocks[p].start as usize).max())
             .max()
-            .unwrap();
+            .unwrap_or(0);
         let mut best: Option<usize> = None;
         let mut best_start = usize::MAX;
         for &x in ctx.universe.iter() {
@@ -185,16 +190,42 @@ impl<'a> Structurer<'a> {
             if stop.contains(&x) || ctx.consumed.contains(&x) {
                 continue;
             }
-            // A candidate that properly DOMINATES ANOTHER branch target is an ancestor
+            // A loop header is never a merge candidate: a branch that jumps
+            // to it is a `continue` (the back edge fires on the NEXT
+            // iteration), not a fall-through confluence. During a body walk
+            // the header is not yet consumed, so without this guard a pair of
+            // continue-branches "merges" at the header or at each other
+            // THROUGH the header, both branch regions elide to empty, and the
+            // real tail runs unconditionally (StringUTF16.codePointCount
+            // losing both `continue`s).
+            if ctx.loop_headers.contains(&x) || ctx.loop_stack.contains(&x) {
+                continue;
+            }
+            // A candidate that DOMINATES ANY branch target (reflexively: is
+            // a target) is an ancestor
             // confluence (a fixup block the branches jump back/up to, e.g.
             // `if (A || B) radix = 10;` where the fixup dominates the cond),
             // not a follow: choosing it empties a branch and loses the
             // post-fixup continuation (Integer.toString). Such shapes need
             // follow=None so the branches are walked naturally and the
             // re-reached continuation is duplicated by copy_walk (walk
-            // parity). A genuine shared tail may BE one target (the fall
-            // branch, Legacy6 TAIL) but never dominates the OTHER one.
+            // parity). Genuine shared tails (Legacy6/EnumSwitch) are
+            // dominated BY their targets, never dominate them.
             if targets.iter().any(|&t| t != x && ctx.idom.dominates(x, t)) {
+                continue;
+            }
+            // ... and reject a candidate that IS a branch target while
+            // ANOTHER target sits strictly above it in the dominator tree
+            // (`if (A || B) fixup; main;` — fixup dominates main): choosing
+            // the lower target as follow empties the jump branch and orphans
+            // the fixup (Integer.toString C2 -> empty `if (radix <= 36)`).
+            // A genuine shared tail (Legacy6) is dominated BY its sibling
+            // branch, not the other way around, so it survives both guards.
+            if targets.contains(&x)
+                && targets
+                    .iter()
+                    .any(|&t| t != x && ctx.idom.dominates(t, x))
+            {
                 continue;
             }
             if targets.iter().all(|&t| self.reaches_within(ctx, t, x, stop)) {
@@ -218,6 +249,14 @@ impl<'a> Structurer<'a> {
         if from == target {
             return true;
         }
+        // A branch that jumps straight to a stop block LEAVES the region
+        // (sibling/follow owns it); it contributes no in-region confluence.
+        // Without this, Integer's C2 (`radix <= 36`) "reaches" the subtree
+        // through the fixup stop in one hop and cm picks the subtree head as
+        // follow, emptying the branch and losing the fixup+copy shape.
+        if stop.contains(&from) {
+            return false;
+        }
         let mut seen = HashSet::new();
         let mut stack = vec![from];
         seen.insert(from);
@@ -226,7 +265,16 @@ impl<'a> Structurer<'a> {
                 if s == target {
                     return true;
                 }
-                if stop.contains(&s) || ctx.loop_stack.contains(&s) {
+                // Not expandable: stop blocks (region boundaries — a sibling
+                // branch owns them; routing through one is not a confluence of
+                // THIS branch set: Integer C2 whose fixup target is the C1
+                // follow must not "reach" the subtree through it) and loop
+                // headers (re-entering a loop body is a later iteration, not a
+                // forward merge: ControlFlow.nestedLoops).
+                if stop.contains(&s)
+                    || ctx.loop_stack.contains(&s)
+                    || ctx.loop_headers.contains(&s)
+                {
                     continue;
                 }
                 if seen.insert(s) {
@@ -311,10 +359,13 @@ impl<'a> Structurer<'a> {
                 } else if ctx.loop_stack.contains(&cur) {
                     // Back-edge to an enclosing loop header: a `continue`
                     // (resolved at conversion). NEVER copy_walk it — that would
-                    // re-walk the whole loop as a nested duplicate.
-                    if !parts.is_empty() {
-                        parts.push(Region::Goto { target: cur });
-                    }
+                    // re-walk the whole loop as a nested duplicate. The Goto is
+                    // emitted even when parts is empty: a branch region that
+                    // IS the jump to the header (`if (c) continue;`) must not
+                    // collapse to Empty — that silently dropped BOTH continues
+                    // of StringUTF16.codePointCount, running the loop tail
+                    // unconditionally.
+                    parts.push(Region::Goto { target: cur });
                 } else if !stop.contains(&cur) {
                     // Shared non-terminator reached from a divergent sibling
                     // (e.g. the continuation after `if (A && B) return X;`):
@@ -471,6 +522,12 @@ impl<'a> Structurer<'a> {
                     if !members.contains(&s) && ctx.universe.contains(&s) {
                         natural_follow.push(s);
                     }
+                }
+                if natural_follow.is_empty() {
+                    // Bottom-tested loop (do-while): the header is the body
+                    // entry whose only successor is inside the loop; the
+                    // natural exit hangs off the condition member instead.
+                    natural_follow = exits.clone();
                 }
                 natural_follow.sort_by_key(|e| self.cfg.blocks[*e].start);
                 // Body: structure from the header; the loop's exits and the

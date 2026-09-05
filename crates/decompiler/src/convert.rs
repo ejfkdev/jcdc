@@ -528,6 +528,19 @@ impl<'a> Converter<'a> {
                     // `if(c1)continue; .. if(cN)continue; else exit;` becomes
                     // `do{body}while(c1||..||cN); exit`.
                     if let Some((stmts, c, exit)) = extract_compound_do_while(&body_stmt) {
+                        // An extracted exit that is the loop's OWN unlabeled
+                        // break must be dropped: the do-while condition false
+                        // already exits, and re-emitting the break OUTSIDE the
+                        // loop is a stray `break;` (compile error). SESE's
+                        // explicit `Goto{header}` -> continue makes self-loop
+                        // bodies hit this shape (`if (c) continue; else break;`).
+                        // return/throw/labeled-break exits stay (real fall-out).
+                        if matches!(exit, Stmt::Break(None)) {
+                            return Stmt::DoWhile {
+                                body: Box::new(Stmt::Block(stmts)),
+                                cond: c,
+                            };
+                        }
                         return Stmt::Block(vec![
                             Stmt::DoWhile { body: Box::new(Stmt::Block(stmts)), cond: c },
                             exit,
