@@ -38,6 +38,9 @@ struct SeseCtx {
     loop_members: HashMap<usize, HashSet<usize>>,
     /// blocks consumed (structured exactly once) across the whole method.
     consumed: HashSet<usize>,
+    /// loop headers currently being structured (a back-edge to one is a
+    /// `continue`, never a copy_walk target).
+    loop_stack: Vec<usize>,
     /// recursion depth (safety bound).
     depth: usize,
 }
@@ -94,6 +97,14 @@ impl<'a> Structurer<'a> {
                 }
             }
             while let Some(b) = stack.pop() {
+                // Do NOT traverse the header's own predecessors: the natural
+                // loop is {h} u {nodes reaching a back-edge source without
+                // going through h}. Walking h's preds would pull in the
+                // pre-loop code (entry, guards) and duplicate it inside the
+                // body region.
+                if b == h {
+                    continue;
+                }
                 for &p in &self.cfg.blocks[b].pred {
                     if universe.contains(&p) && members.insert(p) {
                         stack.push(p);
@@ -118,6 +129,7 @@ impl<'a> Structurer<'a> {
             loop_headers,
             loop_members,
             consumed: HashSet::new(),
+            loop_stack: Vec::new(),
             depth: 0,
         };
         let r = self.sese_region(self.cfg.entry, &HashSet::new(), &mut ctx);
@@ -131,6 +143,80 @@ impl<'a> Structurer<'a> {
             Some(p) if p != ctx.vx && p != b => Some(p),
             _ => None,
         }
+    }
+
+    /// Convergent merge of a set of branch/case targets within a region: the
+    /// nearest block (by linear layout) forward-reachable from ALL targets,
+    /// not in `stop`, and not yet consumed. This recovers a shared
+    /// continuation that is NOT a post-dominator because the targets diverge
+    /// to different terminals (a loop `break` -> exit, a `return`/`throw`, or
+    /// a loop tail -> header back-edge that only post-dominates at the virtual
+    /// exit). Examples: the loop tail after `if (a==2 && b==2) break outer;`
+    /// (Legacy6), and the shared `++i` tail after every `case` of a switch
+    /// inside a loop (EnumSwitch — without it the first case swallows the tail
+    /// as `++i; continue` and the remaining cases spin forever).
+    fn convergent_merge(
+        &self,
+        ctx: &SeseCtx,
+        targets: &[usize],
+        stop: &HashSet<usize>,
+    ) -> Option<usize> {
+        if targets.is_empty() {
+            return None;
+        }
+        let floor = targets
+            .iter()
+            .map(|&t| self.cfg.blocks[t].start as usize)
+            .max()
+            .unwrap();
+        let mut best: Option<usize> = None;
+        let mut best_start = usize::MAX;
+        for &x in ctx.universe.iter() {
+            let xs = self.cfg.blocks[x].start as usize;
+            if xs < floor || xs >= best_start {
+                continue;
+            }
+            if stop.contains(&x) || ctx.consumed.contains(&x) {
+                continue;
+            }
+            if targets.iter().all(|&t| self.reaches_within(ctx, t, x, stop)) {
+                best = Some(x);
+                best_start = xs;
+            }
+        }
+        best
+    }
+
+    /// Can `from` reach `target` stepping only through blocks not in `stop`
+    /// (target itself may be in `stop` — it is the destination), AND without
+    /// re-entering an enclosing loop? Reaching a loop header on `loop_stack`
+    /// is a back-edge (loop re-entry): anything past it is a *later iteration*,
+    /// not a forward merge. Restricting to forward reach is what lets
+    /// convergent_merge recover a shared loop tail (Legacy6: B2 -> TAIL is a
+    /// forward edge) while refusing to invent a follow across a `continue`
+    /// (ControlFlow.nestedLoops: the `++j;continue` block only reaches `++c`
+    /// via the header back-edge, so `++c` is correctly NOT a merge).
+    fn reaches_within(&self, ctx: &SeseCtx, from: usize, target: usize, stop: &HashSet<usize>) -> bool {
+        if from == target {
+            return true;
+        }
+        let mut seen = HashSet::new();
+        let mut stack = vec![from];
+        seen.insert(from);
+        while let Some(c) = stack.pop() {
+            for &s in &self.cfg.blocks[c].succ {
+                if s == target {
+                    return true;
+                }
+                if stop.contains(&s) || ctx.loop_stack.contains(&s) {
+                    continue;
+                }
+                if seen.insert(s) {
+                    stack.push(s);
+                }
+            }
+        }
+        false
     }
 
     /// Structure the region starting at `entry`, stopping at any block in
@@ -157,6 +243,17 @@ impl<'a> Structurer<'a> {
                 break;
             }
             if stop.contains(&cur) || !ctx.universe.contains(&cur) || !reach.contains(&cur) {
+                // A region whose ENTRY is itself a stop block was branched-to
+                // deliberately (a cond branch / `break` to a loop exit, or a
+                // jump to an enclosing follow). Emit Goto{entry} so the
+                // converter resolves it to break/continue — or elides it as a
+                // natural fallthrough when entry is the enclosing if-follow.
+                // Without this, a `break outer` branch to a stop block renders
+                // as an EMPTY branch and the loop exit is silently lost
+                // (Legacy6 `if (a==2 && b==2) break outer;` -> infinite loop).
+                if cur == entry && stop.contains(&entry) && parts.is_empty() {
+                    parts.push(Region::Goto { target: entry });
+                }
                 break;
             }
             if ctx.consumed.contains(&cur) {
@@ -170,6 +267,13 @@ impl<'a> Structurer<'a> {
                 if matches!(self.results[cur].term, Term::Return(_) | Term::Throw(_)) {
                     // Shared terminator: duplicate inline (no outgoing flow).
                     parts.push(Region::CopyStmts { block: cur });
+                } else if ctx.loop_stack.contains(&cur) {
+                    // Back-edge to an enclosing loop header: a `continue`
+                    // (resolved at conversion). NEVER copy_walk it — that would
+                    // re-walk the whole loop as a nested duplicate.
+                    if !parts.is_empty() {
+                        parts.push(Region::Goto { target: cur });
+                    }
                 } else if !stop.contains(&cur) {
                     // Shared non-terminator reached from a divergent sibling
                     // (e.g. the continuation after `if (A && B) return X;`):
@@ -301,7 +405,16 @@ impl<'a> Structurer<'a> {
                 // (a body block whose succ is the header) hits the consumed
                 // check -> Goto{header} -> `continue` at conversion.
                 ctx.loop_headers.remove(&header);
+                ctx.loop_stack.push(header);
+                // Sync the walk-facing loops_stack so any walk-based sub-builder
+                // reused inside the body (structure_try / structure_switch)
+                // resolves a back-edge to this SESE loop header as a
+                // `continue` (Goto{header}) instead of re-walking it as a new
+                // nested loop (the catch-handler `while(true)` duplication).
+                self.loops_stack.push(header);
                 let body = self.sese_region(header, &body_stop, ctx);
+                self.loops_stack.pop();
+                ctx.loop_stack.pop();
                 if is_header {
                     ctx.loop_headers.insert(header);
                 }
@@ -335,11 +448,18 @@ impl<'a> Structurer<'a> {
                         }
                     }
                     let (fall, taken) = (succs[0], succs[1]);
-                    // True follow = immediate post-dominator (None if the
-                    // branches diverge: each returns/throws/exits separately).
-                    let follow = self.sese_ipdom(ctx, cur).filter(|f| {
-                        ctx.universe.contains(f) && !stop.contains(f)
-                    });
+                    // True follow = immediate post-dominator. When that is None
+                    // the branches diverge to different terminals — but they may
+                    // still reconverge on a shared in-region continuation while
+                    // one path leaves (a loop `break` -> exit, or return/throw).
+                    // convergent_merge recovers that shared follow (the loop
+                    // tail after `if (a==2 && b==2) break outer;`), without
+                    // which the tail folds into one branch and the other falls
+                    // through empty -> infinite loop (Legacy6).
+                    let follow = self
+                        .sese_ipdom(ctx, cur)
+                        .filter(|f| ctx.universe.contains(f) && !stop.contains(f))
+                        .or_else(|| self.convergent_merge(ctx, &[taken, fall], stop));
                     let mut bstop: HashSet<usize> = stop.iter().copied().collect();
                     if let Some(f) = follow {
                         bstop.insert(f);
@@ -385,7 +505,20 @@ impl<'a> Structurer<'a> {
                     // per-case epilogues). Case bodies are structured by walk
                     // over the case sub-scope; `consumed` is passed as the
                     // claimed set so SESE and the switch share consumption.
-                    let follow = self.sese_ipdom(ctx, cur);
+                    //
+                    // follow = ipdom, else the convergent merge of all case
+                    // targets. Inside a loop the shared tail (`++i`, back-edge)
+                    // post-dominates the dispatch only at the virtual exit, so
+                    // ipdom is None; convergent_merge recovers the tail as the
+                    // follow so every case `break`s to it and it is structured
+                    // ONCE after the switch (EnumSwitch — otherwise the first
+                    // case swallows the tail as `++i; continue` and the rest
+                    // spin forever).
+                    let succs = self.cfg.blocks[cur].succ.clone();
+                    let follow = self
+                        .sese_ipdom(ctx, cur)
+                        .filter(|f| !stop.contains(f))
+                        .or_else(|| self.convergent_merge(ctx, &succs, stop));
                     let mut claimed = ctx.consumed.clone();
                     let sw = self.structure_switch(
                         cur,
