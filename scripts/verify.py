@@ -394,6 +394,14 @@ def verify_corpus(features, limit, keep=False):
                 stats["fail_files"].append((stem, "recompile:" + p.stderr.decode("utf-8", "replace")[:300]))
                 continue
             stats["recompiled"] += 1
+            # Live progress: dump the partial stats after every family so a
+            # long corpus run can be monitored (and partial results survive).
+            try:
+                _live = dict(results); _live[feature] = stats
+                with open("/tmp/corpus_live.json", "w") as _lf:
+                    json.dump(_live, _lf, indent=1, ensure_ascii=False, default=str)
+            except Exception:
+                pass
             # javap compare each original class file vs recompiled
             for oc in sorted((fdir / "orig").rglob("*.class")):
                 rel = oc.relative_to(fdir / "orig")
