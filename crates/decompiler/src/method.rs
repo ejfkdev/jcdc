@@ -983,6 +983,42 @@ fn prune_dead_breaks(s: &mut Stmt) {
 /// (return/throw/break/continue) — javac rejects such unreachable code.
 /// True when control cannot fall out of the end of `s` (children are
 /// already pruned when this is consulted).
+/// Conservative: does `s` contain ANY `break` statement (at any nesting)?
+fn contains_break_stmt(s: &Stmt) -> bool {
+    match s {
+        Stmt::Break(_) => true,
+        Stmt::Block(v) => v.iter().any(contains_break_stmt),
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            contains_break_stmt(then_stmt)
+                || else_stmt.as_deref().map(contains_break_stmt).unwrap_or(false)
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::ForEach { body, .. }
+        | Stmt::Synchronized { body, .. }
+        | Stmt::Labeled { body, .. } => contains_break_stmt(body),
+        Stmt::For { init, body, .. } => {
+            init.iter().any(contains_break_stmt) || contains_break_stmt(body)
+        }
+        Stmt::Switch { cases, default, .. } => {
+            cases.iter().flat_map(|c| c.body.iter()).any(contains_break_stmt)
+                || default.as_deref().map(contains_break_stmt).unwrap_or(false)
+        }
+        Stmt::Try { body, catches, finally } => {
+            contains_break_stmt(body)
+                || catches.iter().any(|c| contains_break_stmt(&c.body))
+                || finally.as_deref().map(contains_break_stmt).unwrap_or(false)
+        }
+        Stmt::TryWithResources { resources, body, catches, finally } => {
+            resources.iter().any(contains_break_stmt)
+                || contains_break_stmt(body)
+                || catches.iter().any(|c| contains_break_stmt(&c.body))
+                || finally.as_deref().map(contains_break_stmt).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
 fn stmt_terminates(s: &Stmt) -> bool {
     match s {
         Stmt::Return(_) | Stmt::Throw(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
@@ -995,6 +1031,26 @@ fn stmt_terminates(s: &Stmt) -> bool {
         // through to a successor that terminates. Computed in `switch_terminates`.
         Stmt::Switch { cases, default, .. } => switch_terminates(cases, default.as_deref()),
         Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => stmt_terminates(body),
+        // An infinite loop that cannot complete normally (JLS 14.21):
+        // `while (true)`, `do .. while (true)`, `for (;;)` with NO `break`
+        // anywhere in the body (conservative: any break, labeled or not, and
+        // even one belonging to a nested construct, makes us treat the loop
+        // as escapable). Decompiled shared-return tails copied into every
+        // branch can leave the original tail after such a loop — javac then
+        // rejects it as an unreachable statement (jdk11/26 String.split).
+        Stmt::While { cond, body } | Stmt::DoWhile { body, cond }
+            if matches!(cond, Expr::Const(ConstVal::Int(1))) && !contains_break_stmt(body) =>
+        {
+            true
+        }
+        Stmt::For { cond, body, .. }
+            if match cond {
+                None => true,
+                Some(c) => matches!(c, Expr::Const(ConstVal::Int(1))),
+            } && !contains_break_stmt(body) =>
+        {
+            true
+        }
         Stmt::Try { body, catches, .. } => {
             // A finally that cannot complete abruptly does not change
             // termination; if body and all catches terminate, so does the
