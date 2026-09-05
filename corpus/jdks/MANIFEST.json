@@ -1,0 +1,203 @@
+[
+  {
+    "feature": 6,
+    "version": "1.6.0_65 (Apple Java for OS X 2017-001)",
+    "dir": "jdk6",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 50,
+    "notes": "Oracle 6u45 dmg requires SSO login; used Apple JavaForOSX2017-001 (1.6.0_65, x64, runs via Rosetta). src.zip not included in Apple bundle; taken from Azul Zulu 6u119 linux x64. javac at jdk6/Contents/Home/bin/javac."
+  },
+  {
+    "feature": 7,
+    "version": "1.7.0_352 (Azul Zulu 7.56.0.11)",
+    "dir": "jdk7",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 51,
+    "notes": "Oracle 7u80 dmg requires SSO login; used Azul Zulu jdk7.0.352 macos x64 tar.gz (flat Home layout, src.zip at jdk7/src.zip, javac at jdk7/bin/javac)."
+  },
+  {
+    "feature": 8,
+    "version": "jdk8u504-b01",
+    "dir": "jdk8",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 52
+  },
+  {
+    "feature": 9,
+    "version": "jdk-9+181",
+    "dir": "jdk9",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 53
+  },
+  {
+    "feature": 10,
+    "version": "jdk-10.0.2+13",
+    "dir": "jdk10",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 54
+  },
+  {
+    "feature": 11,
+    "version": "jdk-11.0.32.1+1",
+    "dir": "jdk11",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 55
+  },
+  {
+    "feature": 12,
+    "version": "jdk-12.0.2+10",
+    "dir": "jdk12",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 56
+  },
+  {
+    "feature": 13,
+    "version": "jdk-13.0.2+8",
+    "dir": "jdk13",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 57
+  },
+  {
+    "feature": 14,
+    "version": "jdk-14.0.2+12",
+    "dir": "jdk14",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 58
+  },
+  {
+    "feature": 15,
+    "version": "jdk-15.0.2+7",
+    "dir": "jdk15",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 59
+  },
+  {
+    "feature": 16,
+    "version": "jdk-16.0.2+7",
+    "dir": "jdk16",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 60
+  },
+  {
+    "feature": 17,
+    "version": "jdk-17.0.20.1+1",
+    "dir": "jdk17",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 61
+  },
+  {
+    "feature": 18,
+    "version": "jdk-18.0.2.1+1",
+    "dir": "jdk18",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 62
+  },
+  {
+    "feature": 19,
+    "version": "jdk-19.0.2+7",
+    "dir": "jdk19",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 63
+  },
+  {
+    "feature": 20,
+    "version": "jdk-20.0.2+9",
+    "dir": "jdk20",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 64
+  },
+  {
+    "feature": 21,
+    "version": "jdk-21.0.12.1+1",
+    "dir": "jdk21",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 65
+  },
+  {
+    "feature": 22,
+    "version": "jdk-22.0.2+9",
+    "dir": "jdk22",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 66
+  },
+  {
+    "feature": 23,
+    "version": "jdk-23.0.2+7",
+    "dir": "jdk23",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 67
+  },
+  {
+    "feature": 24,
+    "version": "jdk-24.0.2+12",
+    "dir": "jdk24",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 68
+  },
+  {
+    "feature": 25,
+    "version": "jdk-25.0.4.1+1",
+    "dir": "jdk25",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 69
+  },
+  {
+    "feature": 26,
+    "version": "jdk-26.0.2.1+1",
+    "dir": "jdk26",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 70
+  },
+  {
+    "feature": 5,
+    "version": null,
+    "dir": null,
+    "os": null,
+    "executable": false,
+    "src_zip_extracted": false,
+    "class_file_major": 49,
+    "notes": "SKIPPED: no public download (Oracle archive requires account; no Adoptium/Zulu builds for JDK5 or earlier)."
+  }
+]

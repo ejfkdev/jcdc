@@ -1,0 +1,19 @@
+[package]
+name = "jcdc-classfile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Java class file format parser (vendored from java-class-rs by ejfkdev, extended for jcdc)"
+
+[dependencies]
+nom = "7"
+cesu8 = "1.1"
+bitflags = "2"
+serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+
+[features]
+default = []
+serde = ["dep:serde", "bitflags/serde"]

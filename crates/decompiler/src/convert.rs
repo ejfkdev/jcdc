@@ -1,0 +1,968 @@
+//! Region tree → Stmt tree conversion.
+//!
+//! Responsibilities:
+//! * weave in per-block statements and terminals (return/throw),
+//! * resolve `Goto{target}` nodes against the enclosing loop/switch scope
+//!   stack into `break` / `continue` / labeled goto,
+//! * classify loops into while / do-while / infinite forms,
+//! * assemble try/catch with exception parameter variables.
+
+use std::collections::{HashMap, HashSet};
+
+use crate::block::Cfg;
+use crate::builder::{BlockResult, Term};
+use crate::expr::{BinOp, ConstVal, Expr, UnOp};
+use crate::stmt::{Catch, Stmt};
+use crate::structure::Region;
+
+/// A named Java statement for `break`/`continue` targets.
+#[derive(Debug)]
+pub enum Jump {
+    Break(Option<String>),
+    Continue(Option<String>),
+    /// Unstructured: emit `label:` + goto as comments (best effort).
+    RawGoto(usize),
+}
+
+#[derive(Debug)]
+struct LoopCtx {
+    header: usize,
+    exits: HashSet<usize>,
+    label: String,
+}
+
+#[derive(Debug)]
+struct SwitchCtx {
+    follow: Option<usize>,
+    label: String,
+    /// Loop-stack depth when the switch was entered: a `break` from a case
+    /// body only needs a label when the jump sits inside a loop that was
+    /// opened WITHIN the switch (an enclosing loop does not intercept it).
+    loops_depth: usize,
+}
+
+pub struct Converter<'a> {
+    pub cfg: &'a Cfg,
+    pub results: &'a Vec<BlockResult>,
+    pub groups: Vec<crate::structure::TryGroup>,
+    /// Dominators over the full method graph (for goto fallback decisions).
+    pub dom: crate::structure::DomInfo,
+    /// Block whose statements are currently being converted (for postdom
+    /// checks in goto resolution).
+    cur_block: usize,
+    loops: Vec<LoopCtx>,
+    switches: Vec<SwitchCtx>,
+    /// Labels actually referenced by break/continue statements.
+    used_labels: HashSet<String>,
+    /// Follow block of each enclosing If region; a goto to the innermost
+    /// follow is natural structured flow and disappears.
+    if_follows: Vec<usize>,
+    label_counter: usize,
+    /// True while converting the last element of a Seq (a trailing Goto
+    /// there may be inlined as a copy instead of an unemittable jump).
+    goto_is_last: bool,
+    /// Heads of copy-walked shared tails (from the structurer).
+    copied_tails: std::collections::HashSet<usize>,
+    /// Collected label emissions: block target -> label name (for `Label` stmts).
+    pub pending_labels: HashMap<usize, String>,
+}
+
+/// Remove a trailing `Goto` whose target is the natural continuation.
+fn strip_trailing_goto(s: &mut Stmt, follow: Option<usize>) {
+    let Some(f) = follow else { return };
+    let items = match s {
+        Stmt::Block(v) => v,
+        Stmt::Goto(t) if *t as usize == f => {
+            *s = Stmt::Block(vec![]);
+            return;
+        }
+        _ => return,
+    };
+    while let Some(last) = items.last_mut() {
+        match last {
+            Stmt::Goto(t) if *t as usize == f => {
+                items.pop();
+                return;
+            }
+            Stmt::Block(inner) if !inner.is_empty() => {
+                // descend into trailing block
+                let n = inner.len();
+                if matches!(inner[n - 1], Stmt::Goto(t) if t as usize == f) {
+                    inner.pop();
+                    return;
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+}
+
+impl<'a> Converter<'a> {
+    pub fn with_copied_tails(mut self, tails: std::collections::HashSet<usize>) -> Self {
+        self.copied_tails = tails;
+        self
+    }
+
+    pub fn new(cfg: &'a Cfg, results: &'a Vec<BlockResult>) -> Self {
+        let universe: HashSet<usize> = (0..cfg.blocks.len()).collect();
+        let dom = crate::structure::compute_dominators(cfg, &universe, cfg.entry);
+        Converter {
+            cfg,
+            results,
+            groups: crate::structure::group_exceptions(cfg),
+            dom,
+            cur_block: usize::MAX,
+            loops: Vec::new(),
+            switches: Vec::new(),
+            if_follows: Vec::new(),
+            used_labels: HashSet::new(),
+            label_counter: 0,
+            goto_is_last: false,
+            copied_tails: std::collections::HashSet::new(),
+            pending_labels: HashMap::new(),
+        }
+    }
+
+    fn next_label(&mut self) -> String {
+        self.label_counter += 1;
+        format!("L{}", self.label_counter)
+    }
+
+    fn groups_end(&self, gi: usize) -> Option<u16> {
+        self.groups.get(gi).map(|g| g.end)
+    }
+
+    pub fn convert(&mut self, r: Region) -> Stmt {
+        self.conv(r)
+    }
+
+    fn conv(&mut self, r: Region) -> Stmt {
+        match r {
+            Region::Empty => Stmt::Block(vec![]),
+            Region::Basic { block } => {
+                self.cur_block = block;
+                if std::env::var("JCDC_DBG_BLOCKS").is_ok() {
+                    eprintln!("conv Basic {} ({} stmts)", block, self.results[block].stmts.len());
+                }
+                self.block_stmts(block)
+            }
+            Region::CopyStmts { block } => {
+                // Copies include the block's terminator when it is a
+                // return/throw (shared terminator blocks are inlined at
+                // every arrival site).
+                let mut v = self.results[block].stmts.clone();
+                match &self.results[block].term {
+                    Term::Return(e) => v.push(Stmt::Return(e.clone())),
+                    Term::Throw(e) => v.push(Stmt::Throw(e.clone())),
+                    _ => {}
+                }
+                if v.len() == 1 {
+                    v.into_iter().next().unwrap()
+                } else {
+                    Stmt::Block(v)
+                }
+            }
+            Region::Seq(v) => {
+                let mut out = Vec::new();
+                let n = v.len();
+                for (k, x) in v.into_iter().enumerate() {
+                    let save = self.goto_is_last;
+                    self.goto_is_last = k + 1 == n;
+                    out.push(self.conv(x));
+                    self.goto_is_last = save;
+                }
+                Stmt::Block(out)
+            }
+            Region::If { block, cond, then_r, else_r, follow, ternary } => {
+                self.cur_block = block;
+                let mut head = self.block_stmts_no_term(block);
+                if let Some((_tv, _fv)) = ternary {
+                    // Pure value diamond: the folded conditional flows into
+                    // the merge block's rebuilt input stack; nothing to emit
+                    // here (branch blocks are statement-free by definition).
+                    let _ = cond;
+                } else {
+                    if let Some(f) = follow {
+                        self.if_follows.push(f);
+                    }
+                    let then_stmt = self.conv(*then_r);
+                    let else_stmt = self.conv(*else_r);
+                    if follow.is_some() {
+                        self.if_follows.pop();
+                    }
+                    let if_stmt = Stmt::If {
+                        cond,
+                        then_stmt: Box::new(then_stmt),
+                        else_stmt: if else_stmt.is_empty_block() { None } else { Some(Box::new(else_stmt)) },
+                    };
+                    head.push(if_stmt);
+                }
+                if head.len() == 1 {
+                    head.pop().unwrap()
+                } else {
+                    Stmt::Block(head)
+                }
+            }
+            Region::Loop { header, body, members, exits } => {
+                let label = self.next_label();
+                self.loops.push(LoopCtx {
+                    header,
+                    exits: exits.iter().copied().collect(),
+                    label: label.clone(),
+                });
+                let body_stmt = self.conv(*body);
+                let ctx = self.loops.pop().unwrap();
+                let _ = members;
+                let mut st = self.classify_loop(header, body_stmt, ctx);
+                if self.used_labels.contains(&label) {
+                    st = Stmt::Labeled { label, body: Box::new(st) };
+                }
+                st
+            }
+            Region::Switch { block, selector, cases, default, follow } => {
+                self.cur_block = block;
+                let sw_label = self.next_label();
+                self.switches.push(SwitchCtx {
+                    follow,
+                    label: sw_label.clone(),
+                    loops_depth: self.loops.len(),
+                });
+                let mut case_groups = Vec::new();
+                for (vals, r) in cases {
+                    let s = self.conv(r);
+                    case_groups.push(crate::stmt::CaseGroup {
+                        labels: vals,
+                        string_labels: vec![],
+                        enum_labels: vec![],
+                        raw_labels: vec![],
+                        body: stmt_to_vec(s),
+                    });
+                }
+                let default_stmt = default.map(|d| Box::new(self.conv(*d)));
+                self.switches.pop();
+                let mut head = self.block_stmts_no_term(block);
+                let mut sw = Stmt::Switch {
+                    selector,
+                    cases: case_groups,
+                    default: default_stmt,
+                    on_string: false,
+                };
+                if self.used_labels.contains(&sw_label) {
+                    sw = Stmt::Labeled { label: sw_label, body: Box::new(sw) };
+                }
+                head.push(sw);
+                if head.len() == 1 {
+                    head.pop().unwrap()
+                } else {
+                    Stmt::Block(head)
+                }
+            }
+            Region::Try { group_idx, body, catches } => {
+                let mut body_stmt = self.conv(*body);
+                // Natural exits of the try body / handlers jump to the block
+                // right after the try span; that is structured fallthrough.
+                let gend = self.groups_end(group_idx);
+                let try_follow = gend.and_then(|e| self.cfg.block_at(e));
+                strip_trailing_goto(&mut body_stmt, try_follow);
+                let mut catch_stmts = Vec::new();
+                for (tys, _hblock, r) in catches {
+                    let mut s = self.conv(*r);
+                    strip_trailing_goto(&mut s, try_follow);
+                    catch_stmts.push(Catch {
+                        exc: tys,
+                        var: u32::MAX, // assigned by the method pipeline (handler store)
+                        var_name: None,
+                        body: Box::new(s),
+                    });
+                }
+                Stmt::Try { body: Box::new(body_stmt), catches: catch_stmts, finally: None }
+            }
+            Region::Goto { target } => {
+                if std::env::var("JCDC_DBG_GOTO").is_ok() {
+                    eprintln!("conv Goto target={} cur_block={} loops={:?} switches={} if_follows={:?}",
+                        target, self.cur_block,
+                        self.loops.iter().map(|l| (l.header, l.exits.len())).collect::<Vec<_>>(),
+                        self.switches.len(), self.if_follows);
+                }
+                // A jump to an enclosing if's follow that TERMINATES
+                // (return/throw) can be inlined: the copy ends this path
+                // exactly like the jump would, without needing a label.
+                let inline_terminator = self.if_follows.contains(&target)
+                    && matches!(
+                        self.results[target].term,
+                        Term::Return(_) | Term::Throw(_)
+                    );
+                if inline_terminator {
+                    let mut v = self.results[target].stmts.clone();
+                    match &self.results[target].term {
+                        Term::Return(e) => v.push(Stmt::Return(e.clone())),
+                        Term::Throw(e) => v.push(Stmt::Throw(e.clone())),
+                        _ => {}
+                    }
+                    return if v.len() == 1 {
+                        v.into_iter().next().unwrap()
+                    } else {
+                        Stmt::Block(v)
+                    };
+                }
+                if let Some(j) = self.resolve_goto(target) {
+                    match j {
+                        Jump::Break(lbl) => {
+                            if let Some(l) = &lbl {
+                                self.used_labels.insert(l.clone());
+                            }
+                            Stmt::Break(lbl)
+                        }
+                        Jump::Continue(lbl) => {
+                            if let Some(l) = &lbl {
+                                self.used_labels.insert(l.clone());
+                            }
+                            Stmt::Continue(lbl)
+                        }
+                        Jump::RawGoto(t) => {
+                            if std::env::var("JCDC_DBG_GOTO").is_ok() {
+                                eprintln!("RAWGOTO t={} copied_tails={:?} if_follows={:?} last={}", t, self.copied_tails, self.if_follows, self.goto_is_last);
+                            }
+                            // A Goto region is always the last part of its
+                            // walk, so the jump either falls through to the
+                            // enclosing merge or must be inlined.
+                            let term_copy = matches!(
+                                self.results[t].term,
+                                Term::Return(_) | Term::Throw(_)
+                            );
+                            if term_copy {
+                                let mut cv = self.results[t].stmts.clone();
+                                match &self.results[t].term {
+                                    Term::Return(e) => cv.push(Stmt::Return(e.clone())),
+                                    Term::Throw(e) => cv.push(Stmt::Throw(e.clone())),
+                                    _ => {}
+                                }
+                                if cv.len() == 1 {
+                                    cv.into_iter().next().unwrap()
+                                } else {
+                                    Stmt::Block(cv)
+                                }
+                            } else if self.goto_is_last
+                                || self.if_follows.contains(&t)
+                                || self.reaches_copy_tail(t)
+                            {
+                                // Natural fallthrough reaches the same
+                                // continuation the jump targeted.
+                                Stmt::Block(vec![])
+                            } else if !matches!(
+                                self.results[t].term,
+                                Term::Return(_) | Term::Throw(_)
+                            ) && (self.if_follows.iter().any(|f| {
+                                self.cfg.blocks[t].succ.contains(f)
+                            }))
+                            {
+                                // The jump re-enters an already-structured
+                                // block whose flow ends at an enclosing
+                                // if-follow: inline its statements; the
+                                // natural continuation matches the jump's.
+                                let cv = self.results[t].stmts.clone();
+                                if cv.len() == 1 {
+                                    cv.into_iter().next().unwrap()
+                                } else {
+                                    Stmt::Block(cv)
+                                }
+                            } else {
+                                Stmt::Goto(t as u32)
+                            }
+                        }
+                    }
+                } else {
+                    Stmt::Block(vec![])
+                }
+            }
+        }
+    }
+
+    /// Statements of a block including its terminal (return/throw), but NOT
+    /// the structural terminals (cond/switch/goto — handled by regions).
+    fn block_stmts(&mut self, block: usize) -> Stmt {
+        let mut v = self.block_stmts_no_term(block);
+        match &self.results[block].term {
+            Term::Return(e) => v.push(Stmt::Return(e.clone())),
+            Term::Throw(e) => v.push(Stmt::Throw(e.clone())),
+            Term::Jsr | Term::Ret => v.push(Stmt::Comment("// jsr/ret not supported".into())),
+            _ => {}
+        }
+        if v.len() == 1 {
+            v.pop().unwrap()
+        } else {
+            Stmt::Block(v)
+        }
+    }
+
+    fn block_stmts_no_term(&self, block: usize) -> Vec<Stmt> {
+        // Monitor markers are kept; synchronized reconstruction happens later.
+        self.results[block].stmts.clone()
+    }
+
+    /// Resolve a goto target against the scope stack.
+    fn resolve_goto(&mut self, target: usize) -> Option<Jump> {
+        // continue: innermost loop whose header == target
+        if let Some(i) = (0..self.loops.len()).rev().find(|&i| self.loops[i].header == target) {
+            let depth = self.loops.len() - 1 - i;
+            return Some(if depth == 0 {
+                Jump::Continue(None)
+            } else {
+                Jump::Continue(Some(self.loops[i].label.clone()))
+            });
+        }
+        // break out of a loop whose exit set contains the target; pick the
+        // OUTERMOST such loop — an exit of nested loops (e.g. `break outer`)
+        // belongs to every enclosing loop's exit set, and breaking only the
+        // innermost would wrongly re-enter the outer loop.
+        if let Some(li) = (0..self.loops.len()).find(|&i| self.loops[i].exits.contains(&target)) {
+            // switches opened after that loop intercept a plain `break`
+            let crosses_switch = !self.switches.is_empty();
+            return Some(if li + 1 == self.loops.len() && !crosses_switch {
+                Jump::Break(None)
+            } else {
+                Jump::Break(Some(self.loops[li].label.clone()))
+            });
+        }
+        if let Some(si) = (0..self.switches.len()).rev().find(|&i| self.switches[i].follow == Some(target)) {
+            return Some(if si + 1 == self.switches.len() && self.loops.len() == self.switches[si].loops_depth {
+                Jump::Break(None)
+            } else {
+                Jump::Break(Some(self.switches[si].label.clone()))
+            });
+        }
+        // Natural flow to the enclosing if's merge point: no statement.
+        // Only the INNERMOST open follow qualifies — eliding a jump to an
+        // outer follow would silently skip the statements between (e.g. a
+        // shared throw at the end of an else-branch).
+        if self.if_follows.last() == Some(&target) {
+            return None;
+        }
+        // Inside a loop, a forward escape that cannot reach back into the
+        // loop is a break of the innermost loop.
+        if !self.loops.is_empty()
+            && !crate::structure::can_reach_cfg(
+                self.cfg,
+                target,
+                self.loops[self.loops.len() - 1].header,
+                4096,
+            )
+        {
+            return Some(Jump::Break(None));
+        }
+        // Unstructured jump.
+        Some(Jump::RawGoto(target))
+    }
+
+    /// True if `a` post-dominates `b` (every path from b exits through a).
+    /// True when a jump to `t` is equivalent to natural fallthrough: `t`
+    /// (or the end of a chain of statement-free blocks starting at `t`) is
+    /// a copied shared tail or an open if-follow that the enclosing flow
+    /// will emit next anyway.
+    fn reaches_copy_tail(&self, t: usize) -> bool {
+        let mut x = t;
+        for _ in 0..8 {
+            if self.copied_tails.contains(&x) || self.if_follows.contains(&x) {
+                return true;
+            }
+            if !self.results[x].stmts.is_empty() {
+                return false;
+            }
+            match &self.results[x].term {
+                Term::Fallthrough | Term::Goto => {
+                    match self.cfg.blocks[x].succ.first() {
+                        Some(&n) => x = n,
+                        None => return false,
+                    }
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+#[allow(dead_code)]
+    fn postdominates(&self, a: usize, b: usize, universe: &HashSet<usize>) -> bool {
+        // BFS from b avoiding a; if no exit block is reachable, a post-dominates.
+        let mut seen = HashSet::new();
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(b);
+        seen.insert(b);
+        while let Some(x) = q.pop_front() {
+            for &s in &self.cfg.blocks[x].succ {
+                if s == a {
+                    continue;
+                }
+                if !universe.contains(&s) {
+                    continue;
+                }
+                if seen.insert(s) {
+                    q.push_back(s);
+                }
+            }
+            if self.cfg.blocks[x].succ.is_empty() && x != a && x != b {
+                // reached an exit without passing through a
+                return false;
+            }
+        }
+        // also treat blocks leaving the universe as exits
+        true
+    }
+
+    /// Classify a loop region into while / do-while / infinite and assemble
+    /// the final statement.
+    fn classify_loop(&mut self, header: usize, body_stmt: Stmt, ctx: LoopCtx) -> Stmt {
+        let term = self.results[header].term.clone();
+        let succs = self.cfg.blocks[header].succ.clone();
+
+        match term {
+            Term::Cond { cond } if succs.len() == 2 => {
+                let taken = succs[1];
+                let fall = succs[0];
+                if taken == header {
+                    // Self-loop: the header block holds both the body and
+                    // the trailing conditional back edge → do-while. The
+                    // fallthrough side is the loop exit.
+                    // A compound (multi-test) trailing condition folds first:
+                    // `if(c1)continue; .. if(cN)continue; else exit;` becomes
+                    // `do{body}while(c1||..||cN); exit`.
+                    if let Some((stmts, c, exit)) = extract_compound_do_while(&body_stmt) {
+                        return Stmt::Block(vec![
+                            Stmt::DoWhile { body: Box::new(Stmt::Block(stmts)), cond: c },
+                            exit,
+                        ]);
+                    }
+                    let (stmts, c) = match extract_trailing_do_while(&body_stmt) {
+                        Some(x) => x,
+                        None => (stmt_to_vec(body_stmt), cond.clone()),
+                    };
+                    return Stmt::DoWhile {
+                        body: Box::new(Stmt::Block(stmts)),
+                        cond: c,
+                    };
+                }
+                if fall == header && ctx.exits.contains(&taken) {
+                    // Inverted self-loop: `while (!(c)) body` — the taken
+                    // side exits, the fallthrough loops back.
+                    let inner2 = strip_trailing_continue(body_stmt);
+                    return Stmt::While {
+                        cond: negate(cond.clone()),
+                        body: Box::new(inner2),
+                    };
+                }
+                let taken_is_exit = ctx.exits.contains(&taken);
+                if std::env::var("JCDC_DBG_LOOP").is_ok() {
+                    eprintln!("CLASSIFY2 header={} taken={} fall={} exits={:?}", header, taken, fall, ctx.exits);
+                }
+                if !taken_is_exit && !ctx.exits.contains(&fall) {
+                    // Multi-block loop condition. The header's fallthrough
+                    // may be a pure condition-continuation test block whose
+                    // taken side is the loop exit and whose fall side rejoins
+                    // the body (`taken`). javac compiles `while (cH || !cB)`
+                    // exactly this way:
+                    //   H: if cH goto body;  B: if cB goto exit;  body: ..; goto H
+                    // Fold B into the while condition. Without this the body
+                    // walk re-emits H and B as empty `if`s inside a
+                    // `while(true)`, dropping the exit and leaving an infinite
+                    // loop plus an unreachable trailing statement.
+                    if self.results[fall].stmts.is_empty() {
+                        if let Term::Cond { cond: cb } = &self.results[fall].term {
+                            let bs = self.cfg.blocks[fall].succ.clone();
+                            if bs.len() == 2 && ctx.exits.contains(&bs[1]) && bs[0] == taken {
+                                let combined = Expr::Bin {
+                                    op: BinOp::LogOr,
+                                    l: Box::new(cond.clone()),
+                                    r: Box::new(negate(cb.clone())),
+                                    ty: None,
+                                };
+                                let body = Stmt::Block(self.results[taken].stmts.clone());
+                                if std::env::var("JCDC_DBG_LOOP").is_ok() {
+                                    eprintln!(
+                                        "CLASSIFY-CONDCHAIN header={} B={} body={} exits={:?}",
+                                        header, fall, taken, ctx.exits
+                                    );
+                                }
+                                return Stmt::While { cond: combined, body: Box::new(body) };
+                            }
+                        }
+                    }
+                    // Neither successor leaves the loop: the header's Cond
+                    // is an interior diamond (e.g. a ternary inside an
+                    // infinite `for(;;)` whose back edge targets the header
+                    // top), not an exit test. Keep it in the body.
+                    return Stmt::While {
+                        cond: Expr::Const(ConstVal::Int(1)),
+                        body: Box::new(body_stmt),
+                    };
+                }
+                // The body walk re-emitted the header's own If region; unwrap
+                // it so the loop reads `while (C) { else-part }`.
+                let (inner, exit_stmts) = split_leading_if(&body_stmt, &cond);
+                if std::env::var("JCDC_DBG_LOOP").is_ok() {
+                    eprintln!(
+                        "CLASSIFY header={} taken_is_exit={} exit_stmts={}",
+                        header,
+                        taken_is_exit,
+                        exit_stmts.len()
+                    );
+                }
+                let inner = strip_trailing_continue(inner);
+                let while_cond = if taken_is_exit { negate(cond.clone()) } else { cond.clone() };
+                let plain_exit = exit_stmts.is_empty()
+                    || matches!(exit_stmts.as_slice(), [Stmt::Break(_)])
+                    || matches!(exit_stmts.as_slice(), [Stmt::Block(b)] if b.is_empty());
+                if taken_is_exit && plain_exit {
+                    Stmt::While { cond: while_cond, body: Box::new(inner) }
+                } else if taken_is_exit {
+                    // Exit branch runs statements before leaving:
+                    // while (true) { if (!C) { stmts; break; } body }
+                    let mut ex = exit_stmts;
+                    ex.push(Stmt::Break(None));
+                    let guard = Stmt::If {
+                        cond: negate(cond),
+                        then_stmt: Box::new(Stmt::Block(ex)),
+                        else_stmt: None,
+                    };
+                    let mut v = vec![guard];
+                    v.extend(stmt_to_vec(inner));
+                    Stmt::While { cond: Expr::Const(ConstVal::Int(1)), body: Box::new(Stmt::Block(v)) }
+                } else {
+                    // Unusual orientation: the fallthrough side exits.
+                    if exit_stmts.is_empty()
+                        || matches!(exit_stmts.as_slice(), [Stmt::Break(_)])
+                        || matches!(exit_stmts.as_slice(), [Stmt::Block(b)] if b.is_empty())
+                    {
+                        // then-side was the exit scaffolding; body is `inner`
+                        Stmt::While { cond: while_cond, body: Box::new(inner) }
+                    } else {
+                        // then-side carries the body ending with the back
+                        // edge; fallthrough exits.
+                        let body2 = strip_trailing_continue(stmts_to_stmt(exit_stmts));
+                        Stmt::While { cond: while_cond, body: Box::new(body2) }
+                    }
+                }
+            }
+            Term::Goto | Term::Fallthrough => {
+                // Possibly do-while: the body ends with a conditional jump
+                // back to the header (`if (c) continue;` or inverted), or a
+                // COMPOUND run of such tests ending in the loop exit.
+                if let Some((stmts, c, exit)) = extract_compound_do_while(&body_stmt) {
+                    return Stmt::Block(vec![
+                        Stmt::DoWhile { body: Box::new(Stmt::Block(stmts)), cond: c },
+                        exit,
+                    ]);
+                }
+                if let Some((stmts, c)) = extract_trailing_do_while(&body_stmt) {
+                    return Stmt::DoWhile { body: Box::new(Stmt::Block(stmts)), cond: c };
+                }
+                Stmt::While {
+                    cond: Expr::Const(ConstVal::Int(1)),
+                    body: Box::new(body_stmt),
+                }
+            }
+            _ => Stmt::While {
+                cond: Expr::Const(ConstVal::Int(1)),
+                body: Box::new(body_stmt),
+            },
+        }
+    }
+
+    /// True if `target` is inside the loop currently being classified
+    /// (approximated: target can reach the header again).
+#[allow(dead_code)]
+    fn loop_contains(&self, header: usize, target: usize) -> bool {
+        can_reach(self.cfg, target, header, 8192)
+    }
+
+#[allow(dead_code)]
+    fn loop_exit_contains(&self, header: usize, target: usize) -> bool {
+        // The loop currently being classified is the innermost on the stack
+        // BEFORE it was popped; ctx.exits was consumed. Recompute cheaply:
+        // target is an exit if it is not reachable-back-to-header within the
+        // loop members — approximated by checking the parent scope recorded
+        // in loops stack is empty here; use cfg: header's own successors that
+        // leave... For the header itself, an exit is any successor that is
+        // not dominated by header OR is not in the natural loop. Simple
+        // approximation: a successor s is "in loop" if s can reach header
+        // again via normal edges.
+        can_reach(self.cfg, target, header, 4096).not()
+    }
+}
+
+#[allow(dead_code)]
+trait NotExt {
+    fn not(self) -> bool;
+}
+impl NotExt for bool {
+    fn not(self) -> bool {
+        !self
+    }
+}
+
+#[allow(dead_code)]
+fn can_reach(cfg: &Cfg, from: usize, to: usize, budget: usize) -> bool {
+    if from == to {
+        return true;
+    }
+    let mut seen = HashSet::new();
+    let mut q = std::collections::VecDeque::new();
+    q.push_back(from);
+    seen.insert(from);
+    let mut n = 0;
+    while let Some(b) = q.pop_front() {
+        n += 1;
+        if n > budget {
+            return false;
+        }
+        for &s in &cfg.blocks[b].succ {
+            if s == to {
+                return true;
+            }
+            if seen.insert(s) {
+                q.push_back(s);
+            }
+        }
+    }
+    false
+}
+
+/// If the body starts with the loop header's own `If` (same condition
+/// expression), return (else-branch content, then-branch content).
+/// Otherwise return (body, []).
+fn stmts_to_stmt(v: Vec<Stmt>) -> Stmt {
+    match v.len() {
+        0 => Stmt::Block(vec![]),
+        1 => v.into_iter().next().unwrap(),
+        _ => Stmt::Block(v),
+    }
+}
+
+fn split_leading_if(body: &Stmt, cond: &Expr) -> (Stmt, Vec<Stmt>) {
+    let items = match body {
+        Stmt::Block(v) => v,
+        other => {
+            return match other {
+                Stmt::If { cond: c, then_stmt, else_stmt } if c == cond => (
+                    else_stmt.as_ref().map(|e| (**e).clone()).unwrap_or(Stmt::Block(vec![])),
+                    stmt_to_vec((**then_stmt).clone()),
+                ),
+                _ => (other.clone(), vec![]),
+            };
+        }
+    };
+    if let Some(first) = items.first() {
+        if let Stmt::If { cond: c, then_stmt, else_stmt } = first {
+            if c == cond {
+                let inner = if items.len() == 1 {
+                    else_stmt.as_ref().map(|e| (**e).clone()).unwrap_or(Stmt::Block(vec![]))
+                } else {
+                    let mut rest = vec![else_stmt
+                        .as_ref()
+                        .map(|e| (**e).clone())
+                        .unwrap_or(Stmt::Block(vec![]))];
+                    rest.extend(items[1..].iter().cloned());
+                    Stmt::Block(rest)
+                };
+                return (inner, stmt_to_vec((**then_stmt).clone()));
+            }
+        }
+    }
+    (body.clone(), vec![])
+}
+
+/// Remove a trailing `continue;` (loop back-edge) from a statement list.
+fn strip_trailing_continue(s: Stmt) -> Stmt {
+    match s {
+        Stmt::Block(mut v) => {
+            while matches!(v.last(), Some(Stmt::Continue(None))) {
+                v.pop();
+            }
+            if v.len() == 1 && matches!(v[0], Stmt::Block(_)) {
+                let inner = match v.pop().unwrap() {
+                    Stmt::Block(inner) => inner,
+                    _ => unreachable!(),
+                };
+                return strip_trailing_continue(Stmt::Block(inner));
+            }
+            Stmt::Block(v)
+        }
+        Stmt::Continue(None) => Stmt::Block(vec![]),
+        other => other,
+    }
+}
+
+pub fn negate(e: Expr) -> Expr {
+    match &e {
+        Expr::Un { op: UnOp::Not, .. } => match e {
+            Expr::Un { e, .. } => *e,
+            _ => unreachable!(),
+        },
+        Expr::Bin { op, .. } => {
+            if let Some(inv) = op.invert() {
+                match e {
+                    Expr::Bin { l, r, ty, .. } => Expr::Bin { op: inv, l, r, ty },
+                    _ => unreachable!(),
+                }
+            } else {
+                Expr::Un { op: UnOp::Not, e: Box::new(e) }
+            }
+        }
+        _ => Expr::Un { op: UnOp::Not, e: Box::new(e) },
+    }
+}
+
+/// True for a bare `continue;` (or a block wrapping just one).
+fn is_continue_stmt(s: &Stmt) -> bool {
+    matches!(s, Stmt::Continue(None))
+        || matches!(s, Stmt::Block(v) if v.len() == 1 && matches!(v[0], Stmt::Continue(None)))
+}
+
+/// Detect a COMPOUND trailing do-while condition: the body ends with a run of
+/// `if (c1) continue;` ... `if (cN) continue; else <exit>;`. javac emits this
+/// for `do { body } while (c1 || ... || cN);` followed by the loop exit when
+/// the condition is a short-circuit `||` whose tests each jump back to the
+/// body head (e.g. `Random.internalNextInt`: `while (r < origin || r >=
+/// bound)`). Fold the run into a single do-while whose condition is the `||`
+/// of the tests, returning the body statements, that condition, and the exit
+/// action (`<exit>`) to emit right after the loop.
+fn extract_compound_do_while(body: &Stmt) -> Option<(Vec<Stmt>, Expr, Stmt)> {
+    // Flatten nested straight-line blocks: the loop body may group the first
+    // condition test(s) inside a nested Block (the self-loop header's region)
+    // while later tests are siblings. Splicing pure sequence blocks is safe.
+    fn flatten_seq(s: &Stmt) -> Vec<Stmt> {
+        match s {
+            Stmt::Block(v) => {
+                let mut out = Vec::new();
+                for x in v {
+                    out.extend(flatten_seq(x));
+                }
+                out
+            }
+            other => vec![other.clone()],
+        }
+    }
+    let stmts = flatten_seq(body);
+    let n = stmts.len();
+    if n < 2 {
+        return None;
+    }
+    // Last statement: `if (c_last) continue; else <exit>` — the exit is the
+    // loop's fall-out (a return/throw/break), NOT another continue.
+    let (c_last, exit) = match &stmts[n - 1] {
+        Stmt::If { cond, then_stmt, else_stmt: Some(e) }
+            if is_continue_stmt(then_stmt) && !is_continue_stmt(e) =>
+        {
+            (cond.clone(), (**e).clone())
+        }
+        _ => return None,
+    };
+    // Walk backwards over preceding `if (ci) continue;` (no else) tests.
+    let mut conds = vec![c_last];
+    let mut i = n - 1;
+    while i >= 1 {
+        match &stmts[i - 1] {
+            Stmt::If { cond, then_stmt, else_stmt: None } if is_continue_stmt(then_stmt) => {
+                conds.push(cond.clone());
+                i -= 1;
+            }
+            _ => break,
+        }
+    }
+    let body_stmts: Vec<Stmt> = stmts[..i].to_vec();
+    // cond = c1 || c2 || ... || c_last (conds currently reversed).
+    let mut it = conds.into_iter().rev();
+    let mut cond = it.next().unwrap();
+    for c in it {
+        cond = Expr::Bin { op: BinOp::LogOr, l: Box::new(c), r: Box::new(cond), ty: None };
+    }
+    Some((body_stmts, cond, exit))
+}
+
+/// Detect a trailing do-while condition at the end of a loop body:
+/// `if (c) continue;` → cond c, or `if (c) {} else continue;` → cond !c.
+fn extract_trailing_do_while(body: &Stmt) -> Option<(Vec<Stmt>, Expr)> {
+    let mut stmts = match body {
+        Stmt::Block(v) => v.clone(),
+        other => vec![other.clone()],
+    };
+    if stmts.is_empty() {
+        return None;
+    }
+    let n = stmts.len() - 1;
+    if let Stmt::If { cond, then_stmt, else_stmt } = &stmts[n] {
+        let then_is_cont = |s: &Stmt| {
+            matches!(s, Stmt::Continue(None))
+                || matches!(s, Stmt::Block(v) if v.len() == 1 && matches!(v[0], Stmt::Continue(None)))
+        };
+        if then_is_cont(then_stmt) && else_stmt.is_none() {
+            let c = cond.clone();
+            stmts.pop();
+            return Some((stmts, c));
+        }
+        if else_stmt.as_ref().map(|e| then_is_cont(e)).unwrap_or(false)
+            && (matches!(&**then_stmt, Stmt::Block(v) if v.is_empty()))
+        {
+            let c = negate(cond.clone());
+            stmts.pop();
+            return Some((stmts, c));
+        }
+    }
+    None
+}
+
+/// If the body ends with `if (c) continue;` (Continue(None), no else),
+/// strip it and return (body without trailing if, c).
+#[allow(dead_code)]
+fn extract_trailing_continue_if(body: &Stmt) -> Option<(Vec<Stmt>, Expr)> {
+    let mut stmts = match body {
+        Stmt::Block(v) => v.clone(),
+        other => vec![other.clone()],
+    };
+    if stmts.is_empty() {
+        return None;
+    }
+    let n = stmts.len() - 1;
+    // Direct trailing `if (c) continue;`.
+    let is_direct = match &stmts[n] {
+        Stmt::If { then_stmt, else_stmt: None, .. } => {
+            matches!(&**then_stmt, Stmt::Continue(None))
+                || matches!(&**then_stmt, Stmt::Block(tb) if tb.len() == 1 && matches!(tb[0], Stmt::Continue(None)))
+        }
+        _ => false,
+    };
+    if is_direct {
+        if let Stmt::If { cond, .. } = stmts.pop().unwrap() {
+            return Some((stmts, cond));
+        }
+    }
+    // Descend into a trailing block.
+    if matches!(stmts.last(), Some(Stmt::Block(_))) {
+        let last = stmts.pop().unwrap();
+        if let Some((inner, c)) = extract_trailing_continue_if(&last) {
+            if !inner.is_empty() {
+                stmts.push(Stmt::Block(inner));
+            }
+            return Some((stmts, c));
+        } else {
+            stmts.push(last);
+        }
+    }
+    None
+}
+
+/// Separate the first Basic block's statements from the rest of a body.
+/// (Bodies built by `walk` start with the header's statements.)
+#[allow(dead_code)]
+fn split_first_block(body: Stmt) -> (Stmt, Option<usize>) {
+    // The body is whatever the walk produced; we keep it intact — header
+    // statements were already woven in by conv(Basic). Return as-is.
+    (body, None)
+}
+
+fn stmt_to_vec(s: Stmt) -> Vec<Stmt> {
+    match s {
+        Stmt::Block(v) => v,
+        other => vec![other],
+    }
+}

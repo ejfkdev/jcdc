@@ -1,0 +1,16 @@
+[package]
+name = "jcdc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "jcdc"
+path = "src/main.rs"
+
+[dependencies]
+jcdc-classfile = { workspace = true }
+jcdc-jvm = { workspace = true }
+jcdc-decompiler = { workspace = true }
+anyhow = { workspace = true }
+zip = { version = "2", default-features = false, features = ["deflate"] }

@@ -1,0 +1,4826 @@
+//! Class-level decompilation: header, fields, methods, static initializer,
+//! nested/anonymous class families.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
+
+use jcdc_classfile::{
+    parse_specialized_attribute, ClassAccessFlags, FieldAccessFlags, MethodAccessFlags,
+    ParsedAttribute,
+};
+use jcdc_jvm::{
+    parse_class_signature, parse_field_descriptor, parse_field_signature, parse_method_descriptor,
+    parse_method_signature, ClassPool, JavaType, PoolClass,
+};
+
+use crate::emit::Printer;
+use crate::expr::{Expr, TypeRef};
+use crate::method::decompile_method;
+use crate::stmt::Stmt;
+use crate::varalloc::VarTable;
+
+fn empty_pool() -> &'static ClassPool {
+    static P: OnceLock<ClassPool> = OnceLock::new();
+    P.get_or_init(ClassPool::new)
+}
+
+fn empty_vt() -> &'static VarTable {
+    static V: OnceLock<VarTable> = OnceLock::new();
+    V.get_or_init(VarTable::default)
+}
+
+#[derive(Clone)]
+pub struct ClassOptions {
+    /// Include synthetic/bridge members.
+    pub show_synthetic: bool,
+    /// Include private members.
+    pub show_private: bool,
+}
+
+impl Default for ClassOptions {
+    fn default() -> Self {
+        ClassOptions { show_synthetic: false, show_private: true }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Family analysis (nested / anonymous / lambda classes)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NestedKind {
+    Member,
+    Anonymous,
+    Local,
+    Lambda,
+}
+
+pub struct NestedClass {
+    pub name: String,
+    pub simple: String,
+    pub kind: NestedKind,
+    pub access: ClassAccessFlags,
+}
+
+pub struct Family {
+    pub root: String,
+    /// All nested classes (any depth) keyed by internal name.
+    pub nested: HashMap<String, NestedClass>,
+    /// Anonymous classes inlined at `new` sites (not printed separately).
+    pub anonymous: HashSet<String>,
+    /// Local classes: declared at their use site inside methods.
+    pub locals: HashSet<String>,
+    /// Lambda impl classes (skipped entirely).
+    pub lambdas: HashSet<String>,
+}
+
+impl Family {
+    pub fn collect(root_pc: &PoolClass, pool: &ClassPool) -> Family {
+        let root = root_pc.internal_name.clone();
+        let mut fam = Family {
+            root: root.clone(),
+            nested: HashMap::new(),
+            anonymous: HashSet::new(),
+            locals: HashSet::new(),
+            lambdas: HashSet::new(),
+        };
+        let prefix = format!("{}$", root);
+        // Only primary (input) sources: classpath jars must not leak
+        // foreign nested classes into the emitted family.
+        for name in pool.primary_names() {
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            let rest = &name[prefix.len()..];
+            let Some(pc) = pool.get(&name) else { continue };
+            let (kind, simple, access) = classify_nested(&name, rest, &pc);
+            match kind {
+                NestedKind::Lambda => {
+                    fam.lambdas.insert(name.clone());
+                }
+                NestedKind::Anonymous => {
+                    fam.anonymous.insert(name.clone());
+                    fam.nested.insert(
+                        name.clone(),
+                        NestedClass { name: name.clone(), simple, kind, access },
+                    );
+                }
+                NestedKind::Local => {
+                    fam.locals.insert(name.clone());
+                    fam.nested.insert(
+                        name.clone(),
+                        NestedClass { name: name.clone(), simple, kind, access },
+                    );
+                }
+                NestedKind::Member => {
+                    fam.nested.insert(
+                        name.clone(),
+                        NestedClass { name: name.clone(), simple, kind, access },
+                    );
+                }
+            }
+        }
+        fam
+    }
+
+    /// Direct nested classes of `outer` that should be printed inside it
+    /// (member/local kinds; anonymous are inlined, lambdas skipped).
+    pub fn direct_children(&self, outer: &str) -> Vec<&NestedClass> {
+        let prefix = format!("{}$", outer);
+        let mut v: Vec<&NestedClass> = self
+            .nested
+            .iter()
+            .filter(|(name, n)| {
+                name.starts_with(&prefix)
+                    && !name[prefix.len()..].contains('$')
+                    && n.kind != NestedKind::Anonymous
+                    && n.kind != NestedKind::Local
+            })
+            .map(|(_, n)| n)
+            .collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
+    }
+
+    /// Direct anonymous children of `outer` (for enum constant bodies etc.).
+    pub fn direct_anonymous(&self, outer: &str) -> Vec<&NestedClass> {
+        let prefix = format!("{}$", outer);
+        let mut v: Vec<&NestedClass> = self
+            .nested
+            .iter()
+            .filter(|(name, n)| {
+                name.starts_with(&prefix)
+                    && !name[prefix.len()..].contains('$')
+                    && n.kind == NestedKind::Anonymous
+            })
+            .map(|(_, n)| n)
+            .collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
+    }
+}
+
+/// Inline javac's synthetic `access$NNN` bridge methods (JDK <= 10 inner
+/// class access). The bridges are hidden from the printed class, so call
+/// sites must carry the underlying field/method expression instead.
+fn inline_accessors(s: &mut Stmt, pc: &PoolClass, pool: &ClassPool) {
+    fn walk_stmt(s: &mut Stmt, pc: &PoolClass, pool: &ClassPool, depth: u8) {
+        match s {
+            Stmt::Block(v) => v.iter_mut().for_each(|x| walk_stmt(x, pc, pool, depth)),
+            Stmt::ExprStmt(e) => walk_expr(e, pc, pool, depth),
+            Stmt::LocalDef { init: Some(e), .. } => walk_expr(e, pc, pool, depth),
+            Stmt::Return(e) => {
+                if let Some(x) = e {
+                    walk_expr(x, pc, pool, depth);
+                }
+            }
+            Stmt::Throw(e) => walk_expr(e, pc, pool, depth),
+            Stmt::If { cond, then_stmt, else_stmt } => {
+                walk_expr(cond, pc, pool, depth);
+                walk_stmt(then_stmt, pc, pool, depth);
+                if let Some(x) = else_stmt {
+                    walk_stmt(x, pc, pool, depth);
+                }
+            }
+            Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+                walk_expr(cond, pc, pool, depth);
+                walk_stmt(body, pc, pool, depth);
+            }
+            Stmt::For { init, cond, update, body } => {
+                init.iter_mut().for_each(|i| walk_stmt(i, pc, pool, depth));
+                if let Some(c) = cond {
+                    walk_expr(c, pc, pool, depth);
+                }
+                update.iter_mut().for_each(|u| walk_expr(u, pc, pool, depth));
+                walk_stmt(body, pc, pool, depth);
+            }
+            Stmt::ForEach { iterable, body, .. } => {
+                walk_expr(iterable, pc, pool, depth);
+                walk_stmt(body, pc, pool, depth);
+            }
+            Stmt::Switch { selector, cases, default, .. } => {
+                walk_expr(selector, pc, pool, depth);
+                for c in cases.iter_mut() {
+                    c.body.iter_mut().for_each(|x| walk_stmt(x, pc, pool, depth));
+                }
+                if let Some(d) = default {
+                    walk_stmt(d, pc, pool, depth);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                walk_stmt(body, pc, pool, depth);
+                for c in catches.iter_mut() {
+                    walk_stmt(&mut c.body, pc, pool, depth);
+                }
+                if let Some(f) = finally {
+                    walk_stmt(f, pc, pool, depth);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                for res in resources.iter_mut() { walk_stmt(res, pc, pool, depth); }
+                walk_stmt(body, pc, pool, depth);
+                for c in catches.iter_mut() {
+                    walk_stmt(&mut c.body, pc, pool, depth);
+                }
+                if let Some(f) = finally {
+                    walk_stmt(f, pc, pool, depth);
+                }
+            }
+            Stmt::Synchronized { lock, body } => {
+                walk_expr(lock, pc, pool, depth);
+                walk_stmt(body, pc, pool, depth);
+            }
+            Stmt::Labeled { body, .. } => walk_stmt(body, pc, pool, depth),
+            _ => {}
+        }
+    }
+    fn walk_expr(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, depth: u8) {
+        if let Some(rep) = accessor_replacement(e, pc, pool, depth) {
+            *e = rep;
+            return;
+        }
+        match e {
+            Expr::Method { owner, args, .. } => {
+                if let Some(o) = owner {
+                    walk_expr(o, pc, pool, depth);
+                }
+                args.iter_mut().for_each(|a| walk_expr(a, pc, pool, depth));
+            }
+            Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+                args.iter_mut().for_each(|a| walk_expr(a, pc, pool, depth));
+            }
+            Expr::Field { owner: Some(o), .. } => walk_expr(o, pc, pool, depth),
+            Expr::ArrayIndex { array, index } => {
+                walk_expr(array, pc, pool, depth);
+                walk_expr(index, pc, pool, depth);
+            }
+            Expr::Cast { e: i, .. } | Expr::InstanceOf { e: i, .. } | Expr::Un { e: i, .. }
+            | Expr::PreIncDec { e: i, .. } | Expr::PostIncDec { e: i, .. } => {
+                walk_expr(i, pc, pool, depth)
+            }
+            Expr::Bin { l, r, .. } => {
+                walk_expr(l, pc, pool, depth);
+                walk_expr(r, pc, pool, depth);
+            }
+            Expr::Cond { c, t, f } => {
+                walk_expr(c, pc, pool, depth);
+                walk_expr(t, pc, pool, depth);
+                walk_expr(f, pc, pool, depth);
+            }
+            Expr::Assign { target, value, .. } => {
+                walk_expr(target, pc, pool, depth);
+                walk_expr(value, pc, pool, depth);
+            }
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter_mut().for_each(|d| walk_expr(d, pc, pool, depth));
+                if let Some(vals) = init {
+                    vals.iter_mut().for_each(|v| walk_expr(v, pc, pool, depth));
+                }
+            }
+            Expr::StringConcat(parts) => parts.iter_mut().for_each(|p| {
+                if let crate::expr::ConcatPart::Str(i) = p {
+                    walk_expr(i, pc, pool, depth);
+                }
+            }),
+            Expr::Lambda(l) => {
+                l.captures.iter_mut().for_each(|c| walk_expr(c, pc, pool, depth));
+            }
+            Expr::Invokedynamic { args, .. } => {
+                args.iter_mut().for_each(|a| walk_expr(a, pc, pool, depth))
+            }
+            _ => {}
+        }
+    }
+    walk_stmt(s, pc, pool, 0);
+}
+
+/// When `e` is a call to a synthetic `access$NNN` bridge, return its body
+/// expression with the parameters substituted by the call arguments.
+fn accessor_replacement(e: &Expr, _pc: &PoolClass, pool: &ClassPool, depth: u8) -> Option<Expr> {
+    if depth > 4 {
+        return None;
+    }
+    let (cls, name, args) = match e {
+        Expr::Method { cls, name, args, is_static: true, .. } if name.starts_with("access$") => {
+            (cls.as_str(), name.as_str(), args)
+        }
+        _ => return None,
+    };
+    let apc = pool.get(cls)?;
+    use jcdc_classfile::MethodAccessFlags;
+    let mi = (0..apc.cf.methods.len()).find(|&i| {
+        apc.method_name(i) == Some(name)
+            && apc.cf.methods[i].access_flags.contains(MethodAccessFlags::SYNTHETIC)
+    })?;
+    let mb = decompile_method(&apc, pool, mi).ok()??;
+    let params: Vec<u32> = mb
+        .vt
+        .vars
+        .iter()
+        .filter(|v| v.is_param)
+        .map(|v| v.id)
+        .collect();
+    if params.len() != args.len() {
+        return None;
+    }
+    // Bridge bodies: `return expr;`, `lhs = rhs; return;`, or a void
+    // delegation `x.m(args); return;`.
+    let stmts = stmt_vec(&mb.body);
+    let delegating = |x: &Stmt| {
+        matches!(x, Stmt::ExprStmt(Expr::Assign { .. }) | Stmt::ExprStmt(Expr::Method { .. }))
+    };
+    let mut body_expr = match stmts.as_slice() {
+        [Stmt::Return(Some(x))] => x.clone(),
+        [Stmt::ExprStmt(x @ Expr::Assign { .. })] => x.clone(),
+        [Stmt::ExprStmt(x @ Expr::Assign { .. }), Stmt::Return(None)] => x.clone(),
+        [x] if delegating(x) => match x {
+            Stmt::ExprStmt(e) => e.clone(),
+            _ => return None,
+        },
+        [x, Stmt::Return(None)] if delegating(x) => match x {
+            Stmt::ExprStmt(e) => e.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    // full recursive substitution
+    fn subst_all(e: &mut Expr, params: &[u32], call_args: &[Expr]) {
+        if let Expr::Local { var, .. } = e {
+            if let Some(i) = params.iter().position(|p| p == var) {
+                *e = call_args[i].clone();
+                return;
+            }
+        }
+        match e {
+            Expr::Method { owner, args, .. } => {
+                if let Some(o) = owner {
+                    subst_all(o, params, call_args);
+                }
+                args.iter_mut().for_each(|a| subst_all(a, params, call_args));
+            }
+            Expr::Field { owner: Some(o), .. } => subst_all(o, params, call_args),
+            Expr::ArrayIndex { array, index } => {
+                subst_all(array, params, call_args);
+                subst_all(index, params, call_args);
+            }
+            Expr::Cast { e: i, .. } | Expr::InstanceOf { e: i, .. } | Expr::Un { e: i, .. }
+            | Expr::PreIncDec { e: i, .. } | Expr::PostIncDec { e: i, .. } => {
+                subst_all(i, params, call_args)
+            }
+            Expr::Bin { l, r, .. } => {
+                subst_all(l, params, call_args);
+                subst_all(r, params, call_args);
+            }
+            Expr::Cond { c, t, f } => {
+                subst_all(c, params, call_args);
+                subst_all(t, params, call_args);
+                subst_all(f, params, call_args);
+            }
+            Expr::Assign { target, value, .. } => {
+                subst_all(target, params, call_args);
+                subst_all(value, params, call_args);
+            }
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter_mut().for_each(|d| subst_all(d, params, call_args));
+                if let Some(vals) = init {
+                    vals.iter_mut().for_each(|v| subst_all(v, params, call_args));
+                }
+            }
+            _ => {}
+        }
+    }
+    subst_all(&mut body_expr, &params, args);
+    // The bridge body may itself reference other bridges.
+    let mut wrapped = Stmt::Return(Some(body_expr));
+    inline_accessors(&mut wrapped, _pc, pool);
+    if let Stmt::Return(Some(x)) = wrapped {
+        Some(x)
+    } else {
+        None
+    }
+}
+
+fn classify_nested(name: &str, rest: &str, pc: &PoolClass) -> (NestedKind, String, ClassAccessFlags) {
+    if rest.contains("lambda$") {
+        return (NestedKind::Lambda, rest.to_string(), pc.access());
+    }
+    if let Some(bytes) = pc.class_attr("InnerClasses") {
+        if let Some(attr) = parse_inner_classes(bytes) {
+            for e in &attr.classes {
+                let is_self = pc
+                    .class_name(e.inner_class_info_index)
+                    .map(|n| n == name)
+                    .unwrap_or(false);
+                if is_self {
+                    let simple = if e.inner_name_index == 0 {
+                        rest.rsplit('$').next().unwrap_or(rest).to_string()
+                    } else {
+                        pc.utf8(e.inner_name_index).unwrap_or(rest).to_string()
+                    };
+                    // Digit-leading simple names are desugared anonymous
+                    // classes (no source identifier can start with a
+                    // digit); inline them at their `new` sites.
+                    let digit_led = simple
+                        .chars()
+                        .next()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false);
+                    let kind = if e.inner_name_index == 0 || digit_led {
+                        NestedKind::Anonymous
+                    } else if e.outer_class_info_index == 0 {
+                        NestedKind::Local
+                    } else {
+                        NestedKind::Member
+                    };
+                    return (kind, simple, e.inner_class_access_flags);
+                }
+            }
+        }
+    }
+    // Heuristic fallback: all-digit simple name → anonymous, else member.
+    let simple_last = rest.rsplit('$').next().unwrap_or(rest);
+    if !simple_last.is_empty() && simple_last.chars().all(|c| c.is_ascii_digit()) {
+        (NestedKind::Anonymous, simple_last.to_string(), pc.access())
+    } else {
+        (NestedKind::Member, simple_last.to_string(), pc.access())
+    }
+}
+
+fn parse_inner_classes(info: &[u8]) -> Option<jcdc_classfile::InnerClassesAttribute> {
+    fn u2(b: &[u8], i: &mut usize) -> Option<u16> {
+        let v = u16::from_be_bytes([*b.get(*i)?, *b.get(*i + 1)?]);
+        *i += 2;
+        Some(v)
+    }
+    let mut i = 0;
+    let n = u2(info, &mut i)? as usize;
+    let mut classes = Vec::with_capacity(n);
+    for _ in 0..n {
+        let inner_class_info_index = u2(info, &mut i)?;
+        let outer_class_info_index = u2(info, &mut i)?;
+        let inner_name_index = u2(info, &mut i)?;
+        let flags = u2(info, &mut i)?;
+        classes.push(jcdc_classfile::InnerClass {
+            inner_class_info_index,
+            outer_class_info_index,
+            inner_name_index,
+            inner_class_access_flags: ClassAccessFlags::from_bits_truncate(flags),
+        });
+    }
+    Some(jcdc_classfile::InnerClassesAttribute { classes })
+}
+
+// ---------------------------------------------------------------------------
+// Entry points
+// ---------------------------------------------------------------------------
+
+/// Decompile one class as a standalone compilation unit, inlining its
+/// nested/anonymous family.
+pub fn decompile_class(pc: &PoolClass, pool: &ClassPool, opts: &ClassOptions) -> anyhow::Result<String> {
+    if pc.is_module() {
+        return decompile_module_info(pc);
+    }
+    // If this class is itself nested and its outer class is in the pool,
+    // decompile from the outer root so the output is a valid compilation unit.
+    if let Some(outer) = find_outer(pc, pool) {
+        let opc = pool.get(&outer).unwrap();
+        return decompile_class(&opc, pool, opts);
+    }
+    let fam = Family::collect(pc, pool);
+    let mut out = String::new();
+    let internal = pc.internal_name.clone();
+    if let Some(slash) = internal.rfind('/') {
+        out.push_str(&format!("package {};\n\n", internal[..slash].replace('/', ".")));
+    }
+    emit_class(pc, pool, opts, &fam, &mut out, 0, true)?;
+    Ok(out)
+}
+
+/// Nearest existing outer class by `$` splitting (None for top-level).
+pub fn find_outer(pc: &PoolClass, pool: &ClassPool) -> Option<String> {
+    let name = &pc.internal_name;
+    let mut cut = name.as_str();
+    while let Some(d) = cut.rfind('$') {
+        cut = &cut[..d];
+        if pool.get(cut).is_some() {
+            return Some(cut.to_string());
+        }
+    }
+    None
+}
+
+/// True if this class will be emitted inside another compilation unit.
+pub fn is_nested_in_family(pc: &PoolClass, pool: &ClassPool) -> bool {
+    find_outer(pc, pool).is_some()
+}
+
+/// Name-based variant: True if a `$`-prefix of this internal name exists in
+/// the pool (so the class is emitted inside that outer class).
+pub fn is_nested_in_pool(internal_name: &str, pool: &ClassPool) -> bool {
+    let mut cut = internal_name;
+    while let Some(d) = cut.rfind('$') {
+        cut = &cut[..d];
+        if pool.get(cut).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Class emission
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Classes currently being emitted on this thread; guards against
+    /// cyclic nested/anonymous emission (class A inlines B which inlines A).
+    static EMITTING: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+thread_local! {
+    static EMIT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct EmitGuard(String);
+impl Drop for EmitGuard {
+    fn drop(&mut self) {
+        EMITTING.with(|e| {
+            e.borrow_mut().remove(&self.0);
+        });
+    }
+}
+
+fn emit_class(
+    pc: &PoolClass,
+    pool: &ClassPool,
+    opts: &ClassOptions,
+    fam: &Family,
+    out: &mut String,
+    indent: usize,
+    is_root: bool,
+) -> anyhow::Result<()> {
+    let pad = "    ".repeat(indent);
+    let internal = pc.internal_name.clone();
+    let cyclic = EMITTING.with(|e| !e.borrow_mut().insert(internal.clone()));
+    if cyclic {
+        out.push_str(&format!(
+            "{}// $JCDC: skipped cyclic emission of {}\n",
+            pad, internal
+        ));
+        return Ok(());
+    }
+    let _emit_guard = EmitGuard(internal.clone());
+    let simple = fam
+        .nested
+        .get(&internal)
+        .map(|n| n.simple.clone())
+        .unwrap_or_else(|| simple_name(&internal));
+
+    let class_sig = pc.class_attr("Signature").and_then(|b| {
+        if b.len() >= 2 {
+            let idx = u16::from_be_bytes([b[0], b[1]]);
+            pc.utf8(idx).and_then(|s| parse_class_signature(s))
+        } else {
+            None
+        }
+    });
+
+    let acc = if is_root {
+        pc.access()
+    } else {
+        fam.nested.get(&internal).map(|n| n.access).unwrap_or_else(|| pc.access())
+    };
+    let major = pc.cf.major_version;
+    let is_enum = acc.contains(ClassAccessFlags::ENUM) || pc.is_enum();
+    let is_interface = acc.contains(ClassAccessFlags::INTERFACE);
+    let is_annotation = acc.contains(ClassAccessFlags::ANNOTATION);
+    let is_record = pc.is_record();
+
+    let annots = class_annotations(pc);
+    if !annots.is_empty() {
+        for line in annots.lines() {
+            out.push_str(&pad);
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+
+    let mut mods: Vec<&str> = Vec::new();
+    if acc.contains(ClassAccessFlags::PUBLIC) {
+        mods.push("public");
+    }
+    if acc.contains(ClassAccessFlags::PROTECTED) {
+        mods.push("protected");
+    }
+    if acc.contains(ClassAccessFlags::PRIVATE) {
+        mods.push("private");
+    }
+    if acc.contains(ClassAccessFlags::ABSTRACT) && !is_annotation && !is_enum {
+        mods.push("abstract");
+    }
+    // Nested member classes: trust the InnerClasses STATIC flag when the
+    // class was classified via InnerClasses (its `access` comes from there);
+    // only infer static for heuristic-classified classes without this$0.
+    let nested_needs_static = !is_root && !is_interface && !is_enum
+        && fam.nested.get(&internal).map(|n| n.kind == NestedKind::Member).unwrap_or(false)
+        && !class_has_this0(pc)
+        && pc.class_attr("InnerClasses").is_none();
+    if (acc.contains(ClassAccessFlags::STATIC) || nested_needs_static) && !is_root {
+        mods.push("static");
+    }
+    if acc.contains(ClassAccessFlags::FINAL) && !is_enum && !is_record {
+        mods.push("final");
+    }
+    // javac emits PermittedSubclasses for enums with constant bodies and
+    // for records' hierarchies; `sealed` is only source-visible on plain
+    // classes/interfaces.
+    let permitted: Vec<String> = if is_enum || is_record {
+        Vec::new()
+    } else {
+        pc.class_attr("PermittedSubclasses")
+            .map(|b| parse_permitted(b, pc))
+            .unwrap_or_default()
+    };
+    let mut sealed_mod = "";
+    if !permitted.is_empty() {
+        sealed_mod = "sealed";
+    } else if !is_enum && !is_record && major >= 60 && !acc.contains(ClassAccessFlags::FINAL) {
+        // non-sealed when a supertype is sealed
+        if supertype_is_sealed(pc, pool) {
+            sealed_mod = "non-sealed";
+        }
+    }
+
+    let mut header = pad.clone();
+    for m in &mods {
+        header.push_str(m);
+        header.push(' ');
+    }
+    if !sealed_mod.is_empty() {
+        header.push_str(sealed_mod);
+        header.push(' ');
+    }
+    if is_annotation {
+        header.push_str("@interface ");
+    } else if is_enum {
+        header.push_str("enum ");
+    } else if is_record {
+        header.push_str("record ");
+    } else if is_interface {
+        header.push_str("interface ");
+    } else {
+        header.push_str("class ");
+    }
+    header.push_str(&simple);
+
+    if let Some(sig) = &class_sig {
+        let mut tp = String::new();
+        jcdc_jvm::render_type_params(&sig.params, &mut tp);
+        header.push_str(&tp);
+    }
+    if is_record {
+        header.push_str(&record_components(pc, pool));
+    }
+
+    let super_name = pc.super_name().unwrap_or("").to_string();
+    let suppress_super = super_name.is_empty()
+        || super_name == "java/lang/Object"
+        || (is_enum && super_name == "java/lang/Enum")
+        || (is_record && super_name == "java/lang/Record")
+        || is_annotation
+        || is_record;
+    if !suppress_super {
+        let rendered = match &class_sig {
+            Some(sig) => Printer::new(pc, pool, empty_vt()).type_name(&TypeRef::G(sig.superclass.clone())),
+            None => Printer::new(pc, pool, empty_vt()).shorten(&super_name),
+        };
+        header.push_str(" extends ");
+        header.push_str(&rendered);
+    }
+
+    let interfaces: Vec<String> = {
+        let p = Printer::new(pc, pool, empty_vt());
+        if let Some(sig) = &class_sig {
+            sig.interfaces.iter().map(|i| p.type_name(&TypeRef::G(i.clone()))).collect()
+        } else {
+            pc.cf
+                .interfaces
+                .iter()
+                .filter_map(|&i| pc.class_name(i))
+                .filter(|n| *n != "java/lang/constant/Constable")
+                .map(|n| p.shorten(n))
+                .collect()
+        }
+    };
+    if !interfaces.is_empty() && !is_annotation {
+        header.push_str(if is_interface { " extends " } else { " implements " });
+        header.push_str(&interfaces.join(", "));
+    }
+
+    if !permitted.is_empty() {
+        let p = Printer::new(pc, pool, empty_vt());
+        let names: Vec<String> = permitted.iter().map(|n| p.shorten(n)).collect();
+        header.push_str(" permits ");
+        header.push_str(&names.join(", "));
+    }
+
+    header.push_str(" {");
+    out.push_str(&header);
+    out.push('\n');
+
+    let inner_pad = "    ".repeat(indent + 1);
+
+    if is_enum {
+        emit_enum_constants(pc, pool, opts, fam, out, indent + 1)?;
+    }
+
+    // Fields. For member inner classes whose synthetic constructor is
+    // hidden, recover instance-field initializers from that constructor.
+    let inner_ctor_inits: HashMap<String, Expr> = if !is_root
+        && class_has_this0(pc)
+        && (0..pc.cf.methods.len()).any(|mi| {
+            pc.method_name(mi) == Some("<init>") && is_trivial_inner_ctor(pc, pool, mi)
+        })
+    {
+        // Member inner class: `this$N` references in recovered field
+        // initializers must read `Outer.this` (the synthetic field itself
+        // is hidden).
+        let mut inits = anon_field_inits(pc, pool, &outer_this_map(pc));
+        for v in inits.values_mut() {
+            let mut pending: Vec<Stmt> = Vec::new();
+            walk_expr_anon(v, pc, pool, fam, &mut pending, &empty_vt());
+        }
+        inits
+    } else {
+        HashMap::new()
+    };
+    // <clinit> handling. When the initializer only assigns static fields of
+    // this class, fold the assignments into the field declarations —
+    // interfaces cannot express `static final X f;` plus a static-block
+    // assignment, and constant holders read better this way.
+    let mut static_inits: HashMap<String, Expr> = HashMap::new();
+    let mut clinit_body: Option<(Stmt, VarTable)> = None;
+    if !is_enum {
+        if let Some(ci) = pc.find_own_method("<clinit>", "()V") {
+            if let Ok(Some(mb)) = decompile_method(pc, pool, ci) {
+                let mut body = strip_trailing_return(&mb.body);
+                strip_static_init_returns(&mut body);
+                inline_anonymous(&mut body, pc, pool, fam, &mb.vt);
+                inline_accessors(&mut body, pc, pool);
+                restore_enum_switches(&mut body, pc, pool);
+                let stmts = stmt_vec(&body);
+                let mut all_assigns = !stmts.is_empty();
+                let mut folded: HashMap<String, Expr> = HashMap::new();
+                for st in &stmts {
+                    match st {
+                        Stmt::ExprStmt(Expr::Assign { target, value, .. }) => {
+                            match &**target {
+                                Expr::Field { name, is_static: true, cls, .. }
+                                    if cls == &pc.internal_name =>
+                                {
+                                    folded.insert(name.clone(), (**value).clone());
+                                }
+                                _ => all_assigns = false,
+                            }
+                        }
+                        Stmt::Comment(_) => {}
+                        _ => all_assigns = false,
+                    }
+                }
+                if all_assigns {
+                    static_inits = folded;
+                } else {
+                    clinit_body = Some((body, mb.vt));
+                }
+            }
+        }
+    }
+
+    let comp_names = record_component_names(pc);
+    for (fi, f) in pc.cf.fields.iter().enumerate() {
+        let fname0 = pc.utf8(f.name_index).unwrap_or("").to_string();
+        // `$assertionsDisabled` is synthetic but referenced by decompiled
+        // assert guards; it must be declared for the output to compile —
+        // under a renamed identifier, because javac reserves the exact
+        // name for its own compiler-synthesized field.
+        let keep_synthetic = fname0 == "$assertionsDisabled";
+        let fname = if keep_synthetic {
+            ASSERT_FIELD.to_string()
+        } else {
+            fname0.clone()
+        };
+        if !opts.show_synthetic
+            && f.access_flags.contains(FieldAccessFlags::SYNTHETIC)
+            && !keep_synthetic
+        {
+            continue;
+        }
+        if is_enum && (f.access_flags.contains(FieldAccessFlags::ENUM) || fname == "$VALUES") {
+            continue;
+        }
+        if is_record && comp_names.contains(&fname) {
+            continue;
+        }
+        let init = inner_ctor_inits
+            .get(&fname0)
+            .or_else(|| static_inits.get(&fname0));
+        emit_field_init(pc, pool, fi, out, indent + 1, init)?;
+    }
+
+    // <clinit>
+    if let Some(ci) = pc.find_own_method("<clinit>", "()V") {
+        let hide = is_enum && clinit_only_enum_init(pc, pool, ci);
+        if !hide {
+            let prepared = if is_enum {
+                decompile_method(pc, pool, ci)
+                    .ok()
+                    .flatten()
+                    .map(|mb| {
+                        let mut body = strip_trailing_return(&mb.body);
+                        strip_static_init_returns(&mut body);
+                        strip_enum_const_stores(&mut body, pc);
+                        inline_anonymous(&mut body, pc, pool, fam, &mb.vt);
+                        inline_accessors(&mut body, pc, pool);
+                        restore_enum_switches(&mut body, pc, pool);
+                        (body, mb.vt)
+                    })
+            } else {
+                clinit_body.take()
+            };
+            if let Some((body, vt)) = prepared {
+                let text = Printer::new(pc, pool, &vt).with_indent(indent + 1).into_string(&body);
+                if !text.trim().is_empty() {
+                    out.push('\n');
+                    out.push_str(&inner_pad);
+                    out.push_str("static {\n");
+                    out.push_str(&text);
+                    out.push_str(&inner_pad);
+                    out.push_str("}\n");
+                }
+            }
+        }
+    }
+
+    // Methods.
+    let skip = methods_to_skip(pc, pool, is_enum, is_record, opts);
+    for mi in 0..pc.cf.methods.len() {
+        if skip.contains(&mi) {
+            continue;
+        }
+        emit_method(pc, pool, fam, mi, out, indent + 1)?;
+    }
+
+    // Nested member/local classes.
+    for child in fam.direct_children(&internal) {
+        let Some(npc) = pool.get(&child.name) else { continue };
+        out.push('\n');
+        emit_class(&npc, pool, opts, fam, out, indent + 1, false)?;
+    }
+
+    out.push_str(&pad);
+    out.push_str("}\n");
+    Ok(())
+}
+
+fn methods_to_skip(
+    pc: &PoolClass,
+    pool: &ClassPool,
+    is_enum: bool,
+    is_record: bool,
+    opts: &ClassOptions,
+) -> HashSet<usize> {
+    let mut skip = HashSet::new();
+    let lambda_methods = collect_lambda_methods(pc);
+    for mi in 0..pc.cf.methods.len() {
+        let m = &pc.cf.methods[mi];
+        let name = pc.utf8(m.name_index).unwrap_or("").to_string();
+        if name == "<clinit>" || lambda_methods.contains(&mi) {
+            skip.insert(mi);
+            continue;
+        }
+        if !opts.show_synthetic
+            && (m.access_flags.contains(MethodAccessFlags::SYNTHETIC)
+                || m.access_flags.contains(MethodAccessFlags::BRIDGE))
+        {
+            skip.insert(mi);
+            continue;
+        }
+        if !opts.show_private && m.access_flags.contains(MethodAccessFlags::PRIVATE) {
+            skip.insert(mi);
+            continue;
+        }
+        if is_enum
+            && m.access_flags.contains(MethodAccessFlags::STATIC)
+            && (name == "values" || name == "valueOf" || name == "$values")
+        {
+            skip.insert(mi);
+            continue;
+        }
+        if is_record && is_synthetic_record_method(pc, pool, mi) {
+            skip.insert(mi);
+            continue;
+        }
+        // equals/hashCode/toString generated as a single ObjectMethods
+        // invokedynamic (records and record-like classes): implicit in
+        // source, hidden like the record case.
+        if matches!(name.as_str(), "equals" | "hashCode" | "toString")
+            && is_object_methods_indy(pc, mi)
+        {
+            skip.insert(mi);
+            continue;
+        }
+        // Synthetic outer-instance constructor of a member inner class.
+        if name == "<init>" && class_has_this0(pc) && is_trivial_inner_ctor(pc, pool, mi) {
+            skip.insert(mi);
+        }
+    }
+    skip
+}
+
+/// True if an inner class constructor is compiler-generated: it only stores
+/// this$0 (optionally with requireNonNull), calls super(), and copies
+/// field-initializer values into this class's own instance fields.
+/// True when the constructor's last descriptor parameter is a synthetic
+/// marker class (`Outer$N`, empty + ACC_SYNTHETIC) — javac ≤10 adds it to
+/// bridge private inner constructors.
+fn marker_ctor(pc: &PoolClass, mi: usize) -> bool {
+    let Some(d) = pc.method_desc(mi) else { return false };
+    let Some(md) = parse_method_descriptor(d) else { return false };
+    let Some(JavaType::Object(last)) = md.args.last() else { return false };
+    last != &pc.internal_name
+        && last.rsplit('$').next().map(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit())).unwrap_or(false)
+}
+
+fn is_trivial_inner_ctor(pc: &PoolClass, pool: &ClassPool, mi: usize) -> bool {
+    // Only a parameterless (besides the outer instance / marker) ctor can
+    // be hidden and its field stores recovered as field initializers; a
+    // ctor with real parameters must stay visible.
+    if let Some(d) = pc.method_desc(mi) {
+        if let Some(md) = parse_method_descriptor(d) {
+            let has_this0 = class_has_this0(pc);
+            let n = md.args.len();
+            let skip = (if has_this0 { 1 } else { 0 })
+                + usize::from(n >= 2 && marker_ctor(pc, mi));
+            if n > skip {
+                return false;
+            }
+        }
+    }
+    let Ok(Some(mb)) = decompile_method(pc, pool, mi) else { return false };
+    let stmts = stmt_vec(&mb.body);
+    if stmts.is_empty() {
+        return false;
+    }
+    let field_names: HashSet<String> = pc
+        .cf
+        .fields
+        .iter()
+        .filter(|f| !f.access_flags.contains(FieldAccessFlags::STATIC))
+        .filter_map(|f| pc.utf8(f.name_index).map(|s| s.to_string()))
+        .collect();
+    stmts.iter().all(|st| match st {
+        Stmt::ExprStmt(Expr::Method { name: n, .. }) if n == "<init>" => true,
+        Stmt::ExprStmt(Expr::Method { name: n, cls, .. })
+            if n == "requireNonNull" && cls == "java/util/Objects" => true,
+        Stmt::ExprStmt(Expr::Assign { target, .. }) => match &**target {
+            Expr::Field { name: f, is_static: false, .. } => {
+                f.starts_with("this$") || field_names.contains(f)
+            }
+            _ => false,
+        },
+        Stmt::LocalDef { .. } => true,
+        Stmt::Return(None) => true,
+        Stmt::Comment(_) => true,
+        _ => false,
+    })
+}
+
+/// True if any supertype carries PermittedSubclasses (sealed hierarchy).
+fn supertype_is_sealed(pc: &PoolClass, pool: &ClassPool) -> bool {
+    let mut cur = pc.super_name().map(|s| s.to_string());
+    let mut guard = 0;
+    while let Some(c) = cur {
+        if c == "java/lang/Object" {
+            break;
+        }
+        guard += 1;
+        if guard > 64 {
+            break;
+        }
+        if let Some(sp) = pool.get(&c) {
+            if sp.class_attr("PermittedSubclasses").is_some() {
+                return true;
+            }
+            cur = sp.super_name().map(|s| s.to_string());
+        } else {
+            break;
+        }
+    }
+    for &i in &pc.cf.interfaces {
+        if let Some(n) = pc.class_name(i) {
+            if let Some(ip) = pool.get(n) {
+                if ip.class_attr("PermittedSubclasses").is_some() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// True if the class declares a synthetic `this$0` outer-instance field.
+/// True when a nested class's constructor takes the enclosing instance as
+/// its first parameter even though the class itself has no `this$0` field
+/// (the field lives on an inner superclass, e.g. `ListItr extends Itr`).
+/// javac passes the outer instance straight to `super(...)`.
+/// True when the class's own InnerClasses entry marks it static. Class-file
+/// level access flags cannot express this (0x0008 there is ACC_SUPER).
+fn nested_is_static(pc: &PoolClass) -> bool {
+    let Some(bytes) = pc.class_attr("InnerClasses") else { return false };
+    let Some(attr) = parse_inner_classes(bytes) else { return false };
+    attr.classes.iter().any(|e| {
+        pc.class_name(e.inner_class_info_index)
+            .map(|n| n == pc.internal_name)
+            .unwrap_or(false)
+            && e
+                .inner_class_access_flags
+                .contains(jcdc_classfile::ClassAccessFlags::STATIC)
+    })
+}
+
+fn outer_param_via_super(pc: &PoolClass, desc: &str) -> bool {
+    let Some(md) = parse_method_descriptor(desc) else { return false };
+    let Some(JavaType::Object(first)) = md.args.first() else { return false };
+    // The parameter type must be the class's own this$0 field type...
+    for f in &pc.cf.fields {
+        let is_this0 = pc.utf8(f.name_index).map(|n| n.starts_with("this$")).unwrap_or(false);
+        if is_this0 {
+            if let Some(d) = pc.utf8(f.descriptor_index) {
+                if d == format!("L{};", first) {
+                    return true;
+                }
+            }
+        }
+    }
+    // ...or an enclosing class in the $-chain (the field lives on an
+    // inner superclass and the instance is forwarded to super()).
+    let name = &pc.internal_name;
+    let mut prefix = name.as_str();
+    while let Some(i) = prefix.rfind('$') {
+        prefix = &prefix[..i];
+        if prefix == first {
+            return true;
+        }
+    }
+    false
+}
+
+fn class_has_this0(pc: &PoolClass) -> bool {
+    pc.cf.fields.iter().any(|f| {
+        pc.utf8(f.name_index)
+            .map(|n| n.starts_with("this$"))
+            .unwrap_or(false)
+    })
+}
+
+fn parse_permitted(info: &[u8], pc: &PoolClass) -> Vec<String> {
+    let mut out = Vec::new();
+    if info.len() < 2 {
+        return out;
+    }
+    let n = u16::from_be_bytes([info[0], info[1]]) as usize;
+    for i in 0..n {
+        let off = 2 + i * 2;
+        if off + 2 > info.len() {
+            break;
+        }
+        let idx = u16::from_be_bytes([info[off], info[off + 1]]);
+        if let Some(name) = pc.class_name(idx) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+fn collect_lambda_methods(pc: &PoolClass) -> HashSet<usize> {
+    let mut set = HashSet::new();
+    for mi in 0..pc.cf.methods.len() {
+        let name = pc.method_name(mi).unwrap_or("");
+        if name.starts_with("lambda$") {
+            set.insert(mi);
+        }
+    }
+    set
+}
+
+fn simple_name(internal: &str) -> String {
+    let last = internal.rsplit('/').next().unwrap_or(internal);
+    let simple = last.rsplit('$').next().unwrap_or(last);
+    if simple.is_empty() {
+        last.to_string()
+    } else {
+        simple.to_string()
+    }
+}
+
+fn record_component_names(pc: &PoolClass) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(bytes) = pc.class_attr("Record") {
+        if let Ok(attr) = parse_record_attr(bytes) {
+            for c in &attr.components {
+                if let Some(n) = pc.utf8(c.name_index) {
+                    names.push(n.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+fn record_components(pc: &PoolClass, pool: &ClassPool) -> String {
+    let mut out = String::from("(");
+    let names = record_component_names(pc);
+    for (i, n) in names.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let ty = pc
+            .find_own_field(n, None)
+            .and_then(|fi| {
+                let d = pc.utf8(pc.cf.fields[fi].descriptor_index)?;
+                Some(field_type_of(pc, fi, d))
+            })
+            .unwrap_or(TypeRef::J(JavaType::Object("java/lang/Object".into())));
+        out.push_str(&Printer::new(pc, pool, empty_vt()).type_name(&ty));
+        out.push(' ');
+        out.push_str(n);
+    }
+    out.push(')');
+    out
+}
+
+fn field_type_of(pc: &PoolClass, fi: usize, desc: &str) -> TypeRef {
+    let base = parse_field_descriptor(desc).unwrap_or(JavaType::Int);
+    if let Some(sig) = pc.field_attr(&pc.cf.fields[fi], "Signature") {
+        if sig.len() >= 2 {
+            let idx = u16::from_be_bytes([sig[0], sig[1]]);
+            if let Some(s) = pc.utf8(idx) {
+                if let Some(g) = parse_field_signature(s) {
+                    return TypeRef::G(g);
+                }
+            }
+        }
+    }
+    TypeRef::J(base)
+}
+
+fn parse_record_attr(info: &[u8]) -> Result<jcdc_classfile::RecordAttribute, ()> {
+    fn u2(b: &[u8], i: &mut usize) -> Result<u16, ()> {
+        let v = u16::from_be_bytes([*b.get(*i).ok_or(())?, *b.get(*i + 1).ok_or(())?]);
+        *i += 2;
+        Ok(v)
+    }
+    fn u4(b: &[u8], i: &mut usize) -> Result<u32, ()> {
+        let v = u32::from_be_bytes([
+            *b.get(*i).ok_or(())?,
+            *b.get(*i + 1).ok_or(())?,
+            *b.get(*i + 2).ok_or(())?,
+            *b.get(*i + 3).ok_or(())?,
+        ]);
+        *i += 4;
+        Ok(v)
+    }
+    let mut i = 0;
+    let n = u2(info, &mut i)? as usize;
+    let mut components = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name_index = u2(info, &mut i)?;
+        let descriptor_index = u2(info, &mut i)?;
+        let na = u2(info, &mut i)? as usize;
+        let mut attributes = Vec::with_capacity(na);
+        for _ in 0..na {
+            let name_index2 = u2(info, &mut i)?;
+            let len = u4(info, &mut i)? as usize;
+            let bytes = info.get(i..i + len).ok_or(())?.to_vec();
+            i += len;
+            attributes.push(jcdc_classfile::AttributeInfo { attribute_name_index: name_index2, info: bytes });
+        }
+        components.push(jcdc_classfile::RecordComponentInfo { name_index, descriptor_index, attributes });
+    }
+    Ok(jcdc_classfile::RecordAttribute { components })
+}
+
+fn is_synthetic_record_method(pc: &PoolClass, pool: &ClassPool, mi: usize) -> bool {
+    let name = pc.method_name(mi).unwrap_or("");
+    let desc = pc.method_desc(mi).unwrap_or("");
+    let access = pc.cf.methods[mi].access_flags;
+    if access.contains(MethodAccessFlags::SYNTHETIC) {
+        return true;
+    }
+    // Implicit component accessor: body is exactly `return this.<name>;`.
+    {
+        let comps = record_component_names(pc);
+        if comps.iter().any(|c| c == name) {
+            if let Ok(Some(mb)) = decompile_method(pc, pool, mi) {
+                let stmts = stmt_vec(&mb.body);
+                let implicit = stmts.len() == 1
+                    && matches!(&stmts[0], Stmt::Return(Some(Expr::Field { name: fname, is_static: false, .. })) if fname == name);
+                if implicit {
+                    return true;
+                }
+            }
+        }
+    }
+    // Implicit toString/hashCode/equals: single ObjectMethods indy return.
+    let implicit = matches!(
+        (name, desc),
+        ("toString", "()Ljava/lang/String;") | ("hashCode", "()I") | ("equals", "(Ljava/lang/Object;)Z")
+    );
+    if implicit {
+        if let Ok(Some(mb)) = decompile_method(pc, pool, mi) {
+            let stmts = stmt_vec(&mb.body);
+            let only = stmts.len() == 1
+                && matches!(&stmts[0], Stmt::Return(Some(Expr::Invokedynamic { bsm_text, .. }))
+                    if bsm_text.contains("ObjectMethods"));
+            if only {
+                return true;
+            }
+        }
+    }
+    // Member inner class synthetic constructor: only stores this$0 (+
+    // null check) and calls super — implicit in Java source.
+    if name == "<init>" && class_has_this0(pc) {
+        if let Ok(Some(mb)) = decompile_method(pc, pool, mi) {
+            let stmts = stmt_vec(&mb.body);
+            let trivial = !stmts.is_empty()
+                && stmts.iter().all(|st| match st {
+                    Stmt::ExprStmt(Expr::Method { name: n, .. }) if n == "<init>" => true,
+                    Stmt::ExprStmt(Expr::Method { name: n, cls, .. })
+                        if n == "requireNonNull" && cls == "java/util/Objects" => true,
+                    Stmt::ExprStmt(Expr::Assign { target, .. }) => {
+                        matches!(&**target, Expr::Field { name: f, .. } if f.starts_with("this$"))
+                    }
+                    Stmt::LocalDef { .. } => true,
+                    Stmt::Return(None) => true,
+                    Stmt::Comment(_) => true,
+                    _ => false,
+                });
+            if trivial {
+                return true;
+            }
+        }
+    }
+    // Canonical constructor: body is only super() + field copies.
+    if name == "<init>" {
+        if let Ok(Some(mb)) = decompile_method(pc, pool, mi) {
+            let stmts = stmt_vec(&mb.body);
+            let trivial = !stmts.is_empty()
+                && stmts.iter().all(|st| match st {
+                    Stmt::ExprStmt(Expr::Method { name: n, .. }) if n == "<init>" => true,
+                    Stmt::ExprStmt(Expr::Assign { target, .. }) => matches!(&**target, Expr::Field { .. }),
+                    Stmt::Return(None) => true,
+                    Stmt::Comment(_) => true,
+                    _ => false,
+                });
+            if trivial {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn stmt_vec(s: &Stmt) -> Vec<Stmt> {
+    match s {
+        Stmt::Block(v) => v.clone(),
+        other => vec![other.clone()],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Annotations
+// ---------------------------------------------------------------------------
+
+fn class_annotations(pc: &PoolClass) -> String {
+    let mut out = String::new();
+    for attr in &pc.cf.attributes {
+        if let ParsedAttribute::RuntimeVisibleAnnotations(a) =
+            parse_specialized_attribute(attr, &pc.cf.constant_pool)
+        {
+            for an in &a.annotations {
+                if let Some(s) = render_annotation(pc, an) {
+                    out.push_str(&s);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out
+}
+
+fn member_annotations(pc: &PoolClass, attrs: &[jcdc_classfile::AttributeInfo]) -> Vec<String> {
+    let mut out = Vec::new();
+    for attr in attrs {
+        if let ParsedAttribute::RuntimeVisibleAnnotations(a) =
+            parse_specialized_attribute(attr, &pc.cf.constant_pool)
+        {
+            for an in &a.annotations {
+                if let Some(s) = render_annotation(pc, an) {
+                    out.push(s);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn render_annotation(pc: &PoolClass, an: &jcdc_classfile::Annotation) -> Option<String> {
+    let type_desc = pc.utf8(an.type_index)?;
+    let name = type_desc.trim_start_matches('L').trim_end_matches(';');
+    let p = Printer::new(pc, empty_pool(), empty_vt());
+    let short = p.shorten(name);
+    if an.element_value_pairs.is_empty() {
+        return Some(format!("@{}", short));
+    }
+    let mut s = format!("@{}(", short);
+    let single = an.element_value_pairs.len() == 1
+        && pc.utf8(an.element_value_pairs[0].0).map(|n| n == "value").unwrap_or(false);
+    for (i, (name_idx, v)) in an.element_value_pairs.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        if !single {
+            s.push_str(pc.utf8(*name_idx).unwrap_or("?"));
+            s.push_str(" = ");
+        }
+        s.push_str(&render_element_value(pc, v));
+    }
+    s.push(')');
+    Some(s)
+}
+
+fn render_element_value(pc: &PoolClass, v: &jcdc_classfile::ElementValue) -> String {
+    use jcdc_classfile::ElementValue as EV;
+    match v {
+        EV::Byte { const_value_index: i }
+        | EV::Short { const_value_index: i }
+        | EV::Int { const_value_index: i } => const_render(pc, *i, 'I'),
+        EV::Char { const_value_index: i } => const_render(pc, *i, 'C'),
+        EV::Long { const_value_index: i } => const_render(pc, *i, 'J'),
+        EV::Float { const_value_index: i } => const_render(pc, *i, 'F'),
+        EV::Double { const_value_index: i } => const_render(pc, *i, 'D'),
+        EV::Boolean { const_value_index: i } => const_render(pc, *i, 'Z'),
+        EV::String { const_value_index: i } => pc
+            // JVMS: an element_value of tag 's' indexes a CONSTANT_Utf8
+            // entry directly (not CONSTANT_String).
+            .utf8(*i)
+            .or_else(|| pc.string_value(*i))
+            .map(|s| format!("\"{}\"", crate::emit::escape_string(s)))
+            .unwrap_or_else(|| "\"\"".into()),
+        EV::Enum { type_name_index, const_name_index } => {
+            let t = pc.utf8(*type_name_index).unwrap_or("?");
+            let t = t.trim_start_matches('L').trim_end_matches(';');
+            let c = pc.utf8(*const_name_index).unwrap_or("?");
+            format!("{}.{}", Printer::new(pc, empty_pool(), empty_vt()).shorten(t), c)
+        }
+        EV::Class { class_info_index } => pc
+            .class_name(*class_info_index)
+            .map(|n| format!("{}.class", Printer::new(pc, empty_pool(), empty_vt()).shorten(n)))
+            .unwrap_or_else(|| "void.class".into()),
+        EV::AnnotationType { annotation } => render_annotation(pc, annotation).unwrap_or_else(|| "@?".into()),
+        EV::Array { values } => {
+            let inner: Vec<String> = values.iter().map(|v| render_element_value(pc, v)).collect();
+            format!("{{ {} }}", inner.join(", "))
+        }
+    }
+}
+
+fn const_render(pc: &PoolClass, idx: u16, kind: char) -> String {
+    use jcdc_classfile::ConstantPoolEntry as C;
+    match jcdc_classfile::get_entry(&pc.cf.constant_pool, idx) {
+        Some(C::Integer(i)) => match kind {
+            'Z' => (i.value != 0).to_string(),
+            'C' => format!(
+                "'{}'",
+                crate::emit::escape_char(char::from_u32(i.value as u32).unwrap_or('?'))
+            ),
+            _ => i.value.to_string(),
+        },
+        Some(C::Long(l)) => format!("{}L", l.value),
+        Some(C::Float(f)) => crate::emit::format_float(f.value as f64, true),
+        Some(C::Double(d)) => crate::emit::format_float(d.value, false),
+        _ => "?".into(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fields & methods
+// ---------------------------------------------------------------------------
+
+/// Extract `this.f = expr` field initializers from an anonymous/local
+/// class's generated constructor (with captures substituted).
+fn anon_field_inits(
+    apc: &PoolClass,
+    pool: &ClassPool,
+    captures: &HashMap<String, Expr>,
+) -> HashMap<String, Expr> {
+    let mut map = HashMap::new();
+    let Some(mi) = (0..apc.cf.methods.len()).find(|&i| apc.method_name(i) == Some("<init>")) else {
+        return map;
+    };
+    let Ok(Some(mb)) = decompile_method(apc, pool, mi) else { return map };
+    let mut body = mb.body.clone();
+    substitute_captures(&mut body, captures, pool);
+    let vt = &mb.vt;
+    for st in stmt_vec(&body) {
+        if let Stmt::ExprStmt(Expr::Assign { target, value, .. }) = st {
+            if let Expr::Field { name, is_static: false, .. } = &*target {
+                if !name.starts_with("this$") && !name.starts_with("val$") {
+                    let mut v = *value.clone();
+                    locals_to_raw(&mut v, vt);
+                    let mut wrap = Stmt::Return(Some(v));
+                    inline_accessors(&mut wrap, apc, pool);
+                    let v = match wrap {
+                        Stmt::Return(Some(x)) => x,
+                        _ => Expr::This,
+                    };
+                    map.insert(name.clone(), v);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Replace leftover `Local` references (anonymous ctor parameters with no
+/// capture mapping) with raw name text so class-body rendering with an
+/// empty VarTable cannot panic.
+fn locals_to_raw(e: &mut Expr, vt: &crate::varalloc::VarTable) {
+    if let Expr::Local { var, .. } = e {
+        let name = vt.var(*var).name.clone();
+        *e = Expr::Raw(name);
+        return;
+    }
+    match e {
+        Expr::New { args, .. } => args.iter_mut().for_each(|a| locals_to_raw(a, vt)),
+        Expr::Method { owner, args, .. } => {
+            if let Some(o) = owner {
+                locals_to_raw(o, vt);
+            }
+            args.iter_mut().for_each(|a| locals_to_raw(a, vt));
+        }
+        Expr::Field { owner: Some(o), .. } => locals_to_raw(o, vt),
+        Expr::ArrayIndex { array, index } => {
+            locals_to_raw(array, vt);
+            locals_to_raw(index, vt);
+        }
+        Expr::Cast { e: x, .. }
+        | Expr::InstanceOf { e: x, .. }
+        | Expr::Un { e: x, .. }
+        | Expr::PreIncDec { e: x, .. }
+        | Expr::PostIncDec { e: x, .. } => locals_to_raw(x, vt),
+        Expr::Bin { l, r, .. } | Expr::Assign { target: l, value: r, .. } => {
+            locals_to_raw(l, vt);
+            locals_to_raw(r, vt);
+        }
+        Expr::Cond { c, t, f } => {
+            locals_to_raw(c, vt);
+            locals_to_raw(t, vt);
+            locals_to_raw(f, vt);
+        }
+        Expr::NewArray { dims, init, .. } => {
+            dims.iter_mut().for_each(|d| locals_to_raw(d, vt));
+            if let Some(vals) = init {
+                vals.iter_mut().for_each(|v| locals_to_raw(v, vt));
+            }
+        }
+        Expr::StringConcat(parts) => parts.iter_mut().for_each(|p| {
+            if let crate::expr::ConcatPart::Str(x) = p {
+                locals_to_raw(x, vt);
+            }
+        }),
+        _ => {}
+    }
+}
+
+fn emit_field_init(
+    pc: &PoolClass,
+    pool: &ClassPool,
+    fi: usize,
+    out: &mut String,
+    indent: usize,
+    init: Option<&Expr>,
+) -> anyhow::Result<()> {
+    emit_field_impl(pc, pool, fi, out, indent, init)
+}
+
+#[allow(dead_code)]
+fn emit_field(pc: &PoolClass, pool: &ClassPool, fi: usize, out: &mut String, indent: usize) -> anyhow::Result<()> {
+    emit_field_impl(pc, pool, fi, out, indent, None)
+}
+
+/// The field's generic Signature as a TypeRef, when present.
+fn field_sig_typeref(pc: &PoolClass, f: &jcdc_classfile::FieldInfo) -> Option<TypeRef> {
+    let bytes = f.attributes.iter().find_map(|a| {
+        if pc.utf8(a.attribute_name_index) == Some("Signature") {
+            Some(a.info.as_slice())
+        } else {
+            None
+        }
+    })?;
+    if bytes.len() < 2 {
+        return None;
+    }
+    let idx = u16::from_be_bytes([bytes[0], bytes[1]]);
+    let s = pc.utf8(idx)?;
+    jcdc_jvm::parse_field_signature(s).map(TypeRef::G)
+}
+
+fn emit_field_impl(pc: &PoolClass, pool: &ClassPool, fi: usize, out: &mut String, indent: usize, ctor_init: Option<&Expr>) -> anyhow::Result<()> {
+    let f = &pc.cf.fields[fi];
+    let raw_name = pc.utf8(f.name_index).unwrap_or("?");
+    let name: &str = if raw_name == "$assertionsDisabled" {
+        ASSERT_FIELD
+    } else {
+        raw_name
+    };
+    let desc = pc.utf8(f.descriptor_index).unwrap_or("I");
+    let acc = f.access_flags;
+    let pad = "    ".repeat(indent);
+
+    for a in member_annotations(pc, &f.attributes) {
+        out.push_str(&pad);
+        out.push_str(&a);
+        out.push('\n');
+    }
+
+    let mut line = pad;
+    if acc.contains(FieldAccessFlags::PUBLIC) {
+        line.push_str("public ");
+    }
+    if acc.contains(FieldAccessFlags::PROTECTED) {
+        line.push_str("protected ");
+    }
+    if acc.contains(FieldAccessFlags::PRIVATE) {
+        line.push_str("private ");
+    }
+    if acc.contains(FieldAccessFlags::STATIC) {
+        line.push_str("static ");
+    }
+    if acc.contains(FieldAccessFlags::FINAL) {
+        line.push_str("final ");
+    }
+    if acc.contains(FieldAccessFlags::VOLATILE) {
+        line.push_str("volatile ");
+    }
+    if acc.contains(FieldAccessFlags::TRANSIENT) {
+        line.push_str("transient ");
+    }
+    let ty = field_type_of(pc, fi, desc);
+    line.push_str(&Printer::new(pc, pool, empty_vt()).type_name(&ty));
+    line.push(' ');
+    line.push_str(name);
+    for attr in &f.attributes {
+        if let ParsedAttribute::ConstantValue(cv) = parse_specialized_attribute(attr, &pc.cf.constant_pool) {
+            let base = parse_field_descriptor(desc).unwrap_or(JavaType::Int);
+            let kind = base.primitive_char().unwrap_or('s');
+            let rendered = match jcdc_classfile::get_entry(&pc.cf.constant_pool, cv.constantvalue_index) {
+                Some(jcdc_classfile::ConstantPoolEntry::String(_)) => pc
+                    .string_value(cv.constantvalue_index)
+                    .map(|s| format!("\"{}\"", crate::emit::escape_string(s)))
+                    .unwrap_or_default(),
+                _ => const_render(pc, cv.constantvalue_index, kind),
+            };
+            line.push_str(" = ");
+            line.push_str(&rendered);
+        }
+    }
+    if !line.contains(" = ") {
+        if let Some(init_e) = ctor_init {
+            // Generic field type vs erased initializer (`Class<Double> TYPE
+            // = (Class<Double>) getPrimitiveClass(...)`): the source cast
+            // leaves no bytecode trace; re-insert it.
+            let owned: Option<Expr> = match field_sig_typeref(pc, f) {
+                Some(TypeRef::G(gt))
+                    if !matches!(init_e, Expr::Cast { .. } | Expr::Const(_))
+                        && init_e.type_ref() != TypeRef::G(gt.clone())
+                        && init_e.type_ref().erased() == TypeRef::G(gt.clone()).erased() =>
+                {
+                    // A generic-method initializer gets an explicit type
+                    // witness instead of a cast: casting a poly expression
+                    // can break nested inference (`Map.ofEntries(...)`).
+                    let mut call = init_e.clone();
+                    let witnessed = match &mut call {
+                        Expr::Method { cls, name, desc, type_args, .. } if type_args.is_empty() => {
+                            compute_witness(cls, name, desc, None, &gt, pool)
+                        }
+                        _ => None,
+                    };
+                    if let Some((w, _)) = witnessed {
+                        if let Expr::Method { type_args, .. } = &mut call {
+                            *type_args = w;
+                        }
+                        Some(call)
+                    } else {
+                        Some(Expr::Cast {
+                            ty: TypeRef::G(gt),
+                            e: Box::new(init_e.clone()),
+                        })
+                    }
+                }
+                _ => None,
+            };
+            let e: &Expr = owned.as_ref().unwrap_or(init_e);
+            // Need the declaring method's VarTable for local names; ctor
+            // initializers of anonymous classes only reference constants,
+            // captures (raw text) and fields, so the empty table suffices.
+            let mut p = Printer::new(pc, pool, empty_vt());
+            let mut t = String::new();
+            let is_bool = parse_field_descriptor(desc) == Some(jcdc_jvm::JavaType::Boolean);
+            if is_bool {
+                p.expr_bool(e, &mut t);
+            } else {
+                p.expr(e, 1, &mut t);
+            }
+            line.push_str(" = ");
+            line.push_str(&t);
+        }
+    }
+    line.push(';');
+    out.push_str(&line);
+    out.push('\n');
+    Ok(())
+}
+
+fn emit_method(
+    pc: &PoolClass,
+    pool: &ClassPool,
+    fam: &Family,
+    mi: usize,
+    out: &mut String,
+    indent: usize,
+) -> anyhow::Result<()> {
+    emit_method_with(pc, pool, fam, mi, out, indent, &HashMap::new())
+}
+
+fn emit_method_with(
+    pc: &PoolClass,
+    pool: &ClassPool,
+    fam: &Family,
+    mi: usize,
+    out: &mut String,
+    indent: usize,
+    captures: &HashMap<String, Expr>,
+) -> anyhow::Result<()> {
+    let depth = EMIT_DEPTH.with(|d| {
+        let v = d.get() + 1;
+        d.set(v);
+        v
+    });
+    struct DepthGuard;
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            EMIT_DEPTH.with(|d| d.set(d.get() - 1));
+        }
+    }
+    let _depth_guard = DepthGuard;
+    if depth > 60 {
+        anyhow::bail!(
+            "emit recursion depth exceeded at {}.{}",
+            pc.internal_name,
+            pc.method_name(mi).unwrap_or("?")
+        );
+    }
+    let m = &pc.cf.methods[mi];
+    let name = pc.utf8(m.name_index).unwrap_or("?").to_string();
+    let desc = pc.utf8(m.descriptor_index).unwrap_or("()V").to_string();
+    let acc = m.access_flags;
+    let is_ctor = name == "<init>";
+    let pad = "    ".repeat(indent);
+
+    // Constructors of anonymous/local classes: captured parameters
+    // (this$*/val$*) are implicit and must not be printed.
+    let mut skip_params: HashSet<usize> = HashSet::new();
+    if is_ctor && pc.is_enum() {
+        // javac prepends (String name, int ordinal) to every enum ctor.
+        if let Some(md) = parse_method_descriptor(&desc) {
+            if md.args.len() >= 2 {
+                skip_params.insert(0);
+                skip_params.insert(1);
+            }
+        }
+    }
+    if is_ctor && (!captures.is_empty() || class_has_this0(pc)) {
+        if let Some(md) = parse_method_descriptor(&desc) {
+            let mut slot = 1u16;
+            for (i, a) in md.args.iter().enumerate() {
+                let pname = ctor_param_name(pc, mi, i, slot);
+                if pname.starts_with("this$") || pname.starts_with("val$") {
+                    skip_params.insert(i);
+                }
+                slot += a.slot_size() as u16;
+            }
+        }
+    }
+    // Inner subclass forwarding the enclosing instance to super(): the
+    // first ctor parameter is synthetic even without a local this$0 field.
+    let mut outer_super_param = false;
+    if is_ctor
+        && !pc.is_enum()
+        && !nested_is_static(pc)
+        && pc.internal_name.contains('$')
+        && outer_param_via_super(pc, &desc)
+    {
+        skip_params.insert(0);
+        outer_super_param = true;
+    }
+
+    for a in member_annotations(pc, &m.attributes) {
+        out.push_str(&pad);
+        out.push_str(&a);
+        out.push('\n');
+    }
+
+    let msig = m.attributes.iter().find_map(|a| {
+        match parse_specialized_attribute(a, &pc.cf.constant_pool) {
+            ParsedAttribute::Signature { signature_index } => {
+                pc.utf8(signature_index).and_then(|s| parse_method_signature(s))
+            }
+            _ => None,
+        }
+    });
+    let mdesc = parse_method_descriptor(&desc);
+
+    // Java <= 7 requires captured locals/parameters to be declared final.
+    let need_final_params = pc.cf.major_version < 52
+        && !acc.contains(MethodAccessFlags::ABSTRACT)
+        && !acc.contains(MethodAccessFlags::NATIVE)
+        && method_builds_inner(pc, mi);
+
+    let mut line = pad.clone();
+    if acc.contains(MethodAccessFlags::PUBLIC) {
+        line.push_str("public ");
+    }
+    if acc.contains(MethodAccessFlags::PROTECTED) {
+        line.push_str("protected ");
+    }
+    if acc.contains(MethodAccessFlags::PRIVATE) {
+        line.push_str("private ");
+    }
+    if acc.contains(MethodAccessFlags::STATIC) {
+        line.push_str("static ");
+    }
+    if acc.contains(MethodAccessFlags::FINAL) {
+        line.push_str("final ");
+    }
+    if acc.contains(MethodAccessFlags::SYNCHRONIZED) {
+        line.push_str("synchronized ");
+    }
+    if acc.contains(MethodAccessFlags::NATIVE) {
+        line.push_str("native ");
+    }
+    if acc.contains(MethodAccessFlags::ABSTRACT) {
+        line.push_str("abstract ");
+    }
+    let is_default = pc.is_interface()
+        && !acc.contains(MethodAccessFlags::ABSTRACT)
+        && !acc.contains(MethodAccessFlags::STATIC)
+        && !acc.contains(MethodAccessFlags::PRIVATE)
+        && !is_ctor
+        && m.attributes.iter().any(|a| pc.utf8(a.attribute_name_index) == Some("Code"));
+    if is_default {
+        line.push_str("default ");
+    }
+
+    let p0 = Printer::new(pc, pool, empty_vt());
+    if let Some(sig) = &msig {
+        let mut tp = String::new();
+        jcdc_jvm::render_type_params(&sig.params, &mut tp);
+        if !tp.is_empty() {
+            line.push_str(&tp);
+            line.push(' ');
+        }
+    }
+
+    if !is_ctor {
+        let ret = match &msig {
+            Some(sig) => p0.type_name(&TypeRef::G(sig.ret.clone())),
+            None => mdesc
+                .as_ref()
+                .map(|d| p0.type_name(&TypeRef::J(d.ret.clone())))
+                .unwrap_or_else(|| "void".into()),
+        };
+        line.push_str(&ret);
+        line.push(' ');
+        line.push_str(&name);
+    } else {
+        // Anonymous class constructors take the base type's name.
+        let self_simple = simple_name(&pc.internal_name);
+        let ctor_name = if self_simple.chars().all(|c| c.is_ascii_digit()) {
+            let base = pc
+                .cf
+                .interfaces
+                .first()
+                .and_then(|&i| pc.class_name(i))
+                .map(|s| s.to_string())
+                .or_else(|| pc.super_name().map(|s| s.to_string()));
+            match base {
+                Some(b) if b != "java/lang/Object" => simple_name(&b),
+                _ => self_simple,
+            }
+        } else {
+            self_simple
+        };
+        line.push_str(&ctor_name);
+    }
+
+    line.push('(');
+    let param_names = method_param_names(pc, mi, &desc);
+    let mut arg_types: Vec<TypeRef> = match &msig {
+        Some(sig) => sig.args.iter().map(|g| TypeRef::G(g.clone())).collect(),
+        None => mdesc
+            .as_ref()
+            .map(|d| d.args.iter().map(|t| TypeRef::J(t.clone())).collect())
+            .unwrap_or_default(),
+    };
+    // Enum constructors: javac's Signature attribute omits the implicit
+    // (name, ordinal) parameters — fall back to the real descriptor.
+    if is_ctor && pc.is_enum() {
+        if let Some(md) = &mdesc {
+            if arg_types.len() != md.args.len() {
+                arg_types = md.args.iter().map(|t| TypeRef::J(t.clone())).collect();
+            }
+        }
+    }
+    let varargs = acc.contains(MethodAccessFlags::VARARGS);
+    let mut printed = 0;
+    for (i, t) in arg_types.iter().enumerate() {
+        if skip_params.contains(&i) {
+            continue;
+        }
+        if printed > 0 {
+            line.push_str(", ");
+        }
+        printed += 1;
+        let mut ts = p0.type_name(t);
+        if varargs && i + 1 == arg_types.len() {
+            if let Some(pos) = ts.rfind("[]") {
+                ts.replace_range(pos.., "...");
+            }
+        }
+        if need_final_params {
+            line.push_str("final ");
+        }
+        line.push_str(&ts);
+        line.push(' ');
+        line.push_str(param_names.get(i).map(|s| s.as_str()).unwrap_or("arg"));
+    }
+    line.push(')');
+
+    let mut throws: Vec<String> = Vec::new();
+    if let Some(sig) = &msig {
+        for t in &sig.throws {
+            throws.push(p0.type_name(&TypeRef::G(t.clone())));
+        }
+    }
+    // Merge the Exceptions attribute, skipping entries that are just the
+    // erasure of a signature throws clause (`throws E` with E extends
+    // Exception lists java/lang/Exception in Exceptions).
+    let sig_erasures: Vec<String> = match &msig {
+        Some(sig) => sig
+            .throws
+            .iter()
+            .filter_map(|t| generic_erasure(t, &sig.params))
+            .collect(),
+        None => Vec::new(),
+    };
+    for attr in &m.attributes {
+        if let ParsedAttribute::Exceptions(e) = parse_specialized_attribute(attr, &pc.cf.constant_pool) {
+            for idx in &e.exception_index_table {
+                if let Some(n) = pc.class_name(*idx) {
+                    if sig_erasures.iter().any(|x| x == n) {
+                        continue;
+                    }
+                    let s = p0.shorten(n);
+                    if !throws.contains(&s) {
+                        throws.push(s);
+                    }
+                }
+            }
+        }
+    }
+    if !throws.is_empty() {
+        line.push_str(" throws ");
+        line.push_str(&throws.join(", "));
+    }
+
+    if acc.contains(MethodAccessFlags::ABSTRACT) || acc.contains(MethodAccessFlags::NATIVE) {
+        // Annotation type members carry their default in AnnotationDefault.
+        if pc.access().contains(jcdc_classfile::ClassAccessFlags::ANNOTATION) {
+            for attr in &m.attributes {
+                if let ParsedAttribute::AnnotationDefault(a) =
+                    parse_specialized_attribute(attr, &pc.cf.constant_pool)
+                {
+                    line.push_str(" default ");
+                    line.push_str(&render_element_value(pc, &a.default_value));
+                }
+            }
+        }
+        line.push(';');
+        out.push_str(&line);
+        out.push('\n');
+        return Ok(());
+    }
+
+    match decompile_method(pc, pool, mi) {
+        Ok(Some(mb)) => {
+            let mut body = strip_trailing_return(&mb.body);
+            // Generic methods returning a type variable: javac elides the
+            // `(E)` cast when the erasure already matches, but source needs
+            // it back.
+            if let Some(sig) = &msig {
+                match &sig.ret {
+                    jcdc_jvm::GenericType::TypeVar(tv) => {
+                        cast_returns_to_typevar(&mut body, tv, &mb.vt);
+                    }
+                    // Generic array/object returns (`T[]`, `List<E>`): the
+                    // bytecode works on erasures, so source form needs the
+                    // cast back when the returned expression's type is the
+                    // erasure rather than the generic form.
+                    g @ (jcdc_jvm::GenericType::Array(_) | jcdc_jvm::GenericType::Class(_)) => {
+                        let want = TypeRef::G(g.clone());
+                        cast_generic_returns(&mut body, &want, pc);
+                        // A cast cannot drive inference for a generic
+                        // callee; prefer an explicit type witness.
+                        add_return_witnesses(&mut body, Some(sig), pool);
+                    }
+                    _ => {}
+                }
+            }
+            // Wildcard-parameterized call sites: arguments that carry only
+            // their erasure need the source-level cast back (`accept((K) x)`).
+            cast_wildcard_call_args(&mut body, pool, pc);
+            if pc.cf.major_version < 52 {
+                finalize_captured_locals(&mut body, &pc.internal_name);
+            }
+            if is_ctor && pc.is_enum() {
+                strip_enum_super(&mut body);
+            } else if is_ctor {
+                if outer_super_param {
+                    strip_outer_super_arg(&mut body, &mb.vt);
+                }
+                // anonymous/local subclass: drop a no-arg super() call
+                strip_trivial_super(&mut body, pc);
+                // javac evaluates a delegated `this(expr)` argument before
+                // the call, which decompiles into assignments + mid-body
+                // this(...) calls (invalid Java). Collapse them back into a
+                // single leading delegation when every path delegates.
+                collapse_ctor_delegation(&mut body, pc);
+            }
+            substitute_captures(&mut body, captures, pool);
+            // Member inner classes: this$N field reads become Outer.this.
+            let outer_this = outer_this_map(pc);
+            if !outer_this.is_empty() {
+                substitute_captures(&mut body, &outer_this, pool);
+            }
+            if is_ctor && (class_has_this0(pc) || outer_super_param) {
+                strip_inner_ctor_artifacts(&mut body, &mb.vt);
+            }
+            inline_anonymous(&mut body, pc, pool, fam, &mb.vt);
+            inline_accessors(&mut body, pc, pool);
+            // Accessor inlining can expose the real generic callee only
+            // now; retry the return witnesses (idempotent).
+            add_return_witnesses(&mut body, msig.as_ref(), pool);
+            restore_enum_switches(&mut body, pc, pool);
+            add_throw_witnesses(&mut body, msig.as_ref(), pool);
+            line.push_str(" {\n");
+            out.push_str(&line);
+            let ret_bool = mdesc.as_ref().map(|d| d.ret == jcdc_jvm::JavaType::Boolean).unwrap_or(false)
+                || msig.as_ref().map(|g| matches!(&g.ret, jcdc_jvm::GenericType::Primitive('Z'))).unwrap_or(false);
+            let text = Printer::new(pc, pool, &mb.vt)
+                .with_indent(indent + 1)
+                .with_ret_bool(ret_bool)
+                .into_string(&body);
+            out.push_str(&text);
+            out.push_str(&pad);
+            out.push_str("}\n");
+        }
+        Ok(None) => {
+            line.push(';');
+            out.push_str(&line);
+            out.push('\n');
+        }
+        Err(e) => {
+            line.push_str(" {\n");
+            out.push_str(&line);
+            out.push_str(&format!("{}    // $JCDC: decompilation failed: {}\n", pad, e));
+            out.push_str(&pad);
+            out.push_str("}\n");
+        }
+    }
+    Ok(())
+}
+
+fn ctor_param_name(pc: &PoolClass, mi: usize, idx: usize, slot: u16) -> String {
+    let names = method_param_names(pc, mi, pc.method_desc(mi).unwrap_or("()V"));
+    if let Some(n) = names.get(idx) {
+        return n.clone();
+    }
+    let _ = slot;
+    format!("arg{}", idx)
+}
+
+/// Rewrite the leading `super(outer, rest...)` of an inner subclass ctor
+/// to `super(rest...)`: the enclosing-instance argument is implicit in
+/// Java source. When no arguments remain the call is left for
+/// `strip_trivial_super` to drop.
+fn strip_outer_super_arg(body: &mut Stmt, vt: &VarTable) {
+    let stmts = match body {
+        Stmt::Block(v) => v,
+        _ => return,
+    };
+    // Skip leading synthetic `this.this$N = param` stores to reach the
+    // delegation call.
+    let is_this_store = |st: &Stmt| -> bool {
+        match st {
+            Stmt::ExprStmt(Expr::Assign { target, .. }) => match &**target {
+                Expr::Field { name, .. } => name.starts_with("this$"),
+                _ => false,
+            },
+            _ => false,
+        }
+    };
+    let Some(idx) = stmts.iter().position(|st| !is_this_store(st)) else { return };
+    if let Some(Stmt::ExprStmt(Expr::Method { name, args, .. })) = stmts.get_mut(idx) {
+        if name == "<init>" && !args.is_empty() {
+            let is_outer_local = match &args[0] {
+                Expr::Local { var, .. } => vt.var(*var).name.starts_with("this$")
+                    || vt.var(*var).is_param,
+                Expr::This => true,
+                _ => false,
+            };
+            if is_outer_local {
+                args.remove(0);
+            }
+        }
+    }
+}
+
+/// `return;` is illegal inside a static initializer (it is not a method
+/// body); javac still emits RETURN in <clinit> bytecode. Drop trailing
+/// bare returns from every branch tail.
+fn strip_static_init_returns(s: &mut Stmt) {
+    match s {
+        Stmt::Block(v) => {
+            for x in v.iter_mut() {
+                strip_static_init_returns(x);
+            }
+            while matches!(v.last(), Some(Stmt::Return(None))) {
+                v.pop();
+            }
+        }
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            strip_static_init_returns(then_stmt);
+            if let Some(e) = else_stmt {
+                strip_static_init_returns(e);
+            }
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => strip_static_init_returns(body),
+        Stmt::For { init, body, .. } => {
+            init.iter_mut().for_each(strip_static_init_returns);
+            strip_static_init_returns(body);
+        }
+        Stmt::ForEach { body, .. } => strip_static_init_returns(body),
+        Stmt::Switch { cases, default, .. } => {
+            for c in cases.iter_mut() {
+                c.body.iter_mut().for_each(strip_static_init_returns);
+            }
+            if let Some(d) = default {
+                strip_static_init_returns(d);
+            }
+        }
+        Stmt::Try { body, catches, finally } => {
+            strip_static_init_returns(body);
+            for c in catches.iter_mut() {
+                strip_static_init_returns(&mut c.body);
+            }
+            if let Some(f) = finally {
+                strip_static_init_returns(f);
+            }
+        }
+        Stmt::TryWithResources { resources, body, catches, finally } => {
+            for r in resources.iter_mut() {
+                strip_static_init_returns(r);
+            }
+            strip_static_init_returns(body);
+            for c in catches.iter_mut() {
+                strip_static_init_returns(&mut c.body);
+            }
+            if let Some(f) = finally {
+                strip_static_init_returns(f);
+            }
+        }
+        Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => {
+            strip_static_init_returns(body)
+        }
+        _ => {}
+    }
+}
+
+/// Drop a leading argument-less `super()` call (implicit in Java source).
+fn strip_trivial_super(body: &mut Stmt, pc: &PoolClass) {
+    let stmts = match body {
+        Stmt::Block(v) => v,
+        _ => return,
+    };
+    if let Some(first) = stmts.first_mut() {
+        if let Stmt::ExprStmt(Expr::Method { name, cls, args, .. }) = first {
+            if name == "<init>" && args.is_empty() && cls != &pc.internal_name {
+                *first = Stmt::Block(vec![]);
+            }
+        }
+    }
+    stmts.retain(|s| !s.is_empty_block());
+}
+
+/// Enum constructors: drop the implicit `super(name, ordinal)` call, and
+/// trim the implicit (name, ordinal) args from `this(...)` delegation.
+fn strip_enum_super(body: &mut Stmt) {
+    let stmts = match body {
+        Stmt::Block(v) => v,
+        _ => return,
+    };
+    if let Some(first) = stmts.first_mut() {
+        if let Stmt::ExprStmt(Expr::Method { name, cls, args, .. }) = first {
+            if name == "<init>" && cls == "java/lang/Enum" {
+                *first = Stmt::Block(vec![]);
+            } else if name == "<init>" && args.len() > 2 {
+                // this(name, ordinal, real...) → this(real...)
+                args.drain(0..2);
+            }
+        }
+    }
+    stmts.retain(|s| !s.is_empty_block());
+}
+
+fn method_param_names(pc: &PoolClass, mi: usize, desc: &str) -> Vec<String> {
+    let md = parse_method_descriptor(desc);
+    let n = md.as_ref().map(|d| d.args.len()).unwrap_or(0);
+    let is_static = pc.cf.methods[mi].access_flags.contains(MethodAccessFlags::STATIC);
+    // LVT-derived names (per descriptor arg) as the base.
+    let code_len = crate::varalloc::code_attribute(pc, mi).map(|c| c.code.len() as u16).unwrap_or(0);
+    let max_locals = crate::varalloc::code_attribute(pc, mi).map(|c| c.max_locals).unwrap_or(0);
+    let mut names: Vec<String> = if let Some(md) = &md {
+        let vt = VarTable::build(pc, mi, md, is_static, max_locals, code_len);
+        vt.vars
+            .iter()
+            .filter(|v| v.is_param && v.name != "this")
+            .map(|v| v.name.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if names.len() != n {
+        names = (0..n).map(|i| format!("arg{}", i)).collect();
+    }
+    // MethodParameters overrides where a real name is present.
+    for attr in &pc.cf.methods[mi].attributes {
+        if let ParsedAttribute::MethodParameters(mp) = parse_specialized_attribute(attr, &pc.cf.constant_pool) {
+            if mp.parameters.len() == n {
+                for (i, p) in mp.parameters.iter().enumerate() {
+                    if p.name_index != 0 {
+                        if let Some(nm) = pc.utf8(p.name_index) {
+                            names[i] = nm.to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+fn emit_enum_constants(
+    pc: &PoolClass,
+    pool: &ClassPool,
+    opts: &ClassOptions,
+    fam: &Family,
+    out: &mut String,
+    indent: usize,
+) -> anyhow::Result<()> {
+    let pad = "    ".repeat(indent);
+    let names: Vec<String> = pc
+        .cf
+        .fields
+        .iter()
+        .filter(|f| f.access_flags.contains(FieldAccessFlags::ENUM))
+        .filter_map(|f| pc.utf8(f.name_index).map(|s| s.to_string()))
+        .collect();
+    let inits = enum_ctor_inits(pc, pool);
+    for (i, n) in names.iter().enumerate() {
+        out.push_str(&pad);
+        out.push_str(n);
+        if let Some(init) = inits.get(n) {
+            if !init.args.is_empty() {
+                out.push('(');
+                out.push_str(&init.args);
+                out.push(')');
+            }
+            if let Some(body_cls) = &init.body_class {
+                if let Some(bpc) = pool.get(body_cls) {
+                    let mut body = String::new();
+                    emit_enum_constant_body(&bpc, pool, fam, &mut body, indent)?;
+                    if !body.trim().is_empty() {
+                        out.push_str(" {\n");
+                        out.push_str(&body);
+                        out.push_str(&pad);
+                        out.push('}');
+                    }
+                }
+            }
+        }
+        if i + 1 == names.len() {
+            out.push_str(";\n\n");
+        } else {
+            out.push_str(",\n");
+        }
+    }
+    if names.is_empty() {
+        out.push_str(&pad);
+        out.push_str(";\n");
+    }
+    let _ = opts;
+    Ok(())
+}
+
+fn emit_enum_constant_body(
+    pc: &PoolClass,
+    pool: &ClassPool,
+    fam: &Family,
+    out: &mut String,
+    indent: usize,
+) -> anyhow::Result<()> {
+    let skip = methods_to_skip(pc, pool, false, false, &ClassOptions::default());
+    for mi in 0..pc.cf.methods.len() {
+        let name = pc.method_name(mi).unwrap_or("");
+        if name == "<init>" || name == "<clinit>" || skip.contains(&mi) {
+            continue;
+        }
+        emit_method(pc, pool, fam, mi, out, indent + 1)?;
+    }
+    Ok(())
+}
+
+struct EnumInit {
+    args: String,
+    body_class: Option<String>,
+}
+
+fn enum_ctor_inits(pc: &PoolClass, pool: &ClassPool) -> HashMap<String, EnumInit> {
+    let mut map = HashMap::new();
+    let Some(ci) = pc.find_own_method("<clinit>", "()V") else { return map };
+    let Ok(Some(mb)) = decompile_method(pc, pool, ci) else { return map };
+    walk_enum_inits(&mb.body, &mut map, pc, pool, &mb.vt);
+    map
+}
+
+fn walk_enum_inits(s: &Stmt, map: &mut HashMap<String, EnumInit>, pc: &PoolClass, pool: &ClassPool, vt: &VarTable) {
+    match s {
+        Stmt::Block(v) => {
+            for x in v {
+                walk_enum_inits(x, map, pc, pool, vt);
+            }
+        }
+        Stmt::ExprStmt(Expr::Assign { target, value, .. }) => {
+            if let Expr::Field { name, is_static: true, .. } = &**target {
+                if let Expr::New { cls, args, .. } = &**value {
+                    let body_cls = if cls != &pc.internal_name { Some(cls.clone()) } else { None };
+                    // Resolve the enum ctor descriptor so boolean/char
+                    // constant arguments render as `true`/`'x'`, not 1/120.
+                    let ctor_params: Option<Vec<jcdc_jvm::JavaType>> = (0..pc.cf.methods.len())
+                        .find_map(|mi| {
+                            if pc.method_name(mi) != Some("<init>") {
+                                return None;
+                            }
+                            let d = pc.method_desc(mi)?;
+                            let md = parse_method_descriptor(d)?;
+                            if md.args.len() == args.len() {
+                                Some(md.args)
+                            } else {
+                                None
+                            }
+                        });
+                    let extra: Vec<String> = args
+                        .iter()
+                        .enumerate()
+                        .skip(2)
+                        .map(|(i, a)| {
+                            if let Some(pt) = ctor_params.as_ref().and_then(|p| p.get(i)) {
+                                if let jcdc_jvm::JavaType::Boolean = pt {
+                                    if let Expr::Const(crate::expr::ConstVal::Int(n)) = a {
+                                        return if *n == 0 { "false".to_string() } else { "true".to_string() };
+                                    }
+                                }
+                                if let jcdc_jvm::JavaType::Char = pt {
+                                    if let Expr::Const(crate::expr::ConstVal::Int(n)) = a {
+                                        if let Some(c) = char::from_u32(*n as u32) {
+                                            return format!("'{}'", crate::emit::escape_char(c));
+                                        }
+                                    }
+                                }
+                            }
+                            let mut p = Printer::new(pc, pool, empty_vt());
+                            let mut s = String::new();
+                            p.expr(a, 1, &mut s);
+                            s
+                        })
+                        .collect();
+                    map.insert(name.clone(), EnumInit { args: extra.join(", "), body_class: body_cls });
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Remove the `CONST = new ThisEnum("CONST", ordinal, ...)` stores from an
+/// enum's <clinit> body: the constants are already printed in the enum
+/// constant list, and source may neither assign them nor instantiate the
+/// enum class.
+fn strip_enum_const_stores(s: &mut Stmt, pc: &PoolClass) {
+    let names: HashSet<String> = pc
+        .cf
+        .fields
+        .iter()
+        .filter(|f| f.access_flags.contains(FieldAccessFlags::ENUM))
+        .filter_map(|f| pc.utf8(f.name_index).map(|n| n.to_string()))
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    fn rec(s: &mut Stmt, pc: &PoolClass, names: &HashSet<String>) {
+        match s {
+            Stmt::Block(v) => {
+                v.retain(|st| {
+                    !matches!(st, Stmt::ExprStmt(Expr::Assign { target, .. })
+                        if matches!(&**target, Expr::Field { name, is_static: true, .. }
+                            if name == "$VALUES"))
+                        && !matches!(st, Stmt::ExprStmt(Expr::Assign { target, value, .. })
+                        if matches!(&**target, Expr::Field { name, is_static: true, .. }
+                            if names.contains(name))
+                            && matches!(&**value, Expr::New { cls, .. } if cls == &pc.internal_name
+                                || pc.cf.fields.iter().any(|f| {
+                                    f.access_flags.contains(FieldAccessFlags::ENUM)
+                                })))
+                });
+                v.iter_mut().for_each(|x| rec(x, pc, names));
+            }
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                rec(then_stmt, pc, names);
+                if let Some(e) = else_stmt {
+                    rec(e, pc, names);
+                }
+            }
+            Stmt::Try { body, .. } => rec(body, pc, names),
+            _ => {}
+        }
+    }
+    rec(s, pc, &names);
+}
+
+fn clinit_only_enum_init(pc: &PoolClass, pool: &ClassPool, ci: usize) -> bool {
+    let Ok(Some(mb)) = decompile_method(pc, pool, ci) else { return false };
+    let stmts = stmt_vec(&mb.body);
+    !stmts.is_empty()
+        && stmts.iter().all(|s| match s {
+            Stmt::ExprStmt(Expr::Assign { target, .. }) => matches!(&**target, Expr::Field { is_static: true, .. }),
+            Stmt::Return(None) => true,
+            Stmt::Comment(_) => true,
+            _ => false,
+        })
+}
+
+/// Renamed `$assertionsDisabled` field (javac reserves the original name).
+pub const ASSERT_FIELD: &str = "$jcdcAssertionsDisabled";
+
+// ---------------------------------------------------------------------------
+// Anonymous class inlining
+// ---------------------------------------------------------------------------
+
+pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: &Family, vt: &VarTable) {
+    if fam.anonymous.is_empty() && fam.locals.is_empty() {
+        return;
+    }
+    let mut pending: Vec<Stmt> = Vec::new();
+    walk_stmt_anon(body, pc, pool, fam, &mut pending, vt);
+    if !pending.is_empty() {
+        let old = std::mem::replace(body, Stmt::Block(vec![]));
+        let mut v = pending;
+        match old {
+            Stmt::Block(mut inner) => {
+                v.append(&mut inner);
+                *body = Stmt::Block(v);
+            }
+            other => {
+                v.push(other);
+                *body = Stmt::Block(v);
+            }
+        }
+    }
+}
+
+fn walk_stmt_anon(s: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: &Family, pending: &mut Vec<Stmt>, vt: &VarTable) {
+    match s {
+        Stmt::Block(v) => {
+            // Insert local-class declarations right before the statement
+            // that instantiates them (captures must already be in scope).
+            let mut i = 0;
+            while i < v.len() {
+                let before = pending.len();
+                walk_stmt_anon(&mut v[i], pc, pool, fam, pending, vt);
+                if pending.len() > before {
+                    let new: Vec<Stmt> = pending
+                        .drain(before..)
+                        .filter(|d| match d {
+                            Stmt::ClassDecl { name, .. } => !v.iter().take(i).any(|x| {
+                                matches!(x, Stmt::ClassDecl { name: n2, .. } if n2 == name)
+                            }),
+                            _ => true,
+                        })
+                        .collect();
+                    let n = new.len();
+                    for (j, d) in new.into_iter().enumerate() {
+                        v.insert(i + j, d);
+                    }
+                    i += n;
+                }
+                i += 1;
+            }
+        }
+        Stmt::ExprStmt(e) => walk_expr_anon(e, pc, pool, fam, pending, vt),
+        Stmt::LocalDef { init: Some(e), .. } => walk_expr_anon(e, pc, pool, fam, pending, vt),
+        Stmt::Return(Some(e)) | Stmt::Throw(e) => walk_expr_anon(e, pc, pool, fam, pending, vt),
+        Stmt::If { cond, then_stmt, else_stmt } => {
+            walk_expr_anon(cond, pc, pool, fam, pending, vt);
+            walk_stmt_anon(then_stmt, pc, pool, fam, pending, vt);
+            if let Some(e) = else_stmt {
+                walk_stmt_anon(e, pc, pool, fam, pending, vt);
+            }
+        }
+        Stmt::While { cond, body } => {
+            walk_expr_anon(cond, pc, pool, fam, pending, vt);
+            walk_stmt_anon(body, pc, pool, fam, pending, vt);
+        }
+        Stmt::DoWhile { body, cond } => {
+            walk_stmt_anon(body, pc, pool, fam, pending, vt);
+            walk_expr_anon(cond, pc, pool, fam, pending, vt);
+        }
+        Stmt::For { init, cond, update, body } => {
+            init.iter_mut().for_each(|i| walk_stmt_anon(i, pc, pool, fam, pending, vt));
+            if let Some(c) = cond {
+                walk_expr_anon(c, pc, pool, fam, pending, vt);
+            }
+            update.iter_mut().for_each(|u| walk_expr_anon(u, pc, pool, fam, pending, vt));
+            walk_stmt_anon(body, pc, pool, fam, pending, vt);
+        }
+        Stmt::ForEach { iterable, body, .. } => {
+            walk_expr_anon(iterable, pc, pool, fam, pending, vt);
+            walk_stmt_anon(body, pc, pool, fam, pending, vt);
+        }
+        Stmt::Switch { selector, cases, default, .. } => {
+            walk_expr_anon(selector, pc, pool, fam, pending, vt);
+            for c in cases {
+                c.body.iter_mut().for_each(|st| walk_stmt_anon(st, pc, pool, fam, pending, vt));
+            }
+            if let Some(d) = default {
+                walk_stmt_anon(d, pc, pool, fam, pending, vt);
+            }
+        }
+        Stmt::Try { body, catches, finally } => {
+            walk_stmt_anon(body, pc, pool, fam, pending, vt);
+            for c in catches {
+                walk_stmt_anon(&mut c.body, pc, pool, fam, pending, vt);
+            }
+            if let Some(f) = finally {
+                walk_stmt_anon(f, pc, pool, fam, pending, vt);
+            }
+        }
+        Stmt::TryWithResources { resources, body, catches, finally } => {
+            for res in resources.iter_mut() { walk_stmt_anon(res, pc, pool, fam, pending, vt); }
+            walk_stmt_anon(body, pc, pool, fam, pending, vt);
+            for c in catches {
+                walk_stmt_anon(&mut c.body, pc, pool, fam, pending, vt);
+            }
+            if let Some(f) = finally {
+                walk_stmt_anon(f, pc, pool, fam, pending, vt);
+            }
+        }
+        Stmt::Synchronized { lock, body } => {
+            walk_expr_anon(lock, pc, pool, fam, pending, vt);
+            walk_stmt_anon(body, pc, pool, fam, pending, vt);
+        }
+        _ => {}
+    }
+}
+
+fn walk_expr_anon(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, fam: &Family, pending: &mut Vec<Stmt>, vt: &VarTable) {
+    if std::env::var("JCDC_DBG_ANON").is_ok() {
+        if let Expr::New { cls, raw, .. } = e {
+            eprintln!("ANON see new {} raw={} in_fam={}", cls, raw, fam.anonymous.contains(cls.as_str()));
+        }
+    }
+    match e {
+        Expr::New { cls, args, raw: false, .. } if fam.anonymous.contains(cls.as_str()) => {
+            match pool.get(cls) {
+                Some(apc) => {
+                    if let Some(anon) = build_anon_new(&apc, args.clone(), pc, pool, fam, vt) {
+                        *e = anon;
+                    } else if std::env::var("JCDC_DBG_ANON").is_ok() {
+                        eprintln!("ANON inline declined {}", cls);
+                    }
+                }
+                None => {
+                    if std::env::var("JCDC_DBG_ANON").is_ok() {
+                        eprintln!("ANON not in pool {}", cls);
+                    }
+                }
+            }
+        }
+        Expr::New { cls, args, raw: false, ty, .. } if fam.locals.contains(cls.as_str()) => {
+            if let Some(lpc) = pool.get(cls) {
+                let simple = fam
+                    .nested
+                    .get(cls)
+                    .map(|n| n.simple.clone())
+                    .unwrap_or_else(|| simple_name(cls));
+                let (kept, captures) = analyze_anon_ctor(&lpc, args.clone());
+                let captures = render_captures(captures, pc, pool, vt);
+                // Emit the class declaration once (dedup by name).
+                if !pending.iter().any(|d| matches!(d, Stmt::ClassDecl { name, .. } if *name == simple)) {
+                    let mut header = simple.clone();
+                    let mut bases: Vec<String> = Vec::new();
+                    let p = Printer::new(&lpc, pool, empty_vt());
+                    if lpc.class_attr("Record").is_some() {
+                        // Local record: `record Name(components)`; the
+                        // implicit java.lang.Record supertype is not printed.
+                        header = format!("record {}{}", simple, record_components(&lpc, pool));
+                    } else {
+                        for &ii in &lpc.cf.interfaces {
+                            if let Some(n) = lpc.class_name(ii) {
+                                bases.push(p.shorten(n));
+                            }
+                        }
+                        if bases.is_empty() {
+                            if let Some(sup) = lpc.super_name() {
+                                if sup != "java/lang/Object" && sup != "java/lang/Record" {
+                                    header.push_str(" extends ");
+                                    header.push_str(&p.shorten(sup));
+                                }
+                            }
+                        } else {
+                            header.push_str(" implements ");
+                            header.push_str(&bases.join(", "));
+                        }
+                    }
+                    let mut buf = String::new();
+                    if emit_anon_body(&lpc, pool, fam, &captures, &mut buf, 0).is_ok() {
+                        pending.push(Stmt::ClassDecl { name: simple.clone(), header, body: buf });
+                    }
+                }
+                *e = Expr::New {
+                    cls: format!("\u{2}{}", simple),
+                    ty: ty.clone(),
+                    args: kept,
+                    raw: false,
+                };
+            }
+        }
+        Expr::New { args, .. } => args.iter_mut().for_each(|a| walk_expr_anon(a, pc, pool, fam, pending, vt)),
+        Expr::AnonNew { args, .. } => args.iter_mut().for_each(|a| walk_expr_anon(a, pc, pool, fam, pending, vt)),
+        Expr::Method { owner, args, .. } => {
+            if let Some(o) = owner {
+                walk_expr_anon(o, pc, pool, fam, pending, vt);
+            }
+            args.iter_mut().for_each(|a| walk_expr_anon(a, pc, pool, fam, pending, vt));
+        }
+        Expr::Field { owner: Some(o), .. } => walk_expr_anon(o, pc, pool, fam, pending, vt),
+        Expr::ArrayIndex { array, index } => {
+            walk_expr_anon(array, pc, pool, fam, pending, vt);
+            walk_expr_anon(index, pc, pool, fam, pending, vt);
+        }
+        Expr::Cast { e: inner, .. } | Expr::InstanceOf { e: inner, .. } | Expr::Un { e: inner, .. } => {
+            walk_expr_anon(inner, pc, pool, fam, pending, vt)
+        }
+        Expr::Bin { l, r, .. } => {
+            walk_expr_anon(l, pc, pool, fam, pending, vt);
+            walk_expr_anon(r, pc, pool, fam, pending, vt);
+        }
+        Expr::Cond { c, t, f } => {
+            walk_expr_anon(c, pc, pool, fam, pending, vt);
+            walk_expr_anon(t, pc, pool, fam, pending, vt);
+            walk_expr_anon(f, pc, pool, fam, pending, vt);
+        }
+        Expr::Assign { target, value, .. } => {
+            walk_expr_anon(target, pc, pool, fam, pending, vt);
+            walk_expr_anon(value, pc, pool, fam, pending, vt);
+        }
+        Expr::PreIncDec { e: inner, .. } | Expr::PostIncDec { e: inner, .. } => {
+            walk_expr_anon(inner, pc, pool, fam, pending, vt)
+        }
+        Expr::NewArray { dims, init, .. } => {
+            dims.iter_mut().for_each(|d| walk_expr_anon(d, pc, pool, fam, pending, vt));
+            if let Some(vals) = init {
+                vals.iter_mut().for_each(|v| walk_expr_anon(v, pc, pool, fam, pending, vt));
+            }
+        }
+        Expr::StringConcat(parts) => parts.iter_mut().for_each(|p| {
+            if let crate::expr::ConcatPart::Str(inner) = p {
+                walk_expr_anon(inner, pc, pool, fam, pending, vt);
+            }
+        }),
+        Expr::Lambda(l) => l.captures.iter_mut().for_each(|c| walk_expr_anon(c, pc, pool, fam, pending, vt)),
+        Expr::Invokedynamic { args, .. } => args.iter_mut().for_each(|a| walk_expr_anon(a, pc, pool, fam, pending, vt)),
+        _ => {}
+    }
+}
+
+/// Pre-render captured expressions in the OUTER context so the inner class
+/// body (printed with its own VarTable) can splice them as raw text.
+/// Collapse a `this$N` field chain whose owner is an anonymous class:
+/// `anonInstance.this$0` (possibly chained) resolves to the first NAMED
+/// enclosing class, rendered `Name.this`. Anonymous classes have no
+/// source name, but the lexical scope of an inlined anonymous body still
+/// sees the named enclosing class. Returns None when the chain does not
+/// bottom out at a named class resolvable in the pool.
+fn collapse_this_chain(e: &Expr, pool: &ClassPool) -> Option<String> {
+    let (name, cls) = match e {
+        Expr::Field { name, cls, is_static: false, .. } if name.starts_with("this$") => {
+            (name.as_str(), cls.as_str())
+        }
+        _ => return None,
+    };
+    let owner_pc = pool.get(cls)?;
+    // Find the this$N field descriptor on the owner class.
+    let mut target: Option<String> = None;
+    for f in &owner_pc.cf.fields {
+        if owner_pc.utf8(f.name_index).map(|n| n == name).unwrap_or(false) {
+            if let Some(d) = owner_pc.utf8(f.descriptor_index) {
+                if let Some(inner) = d.strip_prefix('L').and_then(|d| d.strip_suffix(';')) {
+                    target = Some(inner.to_string());
+                }
+            }
+            break;
+        }
+    }
+    let target = target?;
+    let simple = simple_name(&target);
+    let anon = simple
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false);
+    if anon {
+        None
+    } else {
+        Some(format!("{}.this", simple))
+    }
+}
+
+/// True when the expression is a call to a GENERIC method: its static type
+/// at any argument position comes from inference, so inserting our own cast
+/// would freeze a capture identity javac would otherwise unify.
+pub(crate) fn is_generic_call(a: &Expr, pool: &ClassPool) -> bool {
+    let (cls, name, desc) = match a {
+        Expr::Method { cls, name, desc, .. } => (cls.as_str(), name.as_str(), desc),
+        _ => return false,
+    };
+    let want_desc = {
+        let mut s = String::new();
+        for t in &desc.args {
+            s.push_str(&t.to_descriptor());
+        }
+        format!("({}){}", s, desc.ret.to_descriptor())
+    };
+    let Some(dpc) = pool.get(cls) else { return false };
+    let Some(mi) = (0..dpc.cf.methods.len()).find(|&i| {
+        dpc.method_name(i) == Some(name) && dpc.method_desc(i) == Some(want_desc.as_str())
+    }) else { return false };
+    let Some(sig_bytes) = dpc.cf.methods[mi].attributes.iter().find_map(|at| {
+        if dpc.utf8(at.attribute_name_index) == Some("Signature") {
+            Some(at.info.as_slice())
+        } else {
+            None
+        }
+    }) else { return false };
+    if sig_bytes.len() < 2 {
+        return false;
+    }
+    let idx = u16::from_be_bytes([sig_bytes[0], sig_bytes[1]]);
+    dpc.utf8(idx)
+        .and_then(|s2| jcdc_jvm::parse_method_signature(s2))
+        .map(|msig| !msig.params.is_empty())
+        .unwrap_or(false)
+}
+
+fn render_captures(
+    captures: HashMap<String, Expr>,
+    outer_pc: &PoolClass,
+    pool: &ClassPool,
+    outer_vt: &VarTable,
+) -> HashMap<String, Expr> {
+    let outer_simple = simple_name(&outer_pc.internal_name);
+    captures
+        .into_iter()
+        .map(|(k, v)| {
+            if k.starts_with("this$") {
+                // Anonymous outer classes have no source name; their body is
+                // inlined, so plain `this` denotes the same instance.
+                let starts_digit = outer_simple
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false);
+                return if starts_digit {
+                    (k, Expr::Raw("this".to_string()))
+                } else {
+                    (k, Expr::Raw(format!("{}.this", outer_simple)))
+                };
+            }
+            let mut p = Printer::new(outer_pc, pool, outer_vt);
+            let mut text = String::new();
+            let atomic = matches!(v, Expr::Local { .. } | Expr::This | Expr::Const(_));
+            if !atomic {
+                text.push('(');
+            }
+            p.expr(&v, 1, &mut text);
+            if !atomic {
+                text.push(')');
+            }
+            (k, Expr::Raw(text))
+        })
+        .collect()
+}
+
+fn build_anon_new(
+    apc: &PoolClass,
+    args: Vec<Expr>,
+    outer_pc: &PoolClass,
+    pool: &ClassPool,
+    fam: &Family,
+    outer_vt: &VarTable,
+) -> Option<Expr> {
+    // Prefer the generic ClassSignature: anonymous classes record their
+    // instantiated interface/superclass there, and the emitted body only
+    // overrides the generic methods (bridges are hidden).
+    let sig_base: Option<TypeRef> = apc.class_attr("Signature").and_then(|b| {
+        if b.len() < 2 {
+            return None;
+        }
+        let idx = u16::from_be_bytes([b[0], b[1]]);
+        let sig = apc.utf8(idx).and_then(|s| parse_class_signature(s))?;
+        if let Some(i) = sig.interfaces.first() {
+            return Some(TypeRef::G(i.clone()));
+        }
+        match &sig.superclass {
+            jcdc_jvm::GenericType::Class(cs)
+                if cs.parts.first().map(|p| p.name == "Object").unwrap_or(false) =>
+            {
+                None
+            }
+            other => Some(TypeRef::G(other.clone())),
+        }
+    });
+    let base = if let Some(&i) = apc.cf.interfaces.first() {
+        let n = apc.class_name(i)?;
+        sig_base.unwrap_or(TypeRef::J(JavaType::Object(n.to_string())))
+    } else {
+        let sup = apc.super_name()?.to_string();
+        if sup == "java/lang/Object" {
+            return None;
+        }
+        sig_base.unwrap_or(TypeRef::J(JavaType::Object(sup)))
+    };
+
+    let (kept_args, captures) = analyze_anon_ctor(apc, args);
+    let captures = render_captures(captures, outer_pc, pool, outer_vt);
+
+    let mut body = String::new();
+    if let Err(e) = emit_anon_body(apc, pool, fam, &captures, &mut body, 0) {
+        if std::env::var("JCDC_DBG_ANON").is_ok() {
+            eprintln!("ANON build fail {}: {}", apc.internal_name, e);
+        }
+        return None;
+    }
+    let _ = outer_pc;
+
+    Some(Expr::AnonNew { cls: apc.internal_name.clone(), base, args: kept_args, body })
+}
+
+/// Determine which ctor params are captures (stored into this$*/val$*
+/// fields). Returns (kept args, field name -> captured expr).
+fn analyze_anon_ctor(apc: &PoolClass, args: Vec<Expr>) -> (Vec<Expr>, HashMap<String, Expr>) {
+    let mut captures: HashMap<String, Expr> = HashMap::new();
+    let mut captured_idx: HashSet<usize> = HashSet::new();
+    let ctor = (0..apc.cf.methods.len()).find(|&mi| apc.method_name(mi) == Some("<init>"));
+    if let Some(mi) = ctor {
+        if let Ok(Some(mb)) = decompile_method(apc, empty_pool(), mi) {
+            // param var name -> index
+            let mut param_names: Vec<(String, usize)> = Vec::new();
+            let mut idx = 0usize;
+            for v in &mb.vt.vars {
+                if v.is_param && v.name != "this" {
+                    param_names.push((v.name.clone(), idx));
+                    idx += 1;
+                }
+            }
+            for st in stmt_vec(&mb.body) {
+                if let Stmt::ExprStmt(Expr::Assign { target, value, .. }) = st {
+                    if let Expr::Field { name: fname, is_static: false, .. } = &*target {
+                        if fname.starts_with("this$") || fname.starts_with("val$") {
+                            if let Expr::Local { var, .. } = &*value {
+                                let vname = mb.vt.var(*var).name.clone();
+                                if let Some((_, pi)) = param_names.iter().find(|(n, _)| *n == vname) {
+                                    if let Some(e) = args.get(*pi) {
+                                        captures.insert(fname.clone(), e.clone());
+                                        captured_idx.insert(*pi);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let kept: Vec<Expr> = args
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !captured_idx.contains(i))
+        .map(|(_, a)| a)
+        .collect();
+    (kept, captures)
+}
+
+fn emit_anon_body(
+    apc: &PoolClass,
+    pool: &ClassPool,
+    fam: &Family,
+    captures: &HashMap<String, Expr>,
+    out: &mut String,
+    indent: usize,
+) -> anyhow::Result<()> {
+    // Self/mutual instantiation cycles: a local or anonymous class whose
+    // methods instantiate it (or a sibling that instantiates it back) must
+    // not be inlined recursively. The in-progress emission registers the
+    // class name; a re-entry bails and the call site keeps a plain `new`.
+    let cyc = EMITTING.with(|e| !e.borrow_mut().insert(apc.internal_name.clone()));
+    if cyc {
+        anyhow::bail!("cyclic anonymous instantiation of {}", apc.internal_name);
+    }
+    let _anon_guard = EmitGuard(apc.internal_name.clone());
+    // Anonymous/local classes have no source constructor: recover field
+    // initializers from the generated <init>.
+    let is_rec = apc.class_attr("Record").is_some();
+    let rec_comps = if is_rec { record_component_names(apc) } else { Vec::new() };
+    let mut ctor_inits = anon_field_inits(apc, pool, captures);
+    // Field initializers can instantiate anonymous classes (`new X() {...}`
+    // shows up as a digit-leading class ref); inline them like method bodies.
+    for v in ctor_inits.values_mut() {
+        let mut pending: Vec<Stmt> = Vec::new();
+        walk_expr_anon(v, apc, pool, fam, &mut pending, &empty_vt());
+    }
+    // Fields (skip capture/synthetic fields; record components are implicit).
+    for (fi, f) in apc.cf.fields.iter().enumerate() {
+        let fname = apc.utf8(f.name_index).unwrap_or("").to_string();
+        if fname.starts_with("this$")
+            || fname.starts_with("val$")
+            || f.access_flags.contains(FieldAccessFlags::SYNTHETIC)
+            || rec_comps.contains(&fname)
+        {
+            continue;
+        }
+        emit_field_init(apc, pool, fi, out, indent + 1, ctor_inits.get(&fname))?;
+    }
+    // Methods with capture substitution.
+    let skip = methods_to_skip(apc, pool, false, is_rec, &ClassOptions::default());
+    // Anonymous classes never declare constructors in source; super args
+    // ride on the `new Base(args) { ... }` expression itself.
+    for mi in 0..apc.cf.methods.len() {
+        let name = apc.method_name(mi).unwrap_or("").to_string();
+        if name == "<init>" || name == "<clinit>" || skip.contains(&mi) {
+            continue;
+        }
+        emit_method_with(apc, pool, fam, mi, out, indent + 1, captures)?;
+    }
+    // Nested classes of the anonymous class.
+    for child in fam.direct_children(&apc.internal_name) {
+        let Some(npc) = pool.get(&child.name) else { continue };
+        emit_class(&npc, pool, &ClassOptions::default(), fam, out, indent + 1, false)?;
+    }
+    Ok(())
+}
+
+/// Map this$N fields of a member inner class to `Outer.this` raw exprs.
+fn outer_this_map(pc: &PoolClass) -> HashMap<String, Expr> {
+    let mut m = HashMap::new();
+    for f in &pc.cf.fields {
+        if let Some(name) = pc.utf8(f.name_index) {
+            if name.starts_with("this$") {
+                if let Some(desc) = pc.utf8(f.descriptor_index) {
+                    if let Some(inner) = desc.strip_prefix('L').and_then(|d| d.strip_suffix(';')) {
+                        let sn = simple_name(inner);
+                        // An anonymous outer class has no source name; the
+                        // emitted body is inlined, so plain `this` (or the
+                        // enclosing scope) denotes the same instance.
+                        let starts_digit = sn
+                            .chars()
+                            .next()
+                            .map(|c| c.is_ascii_digit())
+                            .unwrap_or(false);
+                        let rep = if starts_digit {
+                            Expr::This
+                        } else {
+                            Expr::Raw(format!("{}.this", sn))
+                        };
+                        m.insert(name.to_string(), rep);
+                    }
+                }
+            }
+        }
+    }
+    m
+}
+
+/// Replace reads of captured synthetic fields with the captured expressions.
+/// True when the method's bytecode instantiates or constructs one of the
+/// owner's inner classes (`Owner$...`) — such classes capture enclosing
+/// locals, which Java <= 7 requires to be declared `final`.
+fn method_builds_inner(pc: &PoolClass, mi: usize) -> bool {
+    use jcdc_classfile::instruction::{decode_all, Opcode};
+    let Some(code) = crate::varalloc::code_attribute(pc, mi) else {
+        return false;
+    };
+    let prefix = format!("{}$", pc.internal_name);
+    for ins in decode_all(&code.code) {
+        match ins.op {
+            Opcode::New => {
+                if let Some(c) = pc.class_name(ins.a as u16) {
+                    if c.starts_with(&prefix) {
+                        return true;
+                    }
+                }
+            }
+            Opcode::Invokespecial => {
+                if let Some((c, n, _)) = pc.member_ref(ins.a as u16) {
+                    if n == "<init>" && c.starts_with(&prefix) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Mark locals captured by inner/anonymous class constructors as `final`
+/// (Java <= 7 compilation requirement).
+fn finalize_captured_locals(s: &mut Stmt, owner_internal: &str) {
+    let mut vars: HashSet<u32> = HashSet::new();
+    let prefix = format!("{}$", owner_internal);
+    collect_captured_stmt(s, &prefix, &mut vars);
+    if vars.is_empty() {
+        return;
+    }
+    mark_final_stmt(s, &vars);
+}
+
+fn collect_captured_expr(e: &Expr, prefix: &str, vars: &mut HashSet<u32>) {
+    let grab_locals = |args: &[Expr], vars: &mut HashSet<u32>| {
+        for a in args {
+            collect_locals_in(a, vars);
+        }
+    };
+    match e {
+        Expr::Method { cls, name, args, .. } if name == "<init>" && cls.starts_with(prefix) => {
+            grab_locals(args, vars);
+        }
+        Expr::AnonNew { args, .. } => grab_locals(args, vars),
+        Expr::New { args, .. } => args.iter().for_each(|a| collect_captured_expr(a, prefix, vars)),
+        Expr::Method { owner, args, .. } => {
+            if let Some(o) = owner {
+                collect_captured_expr(o, prefix, vars);
+            }
+            args.iter().for_each(|a| collect_captured_expr(a, prefix, vars));
+        }
+        Expr::Bin { l, r, .. } | Expr::Assign { target: l, value: r, .. } => {
+            collect_captured_expr(l, prefix, vars);
+            collect_captured_expr(r, prefix, vars);
+        }
+        Expr::Cond { c, t, f } => {
+            collect_captured_expr(c, prefix, vars);
+            collect_captured_expr(t, prefix, vars);
+            collect_captured_expr(f, prefix, vars);
+        }
+        Expr::Un { e: x, .. }
+        | Expr::Cast { e: x, .. }
+        | Expr::InstanceOf { e: x, .. }
+        | Expr::PreIncDec { e: x, .. }
+        | Expr::PostIncDec { e: x, .. } => collect_captured_expr(x, prefix, vars),
+        Expr::ArrayIndex { array, index } => {
+            collect_captured_expr(array, prefix, vars);
+            collect_captured_expr(index, prefix, vars);
+        }
+        Expr::Field { owner: Some(o), .. } => collect_captured_expr(o, prefix, vars),
+        Expr::NewArray { dims, init, .. } => {
+            dims.iter().for_each(|d| collect_captured_expr(d, prefix, vars));
+            if let Some(vals) = init {
+                vals.iter().for_each(|v| collect_captured_expr(v, prefix, vars));
+            }
+        }
+        Expr::StringConcat(parts) => parts.iter().for_each(|p| {
+            if let crate::expr::ConcatPart::Str(x) = p {
+                collect_captured_expr(x, prefix, vars);
+            }
+        }),
+        _ => {}
+    }
+}
+
+fn collect_locals_in(e: &Expr, vars: &mut HashSet<u32>) {
+    match e {
+        Expr::Local { var, .. } => {
+            vars.insert(*var);
+        }
+        Expr::Cast { e: x, .. } | Expr::Un { e: x, .. } => collect_locals_in(x, vars),
+        _ => {}
+    }
+}
+
+fn collect_captured_stmt(s: &Stmt, prefix: &str, vars: &mut HashSet<u32>) {
+    match s {
+        Stmt::Block(v) => v.iter().for_each(|x| collect_captured_stmt(x, prefix, vars)),
+        Stmt::ExprStmt(e) => collect_captured_expr(e, prefix, vars),
+        Stmt::LocalDef { init: Some(e), .. } => collect_captured_expr(e, prefix, vars),
+        Stmt::Return(Some(e)) | Stmt::Throw(e) => collect_captured_expr(e, prefix, vars),
+        Stmt::If { cond, then_stmt, else_stmt } => {
+            collect_captured_expr(cond, prefix, vars);
+            collect_captured_stmt(then_stmt, prefix, vars);
+            if let Some(e) = else_stmt {
+                collect_captured_stmt(e, prefix, vars);
+            }
+        }
+        Stmt::While { cond, body } | Stmt::DoWhile { cond, body } => {
+            collect_captured_expr(cond, prefix, vars);
+            collect_captured_stmt(body, prefix, vars);
+        }
+        Stmt::For { init, cond, update, body } => {
+            init.iter().for_each(|i| collect_captured_stmt(i, prefix, vars));
+            if let Some(c) = cond {
+                collect_captured_expr(c, prefix, vars);
+            }
+            update.iter().for_each(|u| collect_captured_expr(u, prefix, vars));
+            collect_captured_stmt(body, prefix, vars);
+        }
+        Stmt::Switch { selector, cases, default, .. } => {
+            collect_captured_expr(selector, prefix, vars);
+            for c in cases {
+                c.body.iter().for_each(|st| collect_captured_stmt(st, prefix, vars));
+            }
+            if let Some(d) = default {
+                collect_captured_stmt(d, prefix, vars);
+            }
+        }
+        Stmt::Try { body, catches, finally } => {
+            collect_captured_stmt(body, prefix, vars);
+            for c in catches {
+                collect_captured_stmt(&c.body, prefix, vars);
+            }
+            if let Some(f) = finally {
+                collect_captured_stmt(f, prefix, vars);
+            }
+        }
+        Stmt::TryWithResources { resources, body, catches, finally } => {
+            for res in resources.iter() { collect_captured_stmt(res, prefix, vars); }
+            collect_captured_stmt(body, prefix, vars);
+            for c in catches {
+                collect_captured_stmt(&c.body, prefix, vars);
+            }
+            if let Some(f) = finally {
+                collect_captured_stmt(f, prefix, vars);
+            }
+        }
+        Stmt::Synchronized { lock, body } => {
+            collect_captured_expr(lock, prefix, vars);
+            collect_captured_stmt(body, prefix, vars);
+        }
+        _ => {}
+    }
+}
+
+fn mark_final_stmt(s: &mut Stmt, vars: &HashSet<u32>) {
+    match s {
+        Stmt::Block(v) => v.iter_mut().for_each(|x| mark_final_stmt(x, vars)),
+        Stmt::LocalDef { var, is_final, .. } if vars.contains(var) => *is_final = true,
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            mark_final_stmt(then_stmt, vars);
+            if let Some(e) = else_stmt {
+                mark_final_stmt(e, vars);
+            }
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => mark_final_stmt(body, vars),
+        Stmt::For { init, body, .. } => {
+            init.iter_mut().for_each(|i| mark_final_stmt(i, vars));
+            mark_final_stmt(body, vars);
+        }
+        Stmt::Try { body, catches, finally } => {
+            mark_final_stmt(body, vars);
+            for c in catches {
+                mark_final_stmt(&mut c.body, vars);
+            }
+            if let Some(f) = finally {
+                mark_final_stmt(f, vars);
+            }
+        }
+        Stmt::TryWithResources { resources, body, catches, finally } => {
+            for res in resources.iter_mut() { mark_final_stmt(res, vars); }
+            mark_final_stmt(body, vars);
+            for c in catches {
+                mark_final_stmt(&mut c.body, vars);
+            }
+            if let Some(f) = finally {
+                mark_final_stmt(f, vars);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn substitute_captures(s: &mut Stmt, captures: &HashMap<String, Expr>, pool: &ClassPool) {
+    if captures.is_empty() {
+        return;
+    }
+    walk_stmt_subst(s, captures, pool);
+}
+
+fn walk_stmt_subst(s: &mut Stmt, caps: &HashMap<String, Expr>, pool: &ClassPool) {
+    match s {
+        Stmt::Block(v) => v.iter_mut().for_each(|x| walk_stmt_subst(x, caps, pool)),
+        Stmt::ExprStmt(e) => walk_expr_subst(e, caps, pool),
+        Stmt::LocalDef { init: Some(e), .. } => walk_expr_subst(e, caps, pool),
+        Stmt::Return(Some(e)) | Stmt::Throw(e) => walk_expr_subst(e, caps, pool),
+        Stmt::If { cond, then_stmt, else_stmt } => {
+            walk_expr_subst(cond, caps, pool);
+            walk_stmt_subst(then_stmt, caps, pool);
+            if let Some(e) = else_stmt {
+                walk_stmt_subst(e, caps, pool);
+            }
+        }
+        Stmt::While { cond, body } => {
+            walk_expr_subst(cond, caps, pool);
+            walk_stmt_subst(body, caps, pool);
+        }
+        Stmt::DoWhile { body, cond } => {
+            walk_stmt_subst(body, caps, pool);
+            walk_expr_subst(cond, caps, pool);
+        }
+        Stmt::For { init, cond, update, body } => {
+            init.iter_mut().for_each(|i| walk_stmt_subst(i, caps, pool));
+            if let Some(c) = cond {
+                walk_expr_subst(c, caps, pool);
+            }
+            update.iter_mut().for_each(|u| walk_expr_subst(u, caps, pool));
+            walk_stmt_subst(body, caps, pool);
+        }
+        Stmt::ForEach { iterable, body, .. } => {
+            walk_expr_subst(iterable, caps, pool);
+            walk_stmt_subst(body, caps, pool);
+        }
+        Stmt::Switch { selector, cases, default, .. } => {
+            walk_expr_subst(selector, caps, pool);
+            for c in cases {
+                c.body.iter_mut().for_each(|st| walk_stmt_subst(st, caps, pool));
+            }
+            if let Some(d) = default {
+                walk_stmt_subst(d, caps, pool);
+            }
+        }
+        Stmt::Try { body, catches, finally } => {
+            walk_stmt_subst(body, caps, pool);
+            for c in catches {
+                walk_stmt_subst(&mut c.body, caps, pool);
+            }
+            if let Some(f) = finally {
+                walk_stmt_subst(f, caps, pool);
+            }
+        }
+        Stmt::TryWithResources { resources, body, catches, finally } => {
+            for res in resources.iter_mut() { walk_stmt_subst(res, caps, pool); }
+            walk_stmt_subst(body, caps, pool);
+            for c in catches {
+                walk_stmt_subst(&mut c.body, caps, pool);
+            }
+            if let Some(f) = finally {
+                walk_stmt_subst(f, caps, pool);
+            }
+        }
+        Stmt::Synchronized { lock, body } => {
+            walk_expr_subst(lock, caps, pool);
+            walk_stmt_subst(body, caps, pool);
+        }
+        _ => {}
+    }
+}
+
+fn walk_expr_subst(e: &mut Expr, caps: &HashMap<String, Expr>, pool: &ClassPool) {
+    // `anonOuter.this$N` chains: resolve against the owner class before
+    // the generic recursion rewrites the owner to `this`.
+    if let Expr::Field { name, is_static: false, .. } = &*e {
+        if name.starts_with("this$") {
+            if let Some(r) = collapse_this_chain(e, pool) {
+                *e = Expr::Raw(r);
+                return;
+            }
+        }
+    }
+    if let Expr::Field { name, is_static: false, owner, .. } = e {
+        let owner_is_this = match owner {
+            None => true,
+            Some(o) => matches!(&**o, Expr::This),
+        };
+        if owner_is_this {
+            if let Some(rep) = caps.get(name.as_str()) {
+                *e = rep.clone();
+                return;
+            }
+            if name.starts_with("this$") {
+                *e = Expr::This;
+                return;
+            }
+        }
+    }
+    match e {
+        Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+            args.iter_mut().for_each(|a| walk_expr_subst(a, caps, pool))
+        }
+        Expr::Method { owner, args, .. } => {
+            if let Some(o) = owner {
+                walk_expr_subst(o, caps, pool);
+            }
+            args.iter_mut().for_each(|a| walk_expr_subst(a, caps, pool));
+        }
+        Expr::Field { owner: Some(o), .. } => walk_expr_subst(o, caps, pool),
+        Expr::ArrayIndex { array, index } => {
+            walk_expr_subst(array, caps, pool);
+            walk_expr_subst(index, caps, pool);
+        }
+        Expr::Cast { e: inner, .. } | Expr::InstanceOf { e: inner, .. } | Expr::Un { e: inner, .. } => {
+            walk_expr_subst(inner, caps, pool)
+        }
+        Expr::Bin { l, r, .. } => {
+            walk_expr_subst(l, caps, pool);
+            walk_expr_subst(r, caps, pool);
+        }
+        Expr::Cond { c, t, f } => {
+            walk_expr_subst(c, caps, pool);
+            walk_expr_subst(t, caps, pool);
+            walk_expr_subst(f, caps, pool);
+        }
+        Expr::Assign { target, value, .. } => {
+            walk_expr_subst(target, caps, pool);
+            walk_expr_subst(value, caps, pool);
+        }
+        Expr::PreIncDec { e: inner, .. } | Expr::PostIncDec { e: inner, .. } => {
+            walk_expr_subst(inner, caps, pool)
+        }
+        Expr::NewArray { dims, init, .. } => {
+            dims.iter_mut().for_each(|d| walk_expr_subst(d, caps, pool));
+            if let Some(vals) = init {
+                vals.iter_mut().for_each(|v| walk_expr_subst(v, caps, pool));
+            }
+        }
+        Expr::StringConcat(parts) => parts.iter_mut().for_each(|p| {
+            if let crate::expr::ConcatPart::Str(inner) = p {
+                walk_expr_subst(inner, caps, pool);
+            }
+        }),
+        Expr::Lambda(l) => l.captures.iter_mut().for_each(|c| walk_expr_subst(c, caps, pool)),
+        Expr::Invokedynamic { args, .. } => args.iter_mut().for_each(|a| walk_expr_subst(a, caps, pool)),
+        _ => {}
+    }
+}
+
+fn strip_trailing_return(s: &Stmt) -> Stmt {
+    match s {
+        Stmt::Block(v) => {
+            let mut v = v.clone();
+            if let Some(Stmt::Return(None)) = v.last() {
+                v.pop();
+            }
+            Stmt::Block(v)
+        }
+        Stmt::Return(None) => Stmt::Block(vec![]),
+        other => other.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// module-info
+// ---------------------------------------------------------------------------
+
+fn decompile_module_info(pc: &PoolClass) -> anyhow::Result<String> {
+    let Some(bytes) = pc.class_attr("Module") else {
+        anyhow::bail!("module-info without Module attribute");
+    };
+    let attr = parse_module_attr(bytes)?;
+    let mut out = String::new();
+    let name = pc.class_name(attr.module_name_index).unwrap_or("module");
+    out.push_str(&format!("module {} {{\n", name));
+    for r in &attr.requires {
+        let rn = pc.class_name(r.requires_index).unwrap_or("?");
+        let mut mods = Vec::new();
+        if r.requires_flags & 0x0020 != 0 {
+            mods.push("transitive");
+        }
+        if r.requires_flags & 0x0040 != 0 {
+            mods.push("static");
+        }
+        let mstr = if mods.is_empty() { String::new() } else { format!("{} ", mods.join(" ")) };
+        out.push_str(&format!("    requires {}{};\n", mstr, rn));
+    }
+    for e in &attr.exports {
+        let pn = pc.class_name(e.exports_index).unwrap_or("?").replace('/', ".");
+        if e.exports_to_index.is_empty() {
+            out.push_str(&format!("    exports {};\n", pn));
+        } else {
+            let tos: Vec<String> =
+                e.exports_to_index.iter().filter_map(|&i| pc.class_name(i)).map(|s| s.to_string()).collect();
+            out.push_str(&format!("    exports {} to {};\n", pn, tos.join(", ")));
+        }
+    }
+    for o in &attr.opens {
+        let pn = pc.class_name(o.opens_index).unwrap_or("?").replace('/', ".");
+        if o.opens_to_index.is_empty() {
+            out.push_str(&format!("    opens {};\n", pn));
+        } else {
+            let tos: Vec<String> =
+                o.opens_to_index.iter().filter_map(|&i| pc.class_name(i)).map(|s| s.to_string()).collect();
+            out.push_str(&format!("    opens {} to {};\n", pn, tos.join(", ")));
+        }
+    }
+    for u in &attr.uses_index {
+        if let Some(un) = pc.class_name(*u) {
+            out.push_str(&format!("    uses {};\n", un.replace('/', ".")));
+        }
+    }
+    for p in &attr.provides {
+        let sn = pc.class_name(p.provides_index).unwrap_or("?").replace('/', ".");
+        let ws: Vec<String> =
+            p.provides_with_index.iter().filter_map(|&i| pc.class_name(i)).map(|s| s.replace('/', ".")).collect();
+        out.push_str(&format!("    provides {} with {};\n", sn, ws.join(", ")));
+    }
+    out.push_str("}\n");
+    Ok(out)
+}
+
+fn parse_module_attr(info: &[u8]) -> anyhow::Result<jcdc_classfile::ModuleAttribute> {
+    fn u2(b: &[u8], i: &mut usize) -> anyhow::Result<u16> {
+        anyhow::ensure!(*i + 2 <= b.len(), "truncated module attr");
+        let v = u16::from_be_bytes([b[*i], b[*i + 1]]);
+        *i += 2;
+        Ok(v)
+    }
+    let mut i = 0;
+    let module_name_index = u2(info, &mut i)?;
+    let module_flags = u2(info, &mut i)?;
+    let module_version_index = u2(info, &mut i)?;
+    let nr = u2(info, &mut i)? as usize;
+    let mut requires = Vec::with_capacity(nr);
+    for _ in 0..nr {
+        requires.push(jcdc_classfile::ModuleRequires {
+            requires_index: u2(info, &mut i)?,
+            requires_flags: u2(info, &mut i)?,
+            requires_version_index: u2(info, &mut i)?,
+        });
+    }
+    let ne = u2(info, &mut i)? as usize;
+    let mut exports = Vec::with_capacity(ne);
+    for _ in 0..ne {
+        let ei = u2(info, &mut i)?;
+        let ef = u2(info, &mut i)?;
+        let nt = u2(info, &mut i)? as usize;
+        let mut to = Vec::with_capacity(nt);
+        for _ in 0..nt {
+            to.push(u2(info, &mut i)?);
+        }
+        exports.push(jcdc_classfile::ModuleExports { exports_index: ei, exports_flags: ef, exports_to_index: to });
+    }
+    let no = u2(info, &mut i)? as usize;
+    let mut opens = Vec::with_capacity(no);
+    for _ in 0..no {
+        let oi = u2(info, &mut i)?;
+        let of = u2(info, &mut i)?;
+        let nt = u2(info, &mut i)? as usize;
+        let mut to = Vec::with_capacity(nt);
+        for _ in 0..nt {
+            to.push(u2(info, &mut i)?);
+        }
+        opens.push(jcdc_classfile::ModuleOpens { opens_index: oi, opens_flags: of, opens_to_index: to });
+    }
+    let nu = u2(info, &mut i)? as usize;
+    let mut uses_index = Vec::with_capacity(nu);
+    for _ in 0..nu {
+        uses_index.push(u2(info, &mut i)?);
+    }
+    let np = u2(info, &mut i)? as usize;
+    let mut provides = Vec::with_capacity(np);
+    for _ in 0..np {
+        let pi = u2(info, &mut i)?;
+        let nw = u2(info, &mut i)? as usize;
+        let mut with = Vec::with_capacity(nw);
+        for _ in 0..nw {
+            with.push(u2(info, &mut i)?);
+        }
+        provides.push(jcdc_classfile::ModuleProvides { provides_index: pi, provides_with_index: with });
+    }
+    Ok(jcdc_classfile::ModuleAttribute {
+        module_name_index,
+        module_flags,
+        module_version_index,
+        requires,
+        exports,
+        opens,
+        uses_index,
+        provides,
+    })
+}
+
+
+// ---------------------------------------------------------------------------
+// switch-on-enum restoration ($SwitchMap pattern)
+// ---------------------------------------------------------------------------
+
+/// javac compiles `switch (e)` on an enum into
+/// `switch (Synth.$SwitchMap$pkg$Enum[e.ordinal()])` where the synthetic
+/// holder's <clinit> maps `$SwitchMap[C.ordinal()] = k`. Restore: selector
+/// becomes `e`, integer case labels become the enum constant names.
+pub fn restore_enum_switches(s: &mut Stmt, pc: &PoolClass, pool: &ClassPool) {
+    match s {
+        Stmt::Switch { selector, cases, .. } => {
+            restore_one_switch(selector, cases, pc, pool);
+            for c in cases {
+                c.body.iter_mut().for_each(|st| restore_enum_switches(st, pc, pool));
+            }
+        }
+        Stmt::Block(v) => v.iter_mut().for_each(|x| restore_enum_switches(x, pc, pool)),
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            restore_enum_switches(then_stmt, pc, pool);
+            if let Some(e) = else_stmt {
+                restore_enum_switches(e, pc, pool);
+            }
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => restore_enum_switches(body, pc, pool),
+        Stmt::For { init, body, .. } => {
+            init.iter_mut().for_each(|i| restore_enum_switches(i, pc, pool));
+            restore_enum_switches(body, pc, pool);
+        }
+        Stmt::ForEach { body, .. } => restore_enum_switches(body, pc, pool),
+        Stmt::Try { body, catches, finally } => {
+            restore_enum_switches(body, pc, pool);
+            for c in catches {
+                restore_enum_switches(&mut c.body, pc, pool);
+            }
+            if let Some(f) = finally {
+                restore_enum_switches(f, pc, pool);
+            }
+        }
+        Stmt::TryWithResources { resources, body, catches, finally } => {
+            for res in resources.iter_mut() { restore_enum_switches(res, pc, pool); }
+            restore_enum_switches(body, pc, pool);
+            for c in catches {
+                restore_enum_switches(&mut c.body, pc, pool);
+            }
+            if let Some(f) = finally {
+                restore_enum_switches(f, pc, pool);
+            }
+        }
+        Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => {
+            restore_enum_switches(body, pc, pool)
+        }
+        _ => {}
+    }
+}
+
+fn restore_one_switch(selector: &mut Expr, cases: &mut Vec<crate::stmt::CaseGroup>, pc: &PoolClass, pool: &ClassPool) {
+    // Java 21+ SwitchBootstraps.typeSwitch: `switch (recv)` with string
+    // constants, `case null` (index -1) and type patterns.
+    if let Expr::Invokedynamic { name, args, bsm_static_args, .. } = &*selector {
+        if name == "typeSwitch" && !args.is_empty() {
+            let recv = args[0].clone();
+            let labels = bsm_static_args.clone();
+            let _shorten = |c: &str| Printer::new(pc, pool, empty_vt()).shorten(c);
+            let mut ok = true;
+            let mut new_cases: Vec<(Vec<String>, Vec<String>)> = Vec::new(); // (raw, str)
+            let mut pat_ctr = 0usize;
+            for cgroup in cases.iter() {
+                let mut raws = Vec::new();
+                let mut strs = Vec::new();
+                for k in &cgroup.labels {
+                    if *k == -1 {
+                        raws.push("null".to_string());
+                    } else if *k >= 0 && (*k as usize) < labels.len() {
+                        match &labels[*k as usize] {
+                            crate::expr::BsmArg::Str(sv) => strs.push(sv.clone()),
+                            crate::expr::BsmArg::Cls(cv) => {
+                                // Render the pattern type through the
+                                // printer so array types (`[B` → `byte[]`)
+                                // and nested names come out as source.
+                                let ty = if cv.starts_with('[') {
+                                    match jcdc_jvm::parse_field_descriptor(cv) {
+                                        Some(t) => TypeRef::J(t),
+                                        None => TypeRef::J(jcdc_jvm::JavaType::Object(cv.clone())),
+                                    }
+                                } else {
+                                    TypeRef::J(jcdc_jvm::JavaType::Object(cv.clone()))
+                                };
+                                let tn = Printer::new(pc, pool, empty_vt()).type_name(&ty);
+                                raws.push(format!("{} ignored{}", tn, pat_ctr));
+                                pat_ctr += 1;
+                            }
+                            crate::expr::BsmArg::Other => {
+                                ok = false;
+                            }
+                        }
+                    } else {
+                        ok = false;
+                    }
+                }
+                new_cases.push((raws, strs));
+            }
+            if ok {
+                for (cgroup, (raws, strs)) in cases.iter_mut().zip(new_cases) {
+                    cgroup.raw_labels = raws;
+                    cgroup.string_labels = strs;
+                    cgroup.labels.clear();
+                }
+                *selector = recv;
+                return;
+            }
+        }
+    }
+    let (synth, field, recv) = match &*selector {
+        Expr::ArrayIndex { array, index } => {
+            let (synth, field) = match &**array {
+                Expr::Field { cls, name, is_static: true, .. } if name.starts_with("$SwitchMap$") => {
+                    (cls.clone(), name.clone())
+                }
+                _ => return,
+            };
+            let recv = match &**index {
+                Expr::Method { name, owner: Some(o), args, .. } if name == "ordinal" && args.is_empty() => {
+                    (**o).clone()
+                }
+                _ => return,
+            };
+            (synth, field, recv)
+        }
+        _ => return,
+    };
+    let Some(map) = switch_map(pool, &synth, &field) else { return };
+    if map.is_empty() {
+        return;
+    }
+    let mut all_mapped = true;
+    for c in cases.iter_mut() {
+        let mut names = Vec::new();
+        for k in &c.labels {
+            match map.get(k) {
+                Some(n) => names.push(n.clone()),
+                None => {
+                    all_mapped = false;
+                    break;
+                }
+            }
+        }
+        if !all_mapped {
+            break;
+        }
+        c.enum_labels = names;
+    }
+    if !all_mapped {
+        for c in cases.iter_mut() {
+            c.enum_labels.clear();
+        }
+        return;
+    }
+    for c in cases.iter_mut() {
+        c.labels.clear();
+    }
+    *selector = recv;
+}
+
+/// Parse the synthetic holder's <clinit> for `$SwitchMap[C.ordinal()] = k`
+/// sequences and return k -> constant name.
+fn switch_map(pool: &ClassPool, synth: &str, field: &str) -> Option<std::collections::HashMap<i64, String>> {
+    use jcdc_classfile::instruction::{decode_all, Opcode};
+    let spc = pool.get(synth)?;
+    let ci = spc.find_own_method("<clinit>", "()V")?;
+    let code = crate::varalloc::code_attribute(&spc, ci)?;
+    let ins = decode_all(&code.code);
+    let const_int = |i: &jcdc_classfile::instruction::Instruction| -> Option<i32> {
+        match i.op {
+            Opcode::IconstM1 => Some(-1),
+            Opcode::Iconst0 => Some(0),
+            Opcode::Iconst1 => Some(1),
+            Opcode::Iconst2 => Some(2),
+            Opcode::Iconst3 => Some(3),
+            Opcode::Iconst4 => Some(4),
+            Opcode::Iconst5 => Some(5),
+            Opcode::Bipush | Opcode::Sipush => Some(i.a),
+            Opcode::Ldc | Opcode::LdcW => {
+                match jcdc_classfile::get_entry(&spc.cf.constant_pool, i.a as u16) {
+                    Some(jcdc_classfile::ConstantPoolEntry::Integer(n)) => Some(n.value),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    };
+    let mut map = std::collections::HashMap::new();
+    let mut i = 0;
+    while i + 4 < ins.len() {
+        let (i0, i1, i2, i3, i4) = (&ins[i], &ins[i + 1], &ins[i + 2], &ins[i + 3], &ins[i + 4]);
+        if i0.op == Opcode::Getstatic
+            && i1.op == Opcode::Getstatic
+            && i2.op == Opcode::Invokevirtual
+            && i4.op == Opcode::Iastore
+        {
+            let f0 = spc.member_ref(i0.a as u16);
+            let f1 = spc.member_ref(i1.a as u16);
+            let ord = spc.member_ref(i2.a as u16);
+            if let (Some((c0, n0, _)), Some((_, cname, _)), Some((_, "ordinal", _))) = (f0, f1, ord) {
+                if c0 == synth && n0 == field {
+                    if let Some(k) = const_int(i3) {
+                        map.insert(k as i64, cname.to_string());
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    Some(map)
+}
+
+
+/// Remove synthetic inner-class constructor artifacts: `Outer.this = this$0`
+/// assignments and `Objects.requireNonNull(this$0)` guards on the hidden
+/// enclosing-instance parameters (the parameters themselves are skipped in
+/// the printed signature).
+fn strip_inner_ctor_artifacts(s: &mut Stmt, vt: &VarTable) {
+    fn is_this_param(e: &Expr, vt: &VarTable) -> bool {
+        match e {
+            Expr::Local { var, .. } => vt.var(*var).name.starts_with("this$"),
+            Expr::Raw(t) => t.starts_with("this$") || t.ends_with(".this$0"),
+            Expr::Field { name, .. } => name.starts_with("this$"),
+            _ => false,
+        }
+    }
+    fn junk(st: &Stmt, vt: &VarTable) -> bool {
+        match st {
+            Stmt::ExprStmt(Expr::Assign { target, .. }) => match &**target {
+                Expr::Field { name, .. } => name.starts_with("this$"),
+                Expr::Raw(t) => t.ends_with(".this") || t.starts_with("this$"),
+                _ => false,
+            },
+            Stmt::ExprStmt(Expr::Method { name, args, .. }) => {
+                (name == "requireNonNull" || name == "checkNotNull")
+                    && args.len() == 1
+                    && is_this_param(&args[0], vt)
+            }
+            // LocalDef mirroring the outer instance into a synthetic
+            // (`Local x = this$0; requireNonNull(x)`) — x dies with the
+            // ctor prologue.
+            Stmt::LocalDef { init: Some(e), .. } => is_this_param(e, vt),
+            _ => false,
+        }
+    }
+    fn rec(s: &mut Stmt, vt: &VarTable) {
+        if let Stmt::Block(v) = s {
+            v.retain(|st| !junk(st, vt));
+            v.iter_mut().for_each(|x| rec(x, vt));
+        }
+    }
+    rec(s, vt);
+}
+
+
+/// True when the method body is built around an `ObjectMethods.bootstrap`
+/// invokedynamic (compiler-generated equals/hashCode/toString).
+fn is_object_methods_indy(pc: &PoolClass, mi: usize) -> bool {
+    use jcdc_classfile::instruction::{decode_all, Opcode};
+    let Some(code) = crate::varalloc::code_attribute(pc, mi) else {
+        return false;
+    };
+    let Some(bsm_bytes) = pc.class_attr("BootstrapMethods") else {
+        return false;
+    };
+    for ins in decode_all(&code.code) {
+        if ins.op != Opcode::Invokedynamic {
+            continue;
+        }
+        let bm_idx = match jcdc_classfile::get_entry(&pc.cf.constant_pool, ins.a as u16) {
+            Some(jcdc_classfile::ConstantPoolEntry::InvokeDynamic(d)) => {
+                d.bootstrap_method_attr_index
+            }
+            _ => continue,
+        };
+        let mut i = 0usize;
+        let mut found = None;
+        'scan: {
+            let rd = |i: &mut usize| -> Option<u16> {
+                let hi = *bsm_bytes.get(*i)?;
+                let lo = *bsm_bytes.get(*i + 1)?;
+                *i += 2;
+                Some(u16::from_be_bytes([hi, lo]))
+            };
+            let Some(n) = rd(&mut i) else { break 'scan };
+            for k in 0..n {
+                let Some(href) = rd(&mut i) else { break 'scan };
+                let Some(na) = rd(&mut i) else { break 'scan };
+                if k == bm_idx {
+                    found = Some(href);
+                    break;
+                }
+                for _ in 0..na {
+                    if rd(&mut i).is_none() {
+                        break 'scan;
+                    }
+                }
+            }
+        }
+        if let Some(href) = found {
+            // href is a CONSTANT_MethodHandle; dereference to the method.
+            let mref = match jcdc_classfile::get_entry(&pc.cf.constant_pool, href) {
+                Some(jcdc_classfile::ConstantPoolEntry::MethodHandle(h)) => h.reference_index,
+                _ => href,
+            };
+            if let Some((cls, _, _)) = pc.member_ref(mref) {
+                return cls == "java/lang/runtime/ObjectMethods";
+            }
+        }
+    }
+    false
+}
+
+
+/// Re-insert `(T)` casts that javac elided for type-variable returns and
+/// assignments (the bytecode needs no checkcast when the erasure matches).
+fn cast_returns_to_typevar(s: &mut Stmt, tv: &str, vt: &VarTable) {
+    let target = TypeRef::G(jcdc_jvm::GenericType::TypeVar(tv.to_string()));
+    // A field read through a wildcard-parameterized receiver (`e.value`
+    // where e: Entry<?,?>) has a CAPTURE type, not the method's own type
+    // variable — even when the names collide. It always needs the cast.
+    fn capture_field(e: &Expr) -> bool {
+        if let Expr::Field { owner: Some(o), .. } = e {
+            if let TypeRef::G(jcdc_jvm::GenericType::Class(cs)) = o.type_ref() {
+                return cs.parts.iter().any(|p| {
+                    p.args
+                        .iter()
+                        .any(|a| matches!(a, jcdc_jvm::GenericType::Wildcard(_)))
+                });
+            }
+        }
+        false
+    }
+    fn fix(e: &mut Expr, target: &TypeRef, tv: &str) {
+        if matches!(e, Expr::Const(crate::expr::ConstVal::Null)) {
+            return;
+        }
+        let already = match e.type_ref() {
+            TypeRef::G(jcdc_jvm::GenericType::TypeVar(n)) => n == tv && !capture_field(e),
+            _ => false,
+        };
+        if !already {
+            let inner = std::mem::replace(e, Expr::This);
+            *e = Expr::Cast { ty: target.clone(), e: Box::new(inner) };
+        }
+    }
+    match s {
+        Stmt::Block(v) => v.iter_mut().for_each(|x| cast_returns_to_typevar(x, tv, vt)),
+        Stmt::Return(Some(e)) => fix(e, &target, tv),
+        Stmt::LocalDef { var, init: Some(e), .. } => {
+            let is_tv = match &vt.var(*var).ty {
+                TypeRef::G(jcdc_jvm::GenericType::TypeVar(n)) => n == tv,
+                _ => false,
+            };
+            if is_tv {
+                fix(e, &target, tv);
+            }
+        }
+        Stmt::ExprStmt(Expr::Assign { target: t, value, .. }) => {
+            let is_tv = match t.type_ref() {
+                TypeRef::G(jcdc_jvm::GenericType::TypeVar(n)) => n == tv,
+                _ => false,
+            };
+            if is_tv {
+                fix(value, &target, tv);
+            }
+        }
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            cast_returns_to_typevar(then_stmt, tv, vt);
+            if let Some(e) = else_stmt {
+                cast_returns_to_typevar(e, tv, vt);
+            }
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            cast_returns_to_typevar(body, tv, vt)
+        }
+        Stmt::For { init, body, .. } => {
+            init.iter_mut().for_each(|i| cast_returns_to_typevar(i, tv, vt));
+            cast_returns_to_typevar(body, tv, vt);
+        }
+        Stmt::ForEach { body, .. } => cast_returns_to_typevar(body, tv, vt),
+        Stmt::Try { body, catches, finally } => {
+            cast_returns_to_typevar(body, tv, vt);
+            for c in catches {
+                cast_returns_to_typevar(&mut c.body, tv, vt);
+            }
+            if let Some(f) = finally {
+                cast_returns_to_typevar(f, tv, vt);
+            }
+        }
+        Stmt::TryWithResources { resources, body, catches, finally } => {
+            for res in resources.iter_mut() { cast_returns_to_typevar(res, tv, vt); }
+            cast_returns_to_typevar(body, tv, vt);
+            for c in catches {
+                cast_returns_to_typevar(&mut c.body, tv, vt);
+            }
+            if let Some(f) = finally {
+                cast_returns_to_typevar(f, tv, vt);
+            }
+        }
+        Stmt::Switch { cases, default, .. } => {
+            for c in cases {
+                c.body.iter_mut().for_each(|st| cast_returns_to_typevar(st, tv, vt));
+            }
+            if let Some(d) = default {
+                cast_returns_to_typevar(d, tv, vt);
+            }
+        }
+        Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => {
+            cast_returns_to_typevar(body, tv, vt)
+        }
+        _ => {}
+    }
+}
+
+
+/// Collapse `v = <branches>; this(v); return;` constructor bodies into a
+/// single leading `this(<ternary chain>)` delegation.
+fn collapse_ctor_delegation(body: &mut Stmt, pc: &PoolClass) {
+    let items = match body {
+        Stmt::Block(v) => v,
+        _ => return,
+    };
+    let Some(last) = items.last() else { return };
+    let mut tmpl: Option<Expr> = None;
+    let Some(val) = delegation_value(last, &mut tmpl, &pc.internal_name) else {
+        return;
+    };
+    let Some(mut call) = tmpl else { return };
+    // Only a delegation to THIS class (not super) may appear mid-body.
+    match &mut call {
+        Expr::Method { cls, args, .. } if args.len() == 1 => {
+            if cls != &pc.internal_name {
+                return;
+            }
+            args[0] = val;
+        }
+        _ => return,
+    }
+    // Prefix statements: only a bare declaration of the delegated local is
+    // tolerated (it disappears into the expression).
+    let prefix_ok = items[..items.len() - 1].iter().all(|st| match st {
+        Stmt::LocalDef { init: None, .. } => true,
+        Stmt::LocalDef { init: Some(e), .. } => {
+            matches!(e, Expr::Const(crate::expr::ConstVal::Null))
+        }
+        Stmt::Comment(_) => true,
+        _ => false,
+    });
+    if !prefix_ok {
+        return;
+    }
+    *body = Stmt::Block(vec![Stmt::ExprStmt(call)]);
+}
+
+/// Walk an if/else tree whose leaves are `v = e; this(v); return;` and
+/// produce the folded value expression plus the delegation call template.
+fn delegation_value(s: &Stmt, tmpl: &mut Option<Expr>, own: &str) -> Option<Expr> {
+    match s {
+        Stmt::Block(v) => {
+            let mut val: Option<Expr> = None;
+            let mut call: Option<Expr> = None;
+            for st in v {
+                match st {
+                    Stmt::ExprStmt(Expr::Assign { value, .. }) if val.is_none() => {
+                        val = Some((**value).clone());
+                    }
+                    Stmt::LocalDef { init: Some(e), .. } if val.is_none() => {
+                        val = Some(e.clone());
+                    }
+                    Stmt::ExprStmt(e @ Expr::Method { name, cls, .. })
+                        if name == "<init>" && cls == own && call.is_none() =>
+                    {
+                        call = Some(e.clone());
+                    }
+                    Stmt::Return(_) | Stmt::Comment(_) => {}
+                    _ => return None,
+                }
+            }
+            match (val, call) {
+                (Some(v0), Some(c)) => {
+                    if tmpl.is_none() {
+                        *tmpl = Some(c);
+                    }
+                    Some(v0)
+                }
+                _ => None,
+            }
+        }
+        Stmt::If { cond, then_stmt, else_stmt: Some(e), .. } => {
+            let t = delegation_value(then_stmt, tmpl, own)?;
+            let f = delegation_value(e, tmpl, own)?;
+            Some(Expr::Cond {
+                c: Box::new(cond.clone()),
+                t: Box::new(t),
+                f: Box::new(f),
+            })
+        }
+        Stmt::ExprStmt(e @ Expr::Method { name, cls, args, .. })
+            if name == "<init>" && cls == own && args.len() == 1 =>
+        {
+            if tmpl.is_none() {
+                *tmpl = Some(e.clone());
+            }
+            Some(args[0].clone())
+        }
+        _ => None,
+    }
+}
+
+
+
+/// Erasure (internal name) of a signature throws entry: type variables
+/// erase to their class bound.
+fn generic_erasure(t: &jcdc_jvm::GenericType, params: &[jcdc_jvm::TypeParam]) -> Option<String> {
+    match t {
+        jcdc_jvm::GenericType::Class(cs) => Some(cs.internal_name()),
+        jcdc_jvm::GenericType::TypeVar(name) => {
+            let p = params.iter().find(|p| &p.name == name)?;
+            match &p.class_bound {
+                Some(jcdc_jvm::GenericType::Class(cs)) => Some(cs.internal_name()),
+                _ => Some("java/lang/Object".to_string()),
+            }
+        }
+        _ => None,
+    }
+}
+
+
+/// A generic method whose return type is its own type variable, called in
+/// a `throw` statement, needs an explicit type witness (`String.<E>mk()`)
+/// — inference in throw position falls back to the bound and would fail
+/// the enclosing throws clause.
+fn add_throw_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, pool: &ClassPool) {
+    let Some(sig) = msig else { return };
+    if sig.params.is_empty() {
+        return;
+    }
+    match s {
+        Stmt::Throw(e) => {
+            if let Expr::Method { cls, name, desc, type_args, .. } = e {
+                if !type_args.is_empty() {
+                    return;
+                }
+                let Some(cpc) = pool.get(cls) else { return };
+                let mi = (0..cpc.cf.methods.len()).find(|&i| {
+                    cpc.method_name(i) == Some(name.as_str())
+                        && cpc
+                            .method_desc(i)
+                            .and_then(parse_method_descriptor)
+                            .as_ref()
+                            == Some(&*desc)
+                });
+                let Some(mi) = mi else { return };
+                let m = &cpc.cf.methods[mi];
+                let csig = m.attributes.iter().find_map(|a| {
+                    if a.attribute_name_index != 0 {
+                        if let Some(nm) = cpc.utf8(a.attribute_name_index) {
+                            if nm == "Signature" && a.info.len() >= 2 {
+                                let idx = u16::from_be_bytes([a.info[0], a.info[1]]);
+                                return cpc
+                                    .utf8(idx)
+                                    .and_then(|s| parse_method_signature(s));
+                            }
+                        }
+                    }
+                    None
+                });
+                if let Some(cs) = csig {
+                    if let jcdc_jvm::GenericType::TypeVar(v) = &cs.ret {
+                        if sig.params.iter().any(|p| &p.name == v) {
+                            *type_args = vec![v.clone()];
+                        }
+                    }
+                }
+            }
+        }
+        Stmt::Block(v) => {
+            v.iter_mut().for_each(|x| add_throw_witnesses(x, msig, pool));
+        }
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            add_throw_witnesses(then_stmt, msig, pool);
+            if let Some(e) = else_stmt {
+                add_throw_witnesses(e, msig, pool);
+            }
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            add_throw_witnesses(body, msig, pool)
+        }
+        Stmt::For { init, body, .. } => {
+            init.iter_mut().for_each(|i| add_throw_witnesses(i, msig, pool));
+            add_throw_witnesses(body, msig, pool);
+        }
+        Stmt::ForEach { body, .. } => add_throw_witnesses(body, msig, pool),
+        Stmt::Try { body, catches, finally } => {
+            add_throw_witnesses(body, msig, pool);
+            for c in catches {
+                add_throw_witnesses(&mut c.body, msig, pool);
+            }
+            if let Some(f) = finally {
+                add_throw_witnesses(f, msig, pool);
+            }
+        }
+        Stmt::TryWithResources { resources, body, catches, finally } => {
+            for res in resources.iter_mut() { add_throw_witnesses(res, msig, pool); }
+            add_throw_witnesses(body, msig, pool);
+            for c in catches {
+                add_throw_witnesses(&mut c.body, msig, pool);
+            }
+            if let Some(f) = finally {
+                add_throw_witnesses(f, msig, pool);
+            }
+        }
+        Stmt::Switch { cases, default, .. } => {
+            for c in cases {
+                c.body.iter_mut().for_each(|st| add_throw_witnesses(st, msig, pool));
+            }
+            if let Some(d) = default {
+                add_throw_witnesses(d, msig, pool);
+            }
+        }
+        Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => {
+            add_throw_witnesses(body, msig, pool)
+        }
+        _ => {}
+    }
+}
+
+
+/// Wrap `return e;` in `(G) e` when the method's signature return type is
+/// generic and `e` carries only the erased type.
+/// Resolve the generic parameter types of a method call as instantiated by
+/// the owner expression's parameterization. Returns None when unresolvable.
+fn instantiated_method_params(
+    m: &Expr,
+    pool: &ClassPool,
+    pc: &PoolClass,
+) -> Option<Vec<jcdc_jvm::GenericType>> {
+    let (cls, name, desc, owner, is_static) = match m {
+        Expr::Method { cls, name, desc, owner, is_static, .. } => {
+            (cls.as_str(), name.as_str(), desc, owner.as_deref(), *is_static)
+        }
+        _ => return None,
+    };
+    if name == "<init>" {
+        return None;
+    }
+    // Owner parameterization: owner expr type, else `this`, else raw class.
+    let (decl, args): (String, Vec<jcdc_jvm::GenericType>) = if is_static {
+        (cls.to_string(), Vec::new())
+    } else {
+        match owner {
+            Some(Expr::This) | None => {
+                let own = owner.map(|o| o.type_ref());
+                match own {
+                    Some(TypeRef::G(jcdc_jvm::GenericType::Class(cs))) => {
+                        (crate::method::classsig_internal(&cs), cs.parts.last()?.args.clone())
+                    }
+                    _ => {
+                        // implicit `this` or erased owner: the enclosing class
+                        let cs = pc.class_attr("Signature").and_then(|b| {
+                            if b.len() < 2 {
+                                return None;
+                            }
+                            let idx = u16::from_be_bytes([b[0], b[1]]);
+                            pc.utf8(idx).and_then(|s| jcdc_jvm::parse_class_signature(s))
+                        });
+                        let args = cs
+                            .as_ref()
+                            .map(|c| {
+                                c.params
+                                    .iter()
+                                    .map(|p| jcdc_jvm::GenericType::TypeVar(p.name.clone()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        (pc.internal_name.clone(), args)
+                    }
+                }
+            }
+            Some(o) => match o.type_ref() {
+                TypeRef::G(jcdc_jvm::GenericType::Class(cs)) => {
+                    (crate::method::classsig_internal(&cs), cs.parts.last()?.args.clone())
+                }
+                t => match t.erased() {
+                    jcdc_jvm::JavaType::Object(n) => (n, Vec::new()),
+                    _ => return None,
+                },
+            },
+        }
+    };
+    let dpc;
+    let dref: &PoolClass = if decl == pc.internal_name {
+        pc
+    } else {
+        dpc = pool.get(&decl)?;
+        &dpc
+    };
+    let d_str = format!(
+        "({}){}",
+        desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+        desc.ret.to_descriptor()
+    );
+    let _ = &d_str;
+    let mi = (0..dref.cf.methods.len()).find(|&i| {
+        dref.method_name(i) == Some(name) && dref.method_desc(i) == Some(desc_raw(dref, i).as_str())
+            && desc_raw(dref, i) == {
+                let mut a = String::new();
+                for t in &desc.args {
+                    a.push_str(&t.to_descriptor());
+                }
+                format!("({}){}", a, desc.ret.to_descriptor())
+            }
+    })?;
+    let sig_bytes = dref.cf.methods[mi].attributes.iter().find_map(|a| {
+        if dref.utf8(a.attribute_name_index) == Some("Signature") {
+            Some(a.info.as_slice())
+        } else {
+            None
+        }
+    })?;
+    if sig_bytes.len() < 2 {
+        return None;
+    }
+    let idx = u16::from_be_bytes([sig_bytes[0], sig_bytes[1]]);
+    let msig = dref.utf8(idx).and_then(|s| jcdc_jvm::parse_method_signature(s))?;
+    if !msig.params.is_empty() {
+        // The method itself is generic; instantiation needs inference we
+        // do not model here (handled by the return-witness pass instead).
+        return None;
+    }
+    let class_params = dref.class_attr("Signature").and_then(|b| {
+        if b.len() < 2 {
+            return None;
+        }
+        let i2 = u16::from_be_bytes([b[0], b[1]]);
+        dref.utf8(i2).and_then(|s| jcdc_jvm::parse_class_signature(s))
+    })?;
+    if class_params.params.len() != args.len() {
+        return None;
+    }
+    let inst: Vec<jcdc_jvm::GenericType> = msig
+        .args
+        .iter()
+        .map(|t| crate::method::subst_typevars(t, &class_params.params, &args))
+        .collect();
+    // Captured owner arguments can nest wildcards, which is not valid Java.
+    if inst.iter().any(crate::method::has_nested_wildcard) {
+        return None;
+    }
+    Some(inst)
+}
+
+fn desc_raw(pc: &PoolClass, mi: usize) -> String {
+    pc.method_desc(mi).unwrap_or("").to_string()
+}
+
+/// Cast call arguments that land in wildcard/typevar parameter positions
+/// but carry only their erasure (`action.accept((K) entry.key, ...)`).
+fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass) {
+    fn fix_expr(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
+        let params = instantiated_method_params(e, pool, pc);
+        if let Some(params) = params {
+            if let Expr::Method { args, .. } = e {
+                for (a, pt) in args.iter_mut().zip(params.iter()) {
+                    fn parameterized(t: &jcdc_jvm::GenericType) -> bool {
+                        match t {
+                            jcdc_jvm::GenericType::Class(cs) => {
+                                cs.parts.iter().any(|p| !p.args.is_empty())
+                            }
+                            jcdc_jvm::GenericType::Array(i) => parameterized(i),
+                            _ => false,
+                        }
+                    }
+                    let want = match pt {
+                        jcdc_jvm::GenericType::TypeVar(_) => Some(pt.clone()),
+                        jcdc_jvm::GenericType::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
+                        | jcdc_jvm::GenericType::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => {
+                            match t.as_ref() {
+                                jcdc_jvm::GenericType::TypeVar(_)
+                                | jcdc_jvm::GenericType::Class(_) => Some((**t).clone()),
+                                _ => None,
+                            }
+                        }
+                        // A parameterized parameter type (`BiFunction<? super
+                        // String, ...>`): an argument whose erasure matches
+                        // but whose parameters differ needs the source cast.
+                        t @ (jcdc_jvm::GenericType::Class(_) | jcdc_jvm::GenericType::Array(_))
+                            if parameterized(t) =>
+                        {
+                            Some(t.clone())
+                        }
+                        _ => None,
+                    };
+                    let Some(want) = want else { continue };
+                    // Generic-method arguments infer their own type at the
+                    // call site; a frozen cast would break unification.
+                    if is_generic_call(a, pool) {
+                        continue;
+                    }
+                    // Different parameterized classes (LinkedHashMap<..> →
+                    // Map<..>): the original compiled without a cast via
+                    // subtyping/inference; inserting one would fail on
+                    // capture identities. A RE-parameterization of the same
+                    // class (BiFunction<? super Object,..> → BiFunction<?
+                    // super String,..>) still needs the source cast.
+                    if let (TypeRef::G(jcdc_jvm::GenericType::Class(ca)),
+                        jcdc_jvm::GenericType::Class(cw)) = (a.type_ref(), pt)
+                    {
+                        if crate::method::classsig_internal(&ca)
+                            != crate::method::classsig_internal(cw)
+                        {
+                            continue;
+                        }
+                    }
+                    // A field read through a wildcard-parameterized owner
+                    // (`entry.key` where entry: Entry<?,?>) statically has
+                    // a CAPTURE type in javac even though our expression
+                    // records the declaring class's type variable; it still
+                    // needs the cast.
+                    let capture_read = matches!(a, Expr::Field { owner: Some(o), .. }
+                        if matches!(o.type_ref(), TypeRef::G(jcdc_jvm::GenericType::Class(cs))
+                            if cs.parts.iter().any(|p| p.args.iter().any(
+                                |x| matches!(x, jcdc_jvm::GenericType::Wildcard(_))))));
+                    if !capture_read && a.type_ref() == TypeRef::G(want.clone()) {
+                        continue;
+                    }
+                    if matches!(a, Expr::Cast { .. } | Expr::Const(_)) {
+                        continue;
+                    }
+                    // Erasures must line up.
+                    let have = a.type_ref().erased();
+                    let want_er = TypeRef::G(want.clone()).erased();
+                    let ok = match (&have, &want_er) {
+                        (jcdc_jvm::JavaType::Object(x), jcdc_jvm::JavaType::Object(y)) => x == y,
+                        (jcdc_jvm::JavaType::Array(_), jcdc_jvm::JavaType::Array(_)) => true,
+                        _ => false,
+                    };
+                    if !ok {
+                        continue;
+                    }
+                    let inner = std::mem::replace(a, Expr::This);
+                    *a = Expr::Cast { ty: TypeRef::G(want), e: Box::new(inner) };
+                }
+            }
+        }
+        walk_expr_children(e, pool, pc, fix_expr);
+    }
+    walk_stmt_exprs(s, pool, pc, fix_expr);
+}
+
+fn walk_expr_children(
+    e: &mut Expr,
+    pool: &ClassPool,
+    pc: &PoolClass,
+    f: fn(&mut Expr, &ClassPool, &PoolClass),
+) {
+    match e {
+        Expr::Method { owner, args, .. } => {
+            if let Some(o) = owner {
+                f(o, pool, pc);
+            }
+            args.iter_mut().for_each(|a| f(a, pool, pc));
+        }
+        Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+            args.iter_mut().for_each(|a| f(a, pool, pc))
+        }
+        Expr::Field { owner: Some(o), .. } => f(o, pool, pc),
+        Expr::ArrayIndex { array, index } => {
+            f(array, pool, pc);
+            f(index, pool, pc);
+        }
+        Expr::Cast { e: i, .. } | Expr::InstanceOf { e: i, .. } | Expr::Un { e: i, .. }
+        | Expr::PreIncDec { e: i, .. } | Expr::PostIncDec { e: i, .. } => f(i, pool, pc),
+        Expr::Bin { l, r, .. } => {
+            f(l, pool, pc);
+            f(r, pool, pc);
+        }
+        Expr::Cond { c, t, f: ff } => {
+            f(c, pool, pc);
+            f(t, pool, pc);
+            f(ff, pool, pc);
+        }
+        Expr::Assign { target, value, .. } => {
+            f(target, pool, pc);
+            f(value, pool, pc);
+        }
+        Expr::NewArray { dims, init, .. } => {
+            dims.iter_mut().for_each(|d| f(d, pool, pc));
+            if let Some(vals) = init {
+                vals.iter_mut().for_each(|v| f(v, pool, pc));
+            }
+        }
+        Expr::StringConcat(parts) => parts.iter_mut().for_each(|p| {
+            if let crate::expr::ConcatPart::Str(i) = p {
+                f(i, pool, pc);
+            }
+        }),
+        Expr::Lambda(l) => l.captures.iter_mut().for_each(|c| f(c, pool, pc)),
+        Expr::Invokedynamic { args, .. } => args.iter_mut().for_each(|a| f(a, pool, pc)),
+        _ => {}
+    }
+}
+
+fn walk_stmt_exprs(
+    s: &mut Stmt,
+    pool: &ClassPool,
+    pc: &PoolClass,
+    f: fn(&mut Expr, &ClassPool, &PoolClass),
+) {
+    match s {
+        Stmt::Block(v) => v.iter_mut().for_each(|x| walk_stmt_exprs(x, pool, pc, f)),
+        Stmt::ExprStmt(e) => f(e, pool, pc),
+        Stmt::LocalDef { init: Some(e), .. } => f(e, pool, pc),
+        Stmt::Return(e) => {
+            if let Some(x) = e {
+                f(x, pool, pc);
+            }
+        }
+        Stmt::Throw(e) => f(e, pool, pc),
+        Stmt::If { cond, then_stmt, else_stmt } => {
+            f(cond, pool, pc);
+            walk_stmt_exprs(then_stmt, pool, pc, f);
+            if let Some(e) = else_stmt {
+                walk_stmt_exprs(e, pool, pc, f);
+            }
+        }
+        Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+            f(cond, pool, pc);
+            walk_stmt_exprs(body, pool, pc, f);
+        }
+        Stmt::For { init, cond, update, body } => {
+            init.iter_mut().for_each(|i| walk_stmt_exprs(i, pool, pc, f));
+            if let Some(c) = cond {
+                f(c, pool, pc);
+            }
+            update.iter_mut().for_each(|u| f(u, pool, pc));
+            walk_stmt_exprs(body, pool, pc, f);
+        }
+        Stmt::ForEach { iterable, body, .. } => {
+            f(iterable, pool, pc);
+            walk_stmt_exprs(body, pool, pc, f);
+        }
+        Stmt::Switch { selector, cases, default, .. } => {
+            f(selector, pool, pc);
+            for c in cases.iter_mut() {
+                c.body.iter_mut().for_each(|x| walk_stmt_exprs(x, pool, pc, f));
+            }
+            if let Some(d) = default {
+                walk_stmt_exprs(d, pool, pc, f);
+            }
+        }
+        Stmt::Try { body, catches, finally } => {
+            walk_stmt_exprs(body, pool, pc, f);
+            for c in catches.iter_mut() {
+                walk_stmt_exprs(&mut c.body, pool, pc, f);
+            }
+            if let Some(fl) = finally {
+                walk_stmt_exprs(fl, pool, pc, f);
+            }
+        }
+        Stmt::TryWithResources { resources, body, catches, finally } => {
+            for r in resources.iter_mut() {
+                walk_stmt_exprs(r, pool, pc, f);
+            }
+            walk_stmt_exprs(body, pool, pc, f);
+            for c in catches.iter_mut() {
+                walk_stmt_exprs(&mut c.body, pool, pc, f);
+            }
+            if let Some(fl) = finally {
+                walk_stmt_exprs(fl, pool, pc, f);
+            }
+        }
+        Stmt::Synchronized { lock, body } => {
+            f(lock, pool, pc);
+            walk_stmt_exprs(body, pool, pc, f);
+        }
+        Stmt::Labeled { body, .. } => walk_stmt_exprs(body, pool, pc, f),
+        _ => {}
+    }
+}
+
+/// `return (Iterator<Entry<K,V>>) getIterator(2);` — a cast cannot drive
+/// type inference for a generic method; replace it with an explicit type
+/// witness `getIterator::<...>` rendered as `.<T>name(...)`, and drop the
+/// now-redundant cast.
+fn add_return_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, pool: &ClassPool) {
+    let Some(sig) = msig else { return };
+    fn walk(s: &mut Stmt, sig: &jcdc_jvm::MethodSignature, pool: &ClassPool) {
+        match s {
+            Stmt::Block(v) => v.iter_mut().for_each(|x| walk(x, sig, pool)),
+            Stmt::Return(Some(e)) => fix_ret(e, sig, pool),
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                walk(then_stmt, sig, pool);
+                if let Some(e) = else_stmt {
+                    walk(e, sig, pool);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => walk(body, sig, pool),
+            Stmt::For { init, body, .. } => {
+                init.iter_mut().for_each(|i| walk(i, sig, pool));
+                walk(body, sig, pool);
+            }
+            Stmt::ForEach { body, .. } => walk(body, sig, pool),
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    c.body.iter_mut().for_each(|x| walk(x, sig, pool));
+                }
+                if let Some(d) = default {
+                    walk(d, sig, pool);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                walk(body, sig, pool);
+                for c in catches.iter_mut() {
+                    walk(&mut c.body, sig, pool);
+                }
+                if let Some(f) = finally {
+                    walk(f, sig, pool);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                for r in resources.iter_mut() {
+                    walk(r, sig, pool);
+                }
+                walk(body, sig, pool);
+                for c in catches.iter_mut() {
+                    walk(&mut c.body, sig, pool);
+                }
+                if let Some(f) = finally {
+                    walk(f, sig, pool);
+                }
+            }
+            Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => walk(body, sig, pool),
+            _ => {}
+        }
+    }
+    fn fix_ret(e: &mut Expr, sig: &jcdc_jvm::MethodSignature, pool: &ClassPool) {
+        // (Target) callExpr  →  callExpr with witnesses
+        let mut had_cast = false;
+        let witness = {
+            let slot: &mut Expr = match e {
+                Expr::Cast { e: inner, .. } if matches!(&**inner, Expr::Method { .. }) => {
+                    had_cast = true;
+                    inner.as_mut()
+                }
+                Expr::Method { .. } => e,
+                _ => return,
+            };
+            let want = match &sig.ret {
+                jcdc_jvm::GenericType::TypeVar(_) | jcdc_jvm::GenericType::Class(_)
+                | jcdc_jvm::GenericType::Array(_) => &sig.ret,
+                _ => return,
+            };
+            match &mut *slot {
+                Expr::Method { cls, name, desc, type_args, owner, .. } if type_args.is_empty() => {
+                    compute_witness(cls.as_str(), name.as_str(), desc, owner.as_deref(), want, pool)
+                }
+                _ => None,
+            }
+        };
+        if let Some((w, mapping)) = witness {
+            match e {
+                Expr::Cast { e: inner, .. } => {
+                    if let Expr::Method { type_args, cls, name, desc, args, .. } = &mut **inner {
+                        *type_args = w;
+                        retype_witness_arg_casts(cls, name, desc, args, &mapping, pool);
+                    }
+                }
+                Expr::Method { type_args, cls, name, desc, args, .. } => {
+                    *type_args = w;
+                    retype_witness_arg_casts(cls, name, desc, args, &mapping, pool);
+                }
+                _ => {}
+            }
+            if had_cast {
+                let inner = match std::mem::replace(e, Expr::This) {
+                    Expr::Cast { e: inner, .. } => *inner,
+                    other => other,
+                };
+                *e = inner;
+            }
+        }
+    }
+    walk(s, sig, pool);
+}
+
+fn compute_witness(
+    cls: &str,
+    name: &str,
+    desc: &jcdc_jvm::MethodDescriptor,
+    _owner: Option<&Expr>,
+    want: &jcdc_jvm::GenericType,
+    pool: &ClassPool,
+) -> Option<(Vec<String>, Vec<(String, jcdc_jvm::GenericType)>)> {
+    let dpc = pool.get(cls)?;
+    let want_desc = {
+        // descriptor string of the call for matching
+        let mut a = String::new();
+        for t in &desc.args {
+            a.push_str(&t.to_descriptor());
+        }
+        format!("({}){}", a, desc.ret.to_descriptor())
+    };
+    let mi = (0..dpc.cf.methods.len())
+        .find(|&i| dpc.method_name(i) == Some(name) && dpc.method_desc(i) == Some(want_desc.as_str()))?;
+    let sig_bytes = dpc.cf.methods[mi].attributes.iter().find_map(|a| {
+        if dpc.utf8(a.attribute_name_index) == Some("Signature") {
+            Some(a.info.as_slice())
+        } else {
+            None
+        }
+    })?;
+    if sig_bytes.len() < 2 {
+        return None;
+    }
+    let idx = u16::from_be_bytes([sig_bytes[0], sig_bytes[1]]);
+    let msig = dpc.utf8(idx).and_then(|s| jcdc_jvm::parse_method_signature(s))?;
+    if msig.params.is_empty() {
+        return None; // not a generic method
+    }
+    // Match the callee's generic return against the wanted type.
+    let mut mapping: Vec<(String, jcdc_jvm::GenericType)> = Vec::new();
+    if !unify_types(&msig.ret, want, &mut mapping) {
+        return None;
+    }
+    // Every method type parameter must be bound by the unification, and
+    // only to a denotable type — a wildcard bound means inference should
+    // come from the call arguments/target instead (keep the cast form).
+    let mut out = Vec::with_capacity(msig.params.len());
+    for p in &msig.params {
+        match mapping.iter().find(|(n, _)| n == &p.name) {
+            Some((_, jcdc_jvm::GenericType::Wildcard(_))) => return None,
+            Some((_, t)) => out.push(t.to_java()),
+            None => return None,
+        }
+    }
+    Some((out, mapping))
+}
+
+/// With a call's type witnesses known, retype raw-erasure argument casts
+/// (`(Class) x`) to the instantiated parameter type (`(Class<E>) x`).
+fn retype_witness_arg_casts(
+    cls: &str,
+    name: &str,
+    desc: &jcdc_jvm::MethodDescriptor,
+    args: &mut [Expr],
+    mapping: &[(String, jcdc_jvm::GenericType)],
+    pool: &ClassPool,
+) {
+    let Some(dpc) = pool.get(cls) else { return };
+    let want_desc = {
+        let mut a = String::new();
+        for t in &desc.args {
+            a.push_str(&t.to_descriptor());
+        }
+        format!("({}){}", a, desc.ret.to_descriptor())
+    };
+    let Some(mi) = (0..dpc.cf.methods.len()).find(|&i| {
+        dpc.method_name(i) == Some(name) && dpc.method_desc(i) == Some(want_desc.as_str())
+    }) else { return };
+    let Some(sig_bytes) = dpc.cf.methods[mi].attributes.iter().find_map(|a| {
+        if dpc.utf8(a.attribute_name_index) == Some("Signature") {
+            Some(a.info.as_slice())
+        } else {
+            None
+        }
+    }) else { return };
+    if sig_bytes.len() < 2 {
+        return;
+    }
+    let idx = u16::from_be_bytes([sig_bytes[0], sig_bytes[1]]);
+    let Some(msig) = dpc.utf8(idx).and_then(|s| jcdc_jvm::parse_method_signature(s)) else { return };
+    let params: Vec<jcdc_jvm::TypeParam> = mapping
+        .iter()
+        .map(|(n, t)| jcdc_jvm::TypeParam {
+            name: n.clone(),
+            class_bound: Some(t.clone()),
+            interface_bounds: Vec::new(),
+        })
+        .collect();
+    let arg_tys: Vec<jcdc_jvm::GenericType> = mapping
+        .iter()
+        .map(|(_, t)| t.clone())
+        .collect();
+    fn parameterized(t: &jcdc_jvm::GenericType) -> bool {
+        match t {
+            jcdc_jvm::GenericType::Class(cs) => cs.parts.iter().any(|p| !p.args.is_empty()),
+            jcdc_jvm::GenericType::Array(i) => parameterized(i),
+            _ => false,
+        }
+    }
+    for (a, pt) in args.iter_mut().zip(msig.args.iter()) {
+        let inst = crate::method::subst_typevars(pt, &params, &arg_tys);
+        if !parameterized(&inst) && !matches!(inst, jcdc_jvm::GenericType::TypeVar(_)) {
+            continue;
+        }
+        let inst_ref = TypeRef::G(inst.clone());
+        match a {
+            Expr::Cast { ty, e: ce } => {
+                if is_generic_call(ce, pool) {
+                    // A raw checkcast around a generic call would make the
+                    // whole outer call an unchecked erasure-invocation; the
+                    // source relies on target-type inference instead — drop
+                    // the cast and let inference run.
+                    if ty.erased() == inst_ref.erased() {
+                        let inner = std::mem::replace(a, Expr::This);
+                        if let Expr::Cast { e: ce2, .. } = inner {
+                            *a = *ce2;
+                        }
+                    }
+                } else if inst_ref.erased() == ty.erased() && *ty != inst_ref {
+                    *ty = inst_ref.clone();
+                }
+            }
+            Expr::Const(_) => {}
+            other => {
+                // An argument whose static type is only the erasure (or a
+                // capture) needs the source cast to the instantiated
+                // parameter type — unless it is itself a generic call whose
+                // type inference handles the position.
+                if !is_generic_call(other, pool)
+                    && other.type_ref() != inst_ref
+                    && other.type_ref().erased() == inst_ref.erased()
+                {
+                    let inner = std::mem::replace(other, Expr::This);
+                    *other = Expr::Cast { ty: inst_ref, e: Box::new(inner) };
+                }
+            }
+        }
+    }
+}
+
+fn unify_types(
+    have: &jcdc_jvm::GenericType,
+    want: &jcdc_jvm::GenericType,
+    map: &mut Vec<(String, jcdc_jvm::GenericType)>,
+) -> bool {
+    use jcdc_jvm::GenericType as G;
+    if let G::TypeVar(n) = have {
+        if let Some((_, prev)) = map.iter().find(|(m, _)| m == n) {
+            return prev == want;
+        }
+        map.push((n.clone(), want.clone()));
+        return true;
+    }
+    match (have, want) {
+        (G::Array(a), G::Array(b)) => unify_types(a, b, map),
+        (G::Class(ca), G::Class(cb)) => {
+            if ca.parts.len() != cb.parts.len() {
+                return false;
+            }
+            for (pa, pb) in ca.parts.iter().zip(cb.parts.iter()) {
+                if pa.name != pb.name || pa.args.len() != pb.args.len() {
+                    return false;
+                }
+                for (x, y) in pa.args.iter().zip(pb.args.iter()) {
+                    if !unify_types(x, y, map) {
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+        (a, b) => a == b,
+    }
+}
+
+fn cast_generic_returns(s: &mut Stmt, want: &TypeRef, pc: &PoolClass) {
+    fn fix(e: &mut Expr, want: &TypeRef, pc: &PoolClass) {
+        if matches!(e, Expr::Const(_)) {
+            return;
+        }
+        let compatible = |have_er: &jcdc_jvm::JavaType, want_er: &jcdc_jvm::JavaType| {
+            match (have_er, want_er) {
+                (jcdc_jvm::JavaType::Array(a), jcdc_jvm::JavaType::Array(b)) => {
+                    matches!(&**a, jcdc_jvm::JavaType::Object(_))
+                        || matches!(&**b, jcdc_jvm::JavaType::Object(_))
+                        || a == b
+                }
+                (jcdc_jvm::JavaType::Object(x), jcdc_jvm::JavaType::Object(y)) => x == y,
+                _ => false,
+            }
+        };
+        // An existing checkcast carries the erasure (`(Object[])`); retype
+        // it to the generic target (`(T[])`) when the erasures line up.
+        if let Expr::Cast { ty, .. } = e {
+            if matches!(want, TypeRef::G(_))
+                && *ty != *want
+                && compatible(&ty.erased(), &want.erased())
+            {
+                *ty = want.clone();
+            }
+            return;
+        }
+        if e.type_ref() == *want {
+            return;
+        }
+        // Only cast when the erasures line up (avoid nonsense casts).
+        // `this` erases to the enclosing class, not java/lang/Object.
+        let have_er = if matches!(e, Expr::This) {
+            jcdc_jvm::JavaType::Object(pc.internal_name.clone())
+        } else {
+            e.type_ref().erased()
+        };
+        let want_er = want.erased();
+        if !compatible(&have_er, &want_er) {
+            return;
+        }
+        let inner = std::mem::replace(e, Expr::This);
+        *e = Expr::Cast { ty: want.clone(), e: Box::new(inner) };
+    }
+    match s {
+        Stmt::Block(v) => v.iter_mut().for_each(|x| cast_generic_returns(x, want, pc)),
+        Stmt::Return(Some(e)) => fix(e, want, pc),
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            cast_generic_returns(then_stmt, want, pc);
+            if let Some(x) = else_stmt {
+                cast_generic_returns(x, want, pc);
+            }
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => cast_generic_returns(body, want, pc),
+        Stmt::For { init, body, .. } => {
+            init.iter_mut().for_each(|i| cast_generic_returns(i, want, pc));
+            cast_generic_returns(body, want, pc);
+        }
+        Stmt::ForEach { body, .. } => cast_generic_returns(body, want, pc),
+        Stmt::Try { body, catches, finally } => {
+            cast_generic_returns(body, want, pc);
+            for c in catches {
+                cast_generic_returns(&mut c.body, want, pc);
+            }
+            if let Some(f) = finally {
+                cast_generic_returns(f, want, pc);
+            }
+        }
+        Stmt::TryWithResources { resources, body, catches, finally } => {
+            for res in resources.iter_mut() { cast_generic_returns(res, want, pc); }
+            cast_generic_returns(body, want, pc);
+            for c in catches {
+                cast_generic_returns(&mut c.body, want, pc);
+            }
+            if let Some(f) = finally {
+                cast_generic_returns(f, want, pc);
+            }
+        }
+        Stmt::Switch { cases, default, .. } => {
+            for c in cases {
+                c.body.iter_mut().for_each(|st| cast_generic_returns(st, want, pc));
+            }
+            if let Some(d) = default {
+                cast_generic_returns(d, want, pc);
+            }
+        }
+        Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => {
+            cast_generic_returns(body, want, pc)
+        }
+        _ => {}
+    }
+}
