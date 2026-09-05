@@ -180,6 +180,32 @@ impl<'a> Structurer<'a> {
             .filter_map(|&t| self.cfg.blocks[t].pred.iter().map(|&p| self.cfg.blocks[p].start as usize).max())
             .max()
             .unwrap_or(0);
+        // Multi-block condition chains (`while (c1 || c2) body;` compiled as
+        // H1: if c1 goto BODY; H2: if c2 goto BODY; else EXIT; BODY: ..; goto
+        // H1): the confluence of H1's branches is the NEXT TEST block, which
+        // is itself one of the targets. Prefer it before the general scan —
+        // the dominance guards below would (correctly in general) reject it,
+        // but here the sibling target IS the chain continuation; picking it
+        // flattens the body to `if (c1) continue; if (c2) continue; else
+        // exit;`, the shape extract_compound_do_while / the CLASSIFY2 fold
+        // consume (jdk8 Random.internalNextInt). Legacy6 is unaffected: its
+        // fall target (the tail) is reachable from the sibling, so the
+        // sibling is not a confluence there.
+        for &t in targets.iter() {
+            if stop.contains(&t)
+                || ctx.consumed.contains(&t)
+                || ctx.loop_stack.contains(&t)
+                || ctx.loop_headers.contains(&t)
+            {
+                continue;
+            }
+            if targets
+                .iter()
+                .all(|&o| o == t || self.reaches_within(ctx, o, t, stop))
+            {
+                return Some(t);
+            }
+        }
         let mut best: Option<usize> = None;
         let mut best_start = usize::MAX;
         for &x in ctx.universe.iter() {
