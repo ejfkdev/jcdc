@@ -227,6 +227,31 @@ features 56/56 双路绿；cargo test 绿。仍共同阻塞：`List.sort` 裸 ca
 （root cause D，泛型还原，与结构化器无关）、RawGoto 未定义标签家族
 （walk 60 / SESE 43，见上文量化；`Pattern.clazz` 环体中部 hub 为不可约形状）。
 
+**后续三个双路共享修复（corpus 家族级重编译暴露，walk/SESE 同受益）**：
+- **a9eceec7 anon-inline walker 覆盖缺口**：`walk_stmt_anon` 的 `_ => {}`
+  静默跳过 `Stmt::Labeled` 体与 Assert/TernaryValue/MonitorEnter/Exit 表达式
+  ——标签块内的匿名类 `new` 永不内联，印成非法的 `new Outer.1(args)`/
+  `new 3(args)`（jdk9+ `URLClassPath` 家族，**阻塞所有 jdk11/17 corpus 家族
+  批量重编译**，双路同坏）。修复后 URLClassPath 全类零 raw-digit-new。
+- **diamond fold root 豁免**（method.rs `try_diamond_fold` clean 守卫）：
+  折叠此前要求整个区域无任何被引用赋值——**包括 root 自身**；但两个
+  结构化器的 fold-collapse 都会原地发射 root 的语句（`Basic{root}`），
+  root 赋值从不丢失。过严守卫拒绝了所有「header 块兼做 setup 赋值」的
+  clinit 钻石（`props=...; DEBUG = prop!=null`），回退到 stack-var：
+  `int stack0; if(..)stack0=0 else stack0=1; DEBUG=stack0;`——int 赋给
+  boolean 字段（不可编译）+ 错误结构化的 `||` 链恒存 1（语义错）。
+  修复后 rt.jar 含 int/long stack-var 声明的文件 **587 → 25（-96%）**，
+  URLClassPath clinit 折叠为精确布尔表达式。
+- **c0d59f87 不可达共享尾修剪**：`stmt_terminates` 不识别 JLS 14.21 无限
+  循环（无 break 的 `while(true)`/`do..while(true)`/`for(;;)`），共享
+  return 尾被复制进各分支后，原尾留在「两支皆 return/永旋」的 if/else
+  之后 → javac「无法访问的语句」（jdk11/26 `String.split` 家族，双路同坏）。
+  补 While/DoWhile/For 臂（字面 true 条件 + 保守 contains_break 检查）。
+  String.java/URLClassPath.java 现通过家族重编译；剩余闭包错误为泛型/
+  捕获（Class.java 三元 cast、WeakHashMap CAP#1、ObjectInputStream
+  Enum.valueOf——root cause D 同族）与常量定型（Unsafe boolean→byte、
+  JarFile ctor int 参数）、重载消歧（ObjectInputFilter doPrivileged）。
+
 **step 6 后全量冒烟**：rt.jar 12608 文件 / 0 panic / 0 error / 0 hang /
 exit=0，888s（~14.8min，约为 walk ~10min 的 1.5×；step 4/5 的守卫剪枝使
 其比 step 3 时的 ~19min 更快）。**最终二进制（aa6ab069）双路冒烟**：
