@@ -121,7 +121,15 @@ shouldBeInitialized/Reference），暴露出更深层的残余问题：
   重编译失败）⑤**完整后支配树（≤300 块、按 scope 缓存）+ 共享尾复制改走有界
   `copy_walk`（COPY_DEPTH=4，单调收敛、doCommands/闭包均不挂）**——⑤ 解决了
   挂死，却仍令 **features 全 8 release `recompile_ok=false`** 且
-  `internalNextInt` 复合 do-while 回退。**结论**：BFS「最近汇合」follow 语义
+  `internalNextInt` 复合 do-while 回退。逐方法定位后，features 的唯一报错是
+  `未定义的标签 L{n}`：真后支配 follow 改道后，嵌套循环里 break-to-outer 的
+  **跳转目标块从「外层循环记录的 exit」漂移到「循环内某个 if 汇合块」**，于是
+  `resolve_goto` 既匹配不到 `loops[i].exits`、该块又不再是 `if_follows`，只能
+  退化成 `RawGoto(block)`；而 printer 把 `Stmt::Goto(id)` 印成 `break L{id};`，
+  对应的 `L{id}:` 标签机制（`pending_labels`）是**死代码从未实现**，且前向
+  break 的标签在 Java 里本就必须**外围包裹**该 break——故输出非法。这说明
+  follow 语义与 `resolve_goto`/标签发射/`classify_loop` 是**强耦合**的整体。
+  **结论**：BFS「最近汇合」follow 语义
   是整条下游（`classify_loop`、`extract_compound_do_while`、`convert` 的
   break/continue 归约）赖以成立的承重假设，真后支配 follow 无法增量并入；
   彻底修复必须把 `walk` + `convert` + 循环分类一起按 SESE/支配树区域分解
