@@ -13,6 +13,7 @@ pub mod expr;
 pub mod method;
 pub mod stmt;
 pub mod structure;
+pub mod sese;
 pub mod varalloc;
 
 pub use classdec::{decompile_class, ClassOptions};

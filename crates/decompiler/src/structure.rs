@@ -152,6 +152,123 @@ pub fn reachable_within(cfg: &Cfg, entry: usize, stop: &HashSet<usize>) -> HashS
     seen
 }
 
+/// Compute immediate post-dominators over `universe` via the standard
+/// Cooper-Harvey-Kennedy iterative dataflow on the REVERSED cfg, rooted at a
+/// single sentinel VIRTUAL EXIT (`vx`) that every block leaving the universe
+/// (a terminator, or an edge out of `universe`) flows to. Returns
+/// (vx, block_id -> ipdom_id). The single sentinel root makes the reverse RPO
+/// well-defined and the post-dominator forest a single tree, so the CHK
+/// `intersect` walk always terminates (it climbs toward `vx`).
+pub(crate) fn compute_postdominators(cfg: &Cfg, universe: &HashSet<usize>) -> (usize, HashMap<usize, usize>) {
+    let vx = cfg.blocks.len();
+    let leaves_universe = |b: usize| -> bool {
+        cfg.blocks[b].succ.is_empty()
+            || cfg.blocks[b].succ.iter().any(|s| !universe.contains(s))
+    };
+    let succs_of = |b: usize| -> Vec<usize> {
+        let mut v: Vec<usize> = cfg.blocks[b]
+            .succ
+            .iter()
+            .copied()
+            .filter(|s| universe.contains(s))
+            .collect();
+        if leaves_universe(b) {
+            v.push(vx);
+        }
+        v
+    };
+    // Reverse-post-order over the reversed graph rooted at vx (vx's reversed
+    // successors are the exit blocks; b's reversed successors are its forward
+    // preds).
+    let mut order: Vec<usize> = Vec::new();
+    {
+        let mut visited: HashSet<usize> = HashSet::new();
+        visited.insert(vx);
+        let mut stack: Vec<usize> = Vec::new();
+        let mut state: HashMap<usize, usize> = HashMap::new();
+        let mut seeds: Vec<usize> =
+            universe.iter().copied().filter(|&b| leaves_universe(b)).collect();
+        seeds.sort_unstable_by_key(|b| cfg.blocks[*b].start);
+        for s in seeds.iter().rev() {
+            if visited.insert(*s) {
+                stack.push(*s);
+            }
+        }
+        while let Some(&n) = stack.last() {
+            let idx = *state.entry(n).or_insert(0);
+            let ps: Vec<usize> = cfg.blocks[n]
+                .pred
+                .iter()
+                .copied()
+                .filter(|p| universe.contains(p))
+                .collect();
+            if idx < ps.len() {
+                *state.get_mut(&n).unwrap() += 1;
+                let p = ps[idx];
+                if visited.insert(p) {
+                    stack.push(p);
+                }
+            } else {
+                order.push(n);
+                stack.pop();
+            }
+        }
+        order.reverse();
+        order.push(vx);
+    }
+    let mut rpo_num: HashMap<usize, usize> = HashMap::new();
+    for (i, &b) in order.iter().enumerate() {
+        rpo_num.insert(b, i);
+    }
+    let mut ipdom: HashMap<usize, usize> = HashMap::new();
+    ipdom.insert(vx, vx);
+    for &b in universe.iter() {
+        ipdom.insert(b, vx);
+    }
+    let cap = universe.len() + 2;
+    let intersect = |mut a: usize, mut b: usize, ipdom: &HashMap<usize, usize>| -> usize {
+        let mut guard = 0usize;
+        while a != b {
+            guard += 1;
+            if guard > cap {
+                return vx;
+            }
+            let na = rpo_num.get(&a).copied().unwrap_or(0);
+            let nb = rpo_num.get(&b).copied().unwrap_or(0);
+            if na < nb {
+                a = *ipdom.get(&a).unwrap_or(&vx);
+            } else {
+                b = *ipdom.get(&b).unwrap_or(&vx);
+            }
+        }
+        a
+    };
+    let mut changed = true;
+    let mut iter = 0;
+    while changed && iter < 64 {
+        changed = false;
+        iter += 1;
+        for &b in order.iter().rev() {
+            if b == vx {
+                continue;
+            }
+            let ss = succs_of(b);
+            if ss.is_empty() {
+                continue;
+            }
+            let mut new_ipdom = ss[0];
+            for &s in &ss[1..] {
+                new_ipdom = intersect(new_ipdom, s, &ipdom);
+            }
+            if ipdom.get(&b).copied().unwrap_or(vx) != new_ipdom {
+                ipdom.insert(b, new_ipdom);
+                changed = true;
+            }
+        }
+    }
+    (vx, ipdom)
+}
+
 /// Immediate post-dominator of `entry` within `universe`, approximated as
 /// the nearest reconvergence point: the block (other than entry) reachable
 /// from ALL of entry's in-universe successors with the smallest total BFS
@@ -575,6 +692,11 @@ impl<'a> Structurer<'a> {
 
     /// Structure the whole method.
     pub fn structure_method(&mut self) -> Region {
+        // From-scratch SESE/dominator-tree structurer (rewrite), gated so the
+        // default path is the verified `walk` baseline.
+        if std::env::var("JCDC_SESE").is_ok() {
+            return self.structure_method_sese();
+        }
         let universe: HashSet<usize> = self
             .cfg
             .blocks
@@ -1386,7 +1508,7 @@ impl<'a> Structurer<'a> {
     /// region that Java cannot express with a jump (no labelable target):
     /// re-executing the blocks matches the bytecode's per-arrival
     /// semantics. Bounded by depth and a no-reentry check.
-    fn copy_walk(
+    pub(crate) fn copy_walk(
         &mut self,
         t: usize,
         stop: &HashSet<usize>,
@@ -1864,7 +1986,7 @@ impl<'a> Structurer<'a> {
         Region::Loop { header, body: Box::new(body), members, exits }
     }
 
-    fn structure_switch(
+    pub(crate) fn structure_switch(
         &mut self,
         block: usize,
         selector: Expr,
@@ -1992,7 +2114,7 @@ impl<'a> Structurer<'a> {
         Region::Switch { block, selector, cases, default, follow }
     }
 
-    fn structure_try(
+    pub(crate) fn structure_try(
         &mut self,
         gi: usize,
         universe: &HashSet<usize>,
