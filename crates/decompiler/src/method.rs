@@ -872,9 +872,22 @@ fn try_diamond_fold(
             // Intermediate blocks with statements (e.g. `x = (T) y;` before
             // a comparison) can only be folded away when no variable they
             // assign is referenced by the folded expression — otherwise
-            // the assignment would silently vanish.
+            // the assignment would silently vanish. The ROOT is exempt:
+            // fold-collapse emits the root's own statements in place
+            // (Region::Basic{root}) before the merge in BOTH structurizers,
+            // so a root like `props = ...; JAVA_VERSION = ...; if (prop ==
+            // null)` folds safely even though the condition references
+            // `props`. Requiring the root to be statement-free rejected
+            // every clinit-style diamond whose header block also performs
+            // the setup assignments (jdk URLClassPath DEBUG/DISABLE_JAR_CHECKING:
+            // fallback stack-vars typed int but consumed as boolean fields ->
+            // uncompilable, plus a mis-structured `||` chain that always
+            // stored 1 — a shared walk+SESE corpus blocker family).
             let mut assigned: HashSet<u32> = HashSet::new();
             for &b in &vis {
+                if b == h {
+                    continue;
+                }
                 for st in &results[b].stmts {
                     collect_assigned_vars(st, &mut assigned);
                 }
