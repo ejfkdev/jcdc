@@ -211,10 +211,21 @@ shouldBeInitialized/Reference），暴露出更深层的残余问题：
 （游离 break → 干净 do-while）、jdk11/17 `Integer$IntegerCache`（walk 无条件
 分配语义错 → SESE archived 分支 `return;`（static-init 内合法）跳过分配，
 每路径恰好一次 final 赋值，可编译且语义精确）、`StringUTF16.codePointCount`
-（walk 语义对，SESE 曾丢 continue，现修复）。仍共同阻塞：`sun.security.util.Debug`
-hexDigits final 多次赋值（copy_walk 复制含 final 赋值的共享尾；walk 2 份 /
-SESE 3 份，同类同坏）、`List.sort` 裸 cast（root cause D，泛型还原，与结构化器
-无关）。
+（walk 语义对，SESE 曾丢 continue，现修复）。
+
+**final 字段共享尾复制家族——已修复（aa6ab069，walk/SESE 双路共享）**：
+`inline_terminator`/RawGoto `term_copy` 会把共享 return/throw 尾块的语句复制到
+每个到达点（对纯 return 正确：`if (t || explode()) return 1;` 两支都保留
+return 1）。但尾块若先给 **final 字段**赋值再 return（`sun.security.util.Debug`
+`<clinit>`：`hexDigits = ...toCharArray(); return;` 是三个分支的汇合），复制即
+final 二次赋值 → javac「可能已被赋值」编译错（walk 2 份 / SESE 3 份，长期共同
+阻塞）。修复：把本类 final 字段名集合（`pc.cf.fields` access flags）传入
+Converter，`stmts_write_final()` 命中时禁止内联/复制 → Goto 走 resolve_goto
+按自然流省略，尾块只结构化一次。验证：Debug `hexDigits =` 双路各 1 次；
+IntegerCache(jdk8) `cache =` 1 次；jdk8+jdk26 `Integer.toString` 完整 walk 形态；
+features 56/56 双路绿；cargo test 绿。仍共同阻塞：`List.sort` 裸 cast
+（root cause D，泛型还原，与结构化器无关）、RawGoto 未定义标签家族
+（walk 60 / SESE 43，见上文量化；`Pattern.clazz` 环体中部 hub 为不可约形状）。
 
 **step 6 后全量冒烟**：rt.jar 12608 文件 / 0 panic / 0 error / 0 hang /
 exit=0，888s（~14.8min，约为 walk ~10min 的 1.5×；step 4/5 的守卫剪枝使
