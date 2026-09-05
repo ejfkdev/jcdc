@@ -363,7 +363,22 @@ pub fn decompile_method(
 
     // Convert to statements.
     let copied_tails = structurer.copied_tails.clone();
-    let mut converter = Converter::new(&cfg, &results).with_copied_tails(copied_tails);
+    // Final fields of this class: the converter must not duplicate a shared
+    // terminator block that assigns one (a final field accepts exactly one
+    // assignment; copies are a compile error, sun.security.util.Debug).
+    let final_fields: std::collections::HashSet<String> = pc
+        .cf
+        .fields
+        .iter()
+        .filter(|f| {
+            f.access_flags
+                .contains(jcdc_classfile::FieldAccessFlags::FINAL)
+        })
+        .filter_map(|f| pc.utf8(f.name_index).map(|n| n.to_string()))
+        .collect();
+    let mut converter = Converter::new(&cfg, &results)
+        .with_copied_tails(copied_tails)
+        .with_final_fields(final_fields);
     let mut body = converter.convert(region);
 
     // Post-passes.

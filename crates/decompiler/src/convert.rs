@@ -65,6 +65,11 @@ pub struct Converter<'a> {
     copied_tails: std::collections::HashSet<usize>,
     /// Collected label emissions: block target -> label name (for `Label` stmts).
     pub pending_labels: HashMap<usize, String>,
+    /// Names of FINAL fields of the class being decompiled. A shared
+    /// terminator block whose statements write one of them must never be
+    /// inlined/copied at extra arrival sites: javac rejects a second
+    /// assignment to a final field (sun.security.util.Debug `hexDigits`).
+    final_fields: HashSet<String>,
 }
 
 /// Remove a trailing `Goto` whose target is the natural continuation.
@@ -104,6 +109,21 @@ impl<'a> Converter<'a> {
         self
     }
 
+    pub fn with_final_fields(mut self, finals: HashSet<String>) -> Self {
+        self.final_fields = finals;
+        self
+    }
+
+    /// True when any statement assigns a final field of this class.
+    fn stmts_write_final(&self, v: &[Stmt]) -> bool {
+        v.iter().any(|s| match s {
+            Stmt::ExprStmt(Expr::Assign { target, .. }) => {
+                matches!(&**target, Expr::Field { name, .. } if self.final_fields.contains(name))
+            }
+            _ => false,
+        })
+    }
+
     pub fn new(cfg: &'a Cfg, results: &'a Vec<BlockResult>) -> Self {
         let universe: HashSet<usize> = (0..cfg.blocks.len()).collect();
         let dom = crate::structure::compute_dominators(cfg, &universe, cfg.entry);
@@ -121,6 +141,7 @@ impl<'a> Converter<'a> {
             goto_is_last: false,
             copied_tails: std::collections::HashSet::new(),
             pending_labels: HashMap::new(),
+            final_fields: HashSet::new(),
         }
     }
 
@@ -292,7 +313,8 @@ impl<'a> Converter<'a> {
                     && matches!(
                         self.results[target].term,
                         Term::Return(_) | Term::Throw(_)
-                    );
+                    )
+                    && !self.stmts_write_final(&self.results[target].stmts);
                 if inline_terminator {
                     let mut v = self.results[target].stmts.clone();
                     match &self.results[target].term {
@@ -321,6 +343,9 @@ impl<'a> Converter<'a> {
                             Stmt::Continue(lbl)
                         }
                         Jump::RawGoto(t) => {
+                            if std::env::var("JCDC_DBG_RG").is_ok() {
+                                eprintln!("RG t={} cur={} last={} follows={:?} copytail={} term_t={:?} stmts_t={}", t, self.cur_block, self.goto_is_last, self.if_follows, self.reaches_copy_tail(t), matches!(self.results[t].term, Term::Return(_)|Term::Throw(_)), self.results[t].stmts.len());
+                            }
                             if std::env::var("JCDC_DBG_GOTO").is_ok() {
                                 eprintln!("RAWGOTO t={} copied_tails={:?} if_follows={:?} last={}", t, self.copied_tails, self.if_follows, self.goto_is_last);
                             }
@@ -330,7 +355,7 @@ impl<'a> Converter<'a> {
                             let term_copy = matches!(
                                 self.results[t].term,
                                 Term::Return(_) | Term::Throw(_)
-                            );
+                            ) && !self.stmts_write_final(&self.results[t].stmts);
                             if term_copy {
                                 let mut cv = self.results[t].stmts.clone();
                                 match &self.results[t].term {
