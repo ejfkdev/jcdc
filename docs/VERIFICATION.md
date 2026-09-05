@@ -113,29 +113,37 @@ shouldBeInitialized/Reference），暴露出更深层的残余问题：
   导致方法尾重复（`Integer.toString`/`IntegerCache.<clinit>`，后者还令 final
   字段疑似二次赋值）或守卫链展平（`StringUTF16.replace`）。
   **第一性原理**：follow 的正确定义是 entry 的直接后支配者；近似在不对称
-  分支（短路条件）下必错。**彻底修复的障碍（已在 git `refactor-sese-walk`
-  分支系统验证）**：把 follow 改成真后支配者后，整条结构化管线失效——五种
-  实现都失败：①完整后支配树（哨兵虚出口 + 反向 CHK，O(n²)×每 COND，巨方法
+  分支（短路条件）下必错。**彻底修复的障碍（已在 git `rewrite-structurer`
+  分支系统验证）**：把 follow 改成真后支配者后，整条结构化管线失效——六种
+  实现都未能交付：①完整后支配树（哨兵虚出口 + 反向 CHK，O(n²)×每 COND，巨方法
   卡死）②真后支配旁路过滤 ③仅拒绝「后继即候选」（含 self-loop 与 ≤300 块
   门控）④③ + walk 主循环护栏收紧到 O(universe)（消除挂死但 features 全 release
-  重编译失败）⑤**完整后支配树（≤300 块、按 scope 缓存）+ 共享尾复制改走有界
-  `copy_walk`（COPY_DEPTH=4，单调收敛、doCommands/闭包均不挂）**——⑤ 解决了
-  挂死，却仍令 **features 全 8 release `recompile_ok=false`** 且
-  `internalNextInt` 复合 do-while 回退。逐方法定位后，features 的唯一报错是
-  `未定义的标签 L{n}`：真后支配 follow 改道后，嵌套循环里 break-to-outer 的
-  **跳转目标块从「外层循环记录的 exit」漂移到「循环内某个 if 汇合块」**，于是
-  `resolve_goto` 既匹配不到 `loops[i].exits`、该块又不再是 `if_follows`，只能
-  退化成 `RawGoto(block)`；而 printer 把 `Stmt::Goto(id)` 印成 `break L{id};`，
-  对应的 `L{id}:` 标签机制（`pending_labels`）是**死代码从未实现**，且前向
-  break 的标签在 Java 里本就必须**外围包裹**该 break——故输出非法。这说明
-  follow 语义与 `resolve_goto`/标签发射/`classify_loop` 是**强耦合**的整体。
-  **结论**：BFS「最近汇合」follow 语义
-  是整条下游（`classify_loop`、`extract_compound_do_while`、`convert` 的
-  break/continue 归约）赖以成立的承重假设，真后支配 follow 无法增量并入；
-  彻底修复必须把 `walk` + `convert` + 循环分类一起按 SESE/支配树区域分解
-  **从零重写**（非补丁），工作量与回归风险都很大。当前**保留近似 + 记录为
-  限制**：`Integer.toString` 冗余但可编译；`IntegerCache`/`StringUTF16` 仍为
-  jdk17/21 阻塞。重构前的稳定基线已提交（commit b5d0a7f）。
+  重编译失败）⑤完整后支配树 + 共享尾复制改走有界 `copy_walk`（COPY_DEPTH=4）
+  ——解决了挂死，却仍令 features 全 8 release `recompile_ok=false`：逐方法定位
+  发现唯一报错是 `未定义的标签 L{n}`，真后支配 follow 改道后嵌套循环里
+  break-to-outer 的**跳转目标块从「外层循环记录的 exit」漂移到「循环内某个 if
+  汇合块」**，`resolve_goto` 既匹配不到 `loops[i].exits`、该块又不再是
+  `if_follows`，退化成 `RawGoto(block)`；printer 把 `Stmt::Goto(id)` 印成
+  `break L{id};` 而配套 `pending_labels` 标签发射是**死代码从未实现**，且前向
+  break 的标签在 Java 里本必须**外围包裹**该 break——故非法。⑥**混合方案**
+  （≤300 块用精确后支配树、精确 ipdom 为虚出口即分支发散时回退 BFS 最近汇合 +
+  resolve_goto 增补「流向某外层循环 exit 即 break 之」+ 有界共享尾）——**features
+  全 8 release 转绿**（重编译+运行一致，6 修复保留，`Legacy6.loops` 的
+  break-outer 正确带标签），但**全 rt.jar 冒烟仍挂死**（~2492 文件处，xerces
+  `XMLEntityManager` 一带）：发散回退只覆盖 ipdom=虚出口的情形，**具体（concrete）
+  真后支配 follow 仍会驱动 walk 病态重入**，有界共享尾也兜不住；且 corpus 阻塞
+  只是**平移**未消除（jdk9/11 移到 `Provider.java` 缺返回、jdk26 仍是
+  `Class.toGenericString` 游离 break、jdk17/21 仍 `IntegerCache`）。⑥ 已提交在
+  `rewrite-structurer` 分支（`JCDC_RW` 环境变量门控，默认关），**不可作为默认
+  发布**。**结论**：BFS「最近汇合」follow 语义是整条下游（`classify_loop`、
+  `extract_compound_do_while`、`convert` 的 break/continue/标签归约）赖以成立的
+  承重假设；真后支配 follow 无法增量并入，混合方案能让 features 绿却过不了全量
+  冒烟。彻底修复必须把 `walk` + `convert` + 循环分类一起按 SESE/支配树区域分解
+  **从零重写**成对任意合法 follow 都单调收敛的结构（非补丁、非门控混合），工作量
+  与回归风险都很大，属跨会话专项。当前 master **保留近似 + 记录为限制**：
+  `Integer.toString` 冗余但可编译；`IntegerCache`/`StringUTF16` 仍为 jdk17/21
+  阻塞。已验证稳定基线在 master（代码 commit b5d0a7f）。
+
 
 
 
