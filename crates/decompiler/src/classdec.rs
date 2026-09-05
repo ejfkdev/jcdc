@@ -1994,19 +1994,6 @@ fn emit_method_with(
             add_return_witnesses(&mut body, msig.as_ref(), pool);
             restore_enum_switches(&mut body, pc, pool);
             add_throw_witnesses(&mut body, msig.as_ref(), pool);
-            if std::env::var("JCDC_DBG_ANON").is_ok() {
-                let mname = pc.method_name(mi).unwrap_or("?");
-                if mname == "getResource" || mname == "getLoader" {
-                    let bd = format!("{:?}", body);
-                    eprintln!("EMITBODY pc={} m={} fam.root={} anon_new={} has_dollar3={} fam_anon_len={}", pc.internal_name, mname, fam.root, bd.contains("AnonNew"), bd.contains("$3"), fam.anonymous.len());
-                    if bd.contains("$3") && !bd.contains("AnonNew") {
-                        for (pos, _) in bd.match_indices("$3") {
-                            eprintln!("EMITBODYCTX ...{}...", &bd[pos.saturating_sub(420)..(pos+60).min(bd.len())]);
-                            break;
-                        }
-                    }
-                }
-            }
             line.push_str(" {\n");
             out.push_str(&line);
             let ret_bool = mdesc.as_ref().map(|d| d.ret == jcdc_jvm::JavaType::Boolean).unwrap_or(false)
@@ -2426,9 +2413,6 @@ pub const ASSERT_FIELD: &str = "$jcdcAssertionsDisabled";
 // ---------------------------------------------------------------------------
 
 pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: &Family, vt: &VarTable) {
-    if std::env::var("JCDC_DBG_ANON").is_ok() && pc.internal_name.contains("URLClassPath") && !pc.internal_name.contains('$') {
-        eprintln!("ANONCALL pc={} fam.anon={} fam.locals={} fam.root={} primary_has_1={}", pc.internal_name, fam.anonymous.len(), fam.locals.len(), fam.root, pool.primary_names().iter().any(|n| *n == format!("{}$1", pc.internal_name)));
-    }
     if fam.anonymous.is_empty() && fam.locals.is_empty() {
         return;
     }
