@@ -984,7 +984,7 @@ impl<'a> Printer<'a> {
                 // (instance lambda impls carry only the SAM params).
                 let mut pnames = l.param_names.clone();
                 if let Some(MethodBody { vt, .. }) = &body_stmts {
-                    let vt_params: Vec<String> = vt
+                    let mut vt_params: Vec<String> = vt
                         .vars
                         .iter()
                         .filter(|v| v.is_param && v.name != "this")
@@ -992,6 +992,16 @@ impl<'a> Printer<'a> {
                         .collect();
                     if vt_params.len() == pnames.len() {
                         pnames = vt_params;
+                    } else if vt_params.len() > pnames.len() {
+                        // The impl method's signature is (captures..., SAM
+                        // params...): take the TRAILING SAM slice so the
+                        // printed parameter list matches the body's variable
+                        // references (ConcurrentMap.replaceAll printed
+                        // `(x0, x1) -> { .. replace(k, v, ..) }` — undefined
+                        // symbols; the captured `function` occupied the first
+                        // impl slot, breaking the exact-length alignment).
+                        let n = pnames.len();
+                        pnames = vt_params.split_off(vt_params.len() - n);
                     }
                 }
                 let single = pnames.len() == 1;

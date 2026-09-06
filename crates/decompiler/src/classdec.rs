@@ -1994,6 +1994,7 @@ fn emit_method_with(
             add_return_witnesses(&mut body, msig.as_ref(), pool);
             restore_enum_switches(&mut body, pc, pool);
             add_throw_witnesses(&mut body, msig.as_ref(), pool);
+            strip_erasure_casts_generic_ret(&mut body, msig.as_ref(), pool);
             line.push_str(" {\n");
             out.push_str(&line);
             let ret_bool = mdesc.as_ref().map(|d| d.ret == jcdc_jvm::JavaType::Boolean).unwrap_or(false)
@@ -2713,6 +2714,100 @@ fn collapse_this_chain(e: &Expr, pool: &ClassPool) -> Option<String> {
 /// True when the expression is a call to a GENERIC method: its static type
 /// at any argument position comes from inference, so inserting our own cast
 /// would freeze a capture identity javac would otherwise unify.
+/// True when a generic return type actually differs from its erasure
+/// (type variable, generic array, or parameterized class).
+fn generic_ret_ish(g: &jcdc_jvm::GenericType) -> bool {
+    use jcdc_jvm::GenericType as G;
+    match g {
+        G::TypeVar(_) => true,
+        G::Array(i) => generic_ret_ish(i),
+        G::Class(cs) => cs.parts.iter().any(|p| !p.args.is_empty()),
+        _ => false,
+    }
+}
+
+/// In a method whose SIGNATURE return is generic (`T[]`, `List<E>`, ...), a
+/// javac-emitted checkcast to the ERASURE at a return position is invalid
+/// source: the erasure is not convertible to the generic return type
+/// ("Object[] cannot be converted to T[]", Class.getEnumConstants — a corpus
+/// family blocker). When the cast's inner expression already carries the
+/// generic source type (a generic-typed local/field/call, or `clone()` on a
+/// generic array receiver — a poly expression typed by the return target),
+/// drop the erasure cast: the bare expression compiles exactly like the
+/// original source did.
+fn strip_erasure_casts_generic_ret(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, pool: &ClassPool) {
+    let Some(sig) = msig else { return };
+    if !generic_ret_ish(&sig.ret) {
+        return;
+    }
+    let ret_er = TypeRef::G(sig.ret.clone()).erased();
+    fn fix(e: &mut Expr, ret_er: &jcdc_jvm::JavaType, pool: &ClassPool) {
+        match e {
+            Expr::Cond { t, f, .. } => {
+                fix(t, ret_er, pool);
+                fix(f, ret_er, pool);
+            }
+            Expr::Cast { ty, e: inner } => {
+                if &ty.erased() == ret_er {
+                    let droppable = matches!(inner.type_ref(), TypeRef::G(_))
+                        || is_generic_call(inner, pool)
+                        || matches!(&**inner, Expr::Method { name, owner: Some(o), .. }
+                            if name == "clone" && matches!(o.type_ref(), TypeRef::G(_)));
+                    if droppable {
+                        let v = std::mem::replace(&mut **inner, Expr::This);
+                        *e = v;
+                        return;
+                    }
+                }
+                fix(inner, ret_er, pool);
+            }
+            _ => {}
+        }
+    }
+    fn rec(s: &mut Stmt, ret_er: &jcdc_jvm::JavaType, pool: &ClassPool) {
+        match s {
+            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, ret_er, pool)),
+            Stmt::Return(Some(e)) => fix(e, ret_er, pool),
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                rec(then_stmt, ret_er, pool);
+                if let Some(x) = else_stmt {
+                    rec(x, ret_er, pool);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::Labeled { body, .. }
+            | Stmt::Synchronized { body, .. } => rec(body, ret_er, pool),
+            Stmt::For { init, body, .. } => {
+                init.iter_mut().for_each(|i| rec(i, ret_er, pool));
+                rec(body, ret_er, pool);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    for st in c.body.iter_mut() {
+                        rec(st, ret_er, pool);
+                    }
+                }
+                if let Some(d) = default {
+                    rec(d, ret_er, pool);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                rec(body, ret_er, pool);
+                for c in catches.iter_mut() {
+                    rec(&mut c.body, ret_er, pool);
+                }
+                if let Some(f) = finally {
+                    rec(f, ret_er, pool);
+                }
+            }
+            _ => {}
+        }
+    }
+    rec(s, &ret_er, pool);
+}
+
 pub(crate) fn is_generic_call(a: &Expr, pool: &ClassPool) -> bool {
     let (cls, name, desc) = match a {
         Expr::Method { cls, name, desc, .. } => (cls.as_str(), name.as_str(), desc),
