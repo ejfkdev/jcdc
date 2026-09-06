@@ -1036,25 +1036,22 @@ fn is_trivial_inner_ctor(pc: &PoolClass, pool: &ClassPool, mi: usize) -> bool {
     })
 }
 
-/// True if any supertype carries PermittedSubclasses (sealed hierarchy).
+/// True if a DIRECT supertype carries PermittedSubclasses (sealed
+/// hierarchy). Only the immediate superclass/interfaces count: sealing
+/// TERMINATES at a `non-sealed` (or final) intermediate, so walking the
+/// ancestor chain wrongly marks grandchildren — jdk26
+/// `WeakHashMap$Entry extends WeakReference` got `non-sealed` because
+/// Reference (grandparent) is sealed, but WeakReference itself is
+/// non-sealed, and javac rejects it ("class Entry has no sealed
+/// supertype").
 fn supertype_is_sealed(pc: &PoolClass, pool: &ClassPool) -> bool {
-    let mut cur = pc.super_name().map(|s| s.to_string());
-    let mut guard = 0;
-    while let Some(c) = cur {
-        if c == "java/lang/Object" {
-            break;
-        }
-        guard += 1;
-        if guard > 64 {
-            break;
-        }
-        if let Some(sp) = pool.get(&c) {
-            if sp.class_attr("PermittedSubclasses").is_some() {
-                return true;
+    if let Some(c) = pc.super_name() {
+        if c != "java/lang/Object" {
+            if let Some(sp) = pool.get(c) {
+                if sp.class_attr("PermittedSubclasses").is_some() {
+                    return true;
+                }
             }
-            cur = sp.super_name().map(|s| s.to_string());
-        } else {
-            break;
         }
     }
     for &i in &pc.cf.interfaces {
