@@ -79,6 +79,30 @@ impl<'a> Structurer<'a> {
                 }
             }
         }
+        // A catch-and-retry handler has NO normal-flow preds, so the
+        // dominator tree roots it and its `goto header` back edge is
+        // invisible (jdk11 ObjectStreamClass.getInheritableMethod:
+        // `while (defCl != null) { try { ..; break; } catch (NSME) {
+        // defCl = super; } }` unrolled into nested try copies on BOTH
+        // paths). Treat the handler as dominated via its protected
+        // block: handler -> h with h dominating the protected block is
+        // a back edge, and the handler joins the loop.
+        let mut exc_back_sources: HashMap<usize, Vec<usize>> = HashMap::new();
+        for e in &self.cfg.exc_edges {
+            if !(universe.contains(&e.from) && universe.contains(&e.to)) {
+                continue;
+            }
+            let c = e.to;
+            if !self.cfg.blocks[c].pred.is_empty() {
+                continue; // normally reachable: real dominators apply
+            }
+            for &h in &self.cfg.blocks[c].succ {
+                if h != c && universe.contains(&h) && idom.dominates(h, e.from) {
+                    loop_headers.insert(h);
+                    exc_back_sources.entry(h).or_default().push(c);
+                }
+            }
+        }
         // Exception-edge predecessors: handler -> protected blocks. A protected
         // block reaches its handler only on a throw (an exception edge, not a
         // normal pred), so when the handler loops back to the header, the
@@ -108,6 +132,13 @@ impl<'a> Structurer<'a> {
                 if self.cfg.blocks[u].succ.contains(&h) && (is_self_loop || is_back_edge) {
                     if members.insert(u) {
                         stack.push(u);
+                    }
+                }
+            }
+            if let Some(srcs) = exc_back_sources.get(&h) {
+                for &c in srcs {
+                    if members.insert(c) {
+                        stack.push(c);
                     }
                 }
             }
@@ -517,6 +548,18 @@ impl<'a> Structurer<'a> {
                     // of StringUTF16.codePointCount, running the loop tail
                     // unconditionally.
                     parts.push(Region::Goto { target: cur });
+                } else if let Some(&h) = ctx.loop_stack.iter().rev().find(|&&h| {
+                    crate::structure::can_reach_cfg(self.cfg, cur, h, 4096)
+                }) {
+                    // The consumed block flows back into an enclosing loop
+                    // (a catch's retry back-edge into the loop-top try,
+                    // jdk11 ObjectStreamClass.getInheritableMethod): a
+                    // copy_walk here unrolls the loop into nested duplicate
+                    // tries (COPY_DEPTH-bounded, then wrong). Resolve as
+                    // `continue` of the nearest such loop instead — walk's
+                    // loops_stack guard equivalent (walk tracks its own
+                    // stack; SESE keeps it in ctx).
+                    parts.push(Region::Goto { target: h });
                 } else if !stop.contains(&cur) {
                     // Shared non-terminator reached from a divergent sibling
                     // (e.g. the continuation after `if (A && B) return X;`):

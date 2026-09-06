@@ -2434,6 +2434,18 @@ fn emit_method_with(
             // Local-class ctors always strip: a static-method local has no
             // this$0, but its capture stores (val$ puts / substituted Raw
             // assigns) are junk all the same.
+            let outer_slot_param = outer_param_slot(pc).or_else(|| {
+                // No own this$0 field but the ctor forwards the enclosing
+                // instance to super() (jdk26 WeakHashMap$EntryIterator:
+                // javac's implicit inner ctor is requireNonNull(param) +
+                // super(param); with the param unnamed 'arg0' both lines
+                // must be recognized as outer artifacts).
+                if outer_super_param {
+                    Some((1u16, "this$0".to_string()))
+                } else {
+                    None
+                }
+            });
             if is_ctor && (class_has_this0(pc) || outer_super_param || is_local_class) {
                 if is_local_class && std::env::var("JCDC_DBG_CTOR").is_ok() {
                     eprintln!("CTORCAP pc={} captures={:?}", pc.internal_name, captures.keys().collect::<Vec<_>>());
@@ -2477,7 +2489,7 @@ fn emit_method_with(
                         rewrite_param_locals(&mut body, &rep);
                     }
                 }
-                strip_inner_ctor_artifacts(&mut body, &mb.vt, outer_param_slot(pc));
+                strip_inner_ctor_artifacts(&mut body, &mb.vt, outer_slot_param.clone());
             }
             // Member inner classes: this$N field reads become Outer.this.
             let outer_this = outer_this_map(pc);
@@ -2572,7 +2584,23 @@ fn strip_outer_super_arg(body: &mut Stmt, vt: &VarTable) {
             _ => false,
         }
     };
-    let Some(idx) = stmts.iter().position(|st| !is_this_store(st)) else { return };
+    // javac's implicit inner ctor: requireNonNull(outerParam) sits right
+    // before super(outerParam) — skip it when locating the delegation
+    // (jdk26 WeakHashMap$EntryIterator: the check blocked the scan and
+    // super(arg0) survived).
+    let is_pre_junk = |st: &Stmt| -> bool {
+        is_this_store(st)
+            || matches!(st, Stmt::ExprStmt(Expr::Method { name, args, .. })
+                if (name == "requireNonNull" || name == "checkNotNull")
+                    && args.len() == 1
+                    && match &args[0] {
+                        Expr::Local { var, .. } => vt.var(*var).is_param,
+                        Expr::This => true,
+                        Expr::Field { name: fn2, .. } => fn2.starts_with("this$"),
+                        _ => false,
+                    })
+    };
+    let Some(idx) = stmts.iter().position(|st| !is_pre_junk(st)) else { return };
     if let Some(Stmt::ExprStmt(Expr::Method { name, args, .. })) = stmts.get_mut(idx) {
         if name == "<init>" && !args.is_empty() {
             let is_outer_local = match &args[0] {
@@ -5902,15 +5930,22 @@ fn switch_map(pool: &ClassPool, synth: &str, field: &str) -> Option<std::collect
 /// enclosing-instance parameters (the parameters themselves are skipped in
 /// the printed signature).
 fn strip_inner_ctor_artifacts(s: &mut Stmt, vt: &VarTable, outer_param: Option<(u16, String)>) {
-    fn is_this_param(e: &Expr, vt: &VarTable) -> bool {
+    fn is_this_param(e: &Expr, vt: &VarTable, outer_param: Option<&(u16, String)>) -> bool {
         match e {
-            Expr::Local { var, .. } => vt.var(*var).name.starts_with("this$"),
+            Expr::Local { var, .. } => {
+                let info = vt.var(*var);
+                info.name.starts_with("this$")
+                    || match outer_param {
+                        Some((slot, _)) => info.is_param && info.slot == *slot,
+                        None => false,
+                    }
+            }
             Expr::Raw(t) => t.starts_with("this$") || t.ends_with(".this$0"),
             Expr::Field { name, .. } => name.starts_with("this$"),
             _ => false,
         }
     }
-    fn junk(st: &Stmt, vt: &VarTable) -> bool {
+    fn junk(st: &Stmt, vt: &VarTable, outer_param: Option<&(u16, String)>) -> bool {
         match st {
             Stmt::ExprStmt(Expr::Assign { target, .. }) => match &**target {
                 Expr::Field { name, .. } => {
@@ -5926,12 +5961,12 @@ fn strip_inner_ctor_artifacts(s: &mut Stmt, vt: &VarTable, outer_param: Option<(
             Stmt::ExprStmt(Expr::Method { name, args, .. }) => {
                 (name == "requireNonNull" || name == "checkNotNull")
                     && args.len() == 1
-                    && is_this_param(&args[0], vt)
+                    && is_this_param(&args[0], vt, outer_param)
             }
             // LocalDef mirroring the outer instance into a synthetic
             // (`Local x = this$0; requireNonNull(x)`) — x dies with the
             // ctor prologue.
-            Stmt::LocalDef { init: Some(e), .. } => is_this_param(e, vt),
+            Stmt::LocalDef { init: Some(e), .. } => is_this_param(e, vt, outer_param),
             _ => false,
         }
     }
@@ -6023,7 +6058,7 @@ fn strip_inner_ctor_artifacts(s: &mut Stmt, vt: &VarTable, outer_param: Option<(
     fn rec(s: &mut Stmt, vt: &VarTable, outer_param: Option<&(u16, String)>) {
         match s {
             Stmt::Block(v) => {
-                v.retain(|st| !junk(st, vt));
+                v.retain(|st| !junk(st, vt, outer_param));
                 v.iter_mut().for_each(|x| rec(x, vt, outer_param));
             }
             Stmt::ExprStmt(e) => fix_expr(e, vt, outer_param),

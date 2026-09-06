@@ -1545,9 +1545,49 @@ impl<'a> Structurer<'a> {
         if !tu.contains(&t) {
             return None;
         }
+        #[allow(unused_mut)]
+        let mut tu = tu;
         COPY_DEPTH.with(|c| c.set(c.get() + 1));
         let mut fresh: HashSet<usize> = HashSet::new();
-        let r = self.walk(t, &tu, stop, active, &mut fresh, true);
+        // Try groups that START (and whose handler heads live) inside the
+        // copied universe must fire inside the copy: SESE passes only the
+        // top-level groups, so a copied loop-top try head re-walked from a
+        // catch back-edge lost its try wrapper and emitted bare statements
+        // (jdk11 ObjectStreamClass.getInheritableMethod: the retry
+        // getDeclaredMethod call landed in the catch WITHOUT its
+        // try/catch — "unreported exception NoSuchMethodException").
+        // For walk callers `active` already covers the scope, so this is
+        // a no-op there.
+        let mut active2: Vec<usize> = active.to_vec();
+        for gi in 0..self.groups.len() {
+            if active2.contains(&gi) {
+                continue;
+            }
+            let gs = self.groups[gi].start;
+            let start_in = self
+                .cfg
+                .blocks
+                .iter()
+                .any(|b| b.start == gs && tu.contains(&b.id));
+            if !start_in {
+                continue;
+            }
+            // Pull the handler heads (and their forward flow up to the
+            // group's end) into the copy universe: exception edges are
+            // not followed by reachable_within, but structure_try needs
+            // the handler blocks present to rebuild the catch.
+            let heads: Vec<usize> = self
+                .handler_group
+                .iter()
+                .filter(|(_, &g)| g == gi)
+                .map(|(&hb, _)| hb)
+                .collect();
+            for h in heads {
+                tu.insert(h);
+            }
+            active2.push(gi);
+        }
+        let r = self.walk(t, &tu, stop, &active2, &mut fresh, true);
         COPY_DEPTH.with(|c| c.set(c.get() - 1));
         self.copied_tails.insert(t);
         Some(r)
