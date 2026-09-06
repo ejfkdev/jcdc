@@ -2038,13 +2038,17 @@ fn emit_method_with(
                 collapse_ctor_delegation(&mut body, pc);
             }
             substitute_captures(&mut body, captures, pool);
+            // Ctor artifact stripping runs BEFORE the outer-this
+            // substitution: it normalizes param-slot reads of the outer
+            // instance (Local this$N) into field reads (this.this$N),
+            // which the substitution below then rewrites to Outer.this.
+            if is_ctor && (class_has_this0(pc) || outer_super_param) {
+                strip_inner_ctor_artifacts(&mut body, &mb.vt);
+            }
             // Member inner classes: this$N field reads become Outer.this.
             let outer_this = outer_this_map(pc);
             if !outer_this.is_empty() {
                 substitute_captures(&mut body, &outer_this, pool);
-            }
-            if is_ctor && (class_has_this0(pc) || outer_super_param) {
-                strip_inner_ctor_artifacts(&mut body, &mb.vt);
             }
             inline_anonymous(&mut body, pc, pool, fam, &mb.vt);
             inline_accessors(&mut body, pc, pool);
@@ -2971,6 +2975,26 @@ fn walk_expr_anon(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, fam: &Family, 
 
 /// Pre-render captured expressions in the OUTER context so the inner class
 /// body (printed with its own VarTable) can splice them as raw text.
+/// Dotted name for a qualified this (`X.this`): the last two `$`-segments
+/// of the binary name (outermost of the pair + the class itself), or the
+/// simple name for a top-level outer. A BARE simple name can be shadowed
+/// inside the inner class by an inherited member type of the same name —
+/// jdk11 SpinedBuffer$OfPrimitive$BaseSpliterator implements
+/// java.util.Spliterator.OfPrimitive, whose member type is inherited into
+/// scope and WINS the simple-name resolution, so `OfPrimitive.this`
+/// resolves to the interface and javac rejects it ("not an enclosing
+/// class", 13 errors in SpinedBuffer). `SpinedBuffer.OfPrimitive.this`
+/// cannot be shadowed by a member type of SpinedBuffer.
+fn qualified_this_tail(internal: &str) -> String {
+    let (_, nested) = internal.rsplit_once('/').unwrap_or(("", internal));
+    let segs: Vec<&str> = nested.split('$').collect();
+    if segs.len() >= 2 {
+        segs[segs.len() - 2..].join(".")
+    } else {
+        nested.to_string()
+    }
+}
+
 /// Collapse a `this$N` field chain whose owner is an anonymous class:
 /// `anonInstance.this$0` (possibly chained) resolves to the first NAMED
 /// enclosing class, rendered `Name.this`. Anonymous classes have no
@@ -3007,14 +3031,14 @@ fn collapse_this_chain(e: &Expr, pool: &ClassPool) -> Option<String> {
     if anon {
         None
     } else {
-        Some(format!("{}.this", simple))
+        Some(format!("{}.this", qualified_this_tail(&target)))
     }
 }
 
 /// True when the expression is a call to a GENERIC method: its static type
 /// at any argument position comes from inference, so inserting our own cast
 /// would freeze a capture identity javac would otherwise unify.
-fn g_has_typevar(g: &jcdc_jvm::GenericType) -> bool {
+pub(crate) fn g_has_typevar(g: &jcdc_jvm::GenericType) -> bool {
     use jcdc_jvm::GenericType as G;
     match g {
         G::TypeVar(_) => true,
@@ -3322,6 +3346,7 @@ fn render_captures(
     outer_vt: &VarTable,
 ) -> HashMap<String, Expr> {
     let outer_simple = simple_name(&outer_pc.internal_name);
+    let outer_qthis = qualified_this_tail(&outer_pc.internal_name);
     captures
         .into_iter()
         .map(|(k, v)| {
@@ -3336,7 +3361,7 @@ fn render_captures(
                 return if starts_digit {
                     (k, Expr::Raw("this".to_string()))
                 } else {
-                    (k, Expr::Raw(format!("{}.this", outer_simple)))
+                    (k, Expr::Raw(format!("{}.this", outer_qthis)))
                 };
             }
             let mut p = Printer::new(outer_pc, pool, outer_vt);
@@ -3533,7 +3558,7 @@ fn outer_this_map(pc: &PoolClass) -> HashMap<String, Expr> {
                         let rep = if starts_digit {
                             Expr::This
                         } else {
-                            Expr::Raw(format!("{}.this", sn))
+                            Expr::Raw(format!("{}.this", qualified_this_tail(inner)))
                         };
                         m.insert(name.to_string(), rep);
                     }
@@ -4297,10 +4322,149 @@ fn strip_inner_ctor_artifacts(s: &mut Stmt, vt: &VarTable) {
             _ => false,
         }
     }
+    // Reads of the outer-instance PARAMETER slot (before/without the
+    // putfield mirror) print as bare `this$0.field` (symbol not found).
+    // Normalize them to field reads on `this`; the outer-this
+    // substitution (which now runs after this pass) rewrites those to
+    // `Outer.this.field`.
+    fn fix_expr(e: &mut Expr, vt: &VarTable) {
+        if let Expr::Local { var, .. } = e {
+            let info = vt.var(*var);
+            if info.name.starts_with("this$") {
+                let name = info.name.clone();
+                let ty = info.ty.clone();
+                *e = Expr::Field {
+                    owner: Some(Box::new(Expr::This)),
+                    cls: String::new(),
+                    name,
+                    ty,
+                    is_static: false,
+                };
+                return;
+            }
+        }
+        match e {
+            Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+                args.iter_mut().for_each(|a| fix_expr(a, vt))
+            }
+            Expr::Method { owner, args, .. } => {
+                if let Some(o) = owner {
+                    fix_expr(o, vt);
+                }
+                args.iter_mut().for_each(|a| fix_expr(a, vt));
+            }
+            Expr::Field { owner: Some(o), .. } => fix_expr(o, vt),
+            Expr::ArrayIndex { array, index } => {
+                fix_expr(array, vt);
+                fix_expr(index, vt);
+            }
+            Expr::Cast { e: inner, .. } | Expr::InstanceOf { e: inner, .. } | Expr::Un { e: inner, .. } => {
+                fix_expr(inner, vt)
+            }
+            Expr::Bin { l, r, .. } => {
+                fix_expr(l, vt);
+                fix_expr(r, vt);
+            }
+            Expr::Cond { c, t, f } => {
+                fix_expr(c, vt);
+                fix_expr(t, vt);
+                fix_expr(f, vt);
+            }
+            Expr::Assign { target, value, .. } => {
+                fix_expr(target, vt);
+                fix_expr(value, vt);
+            }
+            Expr::PreIncDec { e: inner, .. } | Expr::PostIncDec { e: inner, .. } => {
+                fix_expr(inner, vt)
+            }
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter_mut().for_each(|d| fix_expr(d, vt));
+                if let Some(vals) = init {
+                    vals.iter_mut().for_each(|v| fix_expr(v, vt));
+                }
+            }
+            Expr::StringConcat(parts) => parts.iter_mut().for_each(|p| {
+                if let crate::expr::ConcatPart::Str(inner) = p {
+                    fix_expr(inner, vt);
+                }
+            }),
+            Expr::Lambda(l) => l.captures.iter_mut().for_each(|c| fix_expr(c, vt)),
+            Expr::Invokedynamic { args, .. } => args.iter_mut().for_each(|a| fix_expr(a, vt)),
+            _ => {}
+        }
+    }
     fn rec(s: &mut Stmt, vt: &VarTable) {
-        if let Stmt::Block(v) = s {
-            v.retain(|st| !junk(st, vt));
-            v.iter_mut().for_each(|x| rec(x, vt));
+        match s {
+            Stmt::Block(v) => {
+                v.retain(|st| !junk(st, vt));
+                v.iter_mut().for_each(|x| rec(x, vt));
+            }
+            Stmt::ExprStmt(e) => fix_expr(e, vt),
+            Stmt::LocalDef { init: Some(e), .. } => fix_expr(e, vt),
+            Stmt::Return(Some(e)) | Stmt::Throw(e) => fix_expr(e, vt),
+            Stmt::If { cond, then_stmt, else_stmt } => {
+                fix_expr(cond, vt);
+                rec(then_stmt, vt);
+                if let Some(x) = else_stmt {
+                    rec(x, vt);
+                }
+            }
+            Stmt::While { cond, body } => {
+                fix_expr(cond, vt);
+                rec(body, vt);
+            }
+            Stmt::DoWhile { body, cond } => {
+                rec(body, vt);
+                fix_expr(cond, vt);
+            }
+            Stmt::For { init, cond, update, body } => {
+                init.iter_mut().for_each(|i| rec(i, vt));
+                if let Some(c) = cond {
+                    fix_expr(c, vt);
+                }
+                update.iter_mut().for_each(|u| fix_expr(u, vt));
+                rec(body, vt);
+            }
+            Stmt::ForEach { iterable, body, .. } => {
+                fix_expr(iterable, vt);
+                rec(body, vt);
+            }
+            Stmt::Switch { selector, cases, default, .. } => {
+                fix_expr(selector, vt);
+                for c in cases.iter_mut() {
+                    c.body.iter_mut().for_each(|st| rec(st, vt));
+                }
+                if let Some(d) = default {
+                    rec(d, vt);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                rec(body, vt);
+                for c in catches.iter_mut() {
+                    rec(&mut c.body, vt);
+                }
+                if let Some(f) = finally {
+                    rec(f, vt);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                for r in resources.iter_mut() {
+                    rec(r, vt);
+                }
+                rec(body, vt);
+                for c in catches.iter_mut() {
+                    rec(&mut c.body, vt);
+                }
+                if let Some(f) = finally {
+                    rec(f, vt);
+                }
+            }
+            Stmt::Synchronized { lock, body } => {
+                fix_expr(lock, vt);
+                rec(body, vt);
+            }
+            Stmt::Labeled { body, .. } => rec(body, vt),
+            _ => {}
         }
     }
     rec(s, vt);

@@ -6673,11 +6673,20 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
         {
             return;
         }
-        // A raw checkcast around a GENERIC call breaks target-type
-        // inference (`(Map<K,V>) Map.ofEntries(...)`); the source had no
-        // cast — drop it.
-        if let Expr::Cast { e: ce, .. } = value {
-            if crate::classdec::is_generic_call(ce, pool) {
+        // A GENERICS-ONLY cast around a generic call breaks target-type
+        // inference (`(Map<K,V>) Map.ofEntries(...)`); javac emits no
+        // checkcast for a generics-only cast at all (erasure unchanged), so
+        // such an AST cast is our own synthesis — drop it. A cast whose
+        // erasure DIFFERS from the call's descriptor return came from a real
+        // bytecode checkcast and was in the source: `(ByteBuffer)
+        // Objects.requireNonNull(obb)` — dropping it leaves requireNonNull's
+        // T with lower bound Object (the arg) and upper bound ByteBuffer
+        // (the local's type): "inference variable T has incompatible
+        // bounds" (jdk11 VarHandleByteArrayAs*, 31 errors per sibling).
+        if let Expr::Cast { ty, e: ce } = value {
+            let real_checkcast =
+                matches!(&**ce, Expr::Method { desc, .. } if desc.ret != ty.erased());
+            if !real_checkcast && crate::classdec::is_generic_call(ce, pool) {
                 let inner = std::mem::replace(value, Expr::This);
                 if let Expr::Cast { e: ce2, .. } = inner {
                     *value = *ce2;

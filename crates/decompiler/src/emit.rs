@@ -26,11 +26,16 @@ pub struct Printer<'a> {
     /// Object bounds and then fails the cast — while the bare/raw form
     /// `(T) new X(args)` compiles (unchecked).
     suppress_diamond: bool,
+    /// Instantiated SAM return type while rendering the Lambda directly
+    /// inside a cast to a generic functional interface: the lambda body's
+    /// returns may need `(R) value` witnesses (jdk17 Collectors
+    /// `(Function<I,R>) i -> i`).
+    lambda_sam_ret: Option<TypeRef>,
 }
 
 impl<'a> Printer<'a> {
     pub fn new(pc: &'a PoolClass, pool: &'a ClassPool, vt: &'a VarTable) -> Self {
-        Printer { pc, pool, vt, out: String::new(), indent: 0, lambda_depth: 0, ret_bool: false, suppress_poly_cast: false, suppress_diamond: false }
+        Printer { pc, pool, vt, out: String::new(), indent: 0, lambda_depth: 0, ret_bool: false, suppress_poly_cast: false, suppress_diamond: false, lambda_sam_ret: None }
     }
 
     pub fn with_ret_bool(mut self, b: bool) -> Self {
@@ -495,6 +500,7 @@ impl<'a> Printer<'a> {
             ret_bool: self.ret_bool,
             suppress_poly_cast: self.suppress_poly_cast,
             suppress_diamond: self.suppress_diamond,
+            lambda_sam_ret: self.lambda_sam_ret.clone(),
         }
     }
 
@@ -762,14 +768,38 @@ impl<'a> Printer<'a> {
                         return;
                     }
                 }
+                if let (TypeRef::G(_), Expr::New { cls, .. }) = (ty, &**e) {
+                    if !self.diamond_for(cls).is_empty() {
+                        // Synthetic generics-only cast around a diamond new:
+                        // DROP the cast and keep the diamond. A generic-typed
+                        // cast is always jcdc's own witness (a real checkcast
+                        // carries only erasure), and every cast form loses
+                        // here: with the diamond the cast starves inference
+                        // (`(PendingFuture<Void,A>) new PendingFuture<>(..)`
+                        // infers Object bounds and fails the cast), and the
+                        // bare/raw form makes the whole creation raw so
+                        // method-ref/lambda arguments stop type-checking
+                        // (jdk17 Collectors `(Collector<T,?,C>) new
+                        // CollectorImpl(.., Collection::add, ..)`). Cast-free
+                        // `return new CollectorImpl<>(..)` / `x = new
+                        // PendingFuture<>(..)` target-types the diamond —
+                        // the source shape.
+                        self.expr(e, outer_prec, out);
+                        return;
+                    }
+                }
                 out.push('(');
                 out.push_str(&self.type_name(ty));
                 out.push_str(") ");
                 if matches!(&**e, Expr::New { .. }) {
                     self.suppress_diamond = true;
                 }
+                if let (TypeRef::G(g), Expr::Lambda(l)) = (ty, &**e) {
+                    self.lambda_sam_ret = self.sam_ret_cast(g, &l.sam_name);
+                }
                 self.expr(e, 14, out);
                 self.suppress_diamond = false;
+                self.lambda_sam_ret = None;
             }
             Expr::InstanceOf { e, ty } => {
                 self.expr(e, 10, out);
@@ -1060,6 +1090,7 @@ impl<'a> Printer<'a> {
                     out.push(')');
                 }
                 out.push_str(" -> ");
+                let sam_wrap = self.lambda_sam_ret.take();
                 match body_stmts {
                     Some(MethodBody { mut body, vt, .. }) => {
                         {
@@ -1074,7 +1105,7 @@ impl<'a> Printer<'a> {
                         }
                         crate::classdec::restore_enum_switches(&mut body, self.pc, self.pool);
                         // Single-return body → expression lambda.
-                        let single_expr = match &body {
+                        let mut single_expr = match &body {
                             Stmt::Return(Some(e)) => Some(e.clone()),
                             Stmt::Block(v) if v.len() == 1 => match &v[0] {
                                 Stmt::Return(Some(e)) => Some(e.clone()),
@@ -1082,6 +1113,70 @@ impl<'a> Printer<'a> {
                             },
                             _ => None,
                         };
+                        // Witness the instantiated SAM return on the body's
+                        // returns: the impl method is erased, so `i -> i`
+                        // under `(Function<I,R>)` fails inference without
+                        // `(R) i`.
+                        fn sam_ok(t: &TypeRef, e: &Expr) -> bool {
+                            !matches!(e, Expr::Cast { .. } | Expr::Const(_))
+                                && e.type_ref() != *t
+                        }
+                        fn wrap_returns(s: &mut Stmt, t: &TypeRef) {
+                            match s {
+                                Stmt::Return(Some(e)) => {
+                                    if sam_ok(t, e) {
+                                        let v = std::mem::replace(e, Expr::This);
+                                        *e = Expr::Cast { ty: t.clone(), e: Box::new(v) };
+                                    }
+                                }
+                                Stmt::Block(v) => v.iter_mut().for_each(|x| wrap_returns(x, t)),
+                                Stmt::If { then_stmt, else_stmt, .. } => {
+                                    wrap_returns(then_stmt, t);
+                                    if let Some(x) = else_stmt {
+                                        wrap_returns(x, t);
+                                    }
+                                }
+                                Stmt::While { body, .. }
+                                | Stmt::DoWhile { body, .. }
+                                | Stmt::ForEach { body, .. }
+                                | Stmt::Labeled { body, .. }
+                                | Stmt::Synchronized { body, .. } => wrap_returns(body, t),
+                                Stmt::For { init, body, .. } => {
+                                    init.iter_mut().for_each(|i| wrap_returns(i, t));
+                                    wrap_returns(body, t);
+                                }
+                                Stmt::Switch { cases, default, .. } => {
+                                    for c in cases.iter_mut() {
+                                        for st in c.body.iter_mut() {
+                                            wrap_returns(st, t);
+                                        }
+                                    }
+                                    if let Some(d) = default {
+                                        wrap_returns(d, t);
+                                    }
+                                }
+                                Stmt::Try { body, catches, finally } => {
+                                    wrap_returns(body, t);
+                                    for c in catches.iter_mut() {
+                                        wrap_returns(&mut c.body, t);
+                                    }
+                                    if let Some(f) = finally {
+                                        wrap_returns(f, t);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let Some(t) = &sam_wrap {
+                            if let Some(e) = &mut single_expr {
+                                if sam_ok(t, e) {
+                                    let v = std::mem::replace(e, Expr::This);
+                                    *e = Expr::Cast { ty: t.clone(), e: Box::new(v) };
+                                }
+                            } else {
+                                wrap_returns(&mut body, t);
+                            }
+                        }
                         let mut sub = Printer {
                             pc: self.pc,
                             pool: self.pool,
@@ -1092,6 +1187,7 @@ impl<'a> Printer<'a> {
                             ret_bool: false,
                             suppress_poly_cast: false,
                             suppress_diamond: false,
+                            lambda_sam_ret: None,
                         };
                         if let Some(e) = single_expr {
                             if l.sam_desc.ret == jcdc_jvm::JavaType::Boolean {
@@ -1158,6 +1254,61 @@ impl<'a> Printer<'a> {
                 })
             })
             .unwrap_or(false)
+    }
+
+    /// Instantiated SAM return for a cast to a generic functional
+    /// interface (`(Function<I,R>) lambda`): resolves the interface's SAM
+    /// method Signature return against the cast's type arguments. Only
+    /// meaningful when the result still contains a type variable — the
+    /// erased impl body then needs `(R) value` witnesses on its returns
+    /// (javac: "return type I cannot be converted to R" for `i -> i`).
+    fn sam_ret_cast(&self, g: &jcdc_jvm::GenericType, sam_name: &str) -> Option<TypeRef> {
+        let jcdc_jvm::GenericType::Class(cs) = g else { return None };
+        let part = cs.parts.last()?;
+        if part.args.is_empty() {
+            return None;
+        }
+        let internal = if cs.package.is_empty() {
+            cs.parts.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join("$")
+        } else {
+            format!("{}/{}", cs.package, cs.parts.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join("$"))
+        };
+        let pc = self.pool.get(&internal)?;
+        let cls_params = pc
+            .class_attr("Signature")
+            .and_then(|b| {
+                if b.len() >= 2 {
+                    pc.utf8(u16::from_be_bytes([b[0], b[1]]))
+                        .and_then(|s| jcdc_jvm::parse_class_signature(s))
+                } else {
+                    None
+                }
+            })?
+            .params;
+        for mi in 0..pc.cf.methods.len() {
+            if pc.method_name(mi) != Some(sam_name) {
+                continue;
+            }
+            let sig_bytes = pc.cf.methods[mi].attributes.iter().find_map(|at| {
+                if pc.utf8(at.attribute_name_index) == Some("Signature") {
+                    Some(at.info.as_slice())
+                } else {
+                    None
+                }
+            })?;
+            if sig_bytes.len() < 2 {
+                return None;
+            }
+            let msig = pc
+                .utf8(u16::from_be_bytes([sig_bytes[0], sig_bytes[1]]))
+                .and_then(|s| jcdc_jvm::parse_method_signature(s))?;
+            let inst = crate::method::subst_typevars(&msig.ret, &cls_params, &part.args);
+            if crate::classdec::g_has_typevar(&inst) {
+                return Some(TypeRef::G(inst));
+            }
+            return None;
+        }
+        None
     }
 
     /// `<>` when `new cls(...)` should carry a diamond: the class is
