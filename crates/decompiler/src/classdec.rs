@@ -728,6 +728,18 @@ thread_local! {
     static ANON_HOIST: std::cell::RefCell<Vec<Stmt>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// Set while an anonymous-class METHOD body is about to be walked:
+    /// the FIRST Block arm consumes it and becomes the designated splice
+    /// point for local-class declarations. Inner blocks leave pending
+    /// decls alone so they bubble to the method-top block — the only
+    /// position that precedes EVERY reference (jdk26 ClassSpecializer
+    /// Factory$1$1Var: the loop-body splice put `class Var` after the
+    /// method-top `Var NO_THIS = ...` uses — "找不到符号" / forward
+    /// reference).
+    static ANON_TOP_BLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 struct EmitGuard(String);
 impl Drop for EmitGuard {
     fn drop(&mut self) {
@@ -3178,7 +3190,14 @@ pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: 
     let mut pending: Vec<Stmt> = Vec::new();
     let mut declared: HashSet<String> = HashSet::new();
     let hoist_mark = LOCAL_DECL_HOIST.with(|h| h.borrow().len());
+    let set_top = ANON_BODY_DEPTH.with(|d| d.get()) > 0;
+    if set_top {
+        ANON_TOP_BLOCK.with(|t| t.set(true));
+    }
     walk_stmt_anon(body, pc, pool, fam, &mut pending, vt, &mut declared);
+    if set_top {
+        ANON_TOP_BLOCK.with(|t| t.set(false));
+    }
     // Inside an inlined anon/local body: leave bubbled decls on the stack
     // for the REAL method's drain (their references — method refs, hoisted
     // type decls — live out there).
@@ -3663,6 +3682,14 @@ fn walk_stmt_anon(
             // "cannot find symbol Var" x11). Captures stay lexically valid:
             // jcdc hoists ALL local declarations to the block head, so any
             // captured local is in scope from position 0.
+            let claimed_top = ANON_TOP_BLOCK.with(|t| {
+                if t.get() {
+                    t.set(false);
+                    true
+                } else {
+                    false
+                }
+            });
             let n_orig = v.len();
             for i in 0..n_orig {
                 walk_stmt_anon(&mut v[i], pc, pool, fam, pending, vt, declared);
@@ -3677,7 +3704,10 @@ fn walk_stmt_anon(
             if !pending.is_empty() {
                 let in_anon_only = ANON_BODY_DEPTH.with(|d| d.get()) > 0
                     && LAMBDA_BODY_DEPTH.with(|d| d.get()) == 0;
-                if in_anon_only {
+                if in_anon_only && !claimed_top {
+                    // Not the method-top block: leave the decls pending so
+                    // the top block splices them before EVERY reference.
+                } else if in_anon_only {
                     let mut k = 0;
                     while k < pending.len() {
                         let decl_name = match &pending[k] {
@@ -3696,6 +3726,9 @@ fn walk_stmt_anon(
                         k += 1;
                     }
                     let n0 = v.len();
+                    if std::env::var("JCDC_DBG_ANON").is_ok() {
+                        eprintln!("ANONAPPEND n0={} pending={}", n0, pending.len());
+                    }
                     v.append(pending);
                     // Relocate each decl before its first mention in this
                     // block (uses inside the anon method itself).
@@ -3713,6 +3746,9 @@ fn walk_stmt_anon(
                             .filter(|&x| !matches!(&v[x], Stmt::ClassDecl { .. }))
                             .find(|&x| stmt_mentions_local(&v[x], &marker, &name, vt, fam))
                             .unwrap_or(j);
+                        if std::env::var("JCDC_DBG_ANON").is_ok() {
+                            eprintln!("RELOC name={} j={} first_use={} vlen={} depth={}", name, j, first_use, v.len(), ANON_BODY_DEPTH.with(|d| d.get()));
+                        }
                         if first_use != j {
                             let d = v[j].clone();
                             v.insert(first_use, d);
@@ -3943,6 +3979,9 @@ fn walk_expr_anon(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, fam: &Family, 
             }
         }
         Expr::New { cls, args, raw: false, ty, .. } if fam.locals.contains(cls.as_str()) => {
+            if std::env::var("JCDC_DBG_ANON").is_ok() {
+                eprintln!("LOCALNEW {} pending={} depth={}", cls, pending.len(), ANON_BODY_DEPTH.with(|d| d.get()));
+            }
             if let Some(lpc) = pool.get(cls) {
                 let simple = fam
                     .nested
