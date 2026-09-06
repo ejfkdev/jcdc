@@ -4304,6 +4304,116 @@ pub(crate) fn g_has_wildcard(g: &jcdc_jvm::GenericType) -> bool {
 /// return expression in `(RetG) expr` (unchecked, compilable). Skips
 /// expressions already carrying the type-variable form (a poly conditional
 /// whose branches are G — those compile as-is).
+/// Cast bare-call arguments that sit at TYPEVAR (or array-of-typevar)
+/// parameter positions but carry only their erasure: `Set.of(elements)`
+/// where the source local was `E[] elements = (E[]) toArray()` — inlined,
+/// the raw Object[] arg gives the call's inference variable an Object
+/// equality bound that conflicts with the return position ("推论变量 E#1
+/// 具有不兼容的上限", jdk11 Set.copyOf). The cast uses the ENCLOSING
+/// method's return typevar name (valid when the call's variable flows
+/// from the generic return — exactly the case the bare call failed on).
+fn cast_typevar_param_args(
+    cls: &str,
+    name: &str,
+    desc: &jcdc_jvm::MethodDescriptor,
+    args: &mut [Expr],
+    sig: &jcdc_jvm::MethodSignature,
+    pool: &ClassPool,
+) {
+    let jcdc_jvm::GenericType::Class(ret_cs) = &sig.ret else {
+        return;
+    };
+    let Some(ret_tvs) = ret_cs.parts.last().map(|p| &p.args) else {
+        return;
+    };
+    if ret_tvs.is_empty() {
+        return;
+    }
+    let Some(dpc) = pool.get(cls) else { return };
+    let want_desc = {
+        let mut a = String::new();
+        for t in &desc.args {
+            a.push_str(&t.to_descriptor());
+        }
+        format!("({}){}", a, desc.ret.to_descriptor())
+    };
+    let Some(mi) = (0..dpc.cf.methods.len()).find(|&i| {
+        dpc.method_name(i) == Some(name) && dpc.method_desc(i) == Some(want_desc.as_str())
+    }) else {
+        return;
+    };
+    let Some(sig_bytes) = dpc.cf.methods[mi].attributes.iter().find_map(|a| {
+        if dpc.utf8(a.attribute_name_index) == Some("Signature") {
+            Some(a.info.as_slice())
+        } else {
+            None
+        }
+    }) else {
+        return;
+    };
+    if sig_bytes.len() < 2 {
+        return;
+    }
+    let idx = u16::from_be_bytes([sig_bytes[0], sig_bytes[1]]);
+    let Some(msig) = dpc
+        .utf8(idx)
+        .and_then(|x| jcdc_jvm::parse_method_signature(x))
+    else {
+        return;
+    };
+    // Map the callee's return-parameter typevars positionally to the
+    // enclosing return's.
+    let mut map: Vec<(String, String)> = Vec::new();
+    if let jcdc_jvm::GenericType::Class(cs) = &msig.ret {
+        if let Some(last) = cs.parts.last() {
+            for (a, b) in last.args.iter().zip(ret_tvs.iter()) {
+                if let (jcdc_jvm::GenericType::TypeVar(x), jcdc_jvm::GenericType::TypeVar(y)) =
+                    (a, b)
+                {
+                    map.push((x.clone(), y.clone()));
+                }
+            }
+        }
+    }
+    if map.is_empty() {
+        return;
+    }
+    fn subst(g: &jcdc_jvm::GenericType, map: &[(String, String)]) -> jcdc_jvm::GenericType {
+        match g {
+            jcdc_jvm::GenericType::TypeVar(x) => {
+                let y = map
+                    .iter()
+                    .find(|(a, _)| a == x)
+                    .map(|(_, b)| b.clone())
+                    .unwrap_or_else(|| x.clone());
+                jcdc_jvm::GenericType::TypeVar(y)
+            }
+            jcdc_jvm::GenericType::Array(i) => {
+                jcdc_jvm::GenericType::Array(Box::new(subst(i, map)))
+            }
+            other => other.clone(),
+        }
+    }
+    for (a, pt) in args.iter_mut().zip(msig.args.iter()) {
+        let inst = subst(pt, &map);
+        let is_tv = matches!(&inst, jcdc_jvm::GenericType::TypeVar(_))
+            || matches!(&inst, jcdc_jvm::GenericType::Array(i)
+                if matches!(&**i, jcdc_jvm::GenericType::TypeVar(_)));
+        if !is_tv {
+            continue;
+        }
+        if matches!(a, Expr::Cast { .. } | Expr::Const(_)) {
+            continue;
+        }
+        let want = TypeRef::G(inst.clone());
+        if a.type_ref() == want || a.type_ref().erased() != want.erased() {
+            continue;
+        }
+        let inner = std::mem::replace(a, Expr::This);
+        *a = Expr::Cast { ty: want, e: Box::new(inner) };
+    }
+}
+
 fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, pool: &ClassPool) {
     use crate::expr::Expr;
     let Some(sig) = msig else { return };
@@ -4450,6 +4560,9 @@ fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature
                             return;
                         }
                     }
+                    // Bare shape: typevar-parameter args that lost their
+                    // source local's cast need it back at the arg.
+                    cast_typevar_param_args(cls, name, desc, args, sig, pool);
                     // Witness failed. A cast to a typevar (or array of
                     // one) is always-legal unchecked and often REQUIRED
                     // (jdk17 ArrayList.toArray `(T[]) Arrays.copyOf(..)`
