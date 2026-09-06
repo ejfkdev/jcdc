@@ -745,7 +745,14 @@ impl<'a> Printer<'a> {
                 } else {
                     name
                 };
-                if name == "length" && cls.is_empty() {
+                if name == crate::classdec::ASSERT_FIELD {
+                    // Assert guards print bare: the field is declared on
+                    // the enclosing emitted class or inlined body; the
+                    // bytecode owner is often a synthetic holder class
+                    // (`ConstantGroup$1`) whose shorten() fallback is
+                    // `Object` — a qualified read can never resolve.
+                    out.push_str(name);
+                } else if name == "length" && cls.is_empty() {
                     if let Some(o) = owner {
                         self.expr(o, 15, out);
                     }

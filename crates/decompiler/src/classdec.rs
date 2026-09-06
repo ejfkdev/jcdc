@@ -1088,6 +1088,7 @@ fn emit_class(
     }
 
     let comp_names = record_component_names(pc);
+    let mut has_assert_field = false;
     for (fi, f) in pc.cf.fields.iter().enumerate() {
         let fname0 = pc.utf8(f.name_index).unwrap_or("").to_string();
         // `$assertionsDisabled` is synthetic but referenced by decompiled
@@ -1095,6 +1096,9 @@ fn emit_class(
         // under a renamed identifier, because javac reserves the exact
         // name for its own compiler-synthesized field.
         let keep_synthetic = fname0 == "$assertionsDisabled";
+        if keep_synthetic {
+            has_assert_field = true;
+        }
         let fname = if keep_synthetic {
             ASSERT_FIELD.to_string()
         } else {
@@ -1151,6 +1155,33 @@ fn emit_class(
                 }
             }
         }
+    }
+
+    // Assert-holder field living on a synthetic sibling class (interfaces
+    // get `ConstantGroup$1.$assertionsDisabled`): the references print
+    // bare, so declare the field here when the pool references one and
+    // this class does not carry it.
+    if !has_assert_field
+        && (0..pc.cf.constant_pool.len()).any(|i| {
+            matches!(jcdc_classfile::get_entry(&pc.cf.constant_pool, i as u16),
+                Some(jcdc_classfile::ConstantPoolEntry::Fieldref(fr))
+                    if pc.utf8(
+                        jcdc_classfile::get_entry(&pc.cf.constant_pool, fr.name_and_type_index)
+                            .and_then(|nt| match nt {
+                                jcdc_classfile::ConstantPoolEntry::NameAndType(n) => Some(n.name_index),
+                                _ => None,
+                            })
+                            .unwrap_or(0)
+                    ) == Some("$assertionsDisabled"))
+        })
+    {
+        let top = pc.internal_name.split('$').next().unwrap_or(&pc.internal_name);
+        let top_simple = top.rsplit('/').next().unwrap_or(top);
+        out.push_str(&inner_pad);
+        out.push_str(&format!(
+            "static final boolean {} = !{}.class.desiredAssertionStatus();\n",
+            ASSERT_FIELD, top_simple
+        ));
     }
 
     // Methods.
@@ -5605,6 +5636,21 @@ fn emit_anon_body(
     // Fields (skip capture/synthetic fields; record components are implicit).
     for (fi, f) in apc.cf.fields.iter().enumerate() {
         let fname = apc.utf8(f.name_index).unwrap_or("").to_string();
+        if fname == "$assertionsDisabled" {
+            // The inlined body's assert guards print as a bare reference
+            // and the enclosing class does not declare the field (jdk17
+            // ThreadLocalCoders$1, SpinedBuffer$1Splitr): carry the field
+            // into the body. Statics are illegal in inner classes before
+            // 16 — instance final computed exactly like javac's clinit.
+            let top = apc.internal_name.split('$').next().unwrap_or(&apc.internal_name);
+            let top_simple = top.rsplit('/').next().unwrap_or(top);
+            out.push_str(&"    ".repeat(indent + 1));
+            out.push_str(&format!(
+                "final boolean {} = !{}.class.desiredAssertionStatus();\n",
+                ASSERT_FIELD, top_simple
+            ));
+            continue;
+        }
         if fname.starts_with("this$")
             || fname.starts_with("val$")
             || f.access_flags.contains(FieldAccessFlags::SYNTHETIC)
