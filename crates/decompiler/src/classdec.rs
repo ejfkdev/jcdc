@@ -4092,6 +4092,14 @@ fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature
         if matches!(e, Expr::Const(_) | Expr::Cast { .. }) {
             return false;
         }
+        // Lambda/method-ref arms are poly expressions: they take their
+        // target type from the return position itself. Wrapping the
+        // conditional in a witness cast turns it into a standalone
+        // expression and javac rejects the poly arms ("此处不应为 lambda
+        // 表达式", jdk11 Predicate.isEqual `(Predicate<T>) (c ? l : m)`).
+        if matches!(e, Expr::Lambda(_)) {
+            return false;
+        }
         // Ternaries: javac glues the branches; if ANY branch needs the
         // witness, wrap the whole cond (`(T) (c ? a : b)` — Hashtable
         // Enumerator.next).
@@ -4114,6 +4122,19 @@ fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature
         }
     }
     fn fix(e: &mut Expr, ret_g: &TypeRef, ret_er: &jcdc_jvm::JavaType) {
+        // A conditional with a poly (lambda/method-ref) arm must NOT be
+        // wrapped as a whole: the cast makes the conditional standalone
+        // and javac rejects the poly arm ("此处不应为 lambda 表达式").
+        // Witness the non-poly arms individually instead — in the return
+        // position the conditional stays a poly expression and the lambda
+        // arm takes the method's return type directly.
+        if let Expr::Cond { t, f, .. } = e {
+            if matches!(**t, Expr::Lambda(_)) || matches!(**f, Expr::Lambda(_)) {
+                fix(t, ret_g, ret_er);
+                fix(f, ret_g, ret_er);
+                return;
+            }
+        }
         if needs_witness(e, ret_g, ret_er) {
             let v = std::mem::replace(e, Expr::This);
             *e = Expr::Cast { ty: ret_g.clone(), e: Box::new(v) };
