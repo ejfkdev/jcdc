@@ -976,6 +976,39 @@ impl<'a> Printer<'a> {
                         return;
                     }
                 }
+                // Mixed boolean/int equality on non-constants (stack-merge
+                // vars of an assert desugaring: jdk26 VirtualThread
+                // `stack38 == stack39` with stack38 boolean, stack39 int
+                // 0/1 — "boolean和int不可比较"): normalize the int side
+                // through `!= 0`.
+                {
+                    let rt = r.type_ref().erased();
+                    if matches!(op, BinOp::Eq | BinOp::Ne)
+                        && ((lt == jcdc_jvm::JavaType::Boolean
+                            && rt == jcdc_jvm::JavaType::Int)
+                            || (lt == jcdc_jvm::JavaType::Int
+                                && rt == jcdc_jvm::JavaType::Boolean))
+                    {
+                        for (i, side) in [l, r].iter().enumerate() {
+                            if i > 0 {
+                                out.push(' ');
+                                out.push_str(op.symbol());
+                                out.push(' ');
+                            }
+                            if side.type_ref().erased() == jcdc_jvm::JavaType::Boolean {
+                                self.expr_bool(side, out);
+                            } else {
+                                out.push('(');
+                                self.expr(side, 1, out);
+                                out.push_str(" != 0)");
+                            }
+                        }
+                        if parens {
+                            out.push(')');
+                        }
+                        return;
+                    }
+                }
                 let p = op.precedence();
                 self.expr(l, p, out);
                 out.push(' ');
