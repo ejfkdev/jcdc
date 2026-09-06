@@ -774,6 +774,58 @@ impl<'a> Structurer<'a> {
                     let follow = self
                         .sese_ipdom(ctx, cur)
                         .filter(|f| !stop.contains(f))
+                        // A switch inside a loop body whose cases all end
+                        // in `break`: the shared target is the loop's
+                        // increment, a body_stop EXIT — and when a case
+                        // THROWS (javac's default: throw InternalError),
+                        // no real ipdom exists at all. Scan for the
+                        // nearest block every NON-TERMINATING branch
+                        // reaches, allowing stop members: case regions
+                        // then end in Goto{follow} -> plain `break`, and
+                        // the increment stays outside the switch
+                        // (jdk11 ObjectStreamClass.computeFieldOffsets —
+                        // fall-through cases + `break L10` RawGoto leak,
+                        // a vU first blocker on both paths).
+                        .or_else(|| {
+                            let live: Vec<usize> = succs
+                                .iter()
+                                .copied()
+                                .filter(|&t| {
+                                    !matches!(
+                                        self.results[t].term,
+                                        Term::Return(_) | Term::Throw(_)
+                                    )
+                                })
+                                .collect();
+                            if live.is_empty() {
+                                return None;
+                            }
+                            let mut best: Option<usize> = None;
+                            for &cand in ctx.universe.iter() {
+                                if ctx.consumed.contains(&cand)
+                                    || ctx.loop_headers.contains(&cand)
+                                    || ctx.loop_stack.contains(&cand)
+                                {
+                                    continue;
+                                }
+                                if live
+                                    .iter()
+                                    .all(|&t| t == cand || self.reaches_within(ctx, t, cand, stop))
+                                {
+                                    match best {
+                                        None => best = Some(cand),
+                                        Some(b)
+                                            if self.cfg.blocks[cand].start
+                                                < self.cfg.blocks[b].start =>
+                                        {
+                                            best = Some(cand)
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            best
+                        })
                         .or_else(|| self.convergent_merge(ctx, &succs, stop));
                     let mut claimed = ctx.consumed.clone();
                     let sw = self.structure_switch(

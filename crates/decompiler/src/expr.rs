@@ -408,7 +408,17 @@ impl Expr {
             Expr::InstanceOf { .. } => JavaType::Boolean.into(),
             Expr::Un { op: UnOp::Not, .. } => JavaType::Boolean.into(),
             Expr::Un { e, .. } => e.type_ref(),
-            Expr::Bin { ty, l, .. } => ty.clone().unwrap_or_else(|| l.type_ref()),
+            Expr::Bin { op, ty, l, .. } => match op {
+                // Comparisons and short-circuit logicals are boolean
+                // regardless of operand types — the stored `ty` (when
+                // present it mirrors the operands) misled the bool->int
+                // assignment rewrite (`int mode = e != null;` stayed
+                // unrewrapped: jdk11 SynchronousQueue).
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Ge | BinOp::Gt
+                | BinOp::Le | BinOp::RefEq | BinOp::RefNe | BinOp::LogAnd
+                | BinOp::LogOr => JavaType::Boolean.into(),
+                _ => ty.clone().unwrap_or_else(|| l.type_ref()),
+            },
             Expr::Cond { t, .. } => t.type_ref(),
             Expr::Assign { value, .. } => value.type_ref(),
             Expr::PreIncDec { e, .. } | Expr::PostIncDec { e, .. } => e.type_ref(),

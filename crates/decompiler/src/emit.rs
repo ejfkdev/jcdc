@@ -36,11 +36,16 @@ pub struct Printer<'a> {
     /// ints; `return cond ? 63 : 105;` in a char method is a lossy
     /// conversion — source was `? '?' : 'i'`, jdk XML Parser x23).
     pub ret_char: bool,
+    /// Narrowing-return markers: int-valued expressions in the return
+    /// need `(byte)`/`(short)` casts (jdk11 MemberName:
+    /// `byte normalVirtual = cond ? 5 : 9;`).
+    pub ret_byte: bool,
+    pub ret_short: bool,
 }
 
 impl<'a> Printer<'a> {
     pub fn new(pc: &'a PoolClass, pool: &'a ClassPool, vt: &'a VarTable) -> Self {
-        Printer { pc, pool, vt, out: String::new(), indent: 0, lambda_depth: 0, ret_bool: false, suppress_poly_cast: false, suppress_diamond: false, lambda_sam_ret: None, ret_char: false }
+        Printer { pc, pool, vt, out: String::new(), indent: 0, lambda_depth: 0, ret_bool: false, suppress_poly_cast: false, suppress_diamond: false, lambda_sam_ret: None, ret_char: false, ret_byte: false, ret_short: false }
     }
 
     pub fn with_ret_bool(mut self, b: bool) -> Self {
@@ -50,6 +55,12 @@ impl<'a> Printer<'a> {
 
     pub fn with_ret_char(mut self, b: bool) -> Self {
         self.ret_char = b;
+        self
+    }
+
+    pub fn with_ret_narrow(mut self, byte: bool, short: bool) -> Self {
+        self.ret_byte = byte;
+        self.ret_short = short;
         self
     }
 
@@ -107,6 +118,37 @@ impl<'a> Printer<'a> {
         }
         self.out.push_str(s);
         self.out.push('\n');
+    }
+
+    /// Render an int-typed expression in a byte/short target: constants
+    /// and ternary branches get the narrowing cast (javac's conditional
+    /// expression only narrows when the target type is known — a return
+    /// or local-decl of byte/short with int constants needs explicit
+    /// casts: `byte normalVirtual = !if() ? (byte) 5 : (byte) 9;`).
+    pub fn expr_narrow(&mut self, e: &Expr, ty: &jcdc_jvm::JavaType, out: &mut String) {
+        match e {
+            Expr::Const(ConstVal::Int(n)) => {
+                let (lo, hi) = match ty {
+                    jcdc_jvm::JavaType::Byte => (-128i64, 127i64),
+                    jcdc_jvm::JavaType::Short => (-32768i64, 32767i64),
+                    _ => (i32::MIN as i64, i32::MAX as i64),
+                };
+                if (*n as i64) < lo || (*n as i64) > hi {
+                    out.push('(');
+                    out.push_str(&self.type_name(&TypeRef::J(ty.clone())));
+                    out.push_str(") ");
+                }
+                out.push_str(&n.to_string());
+            }
+            Expr::Cond { c, t, f } => {
+                self.expr(c, 3, out);
+                out.push_str(" ? ");
+                self.expr_narrow(t, ty, out);
+                out.push_str(" : ");
+                self.expr_narrow(f, ty, out);
+            }
+            _ => self.expr(e, 1, out),
+        }
     }
 
     /// Render an expression in a char-typed target: int constants become
@@ -170,6 +212,11 @@ impl<'a> Printer<'a> {
                         self.expr_bool(e, &mut line);
                     } else if info.ty.erased() == jcdc_jvm::JavaType::Char {
                         self.expr_char(e, &mut line);
+                    } else if info.ty.erased() == jcdc_jvm::JavaType::Byte
+                        || info.ty.erased() == jcdc_jvm::JavaType::Short
+                    {
+                        let t = info.ty.erased();
+                        self.expr_narrow(e, &t, &mut line);
                     } else {
                         self.expr(e, 1, &mut line);
                     }
@@ -183,6 +230,10 @@ impl<'a> Printer<'a> {
                     self.expr_bool(e, &mut line);
                 } else if self.ret_char {
                     self.expr_char(e, &mut line);
+                } else if self.ret_byte {
+                    self.expr_narrow(e, &jcdc_jvm::JavaType::Byte, &mut line);
+                } else if self.ret_short {
+                    self.expr_narrow(e, &jcdc_jvm::JavaType::Short, &mut line);
                 } else {
                     self.expr(e, 1, &mut line);
                 }
@@ -530,6 +581,8 @@ impl<'a> Printer<'a> {
             lambda_depth: self.lambda_depth,
             ret_bool: self.ret_bool,
             ret_char: self.ret_char,
+            ret_byte: self.ret_byte,
+            ret_short: self.ret_short,
             suppress_poly_cast: self.suppress_poly_cast,
             suppress_diamond: self.suppress_diamond,
             lambda_sam_ret: self.lambda_sam_ret.clone(),
@@ -1264,6 +1317,8 @@ impl<'a> Printer<'a> {
                             // (jdk26 Gatherers.fold's ofGreedy lambda).
                             ret_bool: l.sam_desc.ret == jcdc_jvm::JavaType::Boolean,
                             ret_char: l.sam_desc.ret == jcdc_jvm::JavaType::Char,
+                            ret_byte: l.sam_desc.ret == jcdc_jvm::JavaType::Byte,
+                            ret_short: l.sam_desc.ret == jcdc_jvm::JavaType::Short,
                             suppress_poly_cast: false,
                             suppress_diamond: false,
                             lambda_sam_ret: None,

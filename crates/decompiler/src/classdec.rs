@@ -2514,10 +2514,13 @@ fn emit_method_with(
                 || msig.as_ref().map(|g| matches!(&g.ret, jcdc_jvm::GenericType::Primitive('Z'))).unwrap_or(false);
             let ret_char = mdesc.as_ref().map(|d| d.ret == jcdc_jvm::JavaType::Char).unwrap_or(false)
                 || msig.as_ref().map(|g| matches!(&g.ret, jcdc_jvm::GenericType::Primitive('C'))).unwrap_or(false);
+            let ret_byte = mdesc.as_ref().map(|d| d.ret == jcdc_jvm::JavaType::Byte).unwrap_or(false);
+            let ret_short = mdesc.as_ref().map(|d| d.ret == jcdc_jvm::JavaType::Short).unwrap_or(false);
             let text = Printer::new(pc, pool, &mb.vt)
                 .with_indent(indent + 1)
                 .with_ret_bool(ret_bool)
                 .with_ret_char(ret_char)
+                .with_ret_narrow(ret_byte, ret_short)
                 .into_string(&body);
             EXTERN_DECL.with(|x| *x.borrow_mut() = extern_save);
             out.push_str(&text);

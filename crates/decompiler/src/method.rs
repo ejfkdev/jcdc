@@ -415,7 +415,7 @@ pub fn decompile_method(
             | jcdc_jvm::JavaType::Float
             | jcdc_jvm::JavaType::Double
     );
-    booleanize_deep_stmt_r(&mut body, numeric_ret);
+    booleanize_deep_stmt_r(&mut body, numeric_ret, &desc.ret);
     cleanup(&mut body);
     rotate_empty_then(&mut body);
     cleanup(&mut body);
@@ -4610,7 +4610,7 @@ fn booleanize_deep(e: &mut crate::expr::Expr) {
 }
 
 fn booleanize_deep_stmt(s: &mut Stmt) {
-    booleanize_deep_stmt_r(s, false)
+    booleanize_deep_stmt_r(s, false, &jcdc_jvm::JavaType::Int)
 }
 
 /// `numeric_ret`: the enclosing method returns a numeric (non-boolean)
@@ -4618,72 +4618,88 @@ fn booleanize_deep_stmt(s: &mut Stmt) {
 /// `e ? 1 : 0` — a poly conditional whose constant branches narrow to the
 /// target type, so `byte bool2byte(boolean b)` keeps compiling instead of
 /// emitting `return b;` (boolean -> byte error, jdk Unsafe family).
-fn booleanize_deep_stmt_r(s: &mut Stmt, numeric_ret: bool) {
+fn booleanize_deep_stmt_r(s: &mut Stmt, numeric_ret: bool, ret_ty: &jcdc_jvm::JavaType) {
     match s {
-        Stmt::Block(v) => v.iter_mut().for_each(|x| booleanize_deep_stmt_r(x, numeric_ret)),
+        Stmt::Block(v) => v.iter_mut().for_each(|x| booleanize_deep_stmt_r(x, numeric_ret, ret_ty)),
         Stmt::ExprStmt(e) => booleanize_deep(e),
         Stmt::LocalDef { init: Some(e), .. } => booleanize_deep(e),
         Stmt::Return(Some(e)) => {
             booleanize_deep(e);
             if numeric_ret && e.type_ref().erased() == jcdc_jvm::JavaType::Boolean {
                 let c = std::mem::replace(e, crate::expr::Expr::Const(crate::expr::ConstVal::Null));
+                // byte/short returns need narrowed constants: a plain
+                // `b ? 1 : 0` poly conditional does NOT narrow through
+                // the return conversion (jdk Unsafe.copyMemory family:
+                // "possible lossy conversion from int to byte").
+                let mk = |n: i32| {
+                    let k = crate::expr::Expr::Const(crate::expr::ConstVal::Int(n));
+                    match ret_ty {
+                        jcdc_jvm::JavaType::Byte | jcdc_jvm::JavaType::Short => {
+                            crate::expr::Expr::Cast {
+                                ty: crate::expr::TypeRef::J(ret_ty.clone()),
+                                e: Box::new(k),
+                            }
+                        }
+                        _ => k,
+                    }
+                };
                 *e = crate::expr::Expr::Cond {
                     c: Box::new(c),
-                    t: Box::new(crate::expr::Expr::Const(crate::expr::ConstVal::Int(1))),
-                    f: Box::new(crate::expr::Expr::Const(crate::expr::ConstVal::Int(0))),
+                    t: Box::new(mk(1)),
+                    f: Box::new(mk(0)),
                 };
             }
         }
         Stmt::Throw(e) => booleanize_deep(e),
         Stmt::If { cond, then_stmt, else_stmt } => {
             booleanize_deep(cond);
-            booleanize_deep_stmt_r(then_stmt, numeric_ret);
+            booleanize_deep_stmt_r(then_stmt, numeric_ret, ret_ty);
             if let Some(x) = else_stmt {
-                booleanize_deep_stmt_r(x, numeric_ret);
+                booleanize_deep_stmt_r(x, numeric_ret, ret_ty);
             }
         }
         Stmt::While { cond, body } | Stmt::DoWhile { cond, body } => {
             booleanize_deep(cond);
-            booleanize_deep_stmt_r(body, numeric_ret);
+            booleanize_deep_stmt_r(body, numeric_ret, ret_ty);
         }
         Stmt::For { init, cond, update, body } => {
-            init.iter_mut().for_each(|x| booleanize_deep_stmt_r(x, numeric_ret));
+            init.iter_mut().for_each(|x| booleanize_deep_stmt_r(x, numeric_ret, ret_ty));
             if let Some(c) = cond {
                 booleanize_deep(c);
             }
             update.iter_mut().for_each(booleanize_deep);
-            booleanize_deep_stmt_r(body, numeric_ret);
+            booleanize_deep_stmt_r(body, numeric_ret, ret_ty);
         }
         Stmt::ForEach { .. } => {}
         Stmt::Labeled { body, .. } | Stmt::Synchronized { body, .. } => {
-            booleanize_deep_stmt_r(body, numeric_ret)
+            booleanize_deep_stmt_r(body, numeric_ret, ret_ty)
         }
         Stmt::Try { body, catches, finally } => {
-            booleanize_deep_stmt_r(body, numeric_ret);
+            booleanize_deep_stmt_r(body, numeric_ret, ret_ty);
             for c in catches {
-                booleanize_deep_stmt_r(&mut c.body, numeric_ret);
+                booleanize_deep_stmt_r(&mut c.body, numeric_ret, ret_ty);
             }
             if let Some(f) = finally {
-                booleanize_deep_stmt_r(f, numeric_ret);
+                booleanize_deep_stmt_r(f, numeric_ret, ret_ty);
             }
         }
         Stmt::TryWithResources { resources, body, catches, finally } => {
-            for res in resources.iter_mut() { booleanize_deep_stmt_r(res, numeric_ret); }
-            booleanize_deep_stmt_r(body, numeric_ret);
+            for res in resources.iter_mut() { booleanize_deep_stmt_r(res, numeric_ret, ret_ty); }
+            booleanize_deep_stmt_r(body, numeric_ret, ret_ty);
             for c in catches {
-                booleanize_deep_stmt_r(&mut c.body, numeric_ret);
+                booleanize_deep_stmt_r(&mut c.body, numeric_ret, ret_ty);
             }
             if let Some(f) = finally {
-                booleanize_deep_stmt_r(f, numeric_ret);
+                booleanize_deep_stmt_r(f, numeric_ret, ret_ty);
             }
         }
         Stmt::Switch { selector, cases, default, .. } => {
             booleanize_deep(selector);
             for c in cases {
-                c.body.iter_mut().for_each(|x| booleanize_deep_stmt_r(x, numeric_ret));
+                c.body.iter_mut().for_each(|x| booleanize_deep_stmt_r(x, numeric_ret, ret_ty));
             }
             if let Some(d) = default {
-                booleanize_deep_stmt_r(d, numeric_ret);
+                booleanize_deep_stmt_r(d, numeric_ret, ret_ty);
             }
         }
         Stmt::Assert { cond, msg } => {
