@@ -642,6 +642,17 @@ thread_local! {
 }
 
 thread_local! {
+    /// Local-class declarations bubble up from nested blocks to the
+    /// METHOD-top block: type mentions (hoisted `List<Var>` decls) can
+    /// precede the instantiation's enclosing block, and a local class is
+    /// only visible from its declaration point — the top block is the
+    /// only position that can satisfy every reference (jdk11
+    /// ClassSpecializer$Factory$1Var).
+    static LOCAL_DECL_HOIST: std::cell::RefCell<Vec<(String, Stmt)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
     /// While an anonymous-class body is being emitted: local-class
     /// declarations that lexically belong to the OUTER method (their
     /// EnclosingMethod names the outer class, not the anon's) collect
@@ -2837,7 +2848,95 @@ pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: 
         return;
     }
     let mut pending: Vec<Stmt> = Vec::new();
-    walk_stmt_anon(body, pc, pool, fam, &mut pending, vt);
+    let mut declared: HashSet<String> = HashSet::new();
+    let hoist_mark = LOCAL_DECL_HOIST.with(|h| h.borrow().len());
+    walk_stmt_anon(body, pc, pool, fam, &mut pending, vt, &mut declared);
+    // Insert bubbled-up local-class declarations at the top-block
+    // position that satisfies both constraints: AFTER every captured
+    // outer local's definition (a local class only sees locals declared
+    // before it) and BEFORE its first mention (type references in
+    // hoisted `= null` decls included — those are themselves deferred
+    // past the decl when they appear too early).
+    {
+        let drained: Vec<(String, Stmt)> = LOCAL_DECL_HOIST.with(|h| {
+            let mut h = h.borrow_mut();
+            h.drain(hoist_mark..).collect()
+        });
+        if !drained.is_empty() && matches!(body, Stmt::Block(_)) {
+            let Stmt::Block(v) = body else { unreachable!() };
+            for (name, decl) in drained {
+                let marker = format!("\u{2}{}", name);
+                let caps = local_class_captures(&name, fam, pool);
+                let capture_end = if caps.is_empty() {
+                    0
+                } else {
+                    // The decl must sit AFTER the DEFINITION of every
+                    // captured local (a local class only sees locals
+                    // declared before it). Mentions after the definition
+                    // are fine — counting them would push the decl past
+                    // earlier type references (className is read all over
+                    // the method body).
+                    let defines = |st: &Stmt| -> bool {
+                        match st {
+                            Stmt::LocalDef { var, .. } => {
+                                caps.iter().any(|n| vt.var(*var).name == *n)
+                            }
+                            Stmt::ExprStmt(Expr::Assign { target, .. }) => {
+                                matches!(&**target, Expr::Local { var, .. }
+                                    if caps.iter().any(|n| vt.var(*var).name == *n))
+                            }
+                            _ => false,
+                        }
+                    };
+                    v.iter().rposition(defines).map(|p| p + 1).unwrap_or(0)
+                };
+                let mut first_use = (0..v.len())
+                    .filter(|&j| !matches!(&v[j], Stmt::ClassDecl { .. }))
+                    .find(|&j| stmt_mentions_local(&v[j], &marker, &name, vt, fam))
+                    .unwrap_or(v.len());
+                if first_use < capture_end {
+                    // The early mentions sit in hoisted `= null` decls:
+                    // move them past the insertion point (their runtime
+                    // uses all postdate the class decl), then insert the
+                    // decl after the LAST capture definition — a local
+                    // class only sees outer locals declared before it.
+                    let mut moved = Vec::new();
+                    let mut capture_end = capture_end;
+                    loop {
+                        let fu = (0..v.len())
+                            .filter(|&j| !matches!(&v[j], Stmt::ClassDecl { .. }))
+                            .find(|&j| stmt_mentions_local(&v[j], &marker, &name, vt, fam))
+                            .unwrap_or(v.len());
+                        if fu >= capture_end || fu >= v.len() {
+                            break;
+                        }
+                        let movable = matches!(&v[fu], Stmt::LocalDef { init: None, .. })
+                            || matches!(&v[fu], Stmt::LocalDef { init: Some(e), .. }
+                                if matches!(e, Expr::Const(crate::expr::ConstVal::Null)));
+                        if !movable {
+                            break;
+                        }
+                        moved.push(v.remove(fu));
+                        capture_end -= 1;
+                    }
+                    let fu = (0..v.len())
+                        .filter(|&j| !matches!(&v[j], Stmt::ClassDecl { .. }))
+                        .find(|&j| stmt_mentions_local(&v[j], &marker, &name, vt, fam))
+                        .unwrap_or(v.len());
+                    let pos = std::cmp::min(std::cmp::max(fu, capture_end), v.len());
+                    v.insert(pos, decl);
+                    let mut at = pos + 1;
+                    for m in moved {
+                        v.insert(at, m);
+                        at += 1;
+                    }
+                } else {
+                    let pos = std::cmp::max(first_use, capture_end);
+                    v.insert(pos, decl);
+                }
+            }
+        }
+    }
     if !pending.is_empty() {
         let old = std::mem::replace(body, Stmt::Block(vec![]));
         let mut v = pending;
@@ -2854,32 +2953,361 @@ pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: 
     }
 }
 
-fn walk_stmt_anon(s: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: &Family, pending: &mut Vec<Stmt>, vt: &VarTable) {
+/// Names of the outer locals a local class captures (its val$* fields).
+fn local_class_captures(name: &str, fam: &Family, pool: &ClassPool) -> Vec<String> {
+    for (internal, nc) in fam.nested.iter() {
+        if nc.simple == name && matches!(nc.kind, NestedKind::Local) {
+            if let Some(lpc) = pool.get(internal) {
+                return lpc
+                    .cf
+                    .fields
+                    .iter()
+                    .filter_map(|f| {
+                        lpc.utf8(f.name_index)
+                            .and_then(|n| n.strip_prefix("val$").map(|x| x.to_string()))
+                    })
+                    .collect();
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// True when the expression references a local variable by one of `names`.
+fn expr_mentions_local_names(e: &Expr, names: &[String], vt: &VarTable) -> bool {
+    let mut found = false;
+    fn w(e: &Expr, names: &[String], vt: &VarTable, found: &mut bool) {
+        if *found {
+            return;
+        }
+        match e {
+            Expr::Local { var, .. } => {
+                if names.iter().any(|n| vt.var(*var).name == *n) {
+                    *found = true;
+                }
+            }
+            Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+                args.iter().for_each(|a| w(a, names, vt, found))
+            }
+            Expr::Method { owner, args, .. } => {
+                if let Some(o) = owner {
+                    w(o, names, vt, found);
+                }
+                args.iter().for_each(|a| w(a, names, vt, found));
+            }
+            Expr::Field { owner: Some(o), .. } => w(o, names, vt, found),
+            Expr::ArrayIndex { array, index } => {
+                w(array, names, vt, found);
+                w(index, names, vt, found);
+            }
+            Expr::Cast { e: i, .. } | Expr::InstanceOf { e: i, .. } | Expr::Un { e: i, .. }
+            | Expr::PreIncDec { e: i, .. } | Expr::PostIncDec { e: i, .. } => w(i, names, vt, found),
+            Expr::Bin { l, r, .. } => {
+                w(l, names, vt, found);
+                w(r, names, vt, found);
+            }
+            Expr::Cond { c, t, f } => {
+                w(c, names, vt, found);
+                w(t, names, vt, found);
+                w(f, names, vt, found);
+            }
+            Expr::Assign { target, value, .. } => {
+                w(target, names, vt, found);
+                w(value, names, vt, found);
+            }
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter().for_each(|d| w(d, names, vt, found));
+                if let Some(vals) = init {
+                    vals.iter().for_each(|x| w(x, names, vt, found));
+                }
+            }
+            Expr::NewMultiArray { dims, .. } => dims.iter().for_each(|d| w(d, names, vt, found)),
+            Expr::StringConcat(parts) => parts.iter().for_each(|p| {
+                if let crate::expr::ConcatPart::Str(i) = p {
+                    w(i, names, vt, found);
+                }
+            }),
+            Expr::Lambda(l) => l.captures.iter().for_each(|c| w(c, names, vt, found)),
+            Expr::Invokedynamic { args, .. } => args.iter().for_each(|a| w(a, names, vt, found)),
+            _ => {}
+        }
+    }
+    w(e, names, vt, &mut found);
+    found
+}
+
+/// True when a rendered type mentions the local class simple name.
+fn ty_mentions_local(t: &TypeRef, name: &str, fam: &Family) -> bool {
+    fn j_mentions(n: &str, name: &str, fam: &Family) -> bool {
+        let tail = n.rsplit('$').next().unwrap_or(n);
+        let stripped = tail.trim_start_matches(|c: char| c.is_ascii_digit());
+        fam.nested.get(n).map(|x| x.simple.as_str()) == Some(name)
+            || (!stripped.is_empty() && stripped == name && stripped != tail)
+    }
+    match t {
+        TypeRef::J(jcdc_jvm::JavaType::Array(i)) => {
+            ty_mentions_local(&TypeRef::J((**i).clone()), name, fam)
+        }
+        TypeRef::J(jcdc_jvm::JavaType::Object(n)) => j_mentions(n, name, fam),
+        TypeRef::J(_) => false,
+        TypeRef::G(g) => g_mentions_local(g, name, fam),
+    }
+}
+
+fn g_mentions_local(g: &jcdc_jvm::GenericType, name: &str, fam: &Family) -> bool {
+    use jcdc_jvm::GenericType as G;
+    match g {
+        G::Class(cs) => cs.parts.iter().any(|p| {
+            // ClassSig parts carry the FULL internal simple chain with a
+            // separate package field (`java/lang/invoke` +
+            // `ClassSpecializer$Factory$1Var`).
+            let full = if cs.package.is_empty() {
+                p.name.clone()
+            } else {
+                format!("{}/{}", cs.package, p.name)
+            };
+            let tail = p.name.rsplit('$').next().unwrap_or("");
+            let tail_stripped = tail.trim_start_matches(|c: char| c.is_ascii_digit());
+            fam.nested.get(&full).map(|n| n.simple.as_str()) == Some(name)
+                || (!tail_stripped.is_empty() && tail_stripped == name && tail != tail_stripped)
+                || p.args.iter().any(|a| g_mentions_local(a, name, fam))
+        }),
+        G::Array(i) => g_mentions_local(i, name, fam),
+        G::Wildcard(jcdc_jvm::WildcardBound::Extends(i))
+        | G::Wildcard(jcdc_jvm::WildcardBound::Super(i)) => g_mentions_local(i, name, fam),
+        // A local class used as a TYPE ARGUMENT parses as a TypeVar
+        // (`new ReduceOp<T, U, ReducingSink>(..)`).
+        G::TypeVar(n) => n == name,
+        _ => false,
+    }
+}
+
+/// True when the statement (or any nested expression) instantiates the
+/// local class (post-walk marker `\u{2}Name`) or mentions its simple
+/// name in any rendered TYPE (hoisted LocalDef decls, casts, array
+/// creates, instanceof, method type witnesses).
+fn stmt_mentions_local(s: &Stmt, marker: &str, name: &str, vt: &VarTable, fam: &Family) -> bool {
+    let mut found = false;
+    fn ty_hit(t: &TypeRef, name: &str, fam: &Family, found: &mut bool) {
+        if !*found && ty_mentions_local(t, name, fam) {
+            *found = true;
+        }
+    }
+    fn walk_e(e: &Expr, marker: &str, name: &str, fam: &Family, found: &mut bool) {
+        if *found {
+            return;
+        }
+        match e {
+            Expr::New { cls, ty, args, .. } => {
+                if cls == marker {
+                    *found = true;
+                    return;
+                }
+                ty_hit(ty, name, fam, found);
+                args.iter().for_each(|a| walk_e(a, marker, name, fam, found));
+            }
+            Expr::AnonNew { cls, base, args, .. } => {
+                if cls == marker {
+                    *found = true;
+                    return;
+                }
+                // The anonymous base carries the type arguments
+                // (`new ReduceOp<T, U, ReducingSink>() {...}`).
+                ty_hit(base, name, fam, found);
+                args.iter().for_each(|a| walk_e(a, marker, name, fam, found));
+            }
+            Expr::Method { owner, args, type_args, .. } => {
+                if let Some(o) = owner {
+                    walk_e(o, marker, name, fam, found);
+                }
+                args.iter().for_each(|a| walk_e(a, marker, name, fam, found));
+                if type_args.iter().any(|t| t.contains(name)) {
+                    *found = true;
+                }
+            }
+            Expr::Cast { ty, e: inner, .. } | Expr::InstanceOf { e: inner, ty } => {
+                ty_hit(ty, name, fam, found);
+                walk_e(inner, marker, name, fam, found);
+            }
+            Expr::NewArray { elem, dims, init, .. } => {
+                ty_hit(elem, name, fam, found);
+                dims.iter().for_each(|d| walk_e(d, marker, name, fam, found));
+                if let Some(vals) = init {
+                    vals.iter().for_each(|v| walk_e(v, marker, name, fam, found));
+                }
+            }
+            Expr::NewMultiArray { ty, dims } => {
+                ty_hit(ty, name, fam, found);
+                dims.iter().for_each(|d| walk_e(d, marker, name, fam, found));
+            }
+            Expr::Field { owner: Some(o), .. } => walk_e(o, marker, name, fam, found),
+            Expr::ArrayIndex { array, index } => {
+                walk_e(array, marker, name, fam, found);
+                walk_e(index, marker, name, fam, found);
+            }
+            Expr::Un { e: inner, .. } | Expr::PreIncDec { e: inner, .. } | Expr::PostIncDec { e: inner, .. } => {
+                walk_e(inner, marker, name, fam, found)
+            }
+            Expr::Bin { l, r, .. } => {
+                walk_e(l, marker, name, fam, found);
+                walk_e(r, marker, name, fam, found);
+            }
+            Expr::Cond { c, t, f } => {
+                walk_e(c, marker, name, fam, found);
+                walk_e(t, marker, name, fam, found);
+                walk_e(f, marker, name, fam, found);
+            }
+            Expr::Assign { target, value, .. } => {
+                walk_e(target, marker, name, fam, found);
+                walk_e(value, marker, name, fam, found);
+            }
+            Expr::StringConcat(parts) => parts.iter().for_each(|p| {
+                if let crate::expr::ConcatPart::Str(inner) = p {
+                    walk_e(inner, marker, name, fam, found);
+                }
+            }),
+            Expr::Lambda(l) => l.captures.iter().for_each(|c| walk_e(c, marker, name, fam, found)),
+            Expr::Invokedynamic { args, .. } => {
+                args.iter().for_each(|a| walk_e(a, marker, name, fam, found))
+            }
+            _ => {}
+        }
+    }
+    fn walk_s(s: &Stmt, marker: &str, name: &str, vt: &VarTable, fam: &Family, found: &mut bool) {
+        if *found {
+            return;
+        }
+        match s {
+            Stmt::Block(v) => v.iter().for_each(|x| walk_s(x, marker, name, vt, fam, found)),
+            Stmt::ExprStmt(e) => walk_e(e, marker, name, fam, found),
+            Stmt::LocalDef { var, init, .. } => {
+                ty_hit(&vt.var(*var).ty, name, fam, found);
+                if let Some(e) = init {
+                    walk_e(e, marker, name, fam, found);
+                }
+            }
+            Stmt::Return(e) => {
+                if let Some(x) = e {
+                    walk_e(x, marker, name, fam, found);
+                }
+            }
+            Stmt::Throw(e) => walk_e(e, marker, name, fam, found),
+            Stmt::If { cond, then_stmt, else_stmt } => {
+                walk_e(cond, marker, name, fam, found);
+                walk_s(then_stmt, marker, name, vt, fam, found);
+                if let Some(x) = else_stmt {
+                    walk_s(x, marker, name, vt, fam, found);
+                }
+            }
+            Stmt::While { cond, body } => {
+                walk_e(cond, marker, name, fam, found);
+                walk_s(body, marker, name, vt, fam, found);
+            }
+            Stmt::DoWhile { body, cond } => {
+                walk_s(body, marker, name, vt, fam, found);
+                walk_e(cond, marker, name, fam, found);
+            }
+            Stmt::For { init, cond, update, body } => {
+                init.iter().for_each(|i| walk_s(i, marker, name, vt, fam, found));
+                if let Some(c) = cond {
+                    walk_e(c, marker, name, fam, found);
+                }
+                update.iter().for_each(|u| walk_e(u, marker, name, fam, found));
+                walk_s(body, marker, name, vt, fam, found);
+            }
+            Stmt::ForEach { iterable, body, .. } => {
+                walk_e(iterable, marker, name, fam, found);
+                walk_s(body, marker, name, vt, fam, found);
+            }
+            Stmt::Switch { selector, cases, default, .. } => {
+                walk_e(selector, marker, name, fam, found);
+                for c in cases {
+                    c.body.iter().for_each(|st| walk_s(st, marker, name, vt, fam, found));
+                }
+                if let Some(d) = default {
+                    walk_s(d, marker, name, vt, fam, found);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                walk_s(body, marker, name, vt, fam, found);
+                for c in catches {
+                    walk_s(&c.body, marker, name, vt, fam, found);
+                }
+                if let Some(f) = finally {
+                    walk_s(f, marker, name, vt, fam, found);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter().for_each(|r| walk_s(r, marker, name, vt, fam, found));
+                walk_s(body, marker, name, vt, fam, found);
+                for c in catches {
+                    walk_s(&c.body, marker, name, vt, fam, found);
+                }
+                if let Some(f) = finally {
+                    walk_s(f, marker, name, vt, fam, found);
+                }
+            }
+            Stmt::Synchronized { lock, body } => {
+                walk_e(lock, marker, name, fam, found);
+                walk_s(body, marker, name, vt, fam, found);
+            }
+            Stmt::Labeled { body, .. } => walk_s(body, marker, name, vt, fam, found),
+            _ => {}
+        }
+    }
+    walk_s(s, marker, name, vt, fam, &mut found);
+    found
+}
+
+fn walk_stmt_anon(
+    s: &mut Stmt,
+    pc: &PoolClass,
+    pool: &ClassPool,
+    fam: &Family,
+    pending: &mut Vec<Stmt>,
+    vt: &VarTable,
+    declared: &mut HashSet<String>,
+) {
     match s {
         Stmt::Block(v) => {
             // Insert local-class declarations right before the statement
-            // that instantiates them (captures must already be in scope).
-            let mut i = 0;
-            while i < v.len() {
-                let before = pending.len();
-                walk_stmt_anon(&mut v[i], pc, pool, fam, pending, vt);
-                if pending.len() > before {
-                    let new: Vec<Stmt> = pending
-                        .drain(before..)
-                        .filter(|d| match d {
-                            Stmt::ClassDecl { name, .. } => !v.iter().take(i).any(|x| {
-                                matches!(x, Stmt::ClassDecl { name: n2, .. } if n2 == name)
-                            }),
-                            _ => true,
-                        })
-                        .collect();
-                    let n = new.len();
-                    for (j, d) in new.into_iter().enumerate() {
-                        v.insert(i + j, d);
+            // that first NAMES them — a type mention (`List<Var> targs`
+            // hoisted to the method head) can precede the instantiation
+            // (`new Var(..)` deep below), and javac requires the decl
+            // before every reference (jdk11 ClassSpecializer$Factory$1Var:
+            // "cannot find symbol Var" x11). Captures stay lexically valid:
+            // jcdc hoists ALL local declarations to the block head, so any
+            // captured local is in scope from position 0.
+            let n_orig = v.len();
+            for i in 0..n_orig {
+                walk_stmt_anon(&mut v[i], pc, pool, fam, pending, vt, declared);
+            }
+            // Local-class declarations are not spliced locally: they
+            // bubble to the method-top block (LOCAL_DECL_HOIST), which
+            // sees every mention (type refs in hoisted decls of OUTER
+            // blocks included) and the capture definitions.
+            if !pending.is_empty() {
+                let mut k = 0;
+                while k < pending.len() {
+                    let decl_name = match &pending[k] {
+                        Stmt::ClassDecl { name, .. } => Some(name.clone()),
+                        _ => None,
+                    };
+                    if let Some(name) = decl_name {
+                        if declared.contains(&name) {
+                            pending.remove(k);
+                            continue;
+                        }
+                        declared.insert(name.clone());
+                        let d = pending.remove(k);
+                        LOCAL_DECL_HOIST.with(|h| h.borrow_mut().push((name, d)));
+                        continue;
                     }
-                    i += n;
+                    k += 1;
                 }
-                i += 1;
+                if !pending.is_empty() {
+                    v.append(pending);
+                }
             }
         }
         Stmt::ExprStmt(e) => walk_expr_anon(e, pc, pool, fam, pending, vt),
@@ -2887,62 +3315,62 @@ fn walk_stmt_anon(s: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: &Family, 
         Stmt::Return(Some(e)) | Stmt::Throw(e) => walk_expr_anon(e, pc, pool, fam, pending, vt),
         Stmt::If { cond, then_stmt, else_stmt } => {
             walk_expr_anon(cond, pc, pool, fam, pending, vt);
-            walk_stmt_anon(then_stmt, pc, pool, fam, pending, vt);
+            walk_stmt_anon(then_stmt, pc, pool, fam, pending, vt, declared);
             if let Some(e) = else_stmt {
-                walk_stmt_anon(e, pc, pool, fam, pending, vt);
+                walk_stmt_anon(e, pc, pool, fam, pending, vt, declared);
             }
         }
         Stmt::While { cond, body } => {
             walk_expr_anon(cond, pc, pool, fam, pending, vt);
-            walk_stmt_anon(body, pc, pool, fam, pending, vt);
+            walk_stmt_anon(body, pc, pool, fam, pending, vt, declared);
         }
         Stmt::DoWhile { body, cond } => {
-            walk_stmt_anon(body, pc, pool, fam, pending, vt);
+            walk_stmt_anon(body, pc, pool, fam, pending, vt, declared);
             walk_expr_anon(cond, pc, pool, fam, pending, vt);
         }
         Stmt::For { init, cond, update, body } => {
-            init.iter_mut().for_each(|i| walk_stmt_anon(i, pc, pool, fam, pending, vt));
+            init.iter_mut().for_each(|i| walk_stmt_anon(i, pc, pool, fam, pending, vt, declared));
             if let Some(c) = cond {
                 walk_expr_anon(c, pc, pool, fam, pending, vt);
             }
             update.iter_mut().for_each(|u| walk_expr_anon(u, pc, pool, fam, pending, vt));
-            walk_stmt_anon(body, pc, pool, fam, pending, vt);
+            walk_stmt_anon(body, pc, pool, fam, pending, vt, declared);
         }
         Stmt::ForEach { iterable, body, .. } => {
             walk_expr_anon(iterable, pc, pool, fam, pending, vt);
-            walk_stmt_anon(body, pc, pool, fam, pending, vt);
+            walk_stmt_anon(body, pc, pool, fam, pending, vt, declared);
         }
         Stmt::Switch { selector, cases, default, .. } => {
             walk_expr_anon(selector, pc, pool, fam, pending, vt);
             for c in cases {
-                c.body.iter_mut().for_each(|st| walk_stmt_anon(st, pc, pool, fam, pending, vt));
+                c.body.iter_mut().for_each(|st| walk_stmt_anon(st, pc, pool, fam, pending, vt, declared));
             }
             if let Some(d) = default {
-                walk_stmt_anon(d, pc, pool, fam, pending, vt);
+                walk_stmt_anon(d, pc, pool, fam, pending, vt, declared);
             }
         }
         Stmt::Try { body, catches, finally } => {
-            walk_stmt_anon(body, pc, pool, fam, pending, vt);
+            walk_stmt_anon(body, pc, pool, fam, pending, vt, declared);
             for c in catches {
-                walk_stmt_anon(&mut c.body, pc, pool, fam, pending, vt);
+                walk_stmt_anon(&mut c.body, pc, pool, fam, pending, vt, declared);
             }
             if let Some(f) = finally {
-                walk_stmt_anon(f, pc, pool, fam, pending, vt);
+                walk_stmt_anon(f, pc, pool, fam, pending, vt, declared);
             }
         }
         Stmt::TryWithResources { resources, body, catches, finally } => {
-            for res in resources.iter_mut() { walk_stmt_anon(res, pc, pool, fam, pending, vt); }
-            walk_stmt_anon(body, pc, pool, fam, pending, vt);
+            for res in resources.iter_mut() { walk_stmt_anon(res, pc, pool, fam, pending, vt, declared); }
+            walk_stmt_anon(body, pc, pool, fam, pending, vt, declared);
             for c in catches {
-                walk_stmt_anon(&mut c.body, pc, pool, fam, pending, vt);
+                walk_stmt_anon(&mut c.body, pc, pool, fam, pending, vt, declared);
             }
             if let Some(f) = finally {
-                walk_stmt_anon(f, pc, pool, fam, pending, vt);
+                walk_stmt_anon(f, pc, pool, fam, pending, vt, declared);
             }
         }
         Stmt::Synchronized { lock, body } => {
             walk_expr_anon(lock, pc, pool, fam, pending, vt);
-            walk_stmt_anon(body, pc, pool, fam, pending, vt);
+            walk_stmt_anon(body, pc, pool, fam, pending, vt, declared);
         }
         // Coverage gaps that silently skipped anonymous `new` sites:
         // a Labeled body (SESE/walk label emission wraps loops and blocks),
@@ -2951,7 +3379,7 @@ fn walk_stmt_anon(s: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: &Family, 
         // `new Outer.1(args)` / `new 1(args)` (jdk URLClassPath, a corpus
         // batch blocker on BOTH structurizers).
         Stmt::Labeled { body, .. } => {
-            walk_stmt_anon(body, pc, pool, fam, pending, vt);
+            walk_stmt_anon(body, pc, pool, fam, pending, vt, declared);
         }
         Stmt::Assert { cond, msg } => {
             walk_expr_anon(cond, pc, pool, fam, pending, vt);
