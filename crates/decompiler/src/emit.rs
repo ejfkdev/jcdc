@@ -593,12 +593,12 @@ impl<'a> Printer<'a> {
                     out.push_str(diamond);
                     out.push('(');
                     if has_this0 {
-                        match self.ctor_param_types(cls, 1, args.len() - 1) {
+                        match self.ctor_param_types(cls, 1, args.len() - 1, &args[1..]) {
                             Some(pt) => self.args_typed(&args[1..], &pt, out),
                             None => self.args(&args[1..], out),
                         }
                     } else {
-                        match self.ctor_param_types(cls, 0, args.len()) {
+                        match self.ctor_param_types(cls, 0, args.len(), args) {
                             Some(pt) => self.args_typed(args, &pt, out),
                             None => self.args(args, out),
                         }
@@ -619,12 +619,12 @@ impl<'a> Printer<'a> {
                     out.push_str(diamond);
                     out.push('(');
                     if member_this {
-                        match self.ctor_param_types(cls, 1, args.len() - 1) {
+                        match self.ctor_param_types(cls, 1, args.len() - 1, &args[1..]) {
                             Some(pt) => self.args_typed(&args[1..], &pt, out),
                             None => self.args(&args[1..], out),
                         }
                     } else {
-                        match self.ctor_param_types(cls, 0, args.len()) {
+                        match self.ctor_param_types(cls, 0, args.len(), args) {
                             Some(pt) => self.args_typed(args, &pt, out),
                             None => self.args(args, out),
                         }
@@ -753,7 +753,7 @@ impl<'a> Printer<'a> {
                     if desc.args.len() == args.len() {
                         self.args_typed(args, &desc.args, out);
                     } else {
-                        match self.ctor_param_types(cls, 0, args.len()) {
+                        match self.ctor_param_types(cls, 0, args.len(), args) {
                             Some(pt) => self.args_typed(args, &pt, out),
                             None => self.args(args, out),
                         }
@@ -1168,6 +1168,7 @@ impl<'a> Printer<'a> {
                         }
                         {
                             let fam = crate::classdec::Family::collect(self.pc, self.pool);
+                            let _depth = crate::classdec::lambda_body_depth_enter();
                             crate::classdec::inline_anonymous(
                                 &mut body,
                                 self.pc,
@@ -1299,10 +1300,17 @@ impl<'a> Printer<'a> {
     /// Parameter types of the `<init>` matching `skip + n` descriptor args,
     /// returning the tail after `skip` leading synthetic params. Used to
     /// print `new` arguments with boolean/char constant adjustment.
-    fn ctor_param_types(&self, cls: &str, skip: usize, n: usize) -> Option<Vec<jcdc_jvm::JavaType>> {
+    fn ctor_param_types(
+        &self,
+        cls: &str,
+        skip: usize,
+        n: usize,
+        args: &[Expr],
+    ) -> Option<Vec<jcdc_jvm::JavaType>> {
         let pcx = self.pool.get(cls)?;
         // Enum ctors carry the implicit (String name, int ordinal) prefix.
         let extra: usize = if pcx.is_enum() { 2 } else { 0 };
+        let mut cands: Vec<Vec<jcdc_jvm::JavaType>> = Vec::new();
         for mi in 0..pcx.cf.methods.len() {
             if pcx.method_name(mi) != Some("<init>") {
                 continue;
@@ -1310,11 +1318,61 @@ impl<'a> Printer<'a> {
             let d = pcx.method_desc(mi)?;
             if let Some(md) = jcdc_jvm::parse_method_descriptor(d) {
                 if md.args.len() == skip + extra + n {
-                    return Some(md.args[skip + extra..].to_vec());
+                    cands.push(md.args[skip + extra..].to_vec());
                 }
             }
         }
-        None
+        match cands.len() {
+            0 => None,
+            1 => Some(cands.pop().unwrap()),
+            _ => {
+                // Same-arity overloads (jdk11 System: PrintStream(OS,Z) vs
+                // PrintStream(OS,String) — picking the first rendered the
+                // boolean `true` as `1`: "no suitable constructor
+                // PrintStream(BufferedOutputStream,int)"). Score by
+                // argument compatibility; fall back to the first.
+                fn arg_fits(a: &Expr, p: &jcdc_jvm::JavaType) -> bool {
+                    use jcdc_jvm::JavaType as J;
+                    match (a, p) {
+                        (Expr::Const(ConstVal::Int(_)), J::Boolean | J::Byte | J::Short | J::Char | J::Int | J::Long | J::Float | J::Double) => true,
+                        (Expr::Const(ConstVal::Long(_)), J::Long | J::Float | J::Double) => true,
+                        (Expr::Const(ConstVal::Float(_)), J::Float | J::Double) => true,
+                        (Expr::Const(ConstVal::Double(_)), J::Double) => true,
+                        (Expr::Const(ConstVal::Str(_)), J::Object(nm)) => nm == "java/lang/String",
+                        (Expr::Const(ConstVal::Null), J::Object(_) | J::Array(_)) => true,
+                        (Expr::Const(_), _) => false,
+                        (other, p) => {
+                            let have = other.type_ref().erased();
+                            match (&have, p) {
+                                (J::Object(x), J::Object(y)) => x == y,
+                                (J::Array(_), J::Array(_)) => true,
+                                (J::Boolean, J::Boolean) | (J::Int, J::Int) | (J::Long, J::Long)
+                                | (J::Float, J::Float) | (J::Double, J::Double)
+                                | (J::Char, J::Char) | (J::Byte, J::Byte) | (J::Short, J::Short) => true,
+                                (J::Int, J::Long | J::Float | J::Double) => true,
+                                (J::Long, J::Float | J::Double) => true,
+                                (J::Float, J::Double) => true,
+                                (J::Byte | J::Short | J::Char, J::Int | J::Long | J::Float | J::Double) => true,
+                                (J::Boolean, J::Int) | (J::Int, J::Boolean) => true,
+                                _ => false,
+                            }
+                        }
+                    }
+                }
+                let mut best: Option<(usize, Vec<jcdc_jvm::JavaType>)> = None;
+                for c in cands {
+                    let bad = c
+                        .iter()
+                        .zip(args.iter())
+                        .filter(|(p, a)| !arg_fits(a, p))
+                        .count();
+                    if best.as_ref().map(|(b, _)| bad < *b).unwrap_or(true) {
+                        best = Some((bad, c));
+                    }
+                }
+                best.map(|(_, c)| c)
+            }
+        }
     }
 
     fn is_member_inner(&self, cls: &str) -> bool {

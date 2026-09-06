@@ -642,6 +642,69 @@ thread_local! {
 }
 
 thread_local! {
+    /// During the fix_lambda_captures extraction walk: the simple names
+    /// whose ClassDecls were spliced into the cloned lambda body (their
+    /// captures may be lambda params — must NOT be hoisted out).
+    static LOCAL_DECL_SITES: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+thread_local! {
+    /// Local-class names already declared in the outer method scope by
+    /// fix_lambda_captures (extracted from lambda impl bodies at pass
+    /// time): walk_stmt_anon must NOT re-declare them inside the lambda
+    /// body at print time (shadowing would split the class identity —
+    /// `FixedWindow::new` inside vs `FixedWindow::finish` outside).
+    static EXTERN_DECL: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+}
+
+thread_local! {
+    /// Depth of emit_anon_body emission: while > 0, LOCAL_DECL_HOIST
+    /// entries are NOT drained by inline_anonymous — a local class
+    /// declared inside an inlined anonymous/local body must land in the
+    /// REAL method (jdk26 Gatherers: FixedWindow declared inside the
+    /// supplier lambda was invisible to the sibling `FixedWindow::finish`
+    /// method refs — 80 symbol errors).
+    static ANON_BODY_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct AnonBodyDepthGuard;
+impl Drop for AnonBodyDepthGuard {
+    fn drop(&mut self) {
+        ANON_BODY_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
+thread_local! {
+    /// LAMBDA-body emission depth (printer): local-class decls found here
+    /// must bubble to the outer method (sibling method refs cannot see
+    /// into the lambda scope). Anonymous-CLASS bodies (ANON_BODY_DEPTH
+    /// only) keep the old inline behavior: their methods' decls resolve
+    /// locally (jdk26 ReferencePipeline.flatMap's FlatMap is used only
+    /// inside the anon's opWrapSink).
+    static LAMBDA_BODY_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Mark the scope of an inlined anonymous/local/lambda body so
+/// inline_anonymous leaves bubbled local-class decls on the stack for the
+/// REAL method's drain (lambda bodies are decompiled at PRINT time —
+/// their decls must still land in the outer method scope).
+pub(crate) fn lambda_body_depth_enter() -> LambdaBodyDepthGuardEntry {
+    ANON_BODY_DEPTH.with(|d| d.set(d.get() + 1));
+    LAMBDA_BODY_DEPTH.with(|d| d.set(d.get() + 1));
+    LambdaBodyDepthGuardEntry
+}
+
+pub struct LambdaBodyDepthGuardEntry;
+impl Drop for LambdaBodyDepthGuardEntry {
+    fn drop(&mut self) {
+        ANON_BODY_DEPTH.with(|d| d.set(d.get() - 1));
+        LAMBDA_BODY_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
+thread_local! {
     /// Local-class declarations bubble up from nested blocks to the
     /// METHOD-top block: type mentions (hoisted `List<Var>` decls) can
     /// precede the instantiation's enclosing block, and a local class is
@@ -2051,8 +2114,7 @@ fn emit_method_with(
         fam.nested.get(&pc.internal_name).map(|n| n.kind),
         Some(NestedKind::Local)
     );
-    let is_anon_class = self_simple_all_digits(pc);
-    if is_ctor && (is_local_class || is_anon_class) {
+    if is_ctor && is_local_class {
         for i in ctor_capture_params(pc) {
             skip_params.insert(i);
         }
@@ -2349,6 +2411,48 @@ fn emit_method_with(
             // this$0, but its capture stores (val$ puts / substituted Raw
             // assigns) are junk all the same.
             if is_ctor && (class_has_this0(pc) || outer_super_param || is_local_class) {
+                if is_local_class && std::env::var("JCDC_DBG_CTOR").is_ok() {
+                    eprintln!("CTORCAP pc={} captures={:?}", pc.internal_name, captures.keys().collect::<Vec<_>>());
+                }
+                if is_local_class {
+                    // Direct reads of capture PARAMS (before the putfield
+                    // mirror) would print as `arg0` when the LVT lacks the
+                    // synthetic name (jdk26 Gatherers FixedWindow:
+                    // `window = new Object[arg0]`): map them through the
+                    // ctor's putfield statements to the pre-rendered
+                    // capture expressions, like anon_field_inits does.
+                    let mut rep: HashMap<u32, Expr> = HashMap::new();
+                    for st in stmt_vec(&body) {
+                        if let Stmt::ExprStmt(Expr::Assign { target, value, .. }) = st {
+                            match target.as_ref() {
+                                Expr::Field { name, is_static: false, .. }
+                                    if name.starts_with("val$") || name.starts_with("this$") =>
+                                {
+                                    if let (Some(e), Expr::Local { var, .. }) =
+                                        (captures.get(name.as_str()), value.as_ref())
+                                    {
+                                        rep.insert(*var, e.clone());
+                                    }
+                                }
+                                // substitute_captures already ran: the
+                                // store target is the pre-rendered capture
+                                // expression (`windowSize = arg0`).
+                                Expr::Raw(t) => {
+                                    if let Expr::Local { var, .. } = value.as_ref() {
+                                        rep.insert(*var, Expr::Raw(t.clone()));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    if is_local_class && std::env::var("JCDC_DBG_CTOR").is_ok() {
+                        eprintln!("CTORCAP pc={} rep={:?}", pc.internal_name, rep.len());
+                    }
+                    if !rep.is_empty() {
+                        rewrite_param_locals(&mut body, &rep);
+                    }
+                }
                 strip_inner_ctor_artifacts(&mut body, &mb.vt);
             }
             // Member inner classes: this$N field reads become Outer.this.
@@ -2371,7 +2475,15 @@ fn emit_method_with(
             add_throw_witnesses(&mut body, msig.as_ref(), pool);
             strip_erasure_casts_generic_ret(&mut body, msig.as_ref(), pool);
             witness_generic_returns(&mut body, msig.as_ref());
-            fix_lambda_captures(&mut body, &mut mb.vt, pc, pool);
+            // Scope the extern-decl registry to THIS method's emission:
+            // names extracted here must suppress re-declaration inside
+            // lambda bodies printed below, but must not leak into other
+            // methods (common local-class names like State/Spliterator
+            // would suppress their legitimate decls — ReferencePipeline
+            // +32 errors). Nested emissions (anon bodies) snapshot/restore
+            // around themselves, preserving this frame.
+            let extern_save = EXTERN_DECL.with(|x| x.borrow().clone());
+            fix_lambda_captures(&mut body, &mut mb.vt, pc, pool, fam);
             line.push_str(" {\n");
             out.push_str(&line);
             let ret_bool = mdesc.as_ref().map(|d| d.ret == jcdc_jvm::JavaType::Boolean).unwrap_or(false)
@@ -2383,6 +2495,7 @@ fn emit_method_with(
                 .with_ret_bool(ret_bool)
                 .with_ret_char(ret_char)
                 .into_string(&body);
+            EXTERN_DECL.with(|x| *x.borrow_mut() = extern_save);
             out.push_str(&text);
             out.push_str(&pad);
             out.push_str("}\n");
@@ -3041,6 +3154,10 @@ pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: 
     let mut declared: HashSet<String> = HashSet::new();
     let hoist_mark = LOCAL_DECL_HOIST.with(|h| h.borrow().len());
     walk_stmt_anon(body, pc, pool, fam, &mut pending, vt, &mut declared);
+    // Inside an inlined anon/local body: leave bubbled decls on the stack
+    // for the REAL method's drain (their references — method refs, hoisted
+    // type decls — live out there).
+    let in_anon_body = ANON_BODY_DEPTH.with(|d| d.get()) > 0;
     // Insert bubbled-up local-class declarations at the top-block
     // position that satisfies both constraints: AFTER every captured
     // outer local's definition (a local class only sees locals declared
@@ -3048,13 +3165,21 @@ pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: 
     // hoisted `= null` decls included — those are themselves deferred
     // past the decl when they appear too early).
     {
-        let drained: Vec<(String, Stmt)> = LOCAL_DECL_HOIST.with(|h| {
-            let mut h = h.borrow_mut();
-            h.drain(hoist_mark..).collect()
-        });
-        if !drained.is_empty() && matches!(body, Stmt::Block(_)) {
+        let drained: Vec<(String, Stmt)> = if in_anon_body {
+            Vec::new()
+        } else {
+            LOCAL_DECL_HOIST.with(|h| {
+                let mut h = h.borrow_mut();
+                h.drain(hoist_mark..).collect()
+            })
+        };
+        if !drained.is_empty() && matches!(body, Stmt::Block(_)) && !in_anon_body {
             let Stmt::Block(v) = body else { unreachable!() };
             for (name, decl) in drained {
+                if v.iter().any(|x| matches!(x, Stmt::ClassDecl { name: n2, .. } if *n2 == name))
+                {
+                    continue;
+                }
                 let marker = format!("\u{2}{}", name);
                 let caps = local_class_captures(&name, fam, pool);
                 let capture_end = if caps.is_empty() {
@@ -3128,8 +3253,31 @@ pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: 
         }
     }
     if !pending.is_empty() {
+        let in_anon = LAMBDA_BODY_DEPTH.with(|d| d.get()) > 0;
+        let mut v: Vec<Stmt> = Vec::new();
+        for d in pending.drain(..) {
+            let decl_name = match &d {
+                Stmt::ClassDecl { name, .. } => Some(name.clone()),
+                _ => None,
+            };
+            if let Some(name) = decl_name {
+                let extern_done = EXTERN_DECL.with(|x| x.borrow().contains(&name));
+                if extern_done {
+                    continue;
+                }
+                if in_anon {
+                    // Bubble to the outer method's pass-time extraction
+                    // (fix_lambda_captures declares it out there).
+                    LOCAL_DECL_HOIST.with(|h| h.borrow_mut().push((name, d)));
+                    continue;
+                }
+            }
+            v.push(d);
+        }
+        if v.is_empty() {
+            return;
+        }
         let old = std::mem::replace(body, Stmt::Block(vec![]));
-        let mut v = pending;
         match old {
             Stmt::Block(mut inner) => {
                 v.append(&mut inner);
@@ -3356,7 +3504,28 @@ fn stmt_mentions_local(s: &Stmt, marker: &str, name: &str, vt: &VarTable, fam: &
                     walk_e(inner, marker, name, fam, found);
                 }
             }),
-            Expr::Lambda(l) => l.captures.iter().for_each(|c| walk_e(c, marker, name, fam, found)),
+            Expr::Lambda(l) => {
+                // Method refs print as `Name::m` from ref_receiver/
+                // impl_owner — a mention of the local class.
+                let mref = l
+                    .ref_receiver
+                    .as_deref()
+                    .unwrap_or(l.impl_owner.as_str());
+                let tail = mref.rsplit('$').next().unwrap_or(mref);
+                let stripped = tail.trim_start_matches(|c: char| c.is_ascii_digit());
+                let full_matches = fam
+                    .nested
+                    .get(mref)
+                    .map(|n| n.simple.as_str())
+                    == Some(name);
+                if full_matches
+                    || (!stripped.is_empty() && stripped == name && stripped != tail)
+                    || mref == marker
+                {
+                    *found = true;
+                }
+                l.captures.iter().for_each(|c| walk_e(c, marker, name, fam, found))
+            }
             Expr::Invokedynamic { args, .. } => {
                 args.iter().for_each(|a| walk_e(a, marker, name, fam, found))
             }
@@ -3472,31 +3641,89 @@ fn walk_stmt_anon(
             for i in 0..n_orig {
                 walk_stmt_anon(&mut v[i], pc, pool, fam, pending, vt, declared);
             }
-            // Local-class declarations are not spliced locally: they
-            // bubble to the method-top block (LOCAL_DECL_HOIST), which
-            // sees every mention (type refs in hoisted decls of OUTER
-            // blocks included) and the capture definitions.
+            // Local-class declarations bubble to the method-top block
+            // (LOCAL_DECL_HOIST) at top level and inside LAMBDA bodies;
+            // inside anonymous-CLASS bodies they splice inline (their
+            // methods' uses are local — ReferencePipeline.flatMap's
+            // FlatMap lives and dies inside the anon's opWrapSink, and
+            // the anon body is a print-time string the outer mention
+            // scan cannot see).
             if !pending.is_empty() {
-                let mut k = 0;
-                while k < pending.len() {
-                    let decl_name = match &pending[k] {
-                        Stmt::ClassDecl { name, .. } => Some(name.clone()),
-                        _ => None,
-                    };
-                    if let Some(name) = decl_name {
-                        if declared.contains(&name) {
-                            pending.remove(k);
+                let in_anon_only = ANON_BODY_DEPTH.with(|d| d.get()) > 0
+                    && LAMBDA_BODY_DEPTH.with(|d| d.get()) == 0;
+                if in_anon_only {
+                    let mut k = 0;
+                    while k < pending.len() {
+                        let decl_name = match &pending[k] {
+                            Stmt::ClassDecl { name, .. } => Some(name.clone()),
+                            _ => None,
+                        };
+                        if let Some(name) = decl_name {
+                            if declared.contains(&name)
+                                || EXTERN_DECL.with(|x| x.borrow().contains(&name))
+                            {
+                                pending.remove(k);
+                                continue;
+                            }
+                            declared.insert(name.clone());
+                        }
+                        k += 1;
+                    }
+                    let n0 = v.len();
+                    v.append(pending);
+                    // Relocate each decl before its first mention in this
+                    // block (uses inside the anon method itself).
+                    let mut j = n0;
+                    while j < v.len() {
+                        let name = match &v[j] {
+                            Stmt::ClassDecl { name, .. } => name.clone(),
+                            _ => {
+                                j += 1;
+                                continue;
+                            }
+                        };
+                        let marker = format!("\u{2}{}", name);
+                        let first_use = (0..v.len())
+                            .filter(|&x| !matches!(&v[x], Stmt::ClassDecl { .. }))
+                            .find(|&x| stmt_mentions_local(&v[x], &marker, &name, vt, fam))
+                            .unwrap_or(j);
+                        if first_use != j {
+                            let d = v[j].clone();
+                            v.insert(first_use, d);
+                            let removed = if first_use < j { j + 1 } else { j };
+                            v.remove(removed);
+                        }
+                        j += 1;
+                    }
+                } else {
+                    let mut k = 0;
+                    while k < pending.len() {
+                        let decl_name = match &pending[k] {
+                            Stmt::ClassDecl { name, .. } => Some(name.clone()),
+                            _ => None,
+                        };
+                        if let Some(name) = decl_name {
+                            let extern_done =
+                                EXTERN_DECL.with(|x| x.borrow().contains(&name));
+                            if declared.contains(&name) || extern_done {
+                                pending.remove(k);
+                                continue;
+                            }
+                            declared.insert(name.clone());
+                            let d = pending.remove(k);
+                            LOCAL_DECL_SITES.with(|c| {
+                                if let Some(v) = c.borrow_mut().as_mut() {
+                                    v.push(name.clone());
+                                }
+                            });
+                            LOCAL_DECL_HOIST.with(|h| h.borrow_mut().push((name, d)));
                             continue;
                         }
-                        declared.insert(name.clone());
-                        let d = pending.remove(k);
-                        LOCAL_DECL_HOIST.with(|h| h.borrow_mut().push((name, d)));
-                        continue;
+                        k += 1;
                     }
-                    k += 1;
-                }
-                if !pending.is_empty() {
-                    v.append(pending);
+                    if !pending.is_empty() {
+                        v.append(pending);
+                    }
                 }
             }
         }
@@ -4332,6 +4559,8 @@ fn emit_anon_body(
         anyhow::bail!("cyclic anonymous instantiation of {}", apc.internal_name);
     }
     let _anon_guard = EmitGuard(apc.internal_name.clone());
+    ANON_BODY_DEPTH.with(|d| d.set(d.get() + 1));
+    let _anon_depth_guard = AnonBodyDepthGuard;
     // Anonymous/local classes have no source constructor: recover field
     // initializers from the generated <init>.
     let is_rec = apc.class_attr("Record").is_some();
@@ -4402,6 +4631,7 @@ pub(crate) fn fix_lambda_captures(
     vt: &mut crate::varalloc::VarTable,
     pc: &PoolClass,
     pool: &ClassPool,
+    fam: &Family,
 ) {
     let mut assigns: HashMap<u32, usize> = HashMap::new();
     fn count_e(e: &Expr, assigns: &mut HashMap<u32, usize>) {
@@ -4545,7 +4775,7 @@ pub(crate) fn fix_lambda_captures(
         .filter(|(_, &n)| n >= 2)
         .map(|(&v, _)| v)
         .collect();
-    if multi.is_empty() {
+    if multi.is_empty() && fam.locals.is_empty() {
         return;
     }
     let mut counter = 0usize;
@@ -4554,6 +4784,7 @@ pub(crate) fn fix_lambda_captures(
         vt: &mut crate::varalloc::VarTable,
         pc: &PoolClass,
         pool: &ClassPool,
+        fam: &Family,
         multi: &HashSet<u32>,
         counter: &mut usize,
         defs: &mut Vec<Stmt>,
@@ -4561,6 +4792,113 @@ pub(crate) fn fix_lambda_captures(
         if let Expr::Lambda(l) = e {
             if let Some(mi) = pc.find_own_method(&l.impl_name, &l.impl_desc.to_string()) {
                 if let Ok(Some(mb)) = decompile_method(pc, pool, mi) {
+                    // Local classes instantiated INSIDE the lambda body
+                    // must be declared in the OUTER method (sibling
+                    // method refs like `FixedWindow::finish` cannot see
+                    // into the lambda scope; jdk26 Gatherers). Extract
+                    // their decls from a throwaway walk of the impl body
+                    // and register the names so the print-time walk
+                    // inside the lambda body skips re-declaring.
+                    if !fam.locals.is_empty() && ANON_BODY_DEPTH.with(|d| d.get()) == 0 {
+                        let mut retained: HashSet<String> = HashSet::new();
+                        let mark = LOCAL_DECL_HOIST.with(|h| h.borrow().len());
+                        let mut cb = mb.body.clone();
+                        let mut p2: Vec<Stmt> = Vec::new();
+                        let mut d2: HashSet<String> = HashSet::new();
+                        {
+                            ANON_BODY_DEPTH.with(|d| d.set(d.get() + 1));
+                            let _depth = AnonBodyDepthGuard;
+                            let _capture = LOCAL_DECL_SITES.with(|c| c.borrow_mut().take());
+                            LOCAL_DECL_SITES.with(|c| *c.borrow_mut() = Some(Vec::new()));
+                            walk_stmt_anon(&mut cb, pc, pool, fam, &mut p2, &mb.vt, &mut d2);
+                            // Capture local names whose decls live inside
+                            // the lambda body and whose captures are lambda
+                            // params (jdk26 Gatherers.map's `class Box`
+                            // captures the lambda param b — hoisting it to
+                            // the method top puts it out of scope).
+                            let sites: Vec<String> = LOCAL_DECL_SITES
+                                .with(|c| c.borrow_mut().take().unwrap_or_default());
+                            let captured_params: HashSet<String> = mb
+                                .vt
+                                .vars
+                                .iter()
+                                .filter(|v| v.is_param && v.name != "this")
+                                .map(|v| v.name.clone())
+                                .collect();
+                            for name in sites {
+                                if let Some((_, nc)) = fam
+                                    .nested
+                                    .iter()
+                                    .find(|(_, nc)| nc.simple == name)
+                                {
+                                    if let Some(lpc) = pool.get(&nc.name) {
+                                        if lpc
+                                            .cf
+                                            .fields
+                                            .iter()
+                                            .filter_map(|f| {
+                                                lpc.utf8(f.name_index)
+                                                    .and_then(|n| n.strip_prefix("val$"))
+                                                    .map(|x| x.to_string())
+                                            })
+                                            .any(|cn| captured_params.contains(&cn))
+                                        {
+                                            // Keep the decl INSIDE the lambda
+                                            // body (print-time walk redeclares
+                                            // it); do NOT register in
+                                            // EXTERN_DECL and drop it from the
+                                            // extraction below.
+                                            retained.insert(name);
+                                        }
+                                    }
+                                }
+                            }
+                            LOCAL_DECL_SITES.with(|c| *c.borrow_mut() = None);
+                        }
+                        let mut extracted: Vec<(String, Stmt)> = Vec::new();
+                        fn pull(v: &mut Vec<Stmt>, out: &mut Vec<(String, Stmt)>) {
+                            let mut i = 0;
+                            while i < v.len() {
+                                if let Stmt::ClassDecl { name, .. } = &v[i] {
+                                    out.push((name.clone(), v.remove(i)));
+                                    continue;
+                                }
+                                if let Stmt::Block(inner) = &mut v[i] {
+                                    pull(inner, out);
+                                }
+                                i += 1;
+                            }
+                        }
+                        pull(&mut p2, &mut extracted);
+                        if let Stmt::Block(bv) = &mut cb {
+                            pull(bv, &mut extracted);
+                        }
+                        let stacked: Vec<(String, Stmt)> = LOCAL_DECL_HOIST.with(|h| {
+                            let mut h = h.borrow_mut();
+                            if h.len() > mark {
+                                h.drain(mark..).collect()
+                            } else {
+                                Vec::new()
+                            }
+                        });
+                        extracted.extend(stacked);
+                        if !extracted.is_empty() {
+                            let already: HashSet<String> = EXTERN_DECL.with(|x| x.borrow().clone());
+                            let fresh: Vec<(String, Stmt)> = extracted
+                                .into_iter()
+                                .filter(|(n, _)| !already.contains(n) && !retained.contains(n))
+                                .collect();
+                            if !fresh.is_empty() {
+                                EXTERN_DECL.with(|x| {
+                                    let mut x = x.borrow_mut();
+                                    for (n, _) in &fresh {
+                                        x.insert(n.clone());
+                                    }
+                                });
+                                defs.extend(fresh.into_iter().map(|(_, d)| d));
+                            }
+                        }
+                    }
                     let sam_n = l.param_names.len();
                     let impl_params: Vec<(u32, String)> = mb
                         .vt
@@ -4614,52 +4952,52 @@ pub(crate) fn fix_lambda_captures(
         // recurse (captures of nested lambdas too)
         match e {
             Expr::Lambda(l) => l.captures.iter_mut().for_each(|c| {
-                lambda_snaps(c, vt, pc, pool, multi, counter, defs)
+                lambda_snaps(c, vt, pc, pool, fam, multi, counter, defs)
             }),
             Expr::Method { owner, args, .. } => {
                 if let Some(o) = owner {
-                    lambda_snaps(o, vt, pc, pool, multi, counter, defs);
+                    lambda_snaps(o, vt, pc, pool, fam, multi, counter, defs);
                 }
-                args.iter_mut().for_each(|a| lambda_snaps(a, vt, pc, pool, multi, counter, defs));
+                args.iter_mut().for_each(|a| lambda_snaps(a, vt, pc, pool, fam, multi, counter, defs));
             }
             Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
-                args.iter_mut().for_each(|a| lambda_snaps(a, vt, pc, pool, multi, counter, defs));
+                args.iter_mut().for_each(|a| lambda_snaps(a, vt, pc, pool, fam, multi, counter, defs));
             }
-            Expr::Field { owner: Some(o), .. } => lambda_snaps(o, vt, pc, pool, multi, counter, defs),
+            Expr::Field { owner: Some(o), .. } => lambda_snaps(o, vt, pc, pool, fam, multi, counter, defs),
             Expr::ArrayIndex { array, index } => {
-                lambda_snaps(array, vt, pc, pool, multi, counter, defs);
-                lambda_snaps(index, vt, pc, pool, multi, counter, defs);
+                lambda_snaps(array, vt, pc, pool, fam, multi, counter, defs);
+                lambda_snaps(index, vt, pc, pool, fam, multi, counter, defs);
             }
             Expr::Cast { e: i, .. } | Expr::InstanceOf { e: i, .. } | Expr::Un { e: i, .. }
             | Expr::PreIncDec { e: i, .. } | Expr::PostIncDec { e: i, .. } => {
-                lambda_snaps(i, vt, pc, pool, multi, counter, defs)
+                lambda_snaps(i, vt, pc, pool, fam, multi, counter, defs)
             }
             Expr::Bin { l: bl, r, .. } => {
-                lambda_snaps(bl, vt, pc, pool, multi, counter, defs);
-                lambda_snaps(r, vt, pc, pool, multi, counter, defs);
+                lambda_snaps(bl, vt, pc, pool, fam, multi, counter, defs);
+                lambda_snaps(r, vt, pc, pool, fam, multi, counter, defs);
             }
             Expr::Cond { c, t, f } => {
-                lambda_snaps(c, vt, pc, pool, multi, counter, defs);
-                lambda_snaps(t, vt, pc, pool, multi, counter, defs);
-                lambda_snaps(f, vt, pc, pool, multi, counter, defs);
+                lambda_snaps(c, vt, pc, pool, fam, multi, counter, defs);
+                lambda_snaps(t, vt, pc, pool, fam, multi, counter, defs);
+                lambda_snaps(f, vt, pc, pool, fam, multi, counter, defs);
             }
             Expr::Assign { target, value, .. } => {
-                lambda_snaps(target, vt, pc, pool, multi, counter, defs);
-                lambda_snaps(value, vt, pc, pool, multi, counter, defs);
+                lambda_snaps(target, vt, pc, pool, fam, multi, counter, defs);
+                lambda_snaps(value, vt, pc, pool, fam, multi, counter, defs);
             }
             Expr::NewArray { dims, init, .. } => {
-                dims.iter_mut().for_each(|d| lambda_snaps(d, vt, pc, pool, multi, counter, defs));
+                dims.iter_mut().for_each(|d| lambda_snaps(d, vt, pc, pool, fam, multi, counter, defs));
                 if let Some(vals) = init {
-                    vals.iter_mut().for_each(|v| lambda_snaps(v, vt, pc, pool, multi, counter, defs));
+                    vals.iter_mut().for_each(|v| lambda_snaps(v, vt, pc, pool, fam, multi, counter, defs));
                 }
             }
             Expr::StringConcat(parts) => parts.iter_mut().for_each(|p| {
                 if let crate::expr::ConcatPart::Str(i) = p {
-                    lambda_snaps(i, vt, pc, pool, multi, counter, defs);
+                    lambda_snaps(i, vt, pc, pool, fam, multi, counter, defs);
                 }
             }),
             Expr::Invokedynamic { args, .. } => {
-                args.iter_mut().for_each(|a| lambda_snaps(a, vt, pc, pool, multi, counter, defs));
+                args.iter_mut().for_each(|a| lambda_snaps(a, vt, pc, pool, fam, multi, counter, defs));
             }
             _ => {}
         }
@@ -4669,6 +5007,7 @@ pub(crate) fn fix_lambda_captures(
         vt: &mut crate::varalloc::VarTable,
         pc: &PoolClass,
         pool: &ClassPool,
+        fam: &Family,
         multi: &HashSet<u32>,
         counter: &mut usize,
     ) {
@@ -4677,7 +5016,7 @@ pub(crate) fn fix_lambda_captures(
         macro_rules! leaf {
             ($e:expr) => {{
                 let mut defs: Vec<Stmt> = Vec::new();
-                lambda_snaps($e, vt, pc, pool, multi, counter, &mut defs);
+                lambda_snaps($e, vt, pc, pool, fam, multi, counter, &mut defs);
                 if !defs.is_empty() {
                     let old = std::mem::replace(s, Stmt::Block(vec![]));
                     defs.push(old);
@@ -4693,10 +5032,10 @@ pub(crate) fn fix_lambda_captures(
             Stmt::Throw(e) => leaf!(e),
             Stmt::If { cond, then_stmt, else_stmt } => {
                 let mut defs: Vec<Stmt> = Vec::new();
-                lambda_snaps(cond, vt, pc, pool, multi, counter, &mut defs);
-                fix_stmt(then_stmt, vt, pc, pool, multi, counter);
+                lambda_snaps(cond, vt, pc, pool, fam, multi, counter, &mut defs);
+                fix_stmt(then_stmt, vt, pc, pool, fam, multi, counter);
                 if let Some(x) = else_stmt {
-                    fix_stmt(x, vt, pc, pool, multi, counter);
+                    fix_stmt(x, vt, pc, pool, fam, multi, counter);
                 }
                 if !defs.is_empty() {
                     let old = std::mem::replace(s, Stmt::Block(vec![]));
@@ -4706,8 +5045,8 @@ pub(crate) fn fix_lambda_captures(
             }
             Stmt::While { cond, body } => {
                 let mut defs: Vec<Stmt> = Vec::new();
-                lambda_snaps(cond, vt, pc, pool, multi, counter, &mut defs);
-                fix_stmt(body, vt, pc, pool, multi, counter);
+                lambda_snaps(cond, vt, pc, pool, fam, multi, counter, &mut defs);
+                fix_stmt(body, vt, pc, pool, fam, multi, counter);
                 if !defs.is_empty() {
                     let old = std::mem::replace(s, Stmt::Block(vec![]));
                     defs.push(old);
@@ -4715,9 +5054,9 @@ pub(crate) fn fix_lambda_captures(
                 }
             }
             Stmt::DoWhile { body, cond } => {
-                fix_stmt(body, vt, pc, pool, multi, counter);
+                fix_stmt(body, vt, pc, pool, fam, multi, counter);
                 let mut defs: Vec<Stmt> = Vec::new();
-                lambda_snaps(cond, vt, pc, pool, multi, counter, &mut defs);
+                lambda_snaps(cond, vt, pc, pool, fam, multi, counter, &mut defs);
                 if !defs.is_empty() {
                     let old = std::mem::replace(s, Stmt::Block(vec![]));
                     defs.push(old);
@@ -4726,16 +5065,16 @@ pub(crate) fn fix_lambda_captures(
             }
             Stmt::For { init, cond, update, body } => {
                 for i in init.iter_mut() {
-                    fix_stmt(i, vt, pc, pool, multi, counter);
+                    fix_stmt(i, vt, pc, pool, fam, multi, counter);
                 }
                 let mut defs: Vec<Stmt> = Vec::new();
                 if let Some(c) = cond {
-                    lambda_snaps(c, vt, pc, pool, multi, counter, &mut defs);
+                    lambda_snaps(c, vt, pc, pool, fam, multi, counter, &mut defs);
                 }
                 for u in update.iter_mut() {
-                    lambda_snaps(u, vt, pc, pool, multi, counter, &mut defs);
+                    lambda_snaps(u, vt, pc, pool, fam, multi, counter, &mut defs);
                 }
-                fix_stmt(body, vt, pc, pool, multi, counter);
+                fix_stmt(body, vt, pc, pool, fam, multi, counter);
                 if !defs.is_empty() {
                     let old = std::mem::replace(s, Stmt::Block(vec![]));
                     defs.push(old);
@@ -4744,8 +5083,8 @@ pub(crate) fn fix_lambda_captures(
             }
             Stmt::ForEach { iterable, body, .. } => {
                 let mut defs: Vec<Stmt> = Vec::new();
-                lambda_snaps(iterable, vt, pc, pool, multi, counter, &mut defs);
-                fix_stmt(body, vt, pc, pool, multi, counter);
+                lambda_snaps(iterable, vt, pc, pool, fam, multi, counter, &mut defs);
+                fix_stmt(body, vt, pc, pool, fam, multi, counter);
                 if !defs.is_empty() {
                     let old = std::mem::replace(s, Stmt::Block(vec![]));
                     defs.push(old);
@@ -4754,14 +5093,14 @@ pub(crate) fn fix_lambda_captures(
             }
             Stmt::Switch { selector, cases, default, .. } => {
                 let mut defs: Vec<Stmt> = Vec::new();
-                lambda_snaps(selector, vt, pc, pool, multi, counter, &mut defs);
+                lambda_snaps(selector, vt, pc, pool, fam, multi, counter, &mut defs);
                 for c in cases.iter_mut() {
                     for st in c.body.iter_mut() {
-                        fix_stmt(st, vt, pc, pool, multi, counter);
+                        fix_stmt(st, vt, pc, pool, fam, multi, counter);
                     }
                 }
                 if let Some(d) = default {
-                    fix_stmt(d, vt, pc, pool, multi, counter);
+                    fix_stmt(d, vt, pc, pool, fam, multi, counter);
                 }
                 if !defs.is_empty() {
                     let old = std::mem::replace(s, Stmt::Block(vec![]));
@@ -4770,46 +5109,46 @@ pub(crate) fn fix_lambda_captures(
                 }
             }
             Stmt::Try { body, catches, finally } => {
-                fix_stmt(body, vt, pc, pool, multi, counter);
+                fix_stmt(body, vt, pc, pool, fam, multi, counter);
                 for c in catches.iter_mut() {
-                    fix_stmt(&mut c.body, vt, pc, pool, multi, counter);
+                    fix_stmt(&mut c.body, vt, pc, pool, fam, multi, counter);
                 }
                 if let Some(f) = finally {
-                    fix_stmt(f, vt, pc, pool, multi, counter);
+                    fix_stmt(f, vt, pc, pool, fam, multi, counter);
                 }
             }
             Stmt::TryWithResources { resources, body, catches, finally } => {
                 for r in resources.iter_mut() {
-                    fix_stmt(r, vt, pc, pool, multi, counter);
+                    fix_stmt(r, vt, pc, pool, fam, multi, counter);
                 }
-                fix_stmt(body, vt, pc, pool, multi, counter);
+                fix_stmt(body, vt, pc, pool, fam, multi, counter);
                 for c in catches.iter_mut() {
-                    fix_stmt(&mut c.body, vt, pc, pool, multi, counter);
+                    fix_stmt(&mut c.body, vt, pc, pool, fam, multi, counter);
                 }
                 if let Some(f) = finally {
-                    fix_stmt(f, vt, pc, pool, multi, counter);
+                    fix_stmt(f, vt, pc, pool, fam, multi, counter);
                 }
             }
             Stmt::Synchronized { lock, body } => {
                 let mut defs: Vec<Stmt> = Vec::new();
-                lambda_snaps(lock, vt, pc, pool, multi, counter, &mut defs);
-                fix_stmt(body, vt, pc, pool, multi, counter);
+                lambda_snaps(lock, vt, pc, pool, fam, multi, counter, &mut defs);
+                fix_stmt(body, vt, pc, pool, fam, multi, counter);
                 if !defs.is_empty() {
                     let old = std::mem::replace(s, Stmt::Block(vec![]));
                     defs.push(old);
                     *s = Stmt::Block(defs);
                 }
             }
-            Stmt::Labeled { body, .. } => fix_stmt(body, vt, pc, pool, multi, counter),
+            Stmt::Labeled { body, .. } => fix_stmt(body, vt, pc, pool, fam, multi, counter),
             Stmt::Block(v) => {
                 for x in v.iter_mut() {
-                    fix_stmt(x, vt, pc, pool, multi, counter);
+                    fix_stmt(x, vt, pc, pool, fam, multi, counter);
                 }
             }
             _ => {}
         }
     }
-    fix_stmt(s, vt, pc, pool, &multi, &mut counter);
+    fix_stmt(s, vt, pc, pool, fam, &multi, &mut counter);
 }
 
 /// Map this$N fields of a member inner class to `Outer.this` raw exprs.
