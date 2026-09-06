@@ -4352,20 +4352,41 @@ fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature
         if generic_bare {
             if let Expr::Method { cls, name, desc, type_args, owner, args, .. } = e {
                 if let TypeRef::G(want) = ret_g {
-                    let w = compute_witness(
-                        cls.as_str(),
-                        name.as_str(),
-                        desc,
-                        owner.as_deref(),
-                        want,
-                        pool,
-                        Some(&sig.params),
-                    );
-                    if let Some((wit, mapping)) = w {
-                        *type_args = wit;
-                        retype_witness_arg_casts(cls, name, desc, args, &mapping, pool);
-                        return;
+                    // Diamond-bearing args must stay bare: an explicit
+                    // outer witness pins the formal and gives the inner
+                    // diamond contradictory bounds (jdk17 Stream.toList).
+                    if !args_have_generic_new(args, pool) {
+                        let w = compute_witness(
+                            cls.as_str(),
+                            name.as_str(),
+                            desc,
+                            owner.as_deref(),
+                            want,
+                            pool,
+                            Some(&sig.params),
+                        );
+                        if let Some((wit, mapping)) = w {
+                            *type_args = wit;
+                            retype_witness_arg_casts(cls, name, desc, args, &mapping, pool);
+                            return;
+                        }
                     }
+                    // Witness failed. A cast to a typevar (or array of
+                    // one) is always-legal unchecked and often REQUIRED
+                    // (jdk17 ArrayList.toArray `(T[]) Arrays.copyOf(..)`
+                    // — bare inference cannot recover T). A cast to a
+                    // parameterized class would freeze inference and can
+                    // be rejected outright (Gatherer.finisher) — there
+                    // the bare call infers from the return position
+                    // (the source shape).
+                    let tv_target = matches!(want, jcdc_jvm::GenericType::TypeVar(_))
+                        || matches!(want, jcdc_jvm::GenericType::Array(i)
+                            if matches!(&**i, jcdc_jvm::GenericType::TypeVar(_)));
+                    if tv_target {
+                        let v = std::mem::replace(e, Expr::This);
+                        *e = Expr::Cast { ty: ret_g.clone(), e: Box::new(v) };
+                    }
+                    return;
                 }
             }
             return;
