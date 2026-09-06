@@ -428,3 +428,86 @@ live_merge follow 回收（≥2 活分支、目标优先、兄弟完成度过滤
 - Pattern 丢外层 for(;;)（switch 环游 hub，7 处未定义标签）。
 - 泛型尾：无法转换 ~130（root cause D 残余）、Gatherers Downstream CAP
   方法引用、ReferencePipeline StatelessOp `this,this` 重复实参（pre-existing）。
+
+## 2026-09-07 凌晨：普查驱动的第二轮收敛（rewrite-sese，46+ 修复提交）
+
+普查轨迹（SESE 路，`/tmp/census_run.sh`，错误=可编译性）：
+jdk11 352→236，jdk17 398→271，jdk26 929→468→(pattern-break 待测)。
+features 56/56 双路 + cargo test 39/39 每次提交后全绿。
+
+本轮修复家族（详见各 commit message）：
+- **qualified-new via-super**：jdk21+ javac 不再给仅转发 outer 的内部类生成
+  this$0 字段（WeakHashMap 三个 iterator），emit 的 is_member_inner 改为
+  字段检查 + outer_param_via_super 检查，调用点还原 `Outer.this.new Inner()`。
+- **SESE absorbed-tail**：structure_try 吸收的组尾 areturn 不得再被 after-try
+  延续搜索选中复制（ObjectStreamClass.getDeclaredSUID 重复 return；顺带治愈
+  FilterOutputStream.close 重复 catch）。
+- **finally dedupe 增强**：trailing_rethrow_var 识别分支化 rethrow
+  （if/else 双支 throw 同一变量）；内联副本比较用 alpha 归一化（变量 id 按
+  遍历序重映射 + 去掉无值尾 return/throw）——FilterOutputStream.close 还原
+  真 finally。
+- **loop-wins-over-group**：块既是循环头又是 try 组起点且回边在保护区外时
+  先结构循环（ClassValue.getFromHashMap `for(;;){try}catch retry`——SESE
+  3 倍展开/walk 静默丢环，缺返回语句）。
+- **switch follow 放宽**：循环头在 walk 位于该循环之外时可作分支/switch
+  follow（loop_stack 守卫替代 loop_headers 守卫——Subject.populateSet 循环
+  被复制进每个 case）；copied 区域新增 switch_stop_confluence（全体活 case
+  共同逃逸的 stop 块作 break 解析锚点——Calendar catch 副本 case 贯穿）。
+- **witness/推断家族**：witness_generic_returns 跳过 lambda 臂（多义条件
+  standalone 化非法）、同擦除异参数化、子类擦除（super+interface 链）、
+  已带显式 type_args 的调用；gate 放宽至任意参数化返回；泛型调用返回位置
+  永不加擦除 cast（cast 语境饿死推断——Gatherer.finisher），优先显式
+  witness，失败时按目标形态选择裸调用（参数化类返回）或 typevar cast
+  （ArrayList.toArray `(T[]) copyOf`）；带 diamond new 实参的调用保持裸式
+  （Stream.toList）；field-init 合成 cast 跳过泛型调用初始化器
+  （ProtectionDomain cache——cast 冻结外层调用、内层 diamond 推成
+  <Object,Object> 后 cast 不可转换）；throw 位置 checkcast 擦除重定型为
+  throws 类型变量 + 裸 throw 合成 `(T) t`（Optional.orElseThrow /
+  ForkJoinTask.uncheckedThrow）。
+- **varalloc 家族**：gap 收集仅 STORE 前向归因（LOAD 读的是更早的 gap
+  临时值——ForkJoinTask.exec `return rex`）；LVT 同名同描述符但 LVTT 签名
+  不同的区段不合并（Subject pI Iterator<Principal>/<Object>）；同名区段
+  跨活性间隙不合并（ResourceBundle 字符串 switch int 索引被并进 String v）；
+  combine_types 具体类型 join 出的 plain-Object LUB 具粘性（不再被后续
+  KeyStore 证据"恢复"）；split_walk 记录谱系具体类型，unknown→concrete
+  且曾携带不同具体类型时分裂，并把分裂前变量窄化为首个具体类型
+  （KeyStore var6_80 Iterator/KeyStore 双谱系各自成型）。
+- **booleanize**：int 形参位/数组维度/数组下标保持 int 形态
+  （`out.write(v ? 1 : 0)`）；数值父下多义臂 boolify 后重包裹 `? 1 : 0`
+  （Invokers INARG_LIMIT）；int 数组存 boolean 由 cast_generic_locals 重
+  包裹（Calendar.readObject）。
+- **builder dup-mark**：plain dup 的幸存原件被 store 消费时内联为
+  `x = e` 赋值表达式——仅限参数槽（LambdaForm Name ctor `this(.., arguments
+  = copyOf(..))` 灵活构造器）；局部槽内联会重塑条件表达式、破坏下游折叠
+  （+850 回归，已用参数守卫回退）。dup 幸存件上的 requireNonNull+pop 是
+  javac 隐式空检查，不成语句（ClassSpecializer Var ctor super 前 this 引用）。
+  标记为逐块 thread-local，所有 pop 点清理（陈旧标记曾大面积误伤）。
+- **局部类**：anon 体内声明拼接在方法顶块（ANON_TOP_BLOCK 认领——
+  ClassSpecializer Factory$1$1Var 先用后宣）；class-literal 引用触发声明
+  发射且计入先用后宣重排（Module.DummyModuleInfo）；record 保留 implements
+  （CleanupAction implements Runnable）；this(..) 委托构造器不再被当作
+  canonical 跳过（VMStorage 3 参构造器）；enum values/valueOf 按描述符
+  过滤（Tag.valueOf(byte) 保留）；enum 常量同元数构造器按实参兼容性打分
+  （KnownOIDs (String,String,boolean) 不被 varargs 遮蔽）。
+- **其他**：匿名类 new 位丢弃未存储的首位 outer 参数（jdk21+ ctor
+  requireNonNull+pop 无 this$0 字段）；捕获局部变量的提升声明省略
+  `= null`（仅限 anon-ctor-arg 捕获；lambda 捕获走快照通道需要默认值保
+  定值赋值——ObjectInputFilter patternFilter3 反例）；catch 变量重写以
+  首次槽位再赋值为界（Calendar createCalendar 共享尾部被染成异常变量）；
+  assert 条件经 expr_bool 发射（assert 0 → assert false）；byte/short/char
+  目标的 int 条件式补窄化 cast（MemberName 常量变量内联后失去 byte 性）；
+  varargs 展开的窄数组常量按分量类型重 cast（PKCS9Attribute (byte) 22）；
+  typeSwitch（模式 switch）恢复时为每个带标签 case 与 default 补 break
+  （模式贯穿非法）。
+
+**回归教训**（两次被普查当场抓获）：cast 到参数化目标会冻结泛型调用推断
+（HashMap.newHashMap → Map<Object,Object> 不可转换——19 错）；局部槽
+dup 内联重塑条件破坏循环折叠（+850 错）。守则：改发射/推断策略必须跑
+三 JDK 普查对比，必要时 prev-commit dec 树重编译做逐文件错误差分。
+
+**剩余深水区**：找不到符号（jdk26 Gatherers/ClassPrinterImpl——泛型尾）、
+Object 非函数接口 27（`stackN = sink::accept` 方法引用落入 Object 栈合并
+变量，需按使用点函数接口定型）、CHM comparableClassFor 共享尾 return null
+被复制进循环条件（预先存在的 foreach+共享终结符 bug）、jdk11 局部类构造器
+参数名 arg4/LVT 脱节（ClassSpecializer$Factory$1Var prev）、Pattern 丢
+for(;;) 悬空标签、AnnotationReader stackNNN、Gatherers Downstream CAP。
