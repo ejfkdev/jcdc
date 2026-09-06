@@ -3228,11 +3228,27 @@ fn combine_types(types: &[&JavaType]) -> Option<JavaType> {
         return None;
     }
     let mut acc: Option<JavaType> = None;
+    // A join that fell back to plain Object from two CONCRETE types is a
+    // true LUB — later joins must not "recover" concreteness from it
+    // (the plain-Object placeholder rule would join lub(Iterator,
+    // KeyStore)=Object with the next KeyStore evidence into KeyStore,
+    // typing jdk11 KeyStore.getInstance's iterator gap var as KeyStore).
+    let mut lub_object = false;
+    let plain_object = |t: &JavaType| matches!(t, JavaType::Object(n) if n == "java/lang/Object");
     for t in types {
         acc = Some(match acc {
             None => (*t).clone(),
-            Some(a) => join_types(&a, t),
+            Some(a) => {
+                let j = join_types(&a, t);
+                if plain_object(&j) && !plain_object(&a) && !plain_object(t) {
+                    lub_object = true;
+                }
+                j
+            }
         });
+    }
+    if lub_object {
+        return Some(JavaType::Object("java/lang/Object".into()));
     }
     acc
 }
@@ -6778,8 +6794,9 @@ fn split_reassigned_synthetic(vt: &mut VarTable, body: &mut Stmt) {
     let synth: Vec<bool> = (0..n).map(|v| vt.vars[v].synthetic_name && !vt.vars[v].is_param).collect();
     let mut active: HashMap<u32, u32> = HashMap::new(); // original -> current id
     let mut cur_ty: HashMap<u32, JavaType> = HashMap::new();
+    let mut cur_concrete: HashMap<u32, JavaType> = HashMap::new();
     let mut seq = 0usize;
-    split_walk(body, vt, &synth, &mut active, &mut cur_ty, &mut seq);
+    split_walk(body, vt, &synth, &mut active, &mut cur_ty, &mut cur_concrete, &mut seq);
 }
 
 fn value_concrete_type(e: &Expr) -> Option<JavaType> {
@@ -6795,6 +6812,7 @@ fn split_walk(
     synth: &[bool],
     active: &mut HashMap<u32, u32>,
     cur_ty: &mut HashMap<u32, JavaType>,
+    cur_concrete: &mut HashMap<u32, JavaType>,
     seq: &mut usize,
 ) {
     // Rewrite all Local refs in an expression to the active id.
@@ -6861,6 +6879,7 @@ fn split_walk(
         synth: &[bool],
         active: &mut HashMap<u32, u32>,
         cur_ty: &mut HashMap<u32, JavaType>,
+        cur_concrete: &mut HashMap<u32, JavaType>,
         seq: &mut usize,
     ) -> u32 {
         let cur = active.get(&var).copied().unwrap_or(var);
@@ -6878,32 +6897,60 @@ fn split_walk(
             return cur;
         }
         let Some(nt) = value_concrete_type(value) else { return cur };
+        let numeric = |t: &JavaType| {
+            matches!(
+                t,
+                JavaType::Boolean
+                    | JavaType::Byte
+                    | JavaType::Char
+                    | JavaType::Short
+                    | JavaType::Int
+                    | JavaType::Long
+                    | JavaType::Float
+                    | JavaType::Double
+            )
+        };
+        let unknown = |t: &JavaType| {
+            matches!(t, JavaType::Object(n) if n == "java/lang/Object")
+        };
         let need_split = match cur_ty.get(&var) {
             Some(prev) => {
                 if *prev == nt {
                     false
-                } else {
-                    let numeric = |t: &JavaType| {
-                        matches!(
-                            t,
-                            JavaType::Boolean
-                                | JavaType::Byte
-                                | JavaType::Char
-                                | JavaType::Short
-                                | JavaType::Int
-                                | JavaType::Long
-                                | JavaType::Float
-                                | JavaType::Double
-                        )
-                    };
+                } else if !unknown(prev) {
                     // Numeric-to-numeric reuse is handled by type joining;
-                    // plain java/lang/Object is the unknown-type fallback.
-                    // Everything else (array vs iterator, int vs reference,
+                    // everything else (array vs iterator, int vs reference,
                     // distinct classes) needs a distinct variable.
-                    let unknown = |t: &JavaType| {
-                        matches!(t, JavaType::Object(n) if n == "java/lang/Object")
-                    };
-                    !(numeric(prev) && numeric(&nt)) && !unknown(prev) && !unknown(&nt)
+                    !(numeric(prev) && numeric(&nt))
+                } else if !unknown(&nt) {
+                    // Unknown->concrete: split only when the variable
+                    // already CARRIED a different concrete type earlier
+                    // (jdk11 KeyStore.getInstance slot 6: null -> Iterator
+                    // -> KeyStore; without the split the inferred Object
+                    // var serves both lineages and neither declaration
+                    // type-checks).
+                    let carried = cur_concrete.get(&var).map(|c| *c != nt).unwrap_or(false);
+                    if carried && !numeric(&nt) {
+                        true
+                    } else {
+                        if !numeric(&nt) {
+                            cur_ty.insert(var, nt.clone());
+                            // Narrow a plain-Object synthetic to its first
+                            // concrete lineage type so the declaration and
+                            // the loop calls type-check (var6_80 serves the
+                            // Iterator lineage until the split).
+                            if !vt.wide_stack_vars.contains(&var) {
+                                if let JavaType::Object(n) = vt.vars[cur as usize].ty.erased() {
+                                    if n == "java/lang/Object" {
+                                        vt.vars[cur as usize].ty = TypeRef::J(nt.clone());
+                                    }
+                                }
+                            }
+                        }
+                        false
+                    }
+                } else {
+                    false
                 }
             }
             None => {
@@ -6924,12 +6971,16 @@ fn split_walk(
                 false
             }
         };
+        if !unknown(&nt) {
+            cur_concrete.insert(var, nt.clone());
+        }
         if need_split {
             let base_slot = vt.vars[cur as usize].slot;
             *seq += 1;
             let id = vt.add_split(base_slot, format!("{}{}", vt.vars[cur as usize].name, seq), TypeRef::J(nt.clone()));
             active.insert(var, id);
-            cur_ty.insert(var, nt);
+            cur_ty.insert(var, nt.clone());
+            cur_concrete.insert(var, nt);
             id
         } else {
             cur_ty.entry(var).or_insert(nt);
@@ -6940,12 +6991,12 @@ fn split_walk(
     match s {
         Stmt::Block(v) => {
             for x in v.iter_mut() {
-                split_walk(x, vt, synth, active, cur_ty, seq);
+                split_walk(x, vt, synth, active, cur_ty, cur_concrete, seq);
             }
         }
         Stmt::LocalDef { var, init, .. } => {
             if let Some(e) = init {
-                let id = handle_assign(*var, e, vt, synth, active, cur_ty, seq);
+                let id = handle_assign(*var, e, vt, synth, active, cur_ty, cur_concrete, seq);
                 rw(e, active);
                 *var = id;
             }
@@ -6954,7 +7005,7 @@ fn split_walk(
             if let Expr::Assign { target, value, .. } = e {
                 if let Expr::Local { var, .. } = &**target {
                     let v = *var;
-                    let id = handle_assign(v, value, vt, synth, active, cur_ty, seq);
+                    let id = handle_assign(v, value, vt, synth, active, cur_ty, cur_concrete, seq);
                     rw(value, active);
                     if let Expr::Assign { target, .. } = e {
                         if let Expr::Local { var, ty } = &mut **target {
@@ -6973,66 +7024,66 @@ fn split_walk(
             rw(cond, active);
             // Branches may diverge; keep it simple and process then/else
             // with the same mapping (slot reuse across branches is rare).
-            split_walk(then_stmt, vt, synth, active, cur_ty, seq);
+            split_walk(then_stmt, vt, synth, active, cur_ty, cur_concrete, seq);
             if let Some(e) = else_stmt {
-                split_walk(e, vt, synth, active, cur_ty, seq);
+                split_walk(e, vt, synth, active, cur_ty, cur_concrete, seq);
             }
         }
         Stmt::While { cond, body } => {
             rw(cond, active);
-            split_walk(body, vt, synth, active, cur_ty, seq);
+            split_walk(body, vt, synth, active, cur_ty, cur_concrete, seq);
         }
         Stmt::DoWhile { body, cond } => {
-            split_walk(body, vt, synth, active, cur_ty, seq);
+            split_walk(body, vt, synth, active, cur_ty, cur_concrete, seq);
             rw(cond, active);
         }
         Stmt::For { init, cond, update, body } => {
             for i in init {
-                split_walk(i, vt, synth, active, cur_ty, seq);
+                split_walk(i, vt, synth, active, cur_ty, cur_concrete, seq);
             }
             if let Some(c) = cond {
                 rw(c, active);
             }
-            split_walk(body, vt, synth, active, cur_ty, seq);
+            split_walk(body, vt, synth, active, cur_ty, cur_concrete, seq);
             update.iter_mut().for_each(|u| rw(u, active));
         }
         Stmt::ForEach { iterable, body, .. } => {
             rw(iterable, active);
-            split_walk(body, vt, synth, active, cur_ty, seq);
+            split_walk(body, vt, synth, active, cur_ty, cur_concrete, seq);
         }
         Stmt::Try { body, catches, finally } => {
-            split_walk(body, vt, synth, active, cur_ty, seq);
+            split_walk(body, vt, synth, active, cur_ty, cur_concrete, seq);
             for c in catches {
-                split_walk(&mut c.body, vt, synth, active, cur_ty, seq);
+                split_walk(&mut c.body, vt, synth, active, cur_ty, cur_concrete, seq);
             }
             if let Some(f) = finally {
-                split_walk(f, vt, synth, active, cur_ty, seq);
+                split_walk(f, vt, synth, active, cur_ty, cur_concrete, seq);
             }
         }
         Stmt::TryWithResources { resources, body, catches, finally } => {
-            for res in resources.iter_mut() { split_walk(res, vt, synth, active, cur_ty, seq); }
-            split_walk(body, vt, synth, active, cur_ty, seq);
+            for res in resources.iter_mut() { split_walk(res, vt, synth, active, cur_ty, cur_concrete, seq); }
+            split_walk(body, vt, synth, active, cur_ty, cur_concrete, seq);
             for c in catches {
-                split_walk(&mut c.body, vt, synth, active, cur_ty, seq);
+                split_walk(&mut c.body, vt, synth, active, cur_ty, cur_concrete, seq);
             }
             if let Some(f) = finally {
-                split_walk(f, vt, synth, active, cur_ty, seq);
+                split_walk(f, vt, synth, active, cur_ty, cur_concrete, seq);
             }
         }
         Stmt::Switch { selector, cases, default, .. } => {
             rw(selector, active);
             for c in cases {
-                c.body.iter_mut().for_each(|st| split_walk(st, vt, synth, active, cur_ty, seq));
+                c.body.iter_mut().for_each(|st| split_walk(st, vt, synth, active, cur_ty, cur_concrete, seq));
             }
             if let Some(d) = default {
-                split_walk(d, vt, synth, active, cur_ty, seq);
+                split_walk(d, vt, synth, active, cur_ty, cur_concrete, seq);
             }
         }
         Stmt::Synchronized { lock, body } => {
             rw(lock, active);
-            split_walk(body, vt, synth, active, cur_ty, seq);
+            split_walk(body, vt, synth, active, cur_ty, cur_concrete, seq);
         }
-        Stmt::Labeled { body, .. } => split_walk(body, vt, synth, active, cur_ty, seq),
+        Stmt::Labeled { body, .. } => split_walk(body, vt, synth, active, cur_ty, cur_concrete, seq),
         _ => {}
     }
 }
