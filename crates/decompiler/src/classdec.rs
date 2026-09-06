@@ -769,6 +769,7 @@ fn emit_class(
                 inline_anonymous(&mut body, pc, pool, fam, &mb.vt);
                 inline_accessors(&mut body, pc, pool);
                 restore_enum_switches(&mut body, pc, pool);
+                hoist_clinit_returns(&mut body);
                 let stmts = stmt_vec(&body);
                 let mut all_assigns = !stmts.is_empty();
                 let mut folded: HashMap<String, Expr> = HashMap::new();
@@ -843,6 +844,7 @@ fn emit_class(
                         inline_anonymous(&mut body, pc, pool, fam, &mb.vt);
                         inline_accessors(&mut body, pc, pool);
                         restore_enum_switches(&mut body, pc, pool);
+                        hoist_clinit_returns(&mut body);
                         (body, mb.vt)
                     })
             } else {
@@ -1305,9 +1307,18 @@ fn stmt_vec(s: &Stmt) -> Vec<Stmt> {
 fn class_annotations(pc: &PoolClass) -> String {
     let mut out = String::new();
     for attr in &pc.cf.attributes {
-        if let ParsedAttribute::RuntimeVisibleAnnotations(a) =
-            parse_specialized_attribute(attr, &pc.cf.constant_pool)
-        {
+        // CLASS-retention annotations live in RuntimeInvisibleAnnotations and
+        // are load-bearing for recompilation: @MethodHandle.PolymorphicSignature
+        // (VarHandle/MethodHandle accessors) changes how javac types every
+        // call site — without it `int s = STATUS.getAndBitwiseOr(this, m);`
+        // resolves to the Object-returning varargs form (ForkJoinTask corpus
+        // family).
+        let anns = match parse_specialized_attribute(attr, &pc.cf.constant_pool) {
+            ParsedAttribute::RuntimeVisibleAnnotations(a)
+            | ParsedAttribute::RuntimeInvisibleAnnotations(a) => Some(a),
+            _ => None,
+        };
+        if let Some(a) = anns {
             for an in &a.annotations {
                 if let Some(s) = render_annotation(pc, an) {
                     out.push_str(&s);
@@ -1322,9 +1333,14 @@ fn class_annotations(pc: &PoolClass) -> String {
 fn member_annotations(pc: &PoolClass, attrs: &[jcdc_classfile::AttributeInfo]) -> Vec<String> {
     let mut out = Vec::new();
     for attr in attrs {
-        if let ParsedAttribute::RuntimeVisibleAnnotations(a) =
-            parse_specialized_attribute(attr, &pc.cf.constant_pool)
-        {
+        // See class_annotations: invisible (CLASS-retention) annotations must
+        // survive too (@PolymorphicSignature et al).
+        let anns = match parse_specialized_attribute(attr, &pc.cf.constant_pool) {
+            ParsedAttribute::RuntimeVisibleAnnotations(a)
+            | ParsedAttribute::RuntimeInvisibleAnnotations(a) => Some(a),
+            _ => None,
+        };
+        if let Some(a) = anns {
             for an in &a.annotations {
                 if let Some(s) = render_annotation(pc, an) {
                     out.push(s);
@@ -2072,6 +2088,246 @@ fn strip_outer_super_arg(body: &mut Stmt, vt: &VarTable) {
 /// `return;` is illegal inside a static initializer (it is not a method
 /// body); javac still emits RETURN in <clinit> bytecode. Drop trailing
 /// bare returns from every branch tail.
+/// Restructure mid-block bare `return;` statements inside <clinit>: a
+/// branch that "returns" from a static initializer really means "skip the
+/// rest of the initializer", and a literal `return;` there is a compile
+/// error ("return outside method"). Rewrite `if (c) { A; return; } REST`
+/// into `if (c) { A; } else { REST; }` (definite-exit branches get REST
+/// moved into them minus the return; fall-through branches get REST
+/// appended; a bare `return;` statement becomes REST). Applied bottom-up
+/// per block so nested rotated chains (the assert desugaring
+/// `if (AD) return; else if (cond) return; else throw;` at the end of
+/// IntegerCache's archived branch) collapse outward correctly.
+/// Pre-pass for hoist_clinit_returns, on the PRISTINE tree (bare returns
+/// still present): truncate each block right after its first definite-exit
+/// statement. In <clinit> the rotated assert chain (`if (AD) return; else if
+/// (c) return; else throw;`) exits the initializer on every path; the shared
+/// tail following it is the structurizer's duplicated copy — dead code whose
+/// presence double-assigns final fields (IntegerCache `cache`). Rewriting
+/// returns-as-skip first would sanitize the chain and hide the deadness, so
+/// this must run before any rewrite.
+fn prune_post_exit_dead(s: &mut Stmt) {
+    match s {
+        Stmt::Block(v) => {
+            for x in v.iter_mut() {
+                prune_post_exit_dead(x);
+            }
+            fn definite_exit0(s: &Stmt) -> bool {
+                match s {
+                    Stmt::Return(_) | Stmt::Throw(_) => true,
+                    Stmt::Block(v) => v.last().map(definite_exit0).unwrap_or(false),
+                    Stmt::If { then_stmt, else_stmt: Some(e), .. } => {
+                        definite_exit0(then_stmt) && definite_exit0(e)
+                    }
+                    _ => false,
+                }
+            }
+            if let Some(pos) = v.iter().position(definite_exit0) {
+                v.truncate(pos + 1);
+            }
+        }
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            prune_post_exit_dead(then_stmt);
+            if let Some(e) = else_stmt {
+                prune_post_exit_dead(e);
+            }
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => prune_post_exit_dead(body),
+        Stmt::For { init, body, .. } => {
+            init.iter_mut().for_each(prune_post_exit_dead);
+            prune_post_exit_dead(body);
+        }
+        Stmt::ForEach { body, .. } => prune_post_exit_dead(body),
+        Stmt::Switch { cases, default, .. } => {
+            for c in cases.iter_mut() {
+                for st in c.body.iter_mut() {
+                    prune_post_exit_dead(st);
+                }
+            }
+            if let Some(d) = default {
+                prune_post_exit_dead(d);
+            }
+        }
+        Stmt::Try { body, catches, finally } => {
+            prune_post_exit_dead(body);
+            for c in catches.iter_mut() {
+                prune_post_exit_dead(&mut c.body);
+            }
+            if let Some(f) = finally {
+                prune_post_exit_dead(f);
+            }
+        }
+        Stmt::Labeled { body, .. } | Stmt::Synchronized { body, .. } => {
+            prune_post_exit_dead(body)
+        }
+        _ => {}
+    }
+}
+
+fn hoist_clinit_returns(s: &mut Stmt) {
+    prune_post_exit_dead(s);
+    fn block_vec(x: Stmt) -> Vec<Stmt> {
+        match x {
+            Stmt::Block(v) => v,
+            other => vec![other],
+        }
+    }
+    fn make_block(mut v: Vec<Stmt>) -> Stmt {
+        if v.len() == 1 {
+            v.pop().unwrap()
+        } else {
+            Stmt::Block(v)
+        }
+    }
+    fn any_bare_return(s: &Stmt) -> bool {
+        match s {
+            Stmt::Return(None) => true,
+            Stmt::Block(v) => v.iter().any(any_bare_return),
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                any_bare_return(then_stmt)
+                    || else_stmt.as_deref().map(any_bare_return).unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+    /// Every path through `s` ends in a bare `return;` (definite exit).
+    fn definite_exit(s: &Stmt) -> bool {
+        match s {
+            Stmt::Return(None) | Stmt::Return(_) | Stmt::Throw(_) => true,
+            Stmt::Block(v) => v.last().map(definite_exit).unwrap_or(false),
+            Stmt::If { then_stmt, else_stmt: Some(e), .. } => {
+                definite_exit(then_stmt) && definite_exit(e)
+            }
+            _ => false,
+        }
+    }
+    /// Rewrite `s` so that control leaving it (other than through its
+    /// bare-return exit paths) continues into `rest`:
+    /// - a bare `return;` (skip-the-rest exit) is DROPPED — rest must NOT
+    ///   run on that path;
+    /// - a definite-exit branch keeps its content minus the trailing return;
+    /// - every fall-through position gets `rest` appended;
+    /// - a missing else becomes `else { rest }`.
+    fn push_rest(s: Stmt, rest: Vec<Stmt>) -> Stmt {
+        match s {
+            Stmt::Return(None) => Stmt::Block(vec![]),
+            Stmt::Block(mut v) => {
+                if let Some(last) = v.pop() {
+                    if matches!(last, Stmt::Return(None)) {
+                        // Exit path: the return is dropped; the statements
+                        // before it stay, rest does NOT join this path.
+                        Stmt::Block(v)
+                    } else {
+                        v.push(push_rest(last, rest));
+                        Stmt::Block(v)
+                    }
+                } else {
+                    v.extend(rest);
+                    Stmt::Block(v)
+                }
+            }
+            Stmt::If { cond, then_stmt, else_stmt } => {
+                let t = if definite_exit(&then_stmt) {
+                    Box::new(push_rest(*then_stmt, Vec::new()))
+                } else {
+                    let mut tv = block_vec(*then_stmt);
+                    tv.extend(rest.clone());
+                    Box::new(make_block(tv))
+                };
+                let e = match else_stmt {
+                    Some(eb) => {
+                        let e2 = if definite_exit(&eb) {
+                            push_rest(*eb, Vec::new())
+                        } else {
+                            let mut ev = block_vec(*eb);
+                            ev.extend(rest);
+                            make_block(ev)
+                        };
+                        Some(Box::new(e2))
+                    }
+                    None => Some(Box::new(make_block(rest))),
+                };
+                Stmt::If { cond, then_stmt: t, else_stmt: e }
+            }
+            other => make_block({
+                let mut v = vec![other];
+                v.extend(rest);
+                v
+            }),
+        }
+    }
+    match s {
+        Stmt::Block(v) => {
+            // Rewrite BEFORE recursing: the loop needs the pristine bare
+            // returns to see which statements are exit-skipped; child
+            // recursion sanitizes them (correctly per-child, but blind to
+            // the sibling `rest` that must be rerouted around the exit).
+            let mut i = 0;
+            while i < v.len() {
+                if any_bare_return(&v[i]) {
+                    let rest: Vec<Stmt> = v.drain(i + 1..).collect();
+                    let taken = std::mem::replace(&mut v[i], Stmt::Block(vec![]));
+                    let before = format!("{:?}", taken);
+                    let rebuilt = push_rest(taken, rest.clone());
+                    if format!("{:?}", rebuilt) == before {
+                        // No progress (a mid-block bare return this rewrite
+                        // cannot move); RESTORE the statement (v[i] currently
+                        // holds the placeholder) and move on.
+                        v[i] = rebuilt;
+                        if !rest.is_empty() {
+                            v.insert(i + 1, Stmt::Block(rest));
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    v[i] = rebuilt;
+                    // The rewrite may expose further bare returns in v[i];
+                    // re-check the same index.
+                    continue;
+                }
+                i += 1;
+            }
+            // Drop now-empty trailing statements left by the rewrite.
+            v.retain(|x| !matches!(x, Stmt::Block(b) if b.is_empty()));
+            for x in v.iter_mut() {
+                hoist_clinit_returns(x);
+            }
+        }
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            hoist_clinit_returns(then_stmt);
+            if let Some(e) = else_stmt {
+                hoist_clinit_returns(e);
+            }
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => hoist_clinit_returns(body),
+        Stmt::For { init, body, .. } => {
+            init.iter_mut().for_each(hoist_clinit_returns);
+            hoist_clinit_returns(body);
+        }
+        Stmt::ForEach { body, .. } => hoist_clinit_returns(body),
+        Stmt::Switch { cases, default, .. } => {
+            for c in cases.iter_mut() {
+                for st in c.body.iter_mut() {
+                    hoist_clinit_returns(st);
+                }
+            }
+            if let Some(d) = default {
+                hoist_clinit_returns(d);
+            }
+        }
+        Stmt::Try { body, catches, .. } => {
+            hoist_clinit_returns(body);
+            for c in catches.iter_mut() {
+                hoist_clinit_returns(&mut c.body);
+            }
+        }
+        Stmt::Labeled { body, .. } | Stmt::Synchronized { body, .. } => {
+            hoist_clinit_returns(body)
+        }
+        _ => {}
+    }
+}
+
 fn strip_static_init_returns(s: &mut Stmt) {
     match s {
         Stmt::Block(v) => {
