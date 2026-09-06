@@ -2322,7 +2322,7 @@ fn emit_method_with(
             }
             // Wildcard-parameterized call sites: arguments that carry only
             // their erasure need the source-level cast back (`accept((K) x)`).
-            cast_wildcard_call_args(&mut body, pool, pc);
+            cast_wildcard_call_args(&mut body, pool, pc, &mb.vt);
             if pc.cf.major_version < 52 {
                 finalize_captured_locals(&mut body, &pc.internal_name);
             }
@@ -2358,6 +2358,12 @@ fn emit_method_with(
             }
             inline_anonymous(&mut body, pc, pool, fam, &mb.vt);
             inline_accessors(&mut body, pc, pool);
+            // Accessor inlining can EXPOSE diamond `new`s (the synthetic
+            // accessor hid the ctor call from the earlier pass): retry the
+            // ctor-arg witnesses (jdk11 ClassValue.refreshVersion's
+            // `new Entry<>(v2, (T) value)` arrives via an inlined
+            // access$000 ctor accessor).
+            fix_diamond_localdefs(&mut body, &mb.vt, pool);
             // Accessor inlining can expose the real generic callee only
             // now; retry the return witnesses (idempotent).
             add_return_witnesses(&mut body, msig.as_ref(), pool);
@@ -6498,16 +6504,82 @@ fn raw_witness_generic_method_args(e: &mut Expr, pool: &ClassPool, pc: &PoolClas
 
 /// Cast call arguments that land in wildcard/typevar parameter positions
 /// but carry only their erasure (`action.accept((K) entry.key, ...)`).
-fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass) {
-    fn fix_expr(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
-        let params = instantiated_method_params(e, pool, pc);
-        if params.is_none() {
-            raw_witness_generic_method_args(e, pool, pc);
+/// Instantiated ctor parameter types for `new X<..>(args)` when the New
+/// carries its instantiated generic type: the class Signature's params
+/// substituted with the instantiation arguments (jdk11 ClassValue
+/// refreshVersion: `new Entry<>(v2, (T) value)` — the erased `(T)` cast
+/// leaves no bytecode trace, and without it the diamond gets Object
+/// against T: "cannot infer type arguments for Entry<>").
+fn instantiated_ctor_params(e: &Expr, pool: &ClassPool) -> Option<Vec<jcdc_jvm::GenericType>> {
+    let Expr::New { cls, ty, args, .. } = e else { return None };
+    let TypeRef::G(jcdc_jvm::GenericType::Class(cs)) = ty else { return None };
+    let part = cs.parts.last()?;
+    if part.args.is_empty() {
+        return None;
+    }
+    instantiated_ctor_params_core(cls, &part.args, args.len(), pool)
+}
+
+fn instantiated_ctor_params_core(
+    cls: &str,
+    inst_args: &[jcdc_jvm::GenericType],
+    nargs: usize,
+    pool: &ClassPool,
+) -> Option<Vec<jcdc_jvm::GenericType>> {
+    let dpc = pool.get(cls)?;
+    let class_sig = dpc.class_attr("Signature").and_then(|b| {
+        if b.len() >= 2 {
+            dpc.utf8(u16::from_be_bytes([b[0], b[1]])).and_then(|x| parse_class_signature(x))
+        } else {
+            None
         }
-        witness_ambiguous_lambda_args(e, pool, pc);
-        if let Some(params) = params {
-            if let Expr::Method { args, .. } = e {
-                for (a, pt) in args.iter_mut().zip(params.iter()) {
+    })?;
+    if class_sig.params.len() != inst_args.len() {
+        return None;
+    }
+    let mi = (0..dpc.cf.methods.len()).find(|&i| {
+        dpc.method_name(i) == Some("<init>")
+            && dpc
+                .method_desc(i)
+                .and_then(|d| parse_method_descriptor(d))
+                .map(|md| md.args.len() == nargs)
+                .unwrap_or(false)
+    })?;
+    let sig_bytes = dpc.cf.methods[mi].attributes.iter().find_map(|a| {
+        if dpc.utf8(a.attribute_name_index) == Some("Signature") {
+            Some(a.info.as_slice())
+        } else {
+            None
+        }
+    })?;
+    if sig_bytes.len() < 2 {
+        return None;
+    }
+    let msig = dpc
+        .utf8(u16::from_be_bytes([sig_bytes[0], sig_bytes[1]]))
+        .and_then(|x| parse_method_signature(x))?;
+    let inst: Vec<jcdc_jvm::GenericType> = msig
+        .args
+        .iter()
+        .map(|t| crate::method::subst_typevars(t, &class_sig.params, inst_args))
+        .collect();
+    if inst.iter().any(crate::method::has_nested_wildcard) {
+        return None;
+    }
+    Some(inst)
+}
+
+/// Apply per-argument source casts for a call/ctor whose instantiated
+/// parameter types are known (see cast_wildcard_call_args).
+fn apply_param_casts(args: &mut [Expr], params: &[jcdc_jvm::GenericType], pool: &ClassPool) {
+    fn parameterized(t: &jcdc_jvm::GenericType) -> bool {
+        match t {
+            jcdc_jvm::GenericType::Class(cs) => cs.parts.iter().any(|p| !p.args.is_empty()),
+            jcdc_jvm::GenericType::Array(i) => parameterized(i),
+            _ => false,
+        }
+    }
+    for (a, pt) in args.iter_mut().zip(params.iter()) {
                     fn parameterized(t: &jcdc_jvm::GenericType) -> bool {
                         match t {
                             jcdc_jvm::GenericType::Class(cs) => {
@@ -6586,14 +6658,148 @@ fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass) {
                     }
                     let inner = std::mem::replace(a, Expr::This);
                     *a = Expr::Cast { ty: TypeRef::G(want), e: Box::new(inner) };
-                }
+    }
+}
+
+fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass, vt: &crate::varalloc::VarTable) {
+    fn fix_expr(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
+        let params = instantiated_method_params(e, pool, pc);
+        if params.is_none() && !matches!(e, Expr::New { .. }) {
+            raw_witness_generic_method_args(e, pool, pc);
+        }
+        witness_ambiguous_lambda_args(e, pool, pc);
+        let params = params.or_else(|| instantiated_ctor_params(e, pool));
+        if let Some(params) = params {
+            match e {
+                Expr::Method { args, .. } => apply_param_casts(args, &params, pool),
+                Expr::New { args, .. } => apply_param_casts(args, &params, pool),
+                _ => {}
             }
         }
         walk_expr_children(e, pool, pc, fix_expr);
     }
+    fix_diamond_localdefs(s, vt, pool);
     walk_stmt_exprs(s, pool, pc, fix_expr);
 }
 
+/// Diamond news assigned to a generically-declared local: the New's own
+/// ty is erased, so take the instantiation from the local's declared
+/// type and witness the ctor args from it (jdk11 ClassValue
+/// refreshVersion: `Entry<T> e2 = new Entry<>(v2, (T) value)` — the
+/// erased `(T)` cast has no bytecode trace; without it the diamond sees
+/// Object against T and javac gives up: "cannot infer type arguments
+/// for Entry<>").
+fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &ClassPool) {
+    fn inst_from(ty: &TypeRef, value: &Expr) -> Option<(String, Vec<jcdc_jvm::GenericType>, usize)> {
+        let (cls, args) = match value {
+            Expr::New { cls, args, .. } => (cls, args),
+            Expr::Cast { e, .. } => match &**e {
+                Expr::New { cls, args, .. } => (cls, args),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        // A generics-cast wrapper's own instantiation wins over the
+        // declared/erased type.
+        let inst_ty = match value {
+            Expr::Cast { ty: t @ TypeRef::G(_), .. } => t.clone(),
+            _ => ty.clone(),
+        };
+        match &inst_ty {
+            TypeRef::G(jcdc_jvm::GenericType::Class(cs)) => cs
+                .parts
+                .last()
+                .filter(|p| !p.args.is_empty())
+                .map(|p| (cls.clone(), p.args.clone(), args.len())),
+            _ => None,
+        }
+    }
+    fn apply_to_value(value: &mut Expr, params: &[jcdc_jvm::GenericType], pool: &ClassPool) {
+        match value {
+            Expr::New { args, .. } => apply_param_casts(args, params, pool),
+            Expr::Cast { e, .. } => {
+                if let Expr::New { args, .. } = &mut **e {
+                    apply_param_casts(args, params, pool);
+                }
+            }
+            _ => {}
+        }
+    }
+    match s {
+        Stmt::LocalDef { var, init: Some(value), .. } => {
+            if let Some((cls, iargs, n)) = inst_from(&vt.var(*var).ty, value) {
+                if let Some(params) = instantiated_ctor_params_core(&cls, &iargs, n, pool) {
+                    if let Stmt::LocalDef { init: Some(v), .. } = s {
+                        apply_to_value(v, &params, pool);
+                    }
+                }
+            }
+        }
+        // Ordinary locals are assignments in the AST (declarations are
+        // synthesized from the VarTable at print time).
+        Stmt::ExprStmt(inner) => {
+            let target = match &*inner {
+                Expr::Assign { target, value, .. } => match &**target {
+                    Expr::Local { var, .. } => inst_from(&vt.var(*var).ty, value),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((cls, iargs, n)) = target {
+                if let Some(params) = instantiated_ctor_params_core(&cls, &iargs, n, pool) {
+                    if let Expr::Assign { value, .. } = &mut *inner {
+                        apply_to_value(value, &params, pool);
+                    }
+                }
+            }
+        }
+        Stmt::Block(v) => v.iter_mut().for_each(|x| fix_diamond_localdefs(x, vt, pool)),
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            fix_diamond_localdefs(then_stmt, vt, pool);
+            if let Some(x) = else_stmt {
+                fix_diamond_localdefs(x, vt, pool);
+            }
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::ForEach { body, .. }
+        | Stmt::Labeled { body, .. } | Stmt::Synchronized { body, .. } => {
+            fix_diamond_localdefs(body, vt, pool)
+        }
+        Stmt::For { init, body, .. } => {
+            init.iter_mut().for_each(|i| fix_diamond_localdefs(i, vt, pool));
+            fix_diamond_localdefs(body, vt, pool);
+        }
+        Stmt::Switch { cases, default, .. } => {
+            for c in cases.iter_mut() {
+                c.body.iter_mut().for_each(|st| fix_diamond_localdefs(st, vt, pool));
+            }
+            if let Some(d) = default {
+                fix_diamond_localdefs(d, vt, pool);
+            }
+        }
+        Stmt::Try { body, catches, finally } => {
+            fix_diamond_localdefs(body, vt, pool);
+            for c in catches.iter_mut() {
+                fix_diamond_localdefs(&mut c.body, vt, pool);
+            }
+            if let Some(f) = finally {
+                fix_diamond_localdefs(f, vt, pool);
+            }
+        }
+        Stmt::TryWithResources { resources, body, catches, finally } => {
+            for r in resources.iter_mut() {
+                fix_diamond_localdefs(r, vt, pool);
+            }
+            fix_diamond_localdefs(body, vt, pool);
+            for c in catches.iter_mut() {
+                fix_diamond_localdefs(&mut c.body, vt, pool);
+            }
+            if let Some(f) = finally {
+                fix_diamond_localdefs(f, vt, pool);
+            }
+        }
+        _ => {}
+    }
+}
 fn walk_expr_children(
     e: &mut Expr,
     pool: &ClassPool,
