@@ -373,3 +373,58 @@ SESE 的剩余门槛：corpus **家族级重编译**证据（进行中，release
 | `JCDC_DBG_ANON=1` | 匿名类内联跟踪 |
 | `JCDC_DBG_HOIST=1` | 声明提升跟踪 |
 | `JCDC_DBG_BLOCKS=1` | 基本块构建/转换跟踪 |
+
+
+## 2026-09-06 晚：家族普查驱动的长尾收敛（rewrite-sese 98f8f296..HEAD，21+ 修复提交）
+
+方法论（本轮引擎，已验证高效）：
+1. **家族普查**：单源文件 `javac --release N --patch-module java.base=srcroot -d orig`
+   （隐式编译拉全闭包）→ `jcdc -cp jdk8-rt.jar orig -o dec` → 全量重编译
+   **必须 `-Xmaxerrs 10000`**（默认 100 上限会掩盖分布）。基线→现状：
+   jdk11 ForkJoinTask 闭包 1111→338；jdk17 SunJCE 闭包 1020→374；
+   jdk26 WeakHashMap 闭包 1759→974。
+2. **corpus 首阻塞迭代**：`verify.py corpus --jdks 11,17,26 --limit 10` 每路
+   约 6 分钟（并非小时级）；每 JDK 的 10 个家族共享同一首阻塞文件（javac
+   全或无 + 相同 java/util 闭包）。修一个→重跑→下一层。层级推进：
+   vJ Hashtable/WeakHashMap-nonsealed → vK Collections 通配 cast 语法 →
+   vL Hashtable Entry<> diamond → vN LinkedHashMap this$0 / String ctor 折叠 /
+   Collection T[] → vP Set.copyOf 擦除 cast / HashIterator arg0 →
+   vQ ClassValue diamond / ObjectInputFilter lambda 捕获 →
+   vS System PrintStream bool / Enum arg0 → vU ObjectStreamClass 标签 /
+   FilterOutputStream 重复 catch → vV/vW Long-Integer clinit final 双赋值。
+   SESE 每一层都严格不劣于 walk（相同或更晚的首阻塞）。
+
+本轮修复族（详见各提交信息）：JVMS 2.9 签名多态 cast（闭集名单，非 pool
+注解——corpus -cp 是 jdk8 rt.jar 无 VarHandle）；泛型 new 的 diamond 还原
+（cast 下丢弃合成泛型 cast、通配实参退 raw）；non-sealed 仅直接超类；
+typevar/三元返回见证；SESE 逃逸分支共享终结符 follow 拒绝 + 显式 goto 入
+stop 的发射；限定 this 两段名（防继承成员类型遮蔽）；局部类声明提升至方法
+顶块（捕获定义后/首引用前；lambda 体内局部类经 EXTERN_DECL 于 pass 期抽取
+到外层，方法级作用域快照恢复）；局部类真实构造器（合成捕获参数按字节码
+putfield 隐藏；Signature 省略前导 this$0 与**尾部 val$** 的对齐重建）；
+char/boolean 字面量渲染（ret_char/ret_byte/ret_short、NewArray 元素类型、
+booleanize 窄化常量）；TWR 资源护栏（体内再赋值/null 初始化拒绝）；
+构造器委托折叠（裸赋值叶子/块包 if 链/尾部兜底 this(...)）；泛型方法实参
+raw-cast 见证（仅通配参数化实参）；歧义重载 lambda 实参 raw SAM cast
+（doPrivileged）；见证类型参数界违反拒绝（Collections.min）；擦除 cast
+剥除仅限内层擦除相等（Set.copyOf 真实下转保留）；walk_stmt_subst 补
+Labeled/Assert/TernaryValue/Monitor 覆盖；成员类字段初始化经构造器 putfield
+映射捕获参数（arg0 家族归零，含槽位级 outer-param 重写）；clinit 调用见证
+（doPrivileged in clinit）；lambda SAM bool/char 返回渲染；clinit 跳过返回
+保护（strip 仅顶层，hoist 依赖分支内 return 标记——Long/Integer cache 双
+赋值修复）；共享 final 终结符复制恢复（副本各带 return，路径不相交）；
+live_merge follow 回收（≥2 活分支、目标优先、兄弟完成度过滤——switch-in-loop
+增量块 follow、ObjectStreamClass case 边界与 break 还原）。
+
+**剩余深水区**（已归档，跨会话专项）：
+- varalloc 槽位合并错型：ResourceBundle 字符串 switch 临时变量与 Iterator
+  槽位冲突（16）、Calendar catch 参数并入 switch 赋值变量（11）、
+  ProxyGenerator foreach 降级临时变量类型错（13）、CharPredicates
+  stackNNN 泄露为 `Object 不是函数接口`（jdk17，21）、AnnotationReader
+  stackNNN 数组存储泄露（jdk26，42）。
+- SESE try-in-loop 拷贝：getInheritableMethod 循环展平、catch 内复制丢失
+  try 包装（copy_walk active-groups 扩展已写入待验证）；FilterOutputStream
+  旧式 suppressed 模式重复 catch(Throwable)（多范围异常表重建）。
+- Pattern 丢外层 for(;;)（switch 环游 hub，7 处未定义标签）。
+- 泛型尾：无法转换 ~130（root cause D 残余）、Gatherers Downstream CAP
+  方法引用、ReferencePipeline StatelessOp `this,this` 重复实参（pre-existing）。
