@@ -3056,20 +3056,41 @@ fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature
     }
     let ret_g = TypeRef::G(sig.ret.clone());
     let ret_er = ret_g.erased();
-    fn fix(e: &mut Expr, ret_g: &TypeRef, ret_er: &jcdc_jvm::JavaType) {
+    // A returned value needs the erased-cast witness when its static type
+    // is not convertible to the generic return: any reference type when
+    // the return is a bare type variable (`(V) e.value` — Hashtable.get;
+    // javac: "CAP#1 cannot be converted to V"), or a generic type carrying
+    // type vars/wildcards with matching erasure. Type vars count too: a
+    // field's own V (Entry<?,?>.value) is NOT the method's V — casts to a
+    // type var are unchecked no-ops at runtime, so re-witnessing an
+    // already-matching local is harmless.
+    fn needs_witness(e: &Expr, ret_g: &TypeRef, ret_er: &jcdc_jvm::JavaType) -> bool {
         if matches!(e, Expr::Const(_) | Expr::Cast { .. }) {
-            return;
+            return false;
         }
-        let t = e.type_ref();
-        let need = match &t {
-            TypeRef::J(j) => j == ret_er,
+        // Ternaries: javac glues the branches; if ANY branch needs the
+        // witness, wrap the whole cond (`(T) (c ? a : b)` — Hashtable
+        // Enumerator.next).
+        if let Expr::Cond { t, f, .. } = e {
+            return needs_witness(t, ret_g, ret_er) || needs_witness(f, ret_g, ret_er);
+        }
+        let ret_is_typevar = matches!(ret_g, TypeRef::G(g) if g_has_typevar(g));
+        match e.type_ref() {
+            TypeRef::J(j) => {
+                if ret_is_typevar {
+                    matches!(j, jcdc_jvm::JavaType::Object(_) | jcdc_jvm::JavaType::Array(_))
+                } else {
+                    &j == ret_er
+                }
+            }
             TypeRef::G(g) => {
-                !g_has_typevar(g)
-                    && g_has_wildcard(g)
+                (g_has_typevar(&g) || g_has_wildcard(&g))
                     && TypeRef::G(g.clone()).erased() == *ret_er
             }
-        };
-        if need {
+        }
+    }
+    fn fix(e: &mut Expr, ret_g: &TypeRef, ret_er: &jcdc_jvm::JavaType) {
+        if needs_witness(e, ret_g, ret_er) {
             let v = std::mem::replace(e, Expr::This);
             *e = Expr::Cast { ty: ret_g.clone(), e: Box::new(v) };
         }
