@@ -6038,10 +6038,13 @@ fn parse_module_attr(info: &[u8]) -> anyhow::Result<jcdc_classfile::ModuleAttrib
 /// becomes `e`, integer case labels become the enum constant names.
 pub fn restore_enum_switches(s: &mut Stmt, pc: &PoolClass, pool: &ClassPool) {
     match s {
-        Stmt::Switch { selector, cases, .. } => {
-            restore_one_switch(selector, cases, pc, pool);
+        Stmt::Switch { selector, cases, default, .. } => {
+            restore_one_switch(selector, cases, default, pc, pool);
             for c in cases {
                 c.body.iter_mut().for_each(|st| restore_enum_switches(st, pc, pool));
+            }
+            if let Some(d) = default {
+                restore_enum_switches(d, pc, pool);
             }
         }
         Stmt::Block(v) => v.iter_mut().for_each(|x| restore_enum_switches(x, pc, pool)),
@@ -6083,7 +6086,13 @@ pub fn restore_enum_switches(s: &mut Stmt, pc: &PoolClass, pool: &ClassPool) {
     }
 }
 
-fn restore_one_switch(selector: &mut Expr, cases: &mut Vec<crate::stmt::CaseGroup>, pc: &PoolClass, pool: &ClassPool) {
+fn restore_one_switch(
+    selector: &mut Expr,
+    cases: &mut Vec<crate::stmt::CaseGroup>,
+    default: &mut Option<Box<Stmt>>,
+    pc: &PoolClass,
+    pool: &ClassPool,
+) {
     // Java 21+ SwitchBootstraps.typeSwitch: `switch (recv)` with string
     // constants, `case null` (index -1) and type patterns.
     if let Expr::Invokedynamic { name, args, bsm_static_args, .. } = &*selector {
@@ -6134,6 +6143,42 @@ fn restore_one_switch(selector: &mut Expr, cases: &mut Vec<crate::stmt::CaseGrou
                     cgroup.raw_labels = raws;
                     cgroup.string_labels = strs;
                     cgroup.labels.clear();
+                }
+                // A typeSwitch is a PATTERN switch in source: fall-through
+                // is illegal ("贯穿到模式非法", jdk26 ParserVerifier x34).
+                // Every labelled case (and the default) must end in a
+                // jump; when structuring lost the break, re-append it.
+                fn case_terminates(st: &Stmt) -> bool {
+                    match st {
+                        Stmt::Return(_) | Stmt::Throw(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
+                        Stmt::Block(v) => v.last().map(case_terminates).unwrap_or(false),
+                        Stmt::If { then_stmt, else_stmt: Some(e), .. } => {
+                            case_terminates(then_stmt) && case_terminates(e)
+                        }
+                        Stmt::Labeled { body, .. } | Stmt::Synchronized { body, .. } => {
+                            case_terminates(body)
+                        }
+                        Stmt::Try { body, finally, .. }
+                        | Stmt::TryWithResources { body, finally, .. } => match finally {
+                            Some(f) => case_terminates(f),
+                            None => case_terminates(body),
+                        },
+                        _ => false,
+                    }
+                }
+                for cgroup in cases.iter_mut() {
+                    if cgroup.raw_labels.is_empty() && cgroup.string_labels.is_empty() {
+                        continue; // fall-through continuation group
+                    }
+                    if !cgroup.body.last().map(case_terminates).unwrap_or(false) {
+                        cgroup.body.push(Stmt::Break(None));
+                    }
+                }
+                if let Some(d) = default {
+                    if !case_terminates(d) {
+                        let inner = std::mem::replace(d, Box::new(Stmt::Block(vec![])));
+                        *d = Box::new(Stmt::Block(vec![*inner, Stmt::Break(None)]));
+                    }
                 }
                 *selector = recv;
                 return;
