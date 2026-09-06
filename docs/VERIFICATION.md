@@ -279,6 +279,39 @@ Enum.getDeclaringClass 泛型三元 witness、ObjectInputFilter doPrivileged
 重载歧义、FileSystem/Module/Package 等待逐个归因）——多家族长尾，属跨会话
 专项（root cause D 亲族），walk/SESE 共同。
 
+**clinit/嵌套类家族四连修（classdec/emit/method，双路共享）**：
+- **hoist_clinit_returns**：static 初始化器里的裸 `return;` 是编译错
+  （「返回外部方法」），但反编译 clinit 遍地都是——共享尾 RETURN 被复制进
+  各分支 + javac 旋转断言脱糖（`if(AD) return; else if(c) return; else
+  throw;`）用 return 表达「跳过剩余初始化」。原 strip 只剥块尾 return。
+  新 pass：先在**原始树**上剪除 definite-exit 语句后的死代码（重复的共享
+  尾，否则 final 字段二次赋值），再**先改写后递归**：含裸 return 的语句
+  若有后继，退出分支剥掉 return（rest 不进入），落空分支/缺失 else 接收
+  rest。`Integer$IntegerCache` clinit 现与源码语义精确一致（archived 分支
+  恰好一次 final 赋值并跳过分配；null/oversize 路径各持一份分配副本），
+  **jdk17/21 IntegerCache 基线阻塞修复**；Integer.java 家族 0 错误。
+- **局部类 `$NName` 分类**：数字开头的嵌套简名此前一律按匿名类内联；但
+  javac 把方法内**局部类**编码为 `Outer$1Name`（数字+标识符）——有名字、
+  被签名/强转/泛型引用。改为：纯数字=匿名（new 处内联）；数字+标识符=
+  Local（剥前缀，在使用点声明 `class Name`）；printer shorten 同步输出
+  剥前缀简名（原来印 `ClassSpecializer$Factory$1Var` 二进制名→找不到符号；
+  现 38 处引用→0，该文件错误 ~50→~19）。
+- **内部类断言字段**：javac 给非静态内部类也合成 static final
+  `$assertionsDisabled`，但 16 前源级禁止内部类静态成员（「内部类中的静态
+  声明非法」）；有 this$0 的类改发实例 final 字段。
+- **泛型返回 witness**（witness_generic_returns）：Signature 返回含类型
+  变量而 return 表达式是通配参数化（`Class<?>`）或裸擦除时，包一层
+  `(Class<E>)` 非受检 cast——`Enum.getDeclaringClass` 的 poly 三元 javac
+  直接拒绝（bytecode 无 checkcast 可依）。
+
+**剩余 corpus 闭包长尾**（jdk11 Provider 家族为样本，双路共同，多为
+root cause D 亲族，待后续专项）：ClassSpecializer `Var` 构造器签名/初始化
+自引用（~19）、ForkJoinTask VarHandle 签名多态在大 patch 下退化（9，单文件
++srcroot 可编译、全家族失败——疑似依赖类错误降级符号所致）、BoundMethodHandle
+valueOf 泛型（8）、Spliterator tryAdvance 重载歧义（6）、WeakHashMap/
+ConcurrentHashMap CAP#1 捕获转换（7）、URI int→boolean（2）、
+ObjectInputFilter doPrivileged 歧义、Module$1DummyModuleInfo 命名。
+
 **step 6 后全量冒烟**：rt.jar 12608 文件 / 0 panic / 0 error / 0 hang /
 exit=0，888s（~14.8min，约为 walk ~10min 的 1.5×；step 4/5 的守卫剪枝使
 其比 step 3 时的 ~19min 更快）。**最终二进制（aa6ab069）双路冒烟**：
