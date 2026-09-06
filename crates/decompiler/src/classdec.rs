@@ -960,11 +960,17 @@ fn emit_class(
     let mut clinit_body: Option<(Stmt, VarTable)> = None;
     if !is_enum {
         if let Some(ci) = pc.find_own_method("<clinit>", "()V") {
-            if let Ok(Some(mb)) = decompile_method(pc, pool, ci) {
+            if let Ok(Some(mut mb)) = decompile_method(pc, pool, ci) {
                 let mut body = strip_trailing_return(&mb.body);
                 strip_static_init_returns(&mut body);
                 inline_anonymous(&mut body, pc, pool, fam, &mb.vt);
                 inline_accessors(&mut body, pc, pool);
+                // Static initializers need the same call-arg witnesses as
+                // method bodies (jdk11 ObjectInputFilter's clinit
+                // `doPrivileged(() -> {...})` is ambiguous without the raw
+                // PrivilegedAction cast — the vT jdk11 first blocker).
+                cast_wildcard_call_args(&mut body, pool, pc, &mb.vt);
+                fix_lambda_captures(&mut body, &mut mb.vt, pc, pool, fam);
                 restore_enum_switches(&mut body, pc, pool);
                 hoist_clinit_returns(&mut body);
                 let stmts = stmt_vec(&body);

@@ -1258,8 +1258,12 @@ impl<'a> Printer<'a> {
                             out: String::new(),
                             indent: self.indent,
                             lambda_depth: self.lambda_depth + 1,
-                            ret_bool: false,
-                            ret_char: false,
+                            // The SAM's return type governs the impl
+                            // body's renders: boolean SAMs must print
+                            // `return true;` not the JVM-int `return 1;`
+                            // (jdk26 Gatherers.fold's ofGreedy lambda).
+                            ret_bool: l.sam_desc.ret == jcdc_jvm::JavaType::Boolean,
+                            ret_char: l.sam_desc.ret == jcdc_jvm::JavaType::Char,
                             suppress_poly_cast: false,
                             suppress_diamond: false,
                             lambda_sam_ret: None,
