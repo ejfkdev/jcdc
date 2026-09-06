@@ -108,10 +108,24 @@ impl VarTable {
             let mut merged: Vec<(u16, u16, String, String, u16)> = Vec::new();
             lvt.sort_by_key(|(s0, _, _, _, sl)| (*sl, *s0));
             let all = lvt.clone();
+            let lvtt_ref = &lvtt;
             for e in lvt.drain(..) {
                 let same_var = |m: &(u16, u16, String, String, u16)| {
                     if m.4 != e.4 || m.2 != e.2 || m.3 != e.3 {
                         return false;
+                    }
+                    // Ranges whose generic signatures DIFFER are distinct
+                    // source declarations that merely share name+slot
+                    // (jdk11 Subject.toString `pI`: Iterator<Principal>
+                    // then Iterator<Object> — merging types every later
+                    // assignment against the first signature and forces
+                    // an inconvertible cast).
+                    if let Some(base) = parse_field_descriptor(&e.3) {
+                        let sm = sig_type_at(lvtt_ref, m.0, e.4, &base);
+                        let se = sig_type_at(lvtt_ref, e.0, e.4, &base);
+                        if sm.is_some() && se.is_some() && sm != se {
+                            return false;
+                        }
                     }
                     if synthetic_name(&e.2) {
                         return e.0 <= m.1 + 16 && m.0 <= e.1 + 16;
@@ -335,6 +349,11 @@ impl VarTable {
         }
         for v in vt.by_slot.iter_mut() {
             v.sort_by_key(|(s, _, _)| *s);
+        }
+        if std::env::var("JCDC_DBG_PVAR").is_ok() {
+            for vi in &vt.vars {
+                eprintln!("PVAR {} id={} ty={:?} synth={} range=({},{})", vi.name, vi.id, vi.ty, vi.synthetic_name, vi.range_start, vi.range_end);
+            }
         }
         vt
     }
