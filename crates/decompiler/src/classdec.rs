@@ -6475,7 +6475,7 @@ fn relocate_multi_site_decls(
 }
 
 /// Map this$N fields of a member inner class to `Outer.this` raw exprs.
-fn outer_this_map(pc: &PoolClass) -> HashMap<String, Expr> {
+pub(crate) fn outer_this_map(pc: &PoolClass) -> HashMap<String, Expr> {
     let mut m = HashMap::new();
     for f in &pc.cf.fields {
         if let Some(name) = pc.utf8(f.name_index) {
@@ -6731,7 +6731,7 @@ fn mark_final_stmt(s: &mut Stmt, vars: &HashSet<u32>) {
     }
 }
 
-fn substitute_captures(s: &mut Stmt, captures: &HashMap<String, Expr>, pool: &ClassPool) {
+pub(crate) fn substitute_captures(s: &mut Stmt, captures: &HashMap<String, Expr>, pool: &ClassPool) {
     if captures.is_empty() {
         return;
     }

@@ -1252,6 +1252,22 @@ impl<'a> Printer<'a> {
                                 &vt,
                             );
                         }
+                        // Inner-class lambda impls read the synthetic
+                        // outer field directly (`this.this$0.cp`): the
+                        // body bypasses emit_method_with's outer-this
+                        // substitution, so apply it here (jdk26
+                        // ProxyGenerator ProxyMethod.generateMethod's
+                        // withCode lambda — 13 "找不到符号 变量 this$0").
+                        {
+                            let outer_this = crate::classdec::outer_this_map(self.pc);
+                            if !outer_this.is_empty() {
+                                crate::classdec::substitute_captures(
+                                    &mut body,
+                                    &outer_this,
+                                    self.pool,
+                                );
+                            }
+                        }
                         crate::classdec::restore_enum_switches(&mut body, self.pc, self.pool);
                         // Single-return body → expression lambda.
                         let mut single_expr = match &body {
