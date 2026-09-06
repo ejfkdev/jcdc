@@ -988,6 +988,69 @@ fn emit_class(
                 let stmts = stmt_vec(&body);
                 let mut all_assigns = !stmts.is_empty();
                 let mut folded: HashMap<String, Expr> = HashMap::new();
+                // Field emission positions: a folded initializer may not
+                // reference a same-class static field declared AT OR AFTER
+                // it ("非法前向引用" — jdk17 IOVecWrapper LEN_OFFSET =
+                // addressSize with addressSize declared later; the source
+                // kept those assignments in the static block).
+                let field_pos: HashMap<String, usize> = pc
+                    .cf
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, f)| {
+                        pc.utf8(f.name_index).map(|n| (n.to_string(), i))
+                    })
+                    .collect();
+                fn refs_forward(
+                    e: &Expr,
+                    pc: &PoolClass,
+                    field_pos: &HashMap<String, usize>,
+                    my_pos: usize,
+                ) -> bool {
+                    match e {
+                        Expr::Field { cls, name, is_static: true, owner: None, .. }
+                            if cls == &pc.internal_name =>
+                        {
+                            field_pos.get(name).map(|p| *p >= my_pos).unwrap_or(false)
+                        }
+                        Expr::Field { owner: Some(o), .. } => refs_forward(o, pc, field_pos, my_pos),
+                        Expr::Method { owner, args, .. } => {
+                            owner.as_deref().map(|o| refs_forward(o, pc, field_pos, my_pos)).unwrap_or(false)
+                                || args.iter().any(|a| refs_forward(a, pc, field_pos, my_pos))
+                        }
+                        Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+                            args.iter().any(|a| refs_forward(a, pc, field_pos, my_pos))
+                        }
+                        Expr::NewArray { dims, init, .. } => {
+                            dims.iter().any(|d| refs_forward(d, pc, field_pos, my_pos))
+                                || init.as_ref().map(|v| v.iter().any(|x| refs_forward(x, pc, field_pos, my_pos))).unwrap_or(false)
+                        }
+                        Expr::ArrayIndex { array, index } => {
+                            refs_forward(array, pc, field_pos, my_pos)
+                                || refs_forward(index, pc, field_pos, my_pos)
+                        }
+                        Expr::Bin { l, r, .. } | Expr::Assign { target: l, value: r, .. } => {
+                            refs_forward(l, pc, field_pos, my_pos) || refs_forward(r, pc, field_pos, my_pos)
+                        }
+                        Expr::Cond { c, t, f } => {
+                            refs_forward(c, pc, field_pos, my_pos)
+                                || refs_forward(t, pc, field_pos, my_pos)
+                                || refs_forward(f, pc, field_pos, my_pos)
+                        }
+                        Expr::Un { e: x, .. }
+                        | Expr::Cast { e: x, .. }
+                        | Expr::InstanceOf { e: x, .. }
+                        | Expr::PreIncDec { e: x, .. }
+                        | Expr::PostIncDec { e: x, .. } => refs_forward(x, pc, field_pos, my_pos),
+                        Expr::StringConcat(parts) => parts.iter().any(|pp| match pp {
+                            crate::expr::ConcatPart::Str(x) => refs_forward(x, pc, field_pos, my_pos),
+                            _ => false,
+                        }),
+                        Expr::Lambda(l) => l.captures.iter().any(|a| refs_forward(a, pc, field_pos, my_pos)),
+                        _ => false,
+                    }
+                }
                 for st in &stmts {
                     match st {
                         Stmt::ExprStmt(Expr::Assign { target, value, .. }) => {
@@ -995,7 +1058,12 @@ fn emit_class(
                                 Expr::Field { name, is_static: true, cls, .. }
                                     if cls == &pc.internal_name =>
                                 {
-                                    folded.insert(name.clone(), (**value).clone());
+                                    let my_pos = field_pos.get(name).copied().unwrap_or(usize::MAX);
+                                    if refs_forward(value, pc, &field_pos, my_pos) {
+                                        all_assigns = false;
+                                    } else {
+                                        folded.insert(name.clone(), (**value).clone());
+                                    }
                                 }
                                 _ => all_assigns = false,
                             }
