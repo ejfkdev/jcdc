@@ -1272,6 +1272,24 @@ fn outer_param_via_super(pc: &PoolClass, desc: &str) -> bool {
     false
 }
 
+/// (param slot, this$N field name) for the synthetic outer-instance ctor
+/// parameter, when the class stores it in a field.
+fn outer_param_slot(pc: &PoolClass) -> Option<(u16, String)> {
+    if !class_has_this0(pc) {
+        return None;
+    }
+    let fname = pc
+        .cf
+        .fields
+        .iter()
+        .find_map(|f| {
+            pc.utf8(f.name_index)
+                .filter(|n| n.starts_with("this$"))
+                .map(|n| n.to_string())
+        })?;
+    Some((1, fname))
+}
+
 fn class_has_this0(pc: &PoolClass) -> bool {
     pc.cf.fields.iter().any(|f| {
         pc.utf8(f.name_index)
@@ -1676,7 +1694,7 @@ fn anon_field_inits(
             rewrite_param_locals(&mut body, &rep);
         }
     }
-    strip_inner_ctor_artifacts(&mut body, &mb.vt);
+    strip_inner_ctor_artifacts(&mut body, &mb.vt, outer_param_slot(apc));
     substitute_captures(&mut body, captures, pool);
     let vt = &mb.vt;
     for st in stmt_vec(&body) {
@@ -2453,7 +2471,7 @@ fn emit_method_with(
                         rewrite_param_locals(&mut body, &rep);
                     }
                 }
-                strip_inner_ctor_artifacts(&mut body, &mb.vt);
+                strip_inner_ctor_artifacts(&mut body, &mb.vt, outer_param_slot(pc));
             }
             // Member inner classes: this$N field reads become Outer.this.
             let outer_this = outer_this_map(pc);
@@ -5920,7 +5938,7 @@ fn switch_map(pool: &ClassPool, synth: &str, field: &str) -> Option<std::collect
 /// assignments and `Objects.requireNonNull(this$0)` guards on the hidden
 /// enclosing-instance parameters (the parameters themselves are skipped in
 /// the printed signature).
-fn strip_inner_ctor_artifacts(s: &mut Stmt, vt: &VarTable) {
+fn strip_inner_ctor_artifacts(s: &mut Stmt, vt: &VarTable, outer_param: Option<(u16, String)>) {
     fn is_this_param(e: &Expr, vt: &VarTable) -> bool {
         match e {
             Expr::Local { var, .. } => vt.var(*var).name.starts_with("this$"),
@@ -5959,11 +5977,25 @@ fn strip_inner_ctor_artifacts(s: &mut Stmt, vt: &VarTable) {
     // Normalize them to field reads on `this`; the outer-this
     // substitution (which now runs after this pass) rewrites those to
     // `Outer.this.field`.
-    fn fix_expr(e: &mut Expr, vt: &VarTable) {
+    fn fix_expr(e: &mut Expr, vt: &VarTable, outer_param: Option<&(u16, String)>) {
         if let Expr::Local { var, .. } = e {
             let info = vt.var(*var);
-            if info.name.starts_with("this$") {
-                let name = info.name.clone();
+            // The forwarded outer-instance param is often UNNAMED in the
+            // LVT (`arg0` — jdk11 ArrayDeque$DescendingIterator ctor:
+            // `dec(arg0.tail, arg0.elements.length)`): identify it by
+            // param slot when the class has a this$N field.
+            let by_slot = match outer_param {
+                Some((slot, _)) => {
+                    info.is_param && info.slot == *slot && !info.name.starts_with("this$")
+                }
+                None => false,
+            };
+            if info.name.starts_with("this$") || by_slot {
+                let name = if info.name.starts_with("this$") {
+                    info.name.clone()
+                } else {
+                    outer_param.unwrap().1.clone()
+                };
                 let ty = info.ty.clone();
                 *e = Expr::Field {
                     owner: Some(Box::new(Expr::This)),
@@ -5977,129 +6009,129 @@ fn strip_inner_ctor_artifacts(s: &mut Stmt, vt: &VarTable) {
         }
         match e {
             Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
-                args.iter_mut().for_each(|a| fix_expr(a, vt))
+                args.iter_mut().for_each(|a| fix_expr(a, vt, outer_param))
             }
             Expr::Method { owner, args, .. } => {
                 if let Some(o) = owner {
-                    fix_expr(o, vt);
+                    fix_expr(o, vt, outer_param);
                 }
-                args.iter_mut().for_each(|a| fix_expr(a, vt));
+                args.iter_mut().for_each(|a| fix_expr(a, vt, outer_param));
             }
-            Expr::Field { owner: Some(o), .. } => fix_expr(o, vt),
+            Expr::Field { owner: Some(o), .. } => fix_expr(o, vt, outer_param),
             Expr::ArrayIndex { array, index } => {
-                fix_expr(array, vt);
-                fix_expr(index, vt);
+                fix_expr(array, vt, outer_param);
+                fix_expr(index, vt, outer_param);
             }
             Expr::Cast { e: inner, .. } | Expr::InstanceOf { e: inner, .. } | Expr::Un { e: inner, .. } => {
-                fix_expr(inner, vt)
+                fix_expr(inner, vt, outer_param)
             }
             Expr::Bin { l, r, .. } => {
-                fix_expr(l, vt);
-                fix_expr(r, vt);
+                fix_expr(l, vt, outer_param);
+                fix_expr(r, vt, outer_param);
             }
             Expr::Cond { c, t, f } => {
-                fix_expr(c, vt);
-                fix_expr(t, vt);
-                fix_expr(f, vt);
+                fix_expr(c, vt, outer_param);
+                fix_expr(t, vt, outer_param);
+                fix_expr(f, vt, outer_param);
             }
             Expr::Assign { target, value, .. } => {
-                fix_expr(target, vt);
-                fix_expr(value, vt);
+                fix_expr(target, vt, outer_param);
+                fix_expr(value, vt, outer_param);
             }
             Expr::PreIncDec { e: inner, .. } | Expr::PostIncDec { e: inner, .. } => {
-                fix_expr(inner, vt)
+                fix_expr(inner, vt, outer_param)
             }
             Expr::NewArray { dims, init, .. } => {
-                dims.iter_mut().for_each(|d| fix_expr(d, vt));
+                dims.iter_mut().for_each(|d| fix_expr(d, vt, outer_param));
                 if let Some(vals) = init {
-                    vals.iter_mut().for_each(|v| fix_expr(v, vt));
+                    vals.iter_mut().for_each(|v| fix_expr(v, vt, outer_param));
                 }
             }
             Expr::StringConcat(parts) => parts.iter_mut().for_each(|p| {
                 if let crate::expr::ConcatPart::Str(inner) = p {
-                    fix_expr(inner, vt);
+                    fix_expr(inner, vt, outer_param);
                 }
             }),
-            Expr::Lambda(l) => l.captures.iter_mut().for_each(|c| fix_expr(c, vt)),
-            Expr::Invokedynamic { args, .. } => args.iter_mut().for_each(|a| fix_expr(a, vt)),
+            Expr::Lambda(l) => l.captures.iter_mut().for_each(|c| fix_expr(c, vt, outer_param)),
+            Expr::Invokedynamic { args, .. } => args.iter_mut().for_each(|a| fix_expr(a, vt, outer_param)),
             _ => {}
         }
     }
-    fn rec(s: &mut Stmt, vt: &VarTable) {
+    fn rec(s: &mut Stmt, vt: &VarTable, outer_param: Option<&(u16, String)>) {
         match s {
             Stmt::Block(v) => {
                 v.retain(|st| !junk(st, vt));
-                v.iter_mut().for_each(|x| rec(x, vt));
+                v.iter_mut().for_each(|x| rec(x, vt, outer_param));
             }
-            Stmt::ExprStmt(e) => fix_expr(e, vt),
-            Stmt::LocalDef { init: Some(e), .. } => fix_expr(e, vt),
-            Stmt::Return(Some(e)) | Stmt::Throw(e) => fix_expr(e, vt),
+            Stmt::ExprStmt(e) => fix_expr(e, vt, outer_param),
+            Stmt::LocalDef { init: Some(e), .. } => fix_expr(e, vt, outer_param),
+            Stmt::Return(Some(e)) | Stmt::Throw(e) => fix_expr(e, vt, outer_param),
             Stmt::If { cond, then_stmt, else_stmt } => {
-                fix_expr(cond, vt);
-                rec(then_stmt, vt);
+                fix_expr(cond, vt, outer_param);
+                rec(then_stmt, vt, outer_param);
                 if let Some(x) = else_stmt {
-                    rec(x, vt);
+                    rec(x, vt, outer_param);
                 }
             }
             Stmt::While { cond, body } => {
-                fix_expr(cond, vt);
-                rec(body, vt);
+                fix_expr(cond, vt, outer_param);
+                rec(body, vt, outer_param);
             }
             Stmt::DoWhile { body, cond } => {
-                rec(body, vt);
-                fix_expr(cond, vt);
+                rec(body, vt, outer_param);
+                fix_expr(cond, vt, outer_param);
             }
             Stmt::For { init, cond, update, body } => {
-                init.iter_mut().for_each(|i| rec(i, vt));
+                init.iter_mut().for_each(|i| rec(i, vt, outer_param));
                 if let Some(c) = cond {
-                    fix_expr(c, vt);
+                    fix_expr(c, vt, outer_param);
                 }
-                update.iter_mut().for_each(|u| fix_expr(u, vt));
-                rec(body, vt);
+                update.iter_mut().for_each(|u| fix_expr(u, vt, outer_param));
+                rec(body, vt, outer_param);
             }
             Stmt::ForEach { iterable, body, .. } => {
-                fix_expr(iterable, vt);
-                rec(body, vt);
+                fix_expr(iterable, vt, outer_param);
+                rec(body, vt, outer_param);
             }
             Stmt::Switch { selector, cases, default, .. } => {
-                fix_expr(selector, vt);
+                fix_expr(selector, vt, outer_param);
                 for c in cases.iter_mut() {
-                    c.body.iter_mut().for_each(|st| rec(st, vt));
+                    c.body.iter_mut().for_each(|st| rec(st, vt, outer_param));
                 }
                 if let Some(d) = default {
-                    rec(d, vt);
+                    rec(d, vt, outer_param);
                 }
             }
             Stmt::Try { body, catches, finally } => {
-                rec(body, vt);
+                rec(body, vt, outer_param);
                 for c in catches.iter_mut() {
-                    rec(&mut c.body, vt);
+                    rec(&mut c.body, vt, outer_param);
                 }
                 if let Some(f) = finally {
-                    rec(f, vt);
+                    rec(f, vt, outer_param);
                 }
             }
             Stmt::TryWithResources { resources, body, catches, finally } => {
                 for r in resources.iter_mut() {
-                    rec(r, vt);
+                    rec(r, vt, outer_param);
                 }
-                rec(body, vt);
+                rec(body, vt, outer_param);
                 for c in catches.iter_mut() {
-                    rec(&mut c.body, vt);
+                    rec(&mut c.body, vt, outer_param);
                 }
                 if let Some(f) = finally {
-                    rec(f, vt);
+                    rec(f, vt, outer_param);
                 }
             }
             Stmt::Synchronized { lock, body } => {
-                fix_expr(lock, vt);
-                rec(body, vt);
+                fix_expr(lock, vt, outer_param);
+                rec(body, vt, outer_param);
             }
-            Stmt::Labeled { body, .. } => rec(body, vt),
+            Stmt::Labeled { body, .. } => rec(body, vt, outer_param),
             _ => {}
         }
     }
-    rec(s, vt);
+    rec(s, vt, outer_param.as_ref());
 }
 
 
