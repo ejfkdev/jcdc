@@ -1977,12 +1977,28 @@ fn emit_method_with(
             .map(|d| d.args.iter().map(|t| TypeRef::J(t.clone())).collect())
             .unwrap_or_default(),
     };
-    // Enum constructors: javac's Signature attribute omits the implicit
-    // (name, ordinal) parameters — fall back to the real descriptor.
-    if is_ctor && pc.is_enum() {
+    // Constructors: javac's Signature attribute omits the LEADING
+    // synthetic parameters — (name, ordinal) for enums, the forwarded
+    // enclosing instance (this$0) for inner classes — while skip_params
+    // and param_names are indexed in DESCRIPTOR space. Align by padding
+    // the Signature types with the descriptor's leading types; without
+    // this the outer-param skip ate the first REAL parameter (jdk11
+    // TreeMap: `KeyIterator()` printed with no params but a
+    // `super(first)` body; SubMapIterator printed fence's type under
+    // first's name — "cannot find symbol fence").
+    if is_ctor {
         if let Some(md) = &mdesc {
             if arg_types.len() != md.args.len() {
-                arg_types = md.args.iter().map(|t| TypeRef::J(t.clone())).collect();
+                let from_sig = msig.is_some() && arg_types.len() < md.args.len();
+                if from_sig {
+                    let k = md.args.len() - arg_types.len();
+                    let mut padded: Vec<TypeRef> =
+                        md.args.iter().take(k).map(|t| TypeRef::J(t.clone())).collect();
+                    padded.append(&mut arg_types);
+                    arg_types = padded;
+                } else {
+                    arg_types = md.args.iter().map(|t| TypeRef::J(t.clone())).collect();
+                }
             }
         }
     }
@@ -3159,7 +3175,7 @@ pub(crate) fn g_has_typevar(g: &jcdc_jvm::GenericType) -> bool {
     }
 }
 
-fn g_has_wildcard(g: &jcdc_jvm::GenericType) -> bool {
+pub(crate) fn g_has_wildcard(g: &jcdc_jvm::GenericType) -> bool {
     use jcdc_jvm::GenericType as G;
     match g {
         G::Wildcard(_) => true,
@@ -5095,6 +5111,73 @@ fn desc_raw(pc: &PoolClass, mi: usize) -> String {
     pc.method_desc(mi).unwrap_or("").to_string()
 }
 
+/// SAM-interface cast for a lambda argument at an AMBIGUOUS overload
+/// position: `AccessController.doPrivileged(() -> x)` matches both
+/// doPrivileged(PrivilegedAction<T>) and doPrivileged(
+/// PrivilegedExceptionAction<T>) — javac rejects the bare implicitly-
+/// typed lambda ("reference to doPrivileged is ambiguous", 53 errors
+/// across the jdk11 closure); the source always carries the cast
+/// (`(PrivilegedAction<X>) () -> ...`). The call-site descriptor names
+/// the chosen SAM interface; cast to its erasure (raw) — always
+/// applicable and legal, merely unchecked. Fires only when the owner
+/// class exposes same-name/same-arity overloads whose parameter at this
+/// position ERASES differently (true ambiguity potential); unique
+/// signatures keep the bare lambda and its target typing.
+fn witness_ambiguous_lambda_args(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
+    let (cls, name, desc) = match &*e {
+        Expr::Method { cls, name, desc, .. } => (cls.clone(), name.clone(), desc.clone()),
+        _ => return,
+    };
+    if desc.args.is_empty() {
+        return;
+    }
+    let dpc;
+    let dref: &PoolClass = if cls == pc.internal_name {
+        pc
+    } else {
+        dpc = match pool.get(&cls) {
+            Some(p) => p,
+            None => return,
+        };
+        &dpc
+    };
+    let mut ambiguous = vec![false; desc.args.len()];
+    for mi in 0..dref.cf.methods.len() {
+        if dref.method_name(mi) != Some(name.as_str()) {
+            continue;
+        }
+        let Some(d_str) = dref.method_desc(mi) else { continue };
+        if d_str == format!(
+            "({}){}",
+            desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+            desc.ret.to_descriptor()
+        ) {
+            continue; // the call itself
+        }
+        let Some(other) = parse_method_descriptor(d_str) else { continue };
+        if other.args.len() != desc.args.len() {
+            continue;
+        }
+        for (i, t) in other.args.iter().enumerate() {
+            if t != &desc.args[i] {
+                ambiguous[i] = true;
+            }
+        }
+    }
+    if !ambiguous.iter().any(|a| *a) {
+        return;
+    }
+    let Expr::Method { args, .. } = e else { return };
+    for (i, a) in args.iter_mut().enumerate() {
+        if !ambiguous[i] || !matches!(a, Expr::Lambda(_)) {
+            continue;
+        }
+        let sam = TypeRef::J(desc.args[i].clone());
+        let inner = std::mem::replace(a, Expr::This);
+        *a = Expr::Cast { ty: sam, e: Box::new(inner) };
+    }
+}
+
 /// Raw-cast witness for a parameterized argument passed to a GENERIC
 /// method's own typevar-parameterized formal: `Arrays.sort(a, c)` with
 /// a: Object[] and c: Comparator<? super E> — javac pins T=Object from
@@ -5194,6 +5277,7 @@ fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass) {
         if params.is_none() {
             raw_witness_generic_method_args(e, pool, pc);
         }
+        witness_ambiguous_lambda_args(e, pool, pc);
         if let Some(params) = params {
             if let Expr::Method { args, .. } = e {
                 for (a, pt) in args.iter_mut().zip(params.iter()) {

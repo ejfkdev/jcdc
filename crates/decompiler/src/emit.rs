@@ -1303,7 +1303,12 @@ impl<'a> Printer<'a> {
                 .utf8(u16::from_be_bytes([sig_bytes[0], sig_bytes[1]]))
                 .and_then(|s| jcdc_jvm::parse_method_signature(s))?;
             let inst = crate::method::subst_typevars(&msig.ret, &cls_params, &part.args);
-            if crate::classdec::g_has_typevar(&inst) {
+            // A wildcard anywhere in the instantiated return cannot be a
+            // cast type (`(? extends V) x` is invalid syntax — jdk11
+            // Collections.typeCheck's BiFunction<? super K, ? super V,
+            // ? extends V> SAM); the erased body value already satisfies
+            // the wildcard bound or the position needs no witness.
+            if crate::classdec::g_has_typevar(&inst) && !crate::classdec::g_has_wildcard(&inst) {
                 return Some(TypeRef::G(inst));
             }
             return None;
