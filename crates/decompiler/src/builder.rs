@@ -1,7 +1,7 @@
 //! Bytecode → expression/statement building via per-block stack simulation.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use jcdc_classfile::{
     parse_specialized_attribute, ConstantPoolEntry, Instruction, Opcode, ParsedAttribute, SwitchData,
@@ -115,6 +115,11 @@ impl<'a> Builder<'a> {
     /// predecessors).
     pub fn build_block(&self, ins: &[Instruction], initial_stack: Vec<Expr>) -> BResult<BlockResult> {
         let mut stack: Vec<Expr> = initial_stack;
+        // Depths of ORIGINAL entries duplicated by a plain `dup`: a later
+        // store popping the clone is an inline `x = e` embedded in a larger
+        // expression; a popped `Objects.requireNonNull(clone)` over a
+        // survivor is javac's implicit null check (no source statement).
+        let mut dup_marks: HashSet<usize> = HashSet::new();
         let mut stmts: Vec<Stmt> = Vec::new();
         let mut term = Term::Fallthrough;
 
@@ -184,33 +189,58 @@ impl<'a> Builder<'a> {
 
                 // ---- stores ----
                 Opcode::Istore | Opcode::Lstore | Opcode::Fstore | Opcode::Dstore | Opcode::Astore => {
+                    let slot = in0.a as u16;
                     let val = pop(&mut stack)?;
-                    self.store(&mut stmts, in0.a as u16, in0.pc, next_pc, val)?;
+                    dup_marks.retain(|&d| d < stack.len());
+                    match self.inline_dup_store(&mut stack, &mut dup_marks, slot, in0.pc, next_pc, val) {
+                        Some(left) => self.store(&mut stmts, slot, in0.pc, next_pc, left)?,
+                        None => {}
+                    }
                 }
                 Opcode::Istore0 | Opcode::Istore1 | Opcode::Istore2 | Opcode::Istore3 => {
                     let slot = (op as u8 - Opcode::Istore0 as u8) as u16;
                     let val = pop(&mut stack)?;
-                    self.store(&mut stmts, slot, in0.pc, next_pc, val)?;
+                    dup_marks.retain(|&d| d < stack.len());
+                    match self.inline_dup_store(&mut stack, &mut dup_marks, slot, in0.pc, next_pc, val) {
+                        Some(left) => self.store(&mut stmts, slot, in0.pc, next_pc, left)?,
+                        None => {}
+                    }
                 }
                 Opcode::Lstore0 | Opcode::Lstore1 | Opcode::Lstore2 | Opcode::Lstore3 => {
                     let slot = (op as u8 - Opcode::Lstore0 as u8) as u16;
                     let val = pop(&mut stack)?;
-                    self.store(&mut stmts, slot, in0.pc, next_pc, val)?;
+                    dup_marks.retain(|&d| d < stack.len());
+                    match self.inline_dup_store(&mut stack, &mut dup_marks, slot, in0.pc, next_pc, val) {
+                        Some(left) => self.store(&mut stmts, slot, in0.pc, next_pc, left)?,
+                        None => {}
+                    }
                 }
                 Opcode::Fstore0 | Opcode::Fstore1 | Opcode::Fstore2 | Opcode::Fstore3 => {
                     let slot = (op as u8 - Opcode::Fstore0 as u8) as u16;
                     let val = pop(&mut stack)?;
-                    self.store(&mut stmts, slot, in0.pc, next_pc, val)?;
+                    dup_marks.retain(|&d| d < stack.len());
+                    match self.inline_dup_store(&mut stack, &mut dup_marks, slot, in0.pc, next_pc, val) {
+                        Some(left) => self.store(&mut stmts, slot, in0.pc, next_pc, left)?,
+                        None => {}
+                    }
                 }
                 Opcode::Dstore0 | Opcode::Dstore1 | Opcode::Dstore2 | Opcode::Dstore3 => {
                     let slot = (op as u8 - Opcode::Dstore0 as u8) as u16;
                     let val = pop(&mut stack)?;
-                    self.store(&mut stmts, slot, in0.pc, next_pc, val)?;
+                    dup_marks.retain(|&d| d < stack.len());
+                    match self.inline_dup_store(&mut stack, &mut dup_marks, slot, in0.pc, next_pc, val) {
+                        Some(left) => self.store(&mut stmts, slot, in0.pc, next_pc, left)?,
+                        None => {}
+                    }
                 }
                 Opcode::Astore0 | Opcode::Astore1 | Opcode::Astore2 | Opcode::Astore3 => {
                     let slot = (op as u8 - Opcode::Astore0 as u8) as u16;
                     let val = pop(&mut stack)?;
-                    self.store(&mut stmts, slot, in0.pc, next_pc, val)?;
+                    dup_marks.retain(|&d| d < stack.len());
+                    match self.inline_dup_store(&mut stack, &mut dup_marks, slot, in0.pc, next_pc, val) {
+                        Some(left) => self.store(&mut stmts, slot, in0.pc, next_pc, left)?,
+                        None => {}
+                    }
                 }
 
                 // ---- array stores ----
@@ -272,7 +302,20 @@ impl<'a> Builder<'a> {
 // ---- stack ops ----
                 Opcode::Pop => {
                     let v = pop(&mut stack)?;
-                    if has_side_effects(&v) {
+                    dup_marks.retain(|&d| d < stack.len());
+                    // `dup; invokestatic Objects.requireNonNull; pop` over a
+                    // surviving value is javac's implicit null check (jdk21+
+                    // inner-ctor outer params, record components): no source
+                    // statement. Emitting it inside a ctor lands BEFORE
+                    // super()/this() ("对 this 的引用只能在显式调用构造器后
+                    // 出现", jdk26 ClassSpecializer$Factory$1$1Var). An
+                    // EXPLICIT requireNonNull statement has no dup survivor
+                    // and keeps its ExprStmt.
+                    let implicit_check = matches!(&v, Expr::Method { cls, name, .. }
+                        if name == "requireNonNull" && cls == "java/util/Objects")
+                        && !stack.is_empty()
+                        && dup_marks.contains(&(stack.len() - 1));
+                    if !implicit_check && has_side_effects(&v) {
                         stmts.push(Stmt::ExprStmt(v));
                     }
                 }
@@ -317,6 +360,9 @@ impl<'a> Builder<'a> {
                         i += len;
                     } else {
                         let v = stack.last().cloned().ok_or_else(|| BuildError("dup on empty".into()))?;
+                        let orig_depth = stack.len() - 1;
+                        dup_marks.retain(|&d| d < stack.len());
+                        dup_marks.insert(orig_depth);
                         stack.push(v);
                     }
                 }
@@ -1214,6 +1260,37 @@ impl<'a> Builder<'a> {
             bsm_static_args: Vec::new(),
         });
         Ok(())
+    }
+
+    /// A store whose popped value is the clone half of a live `dup` pair:
+    /// the surviving original becomes an inline `x = e` Assign expression
+    /// embedded in the enclosing expression (jdk17 LambdaForm$Name ctor:
+    /// `this(-1, .., arguments = Arrays.copyOf(..))` — hoisting the store
+    /// to a statement precedes the ctor delegation: "灵活构造器" error).
+    /// Returns None when handled, else the untouched value for `store`.
+    fn inline_dup_store(
+        &self,
+        stack: &mut Vec<Expr>,
+        dup_marks: &mut HashSet<usize>,
+        slot: u16,
+        at_pc: u16,
+        next_pc: u16,
+        val: Expr,
+    ) -> Option<Expr> {
+        if stack.is_empty() || !dup_marks.remove(&(stack.len() - 1)) {
+            return Some(val);
+        }
+        let v = match self.vt.at(slot, next_pc).or_else(|| self.vt.at(slot, at_pc)) {
+            Some(v) => v,
+            None => return Some(val),
+        };
+        let _survivor = stack.pop();
+        stack.push(Expr::Assign {
+            target: Box::new(self.local_expr(v)),
+            op: AssignOp::Plain,
+            value: Box::new(val),
+        });
+        None
     }
 
     fn store(&self, stmts: &mut Vec<Stmt>, slot: u16, at_pc: u16, next_pc: u16, val: Expr) -> BResult<()> {
