@@ -479,7 +479,7 @@ fn ensure_declared(vt: &VarTable, body: &mut Stmt) {
         .into_iter()
         .map(|v| Stmt::LocalDef {
             var: v,
-            init: if captured_by_anon(body, v) {
+            init: if captured_by_anon(body, v) && !assigns_null_to(body, v) {
                 None
             } else {
                 default_init_for(vt, v)
@@ -3695,7 +3695,7 @@ fn hoist_escaped_vars(body: &mut Stmt, vt: &VarTable) {
                 // 或实际上的最终变量", jdk11 Subject.populateSet iterator).
                 // The source used a blank declaration assigned once per
                 // path; javac's definite-assignment check re-proves it.
-                init: if captured_by_anon(body, var) {
+                init: if captured_by_anon(body, var) && !assigns_null_to(body, var) {
                     None
                 } else {
                     default_init_for(vt, var)
@@ -6403,6 +6403,51 @@ fn strip_kind(s: &mut Stmt, enters: bool) {
 /// True when `v` flows into an anonymous-class ctor argument (a val$
 /// capture) or a lambda capture list: such locals must remain effectively
 /// final in source form.
+/// True when some statement assigns `null` to `v`: the hoisted `= null`
+/// default then duplicates a real store — the var is NOT a blank-final
+/// split-lineage shape and must keep its initializer (dropping it broke
+/// definite assignment: jdk11/17 ObjectInputFilter patternFilter3).
+fn assigns_null_to(s: &Stmt, v: u32) -> bool {
+    match s {
+        Stmt::Block(x) => x.iter().any(|i| assigns_null_to(i, v)),
+        Stmt::ExprStmt(Expr::Assign { target, value, .. }) => {
+            matches!(&**target, Expr::Local { var, .. } if *var == v)
+                && matches!(&**value, Expr::Const(ConstVal::Null))
+        }
+        Stmt::LocalDef { var, init: Some(e), .. } => {
+            *var == v && matches!(e, Expr::Const(ConstVal::Null))
+        }
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            assigns_null_to(then_stmt, v)
+                || else_stmt.as_deref().map(|x| assigns_null_to(x, v)).unwrap_or(false)
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::ForEach { body, .. }
+        | Stmt::Labeled { body, .. }
+        | Stmt::Synchronized { body, .. } => assigns_null_to(body, v),
+        Stmt::For { init, body, .. } => {
+            init.iter().any(|i| assigns_null_to(i, v)) || assigns_null_to(body, v)
+        }
+        Stmt::Switch { cases, default, .. } => {
+            cases.iter().any(|c| c.body.iter().any(|b| assigns_null_to(b, v)))
+                || default.as_deref().map(|d| assigns_null_to(d, v)).unwrap_or(false)
+        }
+        Stmt::Try { body, catches, finally } => {
+            assigns_null_to(body, v)
+                || catches.iter().any(|c| assigns_null_to(&c.body, v))
+                || finally.as_deref().map(|f| assigns_null_to(f, v)).unwrap_or(false)
+        }
+        Stmt::TryWithResources { resources, body, catches, finally } => {
+            resources.iter().any(|r| assigns_null_to(r, v))
+                || assigns_null_to(body, v)
+                || catches.iter().any(|c| assigns_null_to(&c.body, v))
+                || finally.as_deref().map(|f| assigns_null_to(f, v)).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
 fn captured_by_anon(s: &Stmt, v: u32) -> bool {
     fn refs(e: &Expr, v: u32) -> bool {
         match e {
@@ -6455,7 +6500,13 @@ fn captured_by_anon(s: &Stmt, v: u32) -> bool {
                 args.iter().any(|a| refs(a, v))
             }
             Expr::AnonNew { args, .. } => args.iter().any(|a| refs(a, v)),
-            Expr::Lambda(l) => l.captures.iter().any(|a| refs(a, v)),
+            // Lambda captures deliberately DO NOT count: the lambda
+            // capture-snapshot pass copies reassigned locals into
+            // effectively-final `name$capN` snapshots, so the hoisted
+            // `= null` default is safe there (jdk11/17 ObjectInputFilter
+            // patternFilter3 needs it for definite assignment). Only
+            // anonymous-class ctor args (val$ captures, no snapshot
+            // machinery) require the blank-declaration shape.
             Expr::Method { owner, args, .. } => {
                 owner.as_deref().map(|o| ex(o, v)).unwrap_or(false)
                     || args.iter().any(|a| ex(a, v))
@@ -7593,9 +7644,21 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
                         Expr::Local { var, .. } => vt.var(*var).ty.clone(),
                         other => other.type_ref(),
                     };
-                    if let TypeRef::G(jcdc_jvm::GenericType::Array(comp)) = &aty {
-                        let want = TypeRef::G((**comp).clone());
-                        fix(value, &want, pool);
+                    match &aty {
+                        TypeRef::G(jcdc_jvm::GenericType::Array(comp)) => {
+                            let want = TypeRef::G((**comp).clone());
+                            fix(value, &want, pool);
+                        }
+                        // Primitive-element stores need the same value
+                        // fixups as locals: booleanize folds `b ? 1 : 0`
+                        // to `b` and the int element slot needs the
+                        // conditional rewrapped (jdk11 Calendar.readObject
+                        // `stamp[i] = isSet[i]` — boolean无法转换为int).
+                        TypeRef::J(jcdc_jvm::JavaType::Array(elem)) => {
+                            let want = TypeRef::J((**elem).clone());
+                            fix(value, &want, pool);
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}

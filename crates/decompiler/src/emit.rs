@@ -418,7 +418,10 @@ impl<'a> Printer<'a> {
             }
             Stmt::Assert { cond, msg } => {
                 let mut line = String::from("assert ");
-                self.expr(cond, 1, &mut line);
+                // The assert-condition is boolean-typed: the synthesized
+                // `assert false` carries Const Int(0) — plain expr would
+                // print `assert 0` (int无法转换为boolean, jdk17 URI).
+                self.expr_bool(cond, &mut line);
                 if let Some(m) = msg {
                     line.push_str(" : ");
                     self.expr(m, 1, &mut line);
