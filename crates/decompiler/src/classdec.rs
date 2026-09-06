@@ -3469,20 +3469,25 @@ pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: 
                     // declared before it). Mentions after the definition
                     // are fine — counting them would push the decl past
                     // earlier type references (className is read all over
-                    // the method body).
-                    let defines = |st: &Stmt| -> bool {
-                        match st {
-                            Stmt::LocalDef { var, .. } => {
-                                caps.iter().any(|n| vt.var(*var).name == *n)
-                            }
-                            Stmt::ExprStmt(Expr::Assign { target, .. }) => {
-                                matches!(&**target, Expr::Local { var, .. }
-                                    if caps.iter().any(|n| vt.var(*var).name == *n))
-                            }
-                            _ => false,
+                    // the method body). Definitions inside branches count
+                    // (SESE-copied tails): decl lands after the branch
+                    // structure — before every mention anyway.
+                    let pos = last_capture_def(v, &caps, 0, vt);
+                    if pos < 0 {
+                        0
+                    } else if pos >> 32 == 0 {
+                        (pos as usize) + 1
+                    } else {
+                        let (n, _anchor) =
+                            hoist_branch_captures(v, &caps, vt, ((pos >> 32) as usize) + 1);
+                        if n == 0 {
+                            ((pos >> 32) as usize) + 1
+                        } else {
+                            // Blanks at the head; the decl only needs to
+                            // precede its mentions (first_use below).
+                            0
                         }
-                    };
-                    v.iter().rposition(defines).map(|p| p + 1).unwrap_or(0)
+                    }
                 };
                 let mut first_use =
                     first_local_mention(v, &marker, &name, vt, fam).unwrap_or(v.len());
@@ -3703,6 +3708,287 @@ fn g_mentions_local(g: &jcdc_jvm::GenericType, name: &str, fam: &Family) -> bool
 /// local class (post-walk marker `\u{2}Name`) or mentions its simple
 /// name in any rendered TYPE (hoisted LocalDef decls, casts, array
 /// creates, instanceof, method type witnesses).
+/// Captured locals whose definitions live only in NESTED scopes: the
+/// class decl must sit at the block top (its sibling copy-tails mention
+/// it from every branch), but a branch-scoped capture definition is out
+/// of scope there — hoist a blank decl for it to the block top and
+/// demote the nested LocalDefs to assignments (jdk26 DoublePipeline
+/// flatMap: `fastPath` defined in each copied tail).
+fn hoist_branch_captures(
+    v: &mut Vec<Stmt>,
+    caps: &[String],
+    vt: &VarTable,
+    pos: usize,
+) -> (usize, usize) {
+    use std::collections::HashSet;
+    let mut seen: HashSet<u32> = HashSet::new();
+    fn scan(v: &[Stmt], caps: &[String], vt: &VarTable, seen: &mut HashSet<u32>) {
+        for st in v {
+            match st {
+                Stmt::LocalDef { var, init: Some(_), .. } => {
+                    if caps.iter().any(|n| vt.var(*var).name == *n) {
+                        seen.insert(*var);
+                    }
+                }
+                Stmt::Block(x) => scan(x, caps, vt, seen),
+                Stmt::If { then_stmt, else_stmt, .. } => {
+                    scan(std::slice::from_ref(then_stmt.as_ref()), caps, vt, seen);
+                    if let Some(e) = else_stmt {
+                        scan(std::slice::from_ref(e.as_ref()), caps, vt, seen);
+                    }
+                }
+                Stmt::While { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::ForEach { body, .. }
+                | Stmt::Labeled { body, .. }
+                | Stmt::Synchronized { body, .. } => {
+                    scan(std::slice::from_ref(body.as_ref()), caps, vt, seen);
+                }
+                Stmt::For { init, body, .. } => {
+                    scan(init, caps, vt, seen);
+                    scan(std::slice::from_ref(body.as_ref()), caps, vt, seen);
+                }
+                Stmt::Switch { cases, default, .. } => {
+                    for c in cases {
+                        scan(&c.body, caps, vt, seen);
+                    }
+                    if let Some(d) = default {
+                        scan(std::slice::from_ref(d.as_ref()), caps, vt, seen);
+                    }
+                }
+                Stmt::Try { body, catches, finally } => {
+                    scan(std::slice::from_ref(body.as_ref()), caps, vt, seen);
+                    for c in catches {
+                        scan(std::slice::from_ref(c.body.as_ref()), caps, vt, seen);
+                    }
+                    if let Some(f) = finally {
+                        scan(std::slice::from_ref(f.as_ref()), caps, vt, seen);
+                    }
+                }
+                Stmt::TryWithResources { resources, body, catches, finally } => {
+                    scan(resources, caps, vt, seen);
+                    scan(std::slice::from_ref(body.as_ref()), caps, vt, seen);
+                    for c in catches {
+                        scan(std::slice::from_ref(c.body.as_ref()), caps, vt, seen);
+                    }
+                    if let Some(f) = finally {
+                        scan(std::slice::from_ref(f.as_ref()), caps, vt, seen);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    scan(v, caps, vt, &mut seen);
+    if seen.is_empty() {
+        return (0, pos);
+    }
+    // A capture defined at the TOP level must keep the decl after it;
+    // only nested (branch-copied) definitions are hoistable. Blank
+    // (init-less) decls are placeholders, not definitions.
+    let top_def = v.iter().rposition(|st| match st {
+        Stmt::LocalDef { var, init: Some(_), .. } => seen.contains(var),
+        Stmt::ExprStmt(Expr::Assign { target, .. }) => {
+            matches!(&**target, Expr::Local { var, .. } if seen.contains(var))
+        }
+        _ => false,
+    });
+    let mut blanks: Vec<Stmt> = Vec::new();
+    let mut blanks_seen: HashSet<u32> = HashSet::new();
+    fn demote_stmt(
+        s: &mut Stmt,
+        seen: &HashSet<u32>,
+        blanks: &mut Vec<Stmt>,
+        blanks_seen: &mut HashSet<u32>,
+        vt: &VarTable,
+    ) {
+        match s {
+            Stmt::LocalDef { var, .. } if seen.contains(var) => {
+                match std::mem::replace(s, Stmt::Block(vec![])) {
+                    Stmt::LocalDef { var, init: Some(e), .. } => {
+                        if blanks_seen.insert(var) {
+                            blanks.push(Stmt::LocalDef {
+                                var,
+                                init: None,
+                                is_final: false,
+                                force_type: true,
+                            });
+                        }
+                        *s = Stmt::ExprStmt(Expr::Assign {
+                            target: Box::new(Expr::Local { var, ty: vt.var(var).ty.clone() }),
+                            op: crate::expr::AssignOp::Plain,
+                            value: Box::new(e),
+                        });
+                    }
+                    other => {
+                        // init-less blank: a hoisted placeholder from an
+                        // earlier pass — leave it as the decl.
+                        *s = other;
+                    }
+                }
+            }
+            Stmt::Block(v) => {
+                for x in v.iter_mut() {
+                    demote_stmt(x, seen, blanks, blanks_seen, vt);
+                }
+            }
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                demote_stmt(then_stmt, seen, blanks, blanks_seen, vt);
+                if let Some(e) = else_stmt {
+                    demote_stmt(e, seen, blanks, blanks_seen, vt);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::Labeled { body, .. }
+            | Stmt::Synchronized { body, .. } => {
+                demote_stmt(body, seen, blanks, blanks_seen, vt);
+            }
+            Stmt::For { init, body, .. } => {
+                for x in init.iter_mut() {
+                    demote_stmt(x, seen, blanks, blanks_seen, vt);
+                }
+                demote_stmt(body, seen, blanks, blanks_seen, vt);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    for x in c.body.iter_mut() {
+                        demote_stmt(x, seen, blanks, blanks_seen, vt);
+                    }
+                }
+                if let Some(d) = default {
+                    demote_stmt(d, seen, blanks, blanks_seen, vt);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                demote_stmt(body, seen, blanks, blanks_seen, vt);
+                for c in catches.iter_mut() {
+                    demote_stmt(&mut c.body, seen, blanks, blanks_seen, vt);
+                }
+                if let Some(f) = finally {
+                    demote_stmt(f, seen, blanks, blanks_seen, vt);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                for r in resources.iter_mut() {
+                    demote_stmt(r, seen, blanks, blanks_seen, vt);
+                }
+                demote_stmt(body, seen, blanks, blanks_seen, vt);
+                for c in catches.iter_mut() {
+                    demote_stmt(&mut c.body, seen, blanks, blanks_seen, vt);
+                }
+                if let Some(f) = finally {
+                    demote_stmt(f, seen, blanks, blanks_seen, vt);
+                }
+            }
+            _ => {}
+        }
+    }
+    for x in v.iter_mut() {
+        demote_stmt(x, &seen, &mut blanks, &mut blanks_seen, vt);
+    }
+    let n = blanks.len();
+    // Blanks land at the block head (after any leading plain decls):
+    // the demoted assignments execute inside branches that precede the
+    // class-decl anchor position.
+    let mut blank_pos = 0;
+    while blank_pos < v.len() && matches!(&v[blank_pos], Stmt::LocalDef { .. }) {
+        blank_pos += 1;
+    }
+    let _ = pos;
+    for (k, b) in blanks.into_iter().enumerate() {
+        v.insert(blank_pos + k, b);
+    }
+    if n == 0 {
+        return (0, pos);
+    }
+    (n, top_def.map(|p| p + 1 + n).unwrap_or(0))
+}
+
+/// Last position (in a possibly-nested block list) where a captured/// Last position (in a possibly-nested block list) where a captured
+/// outer local is DEFINED: `-1` when no definition exists (param-only
+/// captures), otherwise an opaque encoding `(path_index << 32) |
+/// sibling_index` ordering paths first, then within-path positions —
+/// branch-copied tails define the capture inside an if-branch (jdk26
+/// DoublePipeline flatMap: `DoubleConsumer fastPath = stack0` lives in
+/// each copied tail), invisible to a flat scan, which parked the decl
+/// before every definition.
+fn last_capture_def(v: &[Stmt], caps: &[String], path: usize, vt: &VarTable) -> i64 {
+    let mut best: i64 = -1;
+    for (i, st) in v.iter().enumerate() {
+        let defines = match st {
+            Stmt::LocalDef { var, .. } => caps.iter().any(|n| vt.var(*var).name == *n),
+            Stmt::ExprStmt(Expr::Assign { target, .. }) => {
+                matches!(&**target, Expr::Local { var, .. }
+                    if caps.iter().any(|n| vt.var(*var).name == *n))
+            }
+            _ => false,
+        };
+        if defines {
+            let cand = ((path as i64) << 32) | i as i64;
+            if cand > best {
+                best = cand;
+            }
+        }
+        let sub: Vec<&Stmt> = match st {
+            Stmt::Block(x) => x.iter().collect(),
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                let mut s2 = vec![then_stmt.as_ref()];
+                if let Some(e) = else_stmt {
+                    s2.push(e.as_ref());
+                }
+                s2
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::Labeled { body, .. }
+            | Stmt::Synchronized { body, .. } => vec![body.as_ref()],
+            Stmt::For { init, body, .. } => {
+                let mut s2: Vec<&Stmt> = init.iter().collect();
+                s2.push(body.as_ref());
+                s2
+            }
+            Stmt::Switch { cases, default, .. } => {
+                let mut s2: Vec<&Stmt> = Vec::new();
+                for c in cases {
+                    s2.extend(c.body.iter());
+                }
+                if let Some(d) = default {
+                    s2.push(d.as_ref());
+                }
+                s2
+            }
+            Stmt::Try { body, catches, finally } => {
+                let mut s2: Vec<&Stmt> = vec![body.as_ref()];
+                s2.extend(catches.iter().map(|c| c.body.as_ref()));
+                if let Some(f) = finally {
+                    s2.push(f.as_ref());
+                }
+                s2
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                let mut s2: Vec<&Stmt> = resources.iter().collect();
+                s2.push(body.as_ref());
+                s2.extend(catches.iter().map(|c| c.body.as_ref()));
+                if let Some(f) = finally {
+                    s2.push(f.as_ref());
+                }
+                s2
+            }
+            _ => Vec::new(),
+        };
+        for x in sub {
+            let cand = last_capture_def(std::slice::from_ref(x), caps, path + 1, vt);
+            if cand > best {
+                best = cand;
+            }
+        }
+    }
+    best
+}
+
 /// First index in `v` mentioning the local class `name`: either a real
 /// statement mention (marker new / type reference) or ANOTHER ClassDecl
 /// whose rendered text names it — a local class is in scope only from
@@ -4000,6 +4286,9 @@ fn walk_stmt_anon(
                         if let Some(name) = decl_name {
                             if declared.contains(&name)
                                 || EXTERN_DECL.with(|x| x.borrow().contains(&name))
+                                || v.iter().any(|x| {
+                                    matches!(x, Stmt::ClassDecl { name: n2, .. } if *n2 == name)
+                                })
                             {
                                 pending.remove(k);
                                 continue;
@@ -4025,18 +4314,76 @@ fn walk_stmt_anon(
                             }
                         };
                         let marker = format!("\u{2}{}", name);
-                        let first_use =
-                            first_local_mention(v, &marker, &name, vt, fam).unwrap_or(j);
+                        // Take the decl OUT while computing its target: a
+                        // backward move left it in the scan path and the
+                        // loop reprocessed it (double hoists).
+                        let d = v.remove(j);
+                        // Capture definitions may live inside the branch
+                        // structure that holds the mentions (copied tails):
+                        // land the decl after that structure and hoist the
+                        // branch-scoped capture decls to before it.
+                        let caps = local_class_captures(&name, fam, pool);
+                        let pdef = if caps.is_empty() {
+                            -1
+                        } else {
+                            last_capture_def(v, &caps, 0, vt)
+                        };
+                        let cpos = if pdef < 0 {
+                            0
+                        } else {
+                            ((pdef >> 32) as usize) + 1
+                        };
+                        let mut target =
+                            first_local_mention(v, &marker, &name, vt, fam).unwrap_or(v.len());
+                        if pdef >> 32 > 0 {
+                            // Capture definitions nested inside the branch
+                            // structure (copied tails): hoist them to blank
+                            // decls at the block head; afterwards the decl
+                            // only needs to precede its mentions (a
+                            // surviving top-level assign can sit AFTER
+                            // mentions — anchoring on it pushed the decl
+                            // past the branch mentions again).
+                            let (n, _anchor) = hoist_branch_captures(v, &caps, vt, cpos);
+                            target = if n > 0 {
+                                first_local_mention(v, &marker, &name, vt, fam)
+                                    .unwrap_or(v.len())
+                            } else {
+                                std::cmp::max(target, cpos)
+                            };
+                        } else if cpos > 0 {
+                            // Top-level definitions: the decl must sit
+                            // after the last one (and before mentions).
+                            target = std::cmp::max(target, cpos);
+                        }
+                        if target > v.len() {
+                            target = v.len();
+                        }
                         if std::env::var("JCDC_DBG_ANON").is_ok() {
-                            eprintln!("RELOC name={} j={} first_use={} vlen={} depth={}", name, j, first_use, v.len(), ANON_BODY_DEPTH.with(|d| d.get()));
+                            let shapes: Vec<String> = v
+                                .iter()
+                                .map(|x| match x {
+                                    Stmt::Block(_) => "blk",
+                                    Stmt::LocalDef { init: Some(_), .. } => "def",
+                                    Stmt::LocalDef { .. } => "blank",
+                                    Stmt::ClassDecl { .. } => "cls",
+                                    Stmt::If { .. } => "if",
+                                    Stmt::Return(_) => "ret",
+                                    Stmt::ExprStmt(_) => "expr",
+                                    _ => "other",
+                                })
+                                .map(|x| x.to_string())
+                                .collect();
+                            eprintln!(
+                                "RELOC2 name={} cpos={} first={:?} shapes={:?}",
+                                name,
+                                cpos,
+                                first_local_mention(v, &marker, &name, vt, fam),
+                                shapes
+                            );
+                            eprintln!("RELOC name={} j={} target={} vlen={} depth={}", name, j, target, v.len(), ANON_BODY_DEPTH.with(|d| d.get()));
                         }
-                        if first_use != j {
-                            let d = v[j].clone();
-                            v.insert(first_use, d);
-                            let removed = if first_use < j { j + 1 } else { j };
-                            v.remove(removed);
-                        }
-                        j += 1;
+                        v.insert(target, d);
+                        j = target + 1;
                     }
                 } else {
                     let mut k = 0;
@@ -6469,23 +6816,27 @@ fn relocate_multi_site_decls(
         if caps.is_empty() {
             continue;
         }
-        let defines = |st: &Stmt| -> bool {
-            match st {
-                Stmt::LocalDef { var, init, .. } => {
-                    init.as_ref()
-                        .map(|e| !matches!(e, Expr::Const(crate::expr::ConstVal::Null)))
-                        .unwrap_or(true)
-                        && caps.iter().any(|n| vt.var(*var).name == *n)
-                }
-                Stmt::ExprStmt(Expr::Assign { target, .. }) => {
-                    matches!(&**target, Expr::Local { var, .. }
-                        if caps.iter().any(|n| vt.var(*var).name == *n))
-                }
-                _ => false,
+        let p = last_capture_def(v, &caps, 0, vt);
+        if p < 0 {
+            continue;
+        }
+        if p >> 32 == 0 {
+            // Top-level definition: land right after the last one.
+            pos = std::cmp::max(pos, (p as u32 as usize) + 1);
+        } else {
+            // Branch-copied definitions: hoist them to blank decls at the
+            // head; the decl then only needs to precede its mentions.
+            let cpos = ((p >> 32) as usize) + 1;
+            let (n, _anchor) = hoist_branch_captures(v, &caps, vt, cpos);
+            if n > 0 {
+                let marker = format!("\u{2}{}", name);
+                pos = std::cmp::max(
+                    pos,
+                    first_local_mention(v, &marker, name, vt, fam).unwrap_or(v.len()),
+                );
+            } else {
+                pos = std::cmp::max(pos, cpos);
             }
-        };
-        if let Some(p) = v.iter().rposition(defines) {
-            pos = std::cmp::max(pos, p + 1);
         }
     }
     for (k, d) in moved.into_iter().enumerate() {
