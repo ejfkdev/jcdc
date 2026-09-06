@@ -1127,12 +1127,20 @@ fn methods_to_skip(
             skip.insert(mi);
             continue;
         }
-        if is_enum
-            && m.access_flags.contains(MethodAccessFlags::STATIC)
-            && (name == "values" || name == "valueOf" || name == "$values")
-        {
-            skip.insert(mi);
-            continue;
+        // javac-GENERATED enum accessors only: match by descriptor, not
+        // bare name — jdk17 ConstantPool.Tag declares its own
+        // `private static Tag valueOf(byte)` which must survive (dropping
+        // it left getTagAt calling a nonexistent overload).
+        if is_enum && m.access_flags.contains(MethodAccessFlags::STATIC) {
+            let d = pc.method_desc(mi).unwrap_or("");
+            let self_l = format!("L{};", pc.internal_name);
+            let is_generated = ((name == "values" || name == "$values")
+                && d == format!("()[{}", self_l))
+                || (name == "valueOf" && d == format!("(Ljava/lang/String;){}", self_l));
+            if is_generated {
+                skip.insert(mi);
+                continue;
+            }
         }
         if is_record && is_synthetic_record_method(pc, pool, mi) {
             skip.insert(mi);
@@ -4184,7 +4192,11 @@ pub(crate) fn g_has_wildcard(g: &jcdc_jvm::GenericType) -> bool {
 fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, pool: &ClassPool) {
     use crate::expr::Expr;
     let Some(sig) = msig else { return };
-    if !generic_ret_ish(&sig.ret) || !g_has_typevar(&sig.ret) {
+    // Parameterized return, typevar or not: wildcard/capture values need
+    // the source's unchecked cast (jdk17 Method.getTypeParameters returns
+    // GenericDeclRepository.EMPTY_TYPE_VARS — TypeVariable<?>[] — as
+    // TypeVariable<Method>[]; the cast leaves no checkcast trace).
+    if !generic_ret_ish(&sig.ret) {
         return;
     }
     let ret_g = TypeRef::G(sig.ret.clone());
