@@ -3331,7 +3331,17 @@ fn gather_evidence(
                 // that also receive genuinely Object-typed values.
                 if matches!(e, Expr::This) {
                     push_ev(ev, *var, Evidence::OfThis);
-                } else if !matches!(e, Expr::Const(ConstVal::Null)) {
+                } else if !matches!(e, Expr::Const(ConstVal::Null))
+                    && !matches!(e, Expr::Lambda(_))
+                {
+                    // Lambda/method-ref values carry NO static type (their
+                    // target comes from context): recording their Object
+                    // placeholder poisons the merge join and pins the
+                    // stack var to Object, where `stackN = sink::accept`
+                    // then fails ("Object 不是函数接口", jdk26
+                    // DoublePipeline.flatMapDouble). Skipping them lets
+                    // the sibling branch's concrete type (DoubleConsumer)
+                    // win the narrowing.
                     let t = e.type_ref().erased();
                     if !matches!(t, JavaType::Void) {
                         push_ev(ev, *var, Evidence::T(t));
@@ -3471,7 +3481,9 @@ fn gather_expr(e: &Expr, ev: &mut Vec<Vec<Evidence>>, assign_target: Option<u32>
                 // always String even though its parts look numeric.
                 if matches!(&**value, Expr::This) {
                     push_ev(ev, *var, Evidence::OfThis);
-                } else if !matches!(&**value, Expr::Const(ConstVal::Null)) {
+                } else if !matches!(&**value, Expr::Const(ConstVal::Null))
+                    && !matches!(&**value, Expr::Lambda(_))
+                {
                     let t = if matches!(&**value, Expr::StringConcat(_)) {
                         JavaType::Object("java/lang/String".into())
                     } else {
