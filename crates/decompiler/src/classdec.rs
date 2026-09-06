@@ -3311,7 +3311,12 @@ pub(crate) fn polymorphic_ret_cast(
     desc: &jcdc_jvm::MethodDescriptor,
 ) -> Option<jcdc_jvm::JavaType> {
     match &desc.ret {
-        jcdc_jvm::JavaType::Object(_) | jcdc_jvm::JavaType::Void => None,
+        // Only a call-site descriptor returning plain Object needs no cast;
+        // ANY other reference return (e.g. invokeBasic's `(BoundMethodHandle)
+        // factory().invokeBasic(..)` — the source cast fixes the descriptor)
+        // must be witnessed, or the bare call types as Object.
+        jcdc_jvm::JavaType::Object(n) if n == "java/lang/Object" => None,
+        jcdc_jvm::JavaType::Void => None,
         _ if is_spec_polymorphic(cls, name) => Some(desc.ret.clone()),
         _ => None,
     }
@@ -5090,11 +5095,105 @@ fn desc_raw(pc: &PoolClass, mi: usize) -> String {
     pc.method_desc(mi).unwrap_or("").to_string()
 }
 
+/// Raw-cast witness for a parameterized argument passed to a GENERIC
+/// method's own typevar-parameterized formal: `Arrays.sort(a, c)` with
+/// a: Object[] and c: Comparator<? super E> — javac pins T=Object from
+/// the array, then rejects Comparator<? super E> for Comparator<? super
+/// Object> ("no suitable method for sort(Object[], Comparator<CAP#1>)").
+/// The source carried the RAW cast `(Comparator) c` (erased — no
+/// bytecode trace). Fire only when formal and argument share the same
+/// parameterized base class, the formal mentions a method type variable,
+/// and the argument's parameters differ; every other shape stays with
+/// inference. The raw cast makes the call unchecked but applicable —
+/// the semantics are unchanged (erasure is identical).
+fn raw_witness_generic_method_args(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
+    use jcdc_jvm::GenericType as G;
+    fn has_tvar(g: &G, tvars: &[&str]) -> bool {
+        match g {
+            G::TypeVar(n) => tvars.contains(&n.as_str()),
+            G::Array(i) => has_tvar(i, tvars),
+            G::Class(cs) => cs.parts.iter().any(|p| p.args.iter().any(|a| has_tvar(a, tvars))),
+            G::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
+            | G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => has_tvar(t, tvars),
+            _ => false,
+        }
+    }
+    let (cls, name, desc) = match &*e {
+        Expr::Method { cls, name, desc, .. } => (cls.clone(), name.clone(), desc.clone()),
+        _ => return,
+    };
+    let want_desc = format!(
+        "({}){}",
+        desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+        desc.ret.to_descriptor()
+    );
+    let dpc;
+    let dref: &PoolClass = if cls == pc.internal_name {
+        pc
+    } else {
+        dpc = match pool.get(&cls) {
+            Some(p) => p,
+            None => return,
+        };
+        &dpc
+    };
+    let Some(mi) = (0..dref.cf.methods.len())
+        .find(|&i| dref.method_name(i) == Some(name.as_str()) && dref.method_desc(i) == Some(want_desc.as_str()))
+    else {
+        return;
+    };
+    let Some(sig_bytes) = dref.cf.methods[mi].attributes.iter().find_map(|a| {
+        if dref.utf8(a.attribute_name_index) == Some("Signature") {
+            Some(a.info.as_slice())
+        } else {
+            None
+        }
+    }) else {
+        return;
+    };
+    if sig_bytes.len() < 2 {
+        return;
+    }
+    let Some(msig) = dref
+        .utf8(u16::from_be_bytes([sig_bytes[0], sig_bytes[1]]))
+        .and_then(|x| parse_method_signature(x))
+    else {
+        return;
+    };
+    if msig.params.is_empty() {
+        return;
+    }
+    let tvars: Vec<&str> = msig.params.iter().map(|p| p.name.as_str()).collect();
+    let Expr::Method { args, .. } = e else { return };
+    for (a, pt) in args.iter_mut().zip(msig.args.iter()) {
+        let G::Class(cw) = pt else { continue };
+        if cw.parts.iter().all(|p| p.args.is_empty()) || !has_tvar(pt, &tvars) {
+            continue;
+        }
+        if matches!(a, Expr::Cast { .. } | Expr::Const(_)) {
+            continue;
+        }
+        let ca = match a.type_ref() {
+            TypeRef::G(G::Class(ca)) if !ca.parts.iter().all(|p| p.args.is_empty()) => ca,
+            _ => continue,
+        };
+        if crate::method::classsig_internal(&ca) != crate::method::classsig_internal(cw) {
+            continue;
+        }
+        let raw = TypeRef::J(jcdc_jvm::JavaType::Object(crate::method::classsig_internal(&ca)));
+        let inner = std::mem::replace(a, Expr::This);
+        *a = Expr::Cast { ty: raw, e: Box::new(inner) };
+    }
+}
+
 /// Cast call arguments that land in wildcard/typevar parameter positions
 /// but carry only their erasure (`action.accept((K) entry.key, ...)`).
 fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass) {
     fn fix_expr(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
         let params = instantiated_method_params(e, pool, pc);
+        if params.is_none() {
+            raw_witness_generic_method_args(e, pool, pc);
+        }
         if let Some(params) = params {
             if let Expr::Method { args, .. } = e {
                 for (a, pt) in args.iter_mut().zip(params.iter()) {
