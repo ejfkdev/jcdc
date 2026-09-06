@@ -233,6 +233,12 @@ pub struct LambdaExpr {
     pub param_names: Vec<String>,
     /// Method-ref receiver class name, for `X::y` form.
     pub ref_receiver: Option<String>,
+    /// Snapshot renames for captured outer locals that are NOT
+    /// effectively final (the decompiler hoists+reassigns them):
+    /// (outer var id, impl-method param var id, snapshot name). The
+    /// method pass declares `final T name = outer;` before the lambda's
+    /// statement and the printer renames the impl param accordingly.
+    pub capture_snaps: Vec<(u32, u32, String)>,
 }
 
 /// Resolved static bootstrap-method argument.

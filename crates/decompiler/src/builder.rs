@@ -1592,6 +1592,7 @@ impl<'a> Builder<'a> {
                 captures,
                 param_names,
                 ref_receiver: None,
+                capture_snaps: Vec::new(),
             }));
         }
         if is_synthetic_lambda
@@ -1616,6 +1617,7 @@ impl<'a> Builder<'a> {
                 captures,
                 param_names,
                 ref_receiver: None,
+                capture_snaps: Vec::new(),
             }));
         }
 
@@ -1641,6 +1643,7 @@ impl<'a> Builder<'a> {
             captures: dynamic_args,
             param_names,
             ref_receiver: receiver,
+            capture_snaps: Vec::new(),
         }))
     }
 

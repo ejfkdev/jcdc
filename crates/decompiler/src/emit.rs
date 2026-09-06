@@ -1149,7 +1149,23 @@ impl<'a> Printer<'a> {
                 out.push_str(" -> ");
                 let sam_wrap = self.lambda_sam_ret.take();
                 match body_stmts {
-                    Some(MethodBody { mut body, vt, .. }) => {
+                    Some(MethodBody { mut body, mut vt, .. }) => {
+                        // Apply capture-snapshot renames: captured outer
+                        // locals that are not effectively final were
+                        // snapshotted into `final` copies before this
+                        // statement (classdec::fix_lambda_captures); the
+                        // impl body must reference the copies.
+                        if !l.capture_snaps.is_empty() {
+                            let mut snap_vt = vt.clone();
+                            for &(_, pid, ref snap) in &l.capture_snaps {
+                                for v in snap_vt.vars.iter_mut() {
+                                    if v.id == pid {
+                                        v.name = snap.clone();
+                                    }
+                                }
+                            }
+                            vt = snap_vt;
+                        }
                         {
                             let fam = crate::classdec::Family::collect(self.pc, self.pool);
                             crate::classdec::inline_anonymous(

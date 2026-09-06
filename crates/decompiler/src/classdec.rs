@@ -2296,7 +2296,7 @@ fn emit_method_with(
     }
 
     match decompile_method(pc, pool, mi) {
-        Ok(Some(mb)) => {
+        Ok(Some(mut mb)) => {
             let mut body = strip_trailing_return(&mb.body);
             // Generic methods returning a type variable: javac elides the
             // `(E)` cast when the erasure already matches, but source needs
@@ -2365,6 +2365,7 @@ fn emit_method_with(
             add_throw_witnesses(&mut body, msig.as_ref(), pool);
             strip_erasure_casts_generic_ret(&mut body, msig.as_ref(), pool);
             witness_generic_returns(&mut body, msig.as_ref());
+            fix_lambda_captures(&mut body, &mut mb.vt, pc, pool);
             line.push_str(" {\n");
             out.push_str(&line);
             let ret_bool = mdesc.as_ref().map(|d| d.ret == jcdc_jvm::JavaType::Boolean).unwrap_or(false)
@@ -4378,6 +4379,431 @@ fn emit_anon_body(
         emit_class(&npc, pool, &ClassOptions::default(), fam, out, indent + 1, false)?;
     }
     Ok(())
+}
+
+/// Snapshot lambda captures of outer locals that are NOT effectively
+/// final: the decompiler's hoisted shape (`T x = null;` + reassigns —
+/// source assigned `x` once per mutually-exclusive branch, which javac
+/// accepts as effectively final) can never be effectively final, so a
+/// lambda capturing it fails ("local variables referenced from a lambda
+/// must be final or effectively final" — jdk26 ObjectInputFilter.Config
+/// createFilter's `patternFilter`, a vP jdk26 blocker). Before the
+/// statement containing the lambda, declare `final T x$capN = x;` and
+/// record the rename on LambdaExpr::capture_snaps so the printer points
+/// the impl body's capture param at the snapshot.
+pub(crate) fn fix_lambda_captures(
+    s: &mut Stmt,
+    vt: &mut crate::varalloc::VarTable,
+    pc: &PoolClass,
+    pool: &ClassPool,
+) {
+    let mut assigns: HashMap<u32, usize> = HashMap::new();
+    fn count_e(e: &Expr, assigns: &mut HashMap<u32, usize>) {
+        match e {
+            Expr::Assign { target, value, .. } => {
+                if let Expr::Local { var, .. } = &**target {
+                    *assigns.entry(*var).or_insert(0) += 1;
+                }
+                count_e(value, assigns);
+            }
+            Expr::PreIncDec { e: i, .. } | Expr::PostIncDec { e: i, .. } => {
+                if let Expr::Local { var, .. } = &**i {
+                    *assigns.entry(*var).or_insert(0) += 1;
+                }
+                count_e(i, assigns);
+            }
+            Expr::Method { owner, args, .. } => {
+                if let Some(o) = owner {
+                    count_e(o, assigns);
+                }
+                args.iter().for_each(|a| count_e(a, assigns));
+            }
+            Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+                args.iter().for_each(|a| count_e(a, assigns))
+            }
+            Expr::Field { owner: Some(o), .. } => count_e(o, assigns),
+            Expr::ArrayIndex { array, index } => {
+                count_e(array, assigns);
+                count_e(index, assigns);
+            }
+            Expr::Cast { e: i, .. } | Expr::InstanceOf { e: i, .. } | Expr::Un { e: i, .. } => count_e(i, assigns),
+            Expr::Bin { l, r, .. } => {
+                count_e(l, assigns);
+                count_e(r, assigns);
+            }
+            Expr::Cond { c, t, f } => {
+                count_e(c, assigns);
+                count_e(t, assigns);
+                count_e(f, assigns);
+            }
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter().for_each(|d| count_e(d, assigns));
+                if let Some(vals) = init {
+                    vals.iter().for_each(|v| count_e(v, assigns));
+                }
+            }
+            Expr::StringConcat(parts) => parts.iter().for_each(|p| {
+                if let crate::expr::ConcatPart::Str(i) = p {
+                    count_e(i, assigns);
+                }
+            }),
+            Expr::Lambda(l) => l.captures.iter().for_each(|c| count_e(c, assigns)),
+            Expr::Invokedynamic { args, .. } => args.iter().for_each(|a| count_e(a, assigns)),
+            _ => {}
+        }
+    }
+    fn count_s(st: &Stmt, assigns: &mut HashMap<u32, usize>) {
+        match st {
+            Stmt::Block(v) => v.iter().for_each(|x| count_s(x, assigns)),
+            Stmt::ExprStmt(e) => count_e(e, assigns),
+            Stmt::LocalDef { var, init, .. } => {
+                if init.is_some() {
+                    *assigns.entry(*var).or_insert(0) += 1;
+                }
+                if let Some(e) = init {
+                    count_e(e, assigns);
+                }
+            }
+            Stmt::Return(e) => {
+                if let Some(x) = e {
+                    count_e(x, assigns);
+                }
+            }
+            Stmt::Throw(e) => count_e(e, assigns),
+            Stmt::If { cond, then_stmt, else_stmt } => {
+                count_e(cond, assigns);
+                count_s(then_stmt, assigns);
+                if let Some(x) = else_stmt {
+                    count_s(x, assigns);
+                }
+            }
+            Stmt::While { cond, body } => {
+                count_e(cond, assigns);
+                count_s(body, assigns);
+            }
+            Stmt::DoWhile { body, cond } => {
+                count_s(body, assigns);
+                count_e(cond, assigns);
+            }
+            Stmt::For { init, cond, update, body } => {
+                init.iter().for_each(|i| count_s(i, assigns));
+                if let Some(c) = cond {
+                    count_e(c, assigns);
+                }
+                update.iter().for_each(|u| count_e(u, assigns));
+                count_s(body, assigns);
+            }
+            Stmt::ForEach { iterable, body, .. } => {
+                count_e(iterable, assigns);
+                count_s(body, assigns);
+            }
+            Stmt::Switch { selector, cases, default, .. } => {
+                count_e(selector, assigns);
+                for c in cases {
+                    c.body.iter().for_each(|st| count_s(st, assigns));
+                }
+                if let Some(d) = default {
+                    count_s(d, assigns);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                count_s(body, assigns);
+                for c in catches {
+                    count_s(&c.body, assigns);
+                }
+                if let Some(f) = finally {
+                    count_s(f, assigns);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter().for_each(|r| count_s(r, assigns));
+                count_s(body, assigns);
+                for c in catches {
+                    count_s(&c.body, assigns);
+                }
+                if let Some(f) = finally {
+                    count_s(f, assigns);
+                }
+            }
+            Stmt::Synchronized { lock, body } => {
+                count_e(lock, assigns);
+                count_s(body, assigns);
+            }
+            Stmt::Labeled { body, .. } => count_s(body, assigns),
+            _ => {}
+        }
+    }
+    count_s(s, &mut assigns);
+    let multi: HashSet<u32> = assigns
+        .iter()
+        .filter(|(_, &n)| n >= 2)
+        .map(|(&v, _)| v)
+        .collect();
+    if multi.is_empty() {
+        return;
+    }
+    let mut counter = 0usize;
+    fn lambda_snaps(
+        e: &mut Expr,
+        vt: &mut crate::varalloc::VarTable,
+        pc: &PoolClass,
+        pool: &ClassPool,
+        multi: &HashSet<u32>,
+        counter: &mut usize,
+        defs: &mut Vec<Stmt>,
+    ) {
+        if let Expr::Lambda(l) = e {
+            if let Some(mi) = pc.find_own_method(&l.impl_name, &l.impl_desc.to_string()) {
+                if let Ok(Some(mb)) = decompile_method(pc, pool, mi) {
+                    let sam_n = l.param_names.len();
+                    let impl_params: Vec<(u32, String)> = mb
+                        .vt
+                        .vars
+                        .iter()
+                        .filter(|v| v.is_param && v.name != "this")
+                        .map(|v| (v.id, v.name.clone()))
+                        .collect();
+                    let n_cap = impl_params.len().saturating_sub(sam_n);
+                    // Match captures positionally (impl-arg order); the
+                    // impl LVT often lacks names for synthetic lambda
+                    // params, so name matching against the outer var is
+                    // unreliable.
+                    let mut snaps: Vec<(u32, u32)> = Vec::new();
+                    for (k, cap) in l.captures.iter().enumerate().take(n_cap) {
+                        if let Expr::Local { var: ovid, .. } = cap {
+                            if multi.contains(ovid) {
+                                if let Some((pid, _)) = impl_params.get(k) {
+                                    snaps.push((*ovid, *pid));
+                                }
+                            }
+                        }
+                    }
+                    for (ovid, pid) in snaps {
+                        let pname = vt.var(ovid).name.clone();
+                        let snap = format!("{}$cap{}", pname, counter);
+                        *counter += 1;
+                        let ty = vt.var(ovid).ty.clone();
+                        let newid = vt.vars.len() as u32;
+                        vt.vars.push(crate::varalloc::VarInfo {
+                            id: newid,
+                            slot: u16::MAX,
+                            name: snap.clone(),
+                            ty,
+                            is_param: false,
+                            range_start: 0,
+                            range_end: u16::MAX,
+                            synthetic_name: true,
+                        });
+                        l.capture_snaps.push((ovid, pid, snap.clone()));
+                        defs.push(Stmt::LocalDef {
+                            var: newid,
+                            init: Some(Expr::Local { var: ovid, ty: vt.var(ovid).ty.clone() }),
+                            is_final: true,
+                            force_type: false,
+                        });
+                    }
+                }
+            }
+        }
+        // recurse (captures of nested lambdas too)
+        match e {
+            Expr::Lambda(l) => l.captures.iter_mut().for_each(|c| {
+                lambda_snaps(c, vt, pc, pool, multi, counter, defs)
+            }),
+            Expr::Method { owner, args, .. } => {
+                if let Some(o) = owner {
+                    lambda_snaps(o, vt, pc, pool, multi, counter, defs);
+                }
+                args.iter_mut().for_each(|a| lambda_snaps(a, vt, pc, pool, multi, counter, defs));
+            }
+            Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+                args.iter_mut().for_each(|a| lambda_snaps(a, vt, pc, pool, multi, counter, defs));
+            }
+            Expr::Field { owner: Some(o), .. } => lambda_snaps(o, vt, pc, pool, multi, counter, defs),
+            Expr::ArrayIndex { array, index } => {
+                lambda_snaps(array, vt, pc, pool, multi, counter, defs);
+                lambda_snaps(index, vt, pc, pool, multi, counter, defs);
+            }
+            Expr::Cast { e: i, .. } | Expr::InstanceOf { e: i, .. } | Expr::Un { e: i, .. }
+            | Expr::PreIncDec { e: i, .. } | Expr::PostIncDec { e: i, .. } => {
+                lambda_snaps(i, vt, pc, pool, multi, counter, defs)
+            }
+            Expr::Bin { l: bl, r, .. } => {
+                lambda_snaps(bl, vt, pc, pool, multi, counter, defs);
+                lambda_snaps(r, vt, pc, pool, multi, counter, defs);
+            }
+            Expr::Cond { c, t, f } => {
+                lambda_snaps(c, vt, pc, pool, multi, counter, defs);
+                lambda_snaps(t, vt, pc, pool, multi, counter, defs);
+                lambda_snaps(f, vt, pc, pool, multi, counter, defs);
+            }
+            Expr::Assign { target, value, .. } => {
+                lambda_snaps(target, vt, pc, pool, multi, counter, defs);
+                lambda_snaps(value, vt, pc, pool, multi, counter, defs);
+            }
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter_mut().for_each(|d| lambda_snaps(d, vt, pc, pool, multi, counter, defs));
+                if let Some(vals) = init {
+                    vals.iter_mut().for_each(|v| lambda_snaps(v, vt, pc, pool, multi, counter, defs));
+                }
+            }
+            Expr::StringConcat(parts) => parts.iter_mut().for_each(|p| {
+                if let crate::expr::ConcatPart::Str(i) = p {
+                    lambda_snaps(i, vt, pc, pool, multi, counter, defs);
+                }
+            }),
+            Expr::Invokedynamic { args, .. } => {
+                args.iter_mut().for_each(|a| lambda_snaps(a, vt, pc, pool, multi, counter, defs));
+            }
+            _ => {}
+        }
+    }
+    fn fix_stmt(
+        s: &mut Stmt,
+        vt: &mut crate::varalloc::VarTable,
+        pc: &PoolClass,
+        pool: &ClassPool,
+        multi: &HashSet<u32>,
+        counter: &mut usize,
+    ) {
+        // Leaf statements: process their expressions; when snapshots are
+        // needed, wrap self in a Block with the decls preceding.
+        macro_rules! leaf {
+            ($e:expr) => {{
+                let mut defs: Vec<Stmt> = Vec::new();
+                lambda_snaps($e, vt, pc, pool, multi, counter, &mut defs);
+                if !defs.is_empty() {
+                    let old = std::mem::replace(s, Stmt::Block(vec![]));
+                    defs.push(old);
+                    *s = Stmt::Block(defs);
+                }
+                return;
+            }};
+        }
+        match s {
+            Stmt::ExprStmt(e) => leaf!(e),
+            Stmt::LocalDef { init: Some(e), .. } => leaf!(e),
+            Stmt::Return(Some(e)) => leaf!(e),
+            Stmt::Throw(e) => leaf!(e),
+            Stmt::If { cond, then_stmt, else_stmt } => {
+                let mut defs: Vec<Stmt> = Vec::new();
+                lambda_snaps(cond, vt, pc, pool, multi, counter, &mut defs);
+                fix_stmt(then_stmt, vt, pc, pool, multi, counter);
+                if let Some(x) = else_stmt {
+                    fix_stmt(x, vt, pc, pool, multi, counter);
+                }
+                if !defs.is_empty() {
+                    let old = std::mem::replace(s, Stmt::Block(vec![]));
+                    defs.push(old);
+                    *s = Stmt::Block(defs);
+                }
+            }
+            Stmt::While { cond, body } => {
+                let mut defs: Vec<Stmt> = Vec::new();
+                lambda_snaps(cond, vt, pc, pool, multi, counter, &mut defs);
+                fix_stmt(body, vt, pc, pool, multi, counter);
+                if !defs.is_empty() {
+                    let old = std::mem::replace(s, Stmt::Block(vec![]));
+                    defs.push(old);
+                    *s = Stmt::Block(defs);
+                }
+            }
+            Stmt::DoWhile { body, cond } => {
+                fix_stmt(body, vt, pc, pool, multi, counter);
+                let mut defs: Vec<Stmt> = Vec::new();
+                lambda_snaps(cond, vt, pc, pool, multi, counter, &mut defs);
+                if !defs.is_empty() {
+                    let old = std::mem::replace(s, Stmt::Block(vec![]));
+                    defs.push(old);
+                    *s = Stmt::Block(defs);
+                }
+            }
+            Stmt::For { init, cond, update, body } => {
+                for i in init.iter_mut() {
+                    fix_stmt(i, vt, pc, pool, multi, counter);
+                }
+                let mut defs: Vec<Stmt> = Vec::new();
+                if let Some(c) = cond {
+                    lambda_snaps(c, vt, pc, pool, multi, counter, &mut defs);
+                }
+                for u in update.iter_mut() {
+                    lambda_snaps(u, vt, pc, pool, multi, counter, &mut defs);
+                }
+                fix_stmt(body, vt, pc, pool, multi, counter);
+                if !defs.is_empty() {
+                    let old = std::mem::replace(s, Stmt::Block(vec![]));
+                    defs.push(old);
+                    *s = Stmt::Block(defs);
+                }
+            }
+            Stmt::ForEach { iterable, body, .. } => {
+                let mut defs: Vec<Stmt> = Vec::new();
+                lambda_snaps(iterable, vt, pc, pool, multi, counter, &mut defs);
+                fix_stmt(body, vt, pc, pool, multi, counter);
+                if !defs.is_empty() {
+                    let old = std::mem::replace(s, Stmt::Block(vec![]));
+                    defs.push(old);
+                    *s = Stmt::Block(defs);
+                }
+            }
+            Stmt::Switch { selector, cases, default, .. } => {
+                let mut defs: Vec<Stmt> = Vec::new();
+                lambda_snaps(selector, vt, pc, pool, multi, counter, &mut defs);
+                for c in cases.iter_mut() {
+                    for st in c.body.iter_mut() {
+                        fix_stmt(st, vt, pc, pool, multi, counter);
+                    }
+                }
+                if let Some(d) = default {
+                    fix_stmt(d, vt, pc, pool, multi, counter);
+                }
+                if !defs.is_empty() {
+                    let old = std::mem::replace(s, Stmt::Block(vec![]));
+                    defs.push(old);
+                    *s = Stmt::Block(defs);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                fix_stmt(body, vt, pc, pool, multi, counter);
+                for c in catches.iter_mut() {
+                    fix_stmt(&mut c.body, vt, pc, pool, multi, counter);
+                }
+                if let Some(f) = finally {
+                    fix_stmt(f, vt, pc, pool, multi, counter);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                for r in resources.iter_mut() {
+                    fix_stmt(r, vt, pc, pool, multi, counter);
+                }
+                fix_stmt(body, vt, pc, pool, multi, counter);
+                for c in catches.iter_mut() {
+                    fix_stmt(&mut c.body, vt, pc, pool, multi, counter);
+                }
+                if let Some(f) = finally {
+                    fix_stmt(f, vt, pc, pool, multi, counter);
+                }
+            }
+            Stmt::Synchronized { lock, body } => {
+                let mut defs: Vec<Stmt> = Vec::new();
+                lambda_snaps(lock, vt, pc, pool, multi, counter, &mut defs);
+                fix_stmt(body, vt, pc, pool, multi, counter);
+                if !defs.is_empty() {
+                    let old = std::mem::replace(s, Stmt::Block(vec![]));
+                    defs.push(old);
+                    *s = Stmt::Block(defs);
+                }
+            }
+            Stmt::Labeled { body, .. } => fix_stmt(body, vt, pc, pool, multi, counter),
+            Stmt::Block(v) => {
+                for x in v.iter_mut() {
+                    fix_stmt(x, vt, pc, pool, multi, counter);
+                }
+            }
+            _ => {}
+        }
+    }
+    fix_stmt(s, vt, pc, pool, &multi, &mut counter);
 }
 
 /// Map this$N fields of a member inner class to `Outer.this` raw exprs.
