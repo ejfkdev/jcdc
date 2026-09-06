@@ -836,6 +836,26 @@ impl<'a> Structurer<'a> {
                         && !self.handler_group.contains_key(&cur)
                 })
                 .copied();
+            // The group starts at a LOOP HEADER whose back edge lies
+            // OUTSIDE the protected span (`for (;;) { try { ... } catch
+            // { ... } ...retry... }` — jdk26 ClassValue.getFromHashMap):
+            // the loop is the enclosing construct. Structuring the try
+            // first consumes the header and leaves the back edge to be
+            // duplicated or dropped (walk: silent lost retry loop +
+            // missing return; SESE: 3× unrolled copies). Let the
+            // loop-header branch below win; the body walk re-finds this
+            // group at its start. try{while} keeps group-first: its back
+            // edge is INSIDE the protected span.
+            let group_here = group_here.filter(|&gi| {
+                entry_preclaimed
+                    || !self.is_loop_header(cur, universe, &dom)
+                    || !self.cfg.blocks[cur].pred.iter().any(|&p| {
+                        p != cur
+                            && dom.dominates(cur, p)
+                            && (self.cfg.blocks[p].end <= self.groups[gi].start
+                                || self.cfg.blocks[p].start >= self.groups[gi].end)
+                    })
+            });
             if let Some(gi) = group_here {
                 let outer_universe = universe.clone();
                 let try_region = self.structure_try(gi, universe, &outer_universe, claimed);

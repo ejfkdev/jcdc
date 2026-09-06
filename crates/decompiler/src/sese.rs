@@ -654,6 +654,25 @@ impl<'a> Structurer<'a> {
                             && !self.handler_group.contains_key(&cur)
                     })
                     .max_by_key(|&gi| self.groups[gi].end);
+                // The group starts at a LOOP HEADER whose back edge lies
+                // OUTSIDE the protected span (`for (;;) { try { ... }
+                // catch { ... } ...retry... }` — jdk26
+                // ClassValue.getFromHashMap): the loop is the enclosing
+                // construct. Structuring the try first consumes the
+                // header and the back edge gets duplicated (3× unrolled
+                // copies, lost retry loop, missing return). Let the
+                // loop-header branch below win; the body walk re-finds
+                // this group at its start. try{while} keeps group-first:
+                // its back edge is INSIDE the protected span.
+                let group_here = group_here.filter(|&gi| {
+                    !ctx.loop_headers.contains(&cur)
+                        || !self.cfg.blocks[cur].pred.iter().any(|&p| {
+                            p != cur
+                                && ctx.idom.dominates(cur, p)
+                                && (self.cfg.blocks[p].end <= self.groups[gi].start
+                                    || self.cfg.blocks[p].start >= self.groups[gi].end)
+                        })
+                });
                 if let Some(gi) = group_here {
                     let outer_universe = ctx.universe.clone();
                     let mut claimed = ctx.consumed.clone();
