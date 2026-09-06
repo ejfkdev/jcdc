@@ -6518,6 +6518,34 @@ fn add_throw_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, p
     }
     match s {
         Stmt::Throw(e) => {
+            // `throw (Throwable) supplier.get();` — javac checkcasts a
+            // generically-thrown value to the ERASURE of the declared
+            // throws type variable (`<X extends Throwable> ... throws X`).
+            // Printing the erasure throws an exception the signature does
+            // not declare ("未报告的异常错误Throwable", jdk17
+            // Optional.orElseThrow). Retype the cast to the variable.
+            if let Expr::Cast { ty, e: _ } = e {
+                if let TypeRef::J(jcdc_jvm::JavaType::Object(cn)) = ty {
+                    if let Some(v) = sig.throws.iter().find_map(|t| {
+                        match t {
+                            jcdc_jvm::GenericType::TypeVar(v) => {
+                                let bounded = sig.params.iter().any(|p| {
+                                    p.name == *v
+                                        && p.class_bound.as_ref().map(|b| {
+                                            TypeRef::G(b.clone()).erased()
+                                                == jcdc_jvm::JavaType::Object(cn.clone())
+                                        }).unwrap_or(false)
+                                });
+                                if bounded { Some(v.clone()) } else { None }
+                            }
+                            _ => None,
+                        }
+                    }) {
+                        *ty = TypeRef::G(jcdc_jvm::GenericType::TypeVar(v));
+                        return;
+                    }
+                }
+            }
             if let Expr::Method { cls, name, desc, type_args, .. } = e {
                 if !type_args.is_empty() {
                     return;
