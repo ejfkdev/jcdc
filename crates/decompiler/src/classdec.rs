@@ -2832,64 +2832,18 @@ fn hoist_clinit_returns(s: &mut Stmt) {
 }
 
 fn strip_static_init_returns(s: &mut Stmt) {
-    match s {
-        Stmt::Block(v) => {
-            for x in v.iter_mut() {
-                strip_static_init_returns(x);
-            }
-            while matches!(v.last(), Some(Stmt::Return(None))) {
-                v.pop();
-            }
+    // Java forbids `return;` in a static initializer and the method's
+    // final one is the natural end. TOP LEVEL ONLY: a mid-body bare
+    // return is a SKIP marker that hoist_clinit_returns redistributes
+    // the rest around — stripping those first made exit branches fall
+    // through silently (Long$LongCache branch copy double-assigned the
+    // final `cache`).
+    if let Stmt::Block(v) = s {
+        while matches!(v.last(), Some(Stmt::Return(None))) {
+            v.pop();
         }
-        Stmt::If { then_stmt, else_stmt, .. } => {
-            strip_static_init_returns(then_stmt);
-            if let Some(e) = else_stmt {
-                strip_static_init_returns(e);
-            }
-        }
-        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => strip_static_init_returns(body),
-        Stmt::For { init, body, .. } => {
-            init.iter_mut().for_each(strip_static_init_returns);
-            strip_static_init_returns(body);
-        }
-        Stmt::ForEach { body, .. } => strip_static_init_returns(body),
-        Stmt::Switch { cases, default, .. } => {
-            for c in cases.iter_mut() {
-                c.body.iter_mut().for_each(strip_static_init_returns);
-            }
-            if let Some(d) = default {
-                strip_static_init_returns(d);
-            }
-        }
-        Stmt::Try { body, catches, finally } => {
-            strip_static_init_returns(body);
-            for c in catches.iter_mut() {
-                strip_static_init_returns(&mut c.body);
-            }
-            if let Some(f) = finally {
-                strip_static_init_returns(f);
-            }
-        }
-        Stmt::TryWithResources { resources, body, catches, finally } => {
-            for r in resources.iter_mut() {
-                strip_static_init_returns(r);
-            }
-            strip_static_init_returns(body);
-            for c in catches.iter_mut() {
-                strip_static_init_returns(&mut c.body);
-            }
-            if let Some(f) = finally {
-                strip_static_init_returns(f);
-            }
-        }
-        Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => {
-            strip_static_init_returns(body)
-        }
-        _ => {}
     }
 }
-
-/// Drop a leading argument-less `super()` call (implicit in Java source).
 fn strip_trivial_super(body: &mut Stmt, pc: &PoolClass) {
     let stmts = match body {
         Stmt::Block(v) => v,

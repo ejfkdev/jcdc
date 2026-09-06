@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::builder::Term;
 use crate::expr::Expr;
+use crate::stmt::Stmt;
 
 use crate::structure::{
     compute_dominators, compute_postdominators, reachable_within, DomInfo, Region, Structurer,
@@ -291,6 +292,95 @@ impl<'a> Structurer<'a> {
     /// forward edge) while refusing to invent a follow across a `continue`
     /// (ControlFlow.nestedLoops: the `++j;continue` block only reaches `++c`
     /// via the header back-edge, so `++c` is correctly NOT a merge).
+    /// Nearest block (by start) that every NON-TERMINATING successor
+    /// reaches within `stop` — unlike convergent_merge this MAY return a
+    /// stop member: a switch/if inside a loop body whose branches break
+    /// to the loop increment (a body_stop exit) still has a well-defined
+    /// merge; refusing it strands breaks as RawGotos and drops shared
+    /// tails (ObjectStreamClass.computeFieldOffsets, Long$LongCache
+    /// clinit). Cm's dominance guards still apply: a candidate that
+    /// (properly) dominates a live target is an ancestor confluence
+    /// (Integer.toString fixup), not a follow.
+    fn live_merge(
+        &self,
+        ctx: &SeseCtx,
+        succs: &[usize],
+        stop: &HashSet<usize>,
+    ) -> Option<usize> {
+        let live: Vec<usize> = succs
+            .iter()
+            .copied()
+            .filter(|&t| !matches!(self.results[t].term, Term::Return(_) | Term::Throw(_)))
+            .collect();
+        // Require 2+ live branches: a single live target trivially
+        // "merges with itself" — for a loop condition that makes the
+        // body entry the follow, emptying the else branch and degrading
+        // ControlFlow.breakInLoop's `return i` to `break`. One-live
+        // shapes must keep follow=None so branches structure naturally.
+        if live.len() < 2 {
+            return None;
+        }
+        // A branch target that every live branch flows to IS the merge
+        // (the sibling completes normally into it and the branch is an
+        // empty fallthrough) — prefer it even when it is a shared
+        // terminator; scanning by nearest-start would otherwise pick a
+        // non-target confluence and strand the tail (Fin/Long$LongCache:
+        // `cache = archivedCache; return` must be the follow, not a
+        // branch-body copy with the top-level tail lost). ONLY with 2+
+        // live targets: a loop condition (one live body entry, one exit
+        // branch) must keep follow=None so both branches structure
+        // naturally — otherwise the body entry becomes the "follow", the
+        // else branch empties, and ControlFlow.breakInLoop's `return i`
+        // degrades to `break`.
+        if live.len() >= 2 {
+            for &t in succs.iter() {
+                if stop.contains(&t) || ctx.consumed.contains(&t) {
+                    continue;
+                }
+                if live
+                    .iter()
+                    .all(|&o| o == t || self.reaches_within(ctx, o, t, stop))
+                {
+                    return Some(t);
+                }
+            }
+        }
+        let mut best: Option<usize> = None;
+        for &cand in ctx.universe.iter() {
+            if ctx.consumed.contains(&cand)
+                || ctx.loop_headers.contains(&cand)
+                || ctx.loop_stack.contains(&cand)
+            {
+                continue;
+            }
+            // (Shared terminators ARE eligible here: a branch merging at
+            // a return block is a normal follow — Long$LongCache's tail.
+            // The escape filter downstream in the follow chain rejects
+            // the cases where a branch jumps OUT instead, jdk17 String.)
+            if live.iter().any(|&t| t != cand && ctx.idom.dominates(cand, t)) {
+                continue;
+            }
+            if live.contains(&cand)
+                && live.iter().any(|&t| t != cand && ctx.idom.dominates(t, cand))
+            {
+                continue;
+            }
+            if live
+                .iter()
+                .all(|&t| t == cand || self.reaches_within(ctx, t, cand, stop))
+            {
+                match best {
+                    None => best = Some(cand),
+                    Some(b) if self.cfg.blocks[cand].start < self.cfg.blocks[b].start => {
+                        best = Some(cand)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        best
+    }
+
     fn reaches_within(&self, ctx: &SeseCtx, from: usize, target: usize, stop: &HashSet<usize>) -> bool {
         if from == target {
             return true;
@@ -410,7 +500,12 @@ impl<'a> Structurer<'a> {
                 // explode-true paths. Anything else becomes a Goto (resolved
                 // to break/continue/label at conversion), never a re-walk.
                 if matches!(self.results[cur].term, Term::Return(_) | Term::Throw(_)) {
-                    // Shared terminator: duplicate inline (no outgoing flow).
+                    // Shared terminator: duplicate inline (no outgoing
+                    // flow). Duplicating a final-field write is REQUIRED
+                    // here: the paths are disjoint (each copy ends in the
+                    // return), and eliding it would drop the assignment
+                    // from this path entirely ("variable f might not have
+                    // been assigned" — Fin/Long$LongCache fresh path).
                     parts.push(Region::CopyStmts { block: cur });
                 } else if ctx.loop_stack.contains(&cur) {
                     // Back-edge to an enclosing loop header: a `continue`
@@ -690,6 +785,27 @@ impl<'a> Structurer<'a> {
                     let follow = self
                         .sese_ipdom(ctx, cur)
                         .filter(|f| ctx.universe.contains(f) && !stop.contains(f))
+                        .or_else(|| self.live_merge(ctx, &[taken, fall], stop))
+                        // A follow that IS one of the branch targets only
+                        // works when the OTHER target flows to it — that
+                        // branch completes normally and falls through
+                        // (empty branch). When the sibling instead exits
+                        // (return/throw) or escapes to a stop, the target
+                        // is shared-tail code: choosing it as follow
+                        // leaves the tail unstructured after the sibling
+                        // consumes it (Fin/Long$LongCache: lost
+                        // `cache = archivedCache;` tail => final
+                        // double-assign in the branch copy / "variable f
+                        // might not have been initialized"). follow=None
+                        // keeps the tail inside the branch (walk parity).
+                        .filter(|f| {
+                            ![taken, fall].contains(f)
+                                || [taken, fall].iter().any(|&t| {
+                                    t != *f
+                                        && (stop.contains(&t)
+                                            || self.reaches_within(ctx, t, *f, stop))
+                                })
+                        })
                         // A shared TERMINATOR as follow means some branch
                         // never completes normally — it must be a branch that
                         // flows to f within this region's stop set. When a
@@ -774,58 +890,13 @@ impl<'a> Structurer<'a> {
                     let follow = self
                         .sese_ipdom(ctx, cur)
                         .filter(|f| !stop.contains(f))
-                        // A switch inside a loop body whose cases all end
-                        // in `break`: the shared target is the loop's
-                        // increment, a body_stop EXIT — and when a case
-                        // THROWS (javac's default: throw InternalError),
-                        // no real ipdom exists at all. Scan for the
-                        // nearest block every NON-TERMINATING branch
-                        // reaches, allowing stop members: case regions
-                        // then end in Goto{follow} -> plain `break`, and
-                        // the increment stays outside the switch
-                        // (jdk11 ObjectStreamClass.computeFieldOffsets —
-                        // fall-through cases + `break L10` RawGoto leak,
-                        // a vU first blocker on both paths).
-                        .or_else(|| {
-                            let live: Vec<usize> = succs
-                                .iter()
-                                .copied()
-                                .filter(|&t| {
-                                    !matches!(
-                                        self.results[t].term,
-                                        Term::Return(_) | Term::Throw(_)
-                                    )
-                                })
-                                .collect();
-                            if live.is_empty() {
-                                return None;
-                            }
-                            let mut best: Option<usize> = None;
-                            for &cand in ctx.universe.iter() {
-                                if ctx.consumed.contains(&cand)
-                                    || ctx.loop_headers.contains(&cand)
-                                    || ctx.loop_stack.contains(&cand)
-                                {
-                                    continue;
-                                }
-                                if live
-                                    .iter()
-                                    .all(|&t| t == cand || self.reaches_within(ctx, t, cand, stop))
-                                {
-                                    match best {
-                                        None => best = Some(cand),
-                                        Some(b)
-                                            if self.cfg.blocks[cand].start
-                                                < self.cfg.blocks[b].start =>
-                                        {
-                                            best = Some(cand)
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            best
-                        })
+                        // A switch inside a loop body whose cases all end in `break`
+                        // merges at the loop increment (a body_stop exit),
+                        // and a throwing default kills the plain ipdom —
+                        // live_merge recovers it (ObjectStreamClass
+                        // .computeFieldOffsets: fall-through cases and
+                        // dangling break labels).
+                        .or_else(|| self.live_merge(ctx, &succs, stop))
                         .or_else(|| self.convergent_merge(ctx, &succs, stop));
                     let mut claimed = ctx.consumed.clone();
                     let sw = self.structure_switch(

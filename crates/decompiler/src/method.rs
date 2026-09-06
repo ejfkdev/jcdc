@@ -359,6 +359,16 @@ pub fn decompile_method(
     let diamond_merges: std::collections::HashSet<usize> =
         merge_cond.keys().copied().collect();
     let mut structurer = Structurer::with_diamonds(&cfg, &results, diamond_merges, fold_regions);
+    structurer.final_fields = pc
+        .cf
+        .fields
+        .iter()
+        .filter(|f| {
+            f.access_flags
+                .contains(jcdc_classfile::FieldAccessFlags::FINAL)
+        })
+        .filter_map(|f| pc.utf8(f.name_index).map(|n| n.to_string()))
+        .collect();
     let region = structurer.structure_method();
 
     // Convert to statements.

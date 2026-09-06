@@ -492,6 +492,12 @@ pub struct Structurer<'a> {
     pub body_group: HashMap<usize, usize>,
     /// Group index owning each handler head block.
     pub handler_group: HashMap<usize, usize>,
+    /// Final fields of the emitting class: SESE must not duplicate a
+    /// shared terminator block that assigns one (a final accepts exactly
+    /// one assignment per path — jdk17 Long$LongCache clinit tail
+    /// `cache = archivedCache; return;` copied into a branch =
+    /// "variable cache might already have been assigned").
+    pub final_fields: std::collections::HashSet<String>,
 }
 
 impl<'a> Structurer<'a> {
@@ -617,7 +623,7 @@ impl<'a> Structurer<'a> {
         for (&merge, (root, _vis)) in &fold_regions {
             fold_root_to_merge.insert(*root, merge);
         }
-        Structurer { cfg, results, groups, body_group, handler_group, diamond_merges, fold_regions, fold_root_to_merge, copied_tails: HashSet::new(), loops_stack: Vec::new(), walk_depth: 0 }
+        Structurer { cfg, results, groups, body_group, handler_group, diamond_merges, fold_regions, fold_root_to_merge, copied_tails: HashSet::new(), loops_stack: Vec::new(), walk_depth: 0, final_fields: HashSet::new() }
     }
 
     /// Immediate post-dominator of `entry` within `universe`. Delegates to the
