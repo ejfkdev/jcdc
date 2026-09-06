@@ -4820,7 +4820,20 @@ fn build_anon_new(
 fn analyze_anon_ctor(apc: &PoolClass, args: Vec<Expr>) -> (Vec<Expr>, HashMap<String, Expr>) {
     let mut captures: HashMap<String, Expr> = HashMap::new();
     let mut captured_idx: HashSet<usize> = HashSet::new();
-    let ctor = (0..apc.cf.methods.len()).find(|&mi| apc.method_name(mi) == Some("<init>"));
+    // The ctor matching the CALL SITE's arity: a local class with several
+    // ctors applied the FIRST ctor's capture positions to every new site
+    // (jdk11 Var: `new Var(vn, vt, className)` — prev dropped, className
+    // kept — "String无法转换为Var").
+    let ctor = (0..apc.cf.methods.len())
+        .find(|&mi| {
+            apc.method_name(mi) == Some("<init>")
+                && apc
+                    .method_desc(mi)
+                    .and_then(parse_method_descriptor)
+                    .map(|md| md.args.len() == args.len())
+                    .unwrap_or(false)
+        })
+        .or_else(|| (0..apc.cf.methods.len()).find(|&mi| apc.method_name(mi) == Some("<init>")));
     if let Some(mi) = ctor {
         if let Ok(Some(mb)) = decompile_method(apc, empty_pool(), mi) {
             // param var name -> index
