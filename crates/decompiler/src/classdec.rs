@@ -663,6 +663,19 @@ thread_local! {
     /// must move to a position dominating both sites.
     static EXTERN_REDECL: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+
+    /// Simple name -> internal name of local classes declared in the
+    /// method frame being emitted: the marker New (`\u{2}Name`) carries
+    /// only the simple name, but typed ctor-arg rendering needs the
+    /// class. Method-scoped (two same-simple local classes cannot
+    /// coexist in one method; across methods the frame save/restore
+    /// keeps the lookup exact).
+    static LOCAL_CLASS_INTERNALS: std::cell::RefCell<HashMap<String, String>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+pub(crate) fn local_class_internal(simple: &str) -> Option<String> {
+    LOCAL_CLASS_INTERNALS.with(|m| m.borrow().get(simple).cloned())
 }
 
 thread_local! {
@@ -2674,6 +2687,8 @@ fn emit_method_with(
             // +32 errors). Nested emissions (anon bodies) snapshot/restore
             // around themselves, preserving this frame.
             let extern_save = EXTERN_DECL.with(|x| x.borrow().clone());
+            let internals_save =
+                LOCAL_CLASS_INTERNALS.with(|m| std::mem::take(&mut *m.borrow_mut()));
             fix_lambda_captures(&mut body, &mut mb.vt, pc, pool, fam);
             line.push_str(" {\n");
             out.push_str(&line);
@@ -2699,6 +2714,7 @@ fn emit_method_with(
                 .with_ret_sam(ret_sam)
                 .into_string(&body);
             EXTERN_DECL.with(|x| *x.borrow_mut() = extern_save);
+            LOCAL_CLASS_INTERNALS.with(|m| *m.borrow_mut() = internals_save);
             out.push_str(&text);
             out.push_str(&pad);
             out.push_str("}\n");
@@ -4156,6 +4172,9 @@ fn emit_local_class_decl(
     pending: &mut Vec<Stmt>,
 ) {
     let simple = simple.to_string();
+    LOCAL_CLASS_INTERNALS.with(|m| {
+        m.borrow_mut().insert(simple.clone(), cls.to_string());
+    });
     // Already extracted to an EARLIER statement of this method
     // (EXTERN_DECL is method-scoped): record the second mention site so
     // fix_lambda_captures can relocate the decl to a position dominating

@@ -650,7 +650,18 @@ impl<'a> Printer<'a> {
                     out.push_str(local);
                     out.push_str(diamond);
                     out.push('(');
-                    self.args(args, out);
+                    // Local records/classes keep bytecode-arity ctors:
+                    // typed rendering turns an int constant into the
+                    // char/boolean literal the ctor expects (jdk17
+                    // MessageFormat `new Qchar(39, quoted)`).
+                    let internal = crate::classdec::local_class_internal(local);
+                    match internal
+                        .as_deref()
+                        .and_then(|i| self.ctor_param_types(i, 0, args.len(), args))
+                    {
+                        Some(pt) => self.args_typed(args, &pt, out),
+                        None => self.args(args, out),
+                    }
                     out.push(')');
                 } else if self.is_member_inner(cls)
                     && !args.is_empty()
@@ -980,13 +991,27 @@ impl<'a> Printer<'a> {
                 self.expr(f, 2, out);
             }
             Expr::Assign { target, op, value } => {
-                let tgt_bool = target.type_ref().erased() == jcdc_jvm::JavaType::Boolean;
+                let tgt_er = target.type_ref().erased();
                 self.expr(target, 1, out);
                 out.push(' ');
                 out.push_str(op.symbol());
                 out.push(' ');
-                if tgt_bool && matches!(op, crate::expr::AssignOp::Plain) {
-                    self.expr_bool(value, out);
+                if matches!(op, crate::expr::AssignOp::Plain) {
+                    // Narrow-target assignments render int constants in the
+                    // target's form (jdk11/17/26 xml Parser: `mESt = ch !=
+                    // 116 ? 512 : 60` against `private char mESt` —
+                    // "从int转换到char可能会有损失").
+                    match tgt_er {
+                        jcdc_jvm::JavaType::Boolean => self.expr_bool(value, out),
+                        jcdc_jvm::JavaType::Char => self.expr_char(value, out),
+                        jcdc_jvm::JavaType::Byte => {
+                            self.expr_narrow(value, &jcdc_jvm::JavaType::Byte, out)
+                        }
+                        jcdc_jvm::JavaType::Short => {
+                            self.expr_narrow(value, &jcdc_jvm::JavaType::Short, out)
+                        }
+                        _ => self.expr(value, 1, out),
+                    }
                 } else {
                     self.expr(value, 1, out);
                 }
