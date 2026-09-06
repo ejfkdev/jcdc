@@ -1856,6 +1856,17 @@ fn emit_method_with(
             }
         }
     }
+    // LOCAL classes: capture-carrying ctor params (this$*/val$* stores)
+    // are synthetic — the source ctor never declares them.
+    let is_local_class = matches!(
+        fam.nested.get(&pc.internal_name).map(|n| n.kind),
+        Some(NestedKind::Local)
+    );
+    if is_ctor && is_local_class {
+        for i in ctor_capture_params(pc) {
+            skip_params.insert(i);
+        }
+    }
     // Inner subclass forwarding the enclosing instance to super(): the
     // first ctor parameter is synthetic even without a local this$0 field.
     let mut outer_super_param = false;
@@ -1948,9 +1959,17 @@ fn emit_method_with(
         line.push(' ');
         line.push_str(&name);
     } else {
-        // Anonymous class constructors take the base type's name.
+        // Anonymous class constructors take the base type's name; LOCAL
+        // classes ($1Splitr) take their stripped source name.
         let self_simple = simple_name(&pc.internal_name);
-        let ctor_name = if self_simple.chars().all(|c| c.is_ascii_digit()) {
+        let local_simple = fam
+            .nested
+            .get(&pc.internal_name)
+            .filter(|n| matches!(n.kind, NestedKind::Local))
+            .map(|n| n.simple.clone());
+        let ctor_name = if let Some(ls) = local_simple {
+            ls
+        } else if self_simple.chars().all(|c| c.is_ascii_digit()) {
             let base = pc
                 .cf
                 .interfaces
@@ -2132,7 +2151,10 @@ fn emit_method_with(
             // substitution: it normalizes param-slot reads of the outer
             // instance (Local this$N) into field reads (this.this$N),
             // which the substitution below then rewrites to Outer.this.
-            if is_ctor && (class_has_this0(pc) || outer_super_param) {
+            // Local-class ctors always strip: a static-method local has no
+            // this$0, but its capture stores (val$ puts / substituted Raw
+            // assigns) are junk all the same.
+            if is_ctor && (class_has_this0(pc) || outer_super_param || is_local_class) {
                 strip_inner_ctor_artifacts(&mut body, &mb.vt);
             }
             // Member inner classes: this$N field reads become Outer.this.
@@ -2153,9 +2175,12 @@ fn emit_method_with(
             out.push_str(&line);
             let ret_bool = mdesc.as_ref().map(|d| d.ret == jcdc_jvm::JavaType::Boolean).unwrap_or(false)
                 || msig.as_ref().map(|g| matches!(&g.ret, jcdc_jvm::GenericType::Primitive('Z'))).unwrap_or(false);
+            let ret_char = mdesc.as_ref().map(|d| d.ret == jcdc_jvm::JavaType::Char).unwrap_or(false)
+                || msig.as_ref().map(|g| matches!(&g.ret, jcdc_jvm::GenericType::Primitive('C'))).unwrap_or(false);
             let text = Printer::new(pc, pool, &mb.vt)
                 .with_indent(indent + 1)
                 .with_ret_bool(ret_bool)
+                .with_ret_char(ret_char)
                 .into_string(&body);
             out.push_str(&text);
             out.push_str(&pad);
@@ -3023,7 +3048,7 @@ fn walk_expr_anon(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, fam: &Family, 
                         }
                     }
                     let mut buf = String::new();
-                    if emit_anon_body(&lpc, pool, fam, &captures, &mut buf, 0).is_ok() {
+                    if emit_anon_body(&lpc, pool, fam, &captures, &mut buf, 0, true).is_ok() {
                         let decl = Stmt::ClassDecl { name: simple.clone(), header, body: buf };
                         if hoist_out {
                             ANON_HOIST.with(|h| {
@@ -3551,7 +3576,7 @@ fn build_anon_new(
 
     let mut body = String::new();
     let hoist_mark = ANON_HOIST.with(|h| h.borrow().len());
-    if let Err(e) = emit_anon_body(apc, pool, fam, &captures, &mut body, 0) {
+    if let Err(e) = emit_anon_body(apc, pool, fam, &captures, &mut body, 0, false) {
         if std::env::var("JCDC_DBG_ANON").is_ok() {
             eprintln!("ANON build fail {}: {}", apc.internal_name, e);
         }
@@ -3617,6 +3642,44 @@ fn analyze_anon_ctor(apc: &PoolClass, args: Vec<Expr>) -> (Vec<Expr>, HashMap<St
     (kept, captures)
 }
 
+/// Descriptor-param indices of ctor parameters that javac synthesized to
+/// carry captures (stored straight into this$*/val$* fields). Their LVT
+/// names are often absent (`arg1`), so the name-based skip in
+/// emit_method_with misses them — but a LOCAL class's emitted ctor must
+/// not declare them (source locals capture lexically).
+fn ctor_capture_params(apc: &PoolClass) -> HashSet<usize> {
+    let mut captured: HashSet<usize> = HashSet::new();
+    let Some(mi) = (0..apc.cf.methods.len()).find(|&i| apc.method_name(i) == Some("<init>")) else {
+        return captured;
+    };
+    let Ok(Some(mb)) = decompile_method(apc, empty_pool(), mi) else {
+        return captured;
+    };
+    let mut param_names: Vec<(String, usize)> = Vec::new();
+    let mut idx = 0usize;
+    for v in &mb.vt.vars {
+        if v.is_param && v.name != "this" {
+            param_names.push((v.name.clone(), idx));
+            idx += 1;
+        }
+    }
+    for st in stmt_vec(&mb.body) {
+        if let Stmt::ExprStmt(Expr::Assign { target, value, .. }) = st {
+            if let Expr::Field { name: fname, is_static: false, .. } = &*target {
+                if fname.starts_with("this$") || fname.starts_with("val$") {
+                    if let Expr::Local { var, .. } = &*value {
+                        let vname = mb.vt.var(*var).name.clone();
+                        if let Some((_, pi)) = param_names.iter().find(|(n, _)| *n == vname) {
+                            captured.insert(*pi);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    captured
+}
+
 fn emit_anon_body(
     apc: &PoolClass,
     pool: &ClassPool,
@@ -3624,6 +3687,7 @@ fn emit_anon_body(
     captures: &HashMap<String, Expr>,
     out: &mut String,
     indent: usize,
+    is_local: bool,
 ) -> anyhow::Result<()> {
     // Self/mutual instantiation cycles: a local or anonymous class whose
     // methods instantiate it (or a sibling that instantiates it back) must
@@ -3638,7 +3702,17 @@ fn emit_anon_body(
     // initializers from the generated <init>.
     let is_rec = apc.class_attr("Record").is_some();
     let rec_comps = if is_rec { record_component_names(apc) } else { Vec::new() };
-    let mut ctor_inits = anon_field_inits(apc, pool, captures);
+    // LOCAL classes keep their real constructor (emitted below): their
+    // field "initializers" are ctor parameter assignments, and folding
+    // them onto the fields produces self-references and unresolved
+    // parameter names (jdk11 SpinedBuffer$1Splitr: `final int
+    // lastSpineIndex = lastSpineIndex;` + `= firstSpineIndex;` with no
+    // ctor — 8 "cannot apply ctor" + 2 self-reference errors).
+    let mut ctor_inits = if is_local {
+        HashMap::new()
+    } else {
+        anon_field_inits(apc, pool, captures)
+    };
     // Field initializers can instantiate anonymous classes (`new X() {...}`
     // shows up as a digit-leading class ref); inline them like method bodies.
     for v in ctor_inits.values_mut() {
@@ -3663,7 +3737,10 @@ fn emit_anon_body(
     // ride on the `new Base(args) { ... }` expression itself.
     for mi in 0..apc.cf.methods.len() {
         let name = apc.method_name(mi).unwrap_or("").to_string();
-        if name == "<init>" || name == "<clinit>" || skip.contains(&mi) {
+        if name == "<clinit>" || skip.contains(&mi) {
+            continue;
+        }
+        if name == "<init>" && !is_local {
             continue;
         }
         emit_method_with(apc, pool, fam, mi, out, indent + 1, captures)?;
@@ -4444,8 +4521,14 @@ fn strip_inner_ctor_artifacts(s: &mut Stmt, vt: &VarTable) {
     fn junk(st: &Stmt, vt: &VarTable) -> bool {
         match st {
             Stmt::ExprStmt(Expr::Assign { target, .. }) => match &**target {
-                Expr::Field { name, .. } => name.starts_with("this$"),
-                Expr::Raw(t) => t.ends_with(".this") || t.starts_with("this$"),
+                Expr::Field { name, .. } => {
+                    name.starts_with("this$") || name.starts_with("val$")
+                }
+                // Capture substitution turns `this.val$x = param` into an
+                // assign to a Raw outer-local name; an inner/local ctor can
+                // never legally assign an outer local, so any Raw target
+                // here is a capture store.
+                Expr::Raw(_) => true,
                 _ => false,
             },
             Stmt::ExprStmt(Expr::Method { name, args, .. }) => {
@@ -4777,12 +4860,33 @@ fn collapse_ctor_delegation(body: &mut Stmt, pc: &PoolClass) {
         Stmt::Block(v) => v,
         _ => return,
     };
-    let Some(last) = items.last() else { return };
+    if items.is_empty() {
+        return;
+    }
+    // javac compiles a leading `this(<big conditional>)` into per-branch
+    // delegations through a shared local: `[str = null;] if-tree with
+    // leaves `str = X; this(str); return;` (branches may also FALL
+    // THROUGH to a trailing `this(str);`)`. Fold the whole tail sequence
+    // back into one leading delegation — mid-body `this(...)` is illegal
+    // source (jdk26 String(Charset,byte[],int,int): "explicit constructor
+    // call not allowed here", blocked every jdk26 corpus family).
+    let (tail, fallback) = match items.last() {
+        Some(Stmt::ExprStmt(e @ Expr::Method { name, cls, args, .. }))
+            if name == "<init>" && cls == &pc.internal_name && args.len() == 1 =>
+        {
+            (&items[..items.len() - 1], Some(e.clone()))
+        }
+        _ => (items.as_slice(), None),
+    };
+    if tail.is_empty() {
+        return;
+    }
     let mut tmpl: Option<Expr> = None;
-    let Some(val) = delegation_value(last, &mut tmpl, &pc.internal_name) else {
+    let Some(val) = delegation_value_seq(tail, &mut tmpl, &pc.internal_name, fallback.as_ref())
+    else {
         return;
     };
-    let Some(mut call) = tmpl else { return };
+    let Some(mut call) = tmpl.or(fallback) else { return };
     // Only a delegation to THIS class (not super) may appear mid-body.
     match &mut call {
         Expr::Method { cls, args, .. } if args.len() == 1 => {
@@ -4793,37 +4897,73 @@ fn collapse_ctor_delegation(body: &mut Stmt, pc: &PoolClass) {
         }
         _ => return,
     }
-    // Prefix statements: only a bare declaration of the delegated local is
-    // tolerated (it disappears into the expression).
-    let prefix_ok = items[..items.len() - 1].iter().all(|st| match st {
-        Stmt::LocalDef { init: None, .. } => true,
-        Stmt::LocalDef { init: Some(e), .. } => {
-            matches!(e, Expr::Const(crate::expr::ConstVal::Null))
-        }
-        Stmt::Comment(_) => true,
-        _ => false,
-    });
-    if !prefix_ok {
-        return;
-    }
     *body = Stmt::Block(vec![Stmt::ExprStmt(call)]);
+}
+
+/// Fold a statement SEQUENCE (assignments + one if-tree + optional
+/// trailing delegation) into the delegated value. Branches without their
+/// own `this(...)` fall through to the trailing delegation, so their
+/// folded value is their last assignment to the delegated local.
+fn delegation_value_seq(
+    stmts: &[Stmt],
+    tmpl: &mut Option<Expr>,
+    own: &str,
+    fallback: Option<&Expr>,
+) -> Option<Expr> {
+    let mut val: Option<Expr> = None;
+    for st in stmts {
+        match st {
+            Stmt::LocalDef { init: None, .. } => {}
+            Stmt::LocalDef { init: Some(e), .. }
+            | Stmt::ExprStmt(e @ Expr::Assign { .. }) => {
+                let v = match e {
+                    Expr::Assign { value, .. } => (**value).clone(),
+                    other => other.clone(),
+                };
+                val = Some(v);
+            }
+            Stmt::Comment(_) => {}
+            Stmt::If { .. } => {
+                val = delegation_value(st, tmpl, own, fallback);
+            }
+            Stmt::ExprStmt(e @ Expr::Method { name, cls, .. })
+                if name == "<init>" && cls == own =>
+            {
+                if tmpl.is_none() {
+                    *tmpl = Some(e.clone());
+                }
+            }
+            Stmt::Return(_) => {}
+            _ => return None,
+        }
+    }
+    val
 }
 
 /// Walk an if/else tree whose leaves are `v = e; this(v); return;` and
 /// produce the folded value expression plus the delegation call template.
-fn delegation_value(s: &Stmt, tmpl: &mut Option<Expr>, own: &str) -> Option<Expr> {
+fn delegation_value(
+    s: &Stmt,
+    tmpl: &mut Option<Expr>,
+    own: &str,
+    fallback: Option<&Expr>,
+) -> Option<Expr> {
     match s {
         Stmt::Block(v) => {
             let mut val: Option<Expr> = None;
             let mut call: Option<Expr> = None;
             for st in v {
                 match st {
-                    Stmt::ExprStmt(Expr::Assign { value, .. }) if val.is_none() => {
+                    // Track the LAST assignment: a fall-through branch's
+                    // delegated value is the local's final value on that
+                    // path (branches that reassign before exiting).
+                    Stmt::ExprStmt(Expr::Assign { value, .. }) => {
                         val = Some((**value).clone());
                     }
-                    Stmt::LocalDef { init: Some(e), .. } if val.is_none() => {
+                    Stmt::LocalDef { init: Some(e), .. } => {
                         val = Some(e.clone());
                     }
+                    Stmt::LocalDef { init: None, .. } => {}
                     Stmt::ExprStmt(e @ Expr::Method { name, cls, .. })
                         if name == "<init>" && cls == own && call.is_none() =>
                     {
@@ -4833,7 +4973,7 @@ fn delegation_value(s: &Stmt, tmpl: &mut Option<Expr>, own: &str) -> Option<Expr
                     _ => return None,
                 }
             }
-            match (val, call) {
+            match (val, call.or_else(|| fallback.cloned())) {
                 (Some(v0), Some(c)) => {
                     if tmpl.is_none() {
                         *tmpl = Some(c);
@@ -4844,8 +4984,8 @@ fn delegation_value(s: &Stmt, tmpl: &mut Option<Expr>, own: &str) -> Option<Expr
             }
         }
         Stmt::If { cond, then_stmt, else_stmt: Some(e), .. } => {
-            let t = delegation_value(then_stmt, tmpl, own)?;
-            let f = delegation_value(e, tmpl, own)?;
+            let t = delegation_value(then_stmt, tmpl, own, fallback)?;
+            let f = delegation_value(e, tmpl, own, fallback)?;
             Some(Expr::Cond {
                 c: Box::new(cond.clone()),
                 t: Box::new(t),
@@ -5260,6 +5400,16 @@ fn raw_witness_generic_method_args(e: &mut Expr, pool: &ClassPool, pc: &PoolClas
             TypeRef::G(G::Class(ca)) if !ca.parts.iter().all(|p| p.args.is_empty()) => ca,
             _ => continue,
         };
+        // Only WILDCARD-parameterized arguments doom unification (a
+        // capture cannot be named by an inference variable): a typevar-
+        // parameterized arg (Class<T_outer> into Class<T_callee>) unifies
+        // cleanly and the raw cast would force an unchecked call whose
+        // erased return then fails its generic target (jdk26
+        // AnnotatedElement: `(Class) annotationClass` made the callee
+        // return Annotation[] against a T[] local).
+        if !g_has_wildcard(&G::Class(ca.clone())) {
+            continue;
+        }
         if crate::method::classsig_internal(&ca) != crate::method::classsig_internal(cw) {
             continue;
         }

@@ -31,15 +31,25 @@ pub struct Printer<'a> {
     /// returns may need `(R) value` witnesses (jdk17 Collectors
     /// `(Function<I,R>) i -> i`).
     lambda_sam_ret: Option<TypeRef>,
+    /// True when the enclosing method returns char: int constants in the
+    /// returned expression render as char literals (bytecode chars are
+    /// ints; `return cond ? 63 : 105;` in a char method is a lossy
+    /// conversion — source was `? '?' : 'i'`, jdk XML Parser x23).
+    pub ret_char: bool,
 }
 
 impl<'a> Printer<'a> {
     pub fn new(pc: &'a PoolClass, pool: &'a ClassPool, vt: &'a VarTable) -> Self {
-        Printer { pc, pool, vt, out: String::new(), indent: 0, lambda_depth: 0, ret_bool: false, suppress_poly_cast: false, suppress_diamond: false, lambda_sam_ret: None }
+        Printer { pc, pool, vt, out: String::new(), indent: 0, lambda_depth: 0, ret_bool: false, suppress_poly_cast: false, suppress_diamond: false, lambda_sam_ret: None, ret_char: false }
     }
 
     pub fn with_ret_bool(mut self, b: bool) -> Self {
         self.ret_bool = b;
+        self
+    }
+
+    pub fn with_ret_char(mut self, b: bool) -> Self {
+        self.ret_char = b;
         self
     }
 
@@ -99,6 +109,23 @@ impl<'a> Printer<'a> {
         self.out.push('\n');
     }
 
+    /// Render an expression in a char-typed target: int constants become
+    /// char literals, ternary branches recurse (the lossy-conversion fix
+    /// for `char name2type(..) { return c ? 63 : 105; }`).
+    pub fn expr_char(&mut self, e: &Expr, out: &mut String) {
+        match e {
+            Expr::Const(ConstVal::Int(n)) => push_char_lit(out, *n),
+            Expr::Cond { c, t, f } => {
+                self.expr(c, 3, out);
+                out.push_str(" ? ");
+                self.expr_char(t, out);
+                out.push_str(" : ");
+                self.expr_char(f, out);
+            }
+            _ => self.expr(e, 1, out),
+        }
+    }
+
     fn stmt(&mut self, s: &Stmt) {
         match s {
             Stmt::Block(v) => {
@@ -141,6 +168,8 @@ impl<'a> Printer<'a> {
                         self.expr(e, 14, &mut line);
                     } else if info.ty.erased() == jcdc_jvm::JavaType::Boolean {
                         self.expr_bool(e, &mut line);
+                    } else if info.ty.erased() == jcdc_jvm::JavaType::Char {
+                        self.expr_char(e, &mut line);
                     } else {
                         self.expr(e, 1, &mut line);
                     }
@@ -152,6 +181,8 @@ impl<'a> Printer<'a> {
                 let mut line = String::from("return ");
                 if self.ret_bool {
                     self.expr_bool(e, &mut line);
+                } else if self.ret_char {
+                    self.expr_char(e, &mut line);
                 } else {
                     self.expr(e, 1, &mut line);
                 }
@@ -498,6 +529,7 @@ impl<'a> Printer<'a> {
             indent: 0,
             lambda_depth: self.lambda_depth,
             ret_bool: self.ret_bool,
+            ret_char: self.ret_char,
             suppress_poly_cast: self.suppress_poly_cast,
             suppress_diamond: self.suppress_diamond,
             lambda_sam_ret: self.lambda_sam_ret.clone(),
@@ -522,7 +554,20 @@ impl<'a> Printer<'a> {
             Expr::New { cls, args, .. } => {
                 let no_diamond = self.suppress_diamond;
                 self.suppress_diamond = false;
-                let diamond = if no_diamond { "" } else { self.diamond_for(cls) };
+                // A wildcard-typed ctor argument dooms diamond inference
+                // (the inference variable gets an equality constraint from
+                // the capture and a different bound from the context —
+                // "cannot infer type arguments for Entry<>", jdk11
+                // Hashtable `tab[i] = new Entry<>(hash, key, value, e)`
+                // with e: Entry<?,?>; the source declared e as Entry<K,V>
+                // via an unchecked cast that leaves no bytecode trace).
+                // The raw form is always applicable (unchecked).
+                let args_wildcard = args.iter().any(|a| {
+                    matches!(a.type_ref(), TypeRef::G(ref g)
+                        if crate::classdec::g_has_wildcard(g))
+                });
+                let diamond =
+                    if no_diamond || args_wildcard { "" } else { self.diamond_for(cls) };
                 if let Some(local) = cls.strip_prefix('\u{2}') {
                     out.push_str("new ");
                     out.push_str(local);
@@ -596,11 +641,23 @@ impl<'a> Printer<'a> {
                             out.push_str("[]");
                         }
                         out.push_str(" {");
+                        // boolean[]/char[] initializers hold int constants
+                        // in bytecode (iconst + bastore/castore): render
+                        // them as true/false and char literals (jdk11
+                        // PKCS9Attribute `new boolean[] {0, 0, 1, ..}` x18).
+                        let elem_bool = elem.erased() == jcdc_jvm::JavaType::Boolean;
+                        let elem_char = elem.erased() == jcdc_jvm::JavaType::Char;
                         for (i, v) in vals.iter().enumerate() {
                             if i > 0 {
                                 out.push_str(", ");
                             }
-                            self.expr(v, 1, out);
+                            if elem_bool {
+                                self.expr_bool(v, out);
+                            } else if elem_char {
+                                self.expr_char(v, out);
+                            } else {
+                                self.expr(v, 1, out);
+                            }
                         }
                         out.push('}');
                     }
@@ -1185,6 +1242,7 @@ impl<'a> Printer<'a> {
                             indent: self.indent,
                             lambda_depth: self.lambda_depth + 1,
                             ret_bool: false,
+                            ret_char: false,
                             suppress_poly_cast: false,
                             suppress_diamond: false,
                             lambda_sam_ret: None,
@@ -1484,6 +1542,24 @@ impl<'a> Printer<'a> {
 fn inner_simple(cls: &str) -> String {
     let last = cls.rsplit('/').next().unwrap_or(cls);
     last.rsplit('$').next().unwrap_or(last).to_string()
+}
+
+fn push_char_lit(out: &mut String, n: i32) {
+    let c = (n as u16) as u32;
+    match char::from_u32(c) {
+        Some('\'') => out.push_str("'\\''"),
+        Some('\\') => out.push_str("'\\\\'"),
+        Some('\n') => out.push_str("'\\n'"),
+        Some('\r') => out.push_str("'\\r'"),
+        Some('\t') => out.push_str("'\\t'"),
+        Some(ch) if ch.is_control() => out.push_str(&format!("'\\u{:04x}'", c)),
+        Some(ch) => {
+            out.push('\'');
+            out.push(ch);
+            out.push('\'');
+        }
+        None => out.push_str(&format!("'\\u{:04x}'", c)),
+    }
 }
 
 fn const_bool(e: &Expr) -> Option<bool> {
