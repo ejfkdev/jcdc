@@ -3488,6 +3488,7 @@ fn stmt_mentions_local(s: &Stmt, marker: &str, name: &str, vt: &VarTable, fam: &
                     *found = true;
                 }
             }
+            Expr::Const(crate::expr::ConstVal::ClassLit(t)) => ty_hit(t, name, fam, found),
             Expr::Cast { ty, e: inner, .. } | Expr::InstanceOf { e: inner, ty } => {
                 ty_hit(ty, name, fam, found);
                 walk_e(inner, marker, name, fam, found);
@@ -3837,6 +3838,87 @@ fn walk_stmt_anon(
     }
 }
 
+/// Emit the source declaration of a local class once (dedup by simple
+/// name), hoisting it out when its EnclosingMethod belongs to another
+/// class. Called from construction sites AND from type-position mentions
+/// (class literals / casts): jdk17 Module.moduleInfoClass references
+/// `DummyModuleInfo` only via `DummyModuleInfo.class` — without a decl
+/// the use is "找不到符号".
+fn emit_local_class_decl(
+    cls: &str,
+    lpc: &PoolClass,
+    simple: &str,
+    pc: &PoolClass,
+    pool: &ClassPool,
+    fam: &Family,
+    captures: &HashMap<String, Expr>,
+    pending: &mut Vec<Stmt>,
+) {
+    let simple = simple.to_string();
+    // A local class whose EnclosingMethod names a DIFFERENT class than
+    // the one being walked is declared in an enclosing scope (the new
+    // site sits inside an inlined anonymous body): hoist the declaration
+    // out instead of splicing it into the anon method.
+    let hoist_out = enclosing_method_of(lpc)
+        .map(|(c, _)| c != pc.internal_name)
+        .unwrap_or(false);
+    let dedup: &mut Vec<Stmt> = pending;
+    if dedup.iter().any(|d| matches!(d, Stmt::ClassDecl { name, .. } if *name == simple)) {
+        return;
+    }
+    let mut header = fam
+        .nested
+        .get(cls)
+        .and_then(|n| n.sig_header.clone())
+        .unwrap_or_else(|| simple.clone());
+    if fam.nested.get(cls).and_then(|n| n.sig_header.as_ref()).is_none() {
+        let mut bases: Vec<String> = Vec::new();
+        let p = Printer::new(lpc, pool, empty_vt());
+        if lpc.class_attr("Record").is_some() {
+            // Local record: `record Name(components)`; the implicit
+            // java.lang.Record supertype is not printed.
+            header = format!("record {}{}", simple, record_components(lpc, pool));
+        } else {
+            for &ii in &lpc.cf.interfaces {
+                if let Some(n) = lpc.class_name(ii) {
+                    bases.push(p.shorten(n));
+                }
+            }
+            if bases.is_empty() {
+                if let Some(sup) = lpc.super_name() {
+                    if sup != "java/lang/Object" && sup != "java/lang/Record" {
+                        header.push_str(" extends ");
+                        header.push_str(&p.shorten(sup));
+                    }
+                }
+            } else {
+                if let Some(sup) = lpc.super_name() {
+                    if sup != "java/lang/Object" && sup != "java/lang/Record" {
+                        header.push_str(" extends ");
+                        header.push_str(&p.shorten(sup));
+                    }
+                }
+                header.push_str(" implements ");
+                header.push_str(&bases.join(", "));
+            }
+        }
+    }
+    let mut buf = String::new();
+    if emit_anon_body(lpc, pool, fam, captures, &mut buf, 0, true).is_ok() {
+        let decl = Stmt::ClassDecl { name: simple.clone(), header, body: buf };
+        if hoist_out {
+            ANON_HOIST.with(|h| {
+                let mut h = h.borrow_mut();
+                if !h.iter().any(|d| matches!(d, Stmt::ClassDecl { name, .. } if *name == simple)) {
+                    h.push(decl);
+                }
+            });
+        } else {
+            dedup.push(decl);
+        }
+    }
+}
+
 fn walk_expr_anon(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, fam: &Family, pending: &mut Vec<Stmt>, vt: &VarTable) {
     if std::env::var("JCDC_DBG_ANON").is_ok() {
         if let Expr::New { cls, raw, .. } = e {
@@ -3869,75 +3951,47 @@ fn walk_expr_anon(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, fam: &Family, 
                     .unwrap_or_else(|| simple_name(cls));
                 let (kept, captures) = analyze_anon_ctor(&lpc, args.clone());
                 let captures = render_captures(captures, pc, pool, vt);
-                // A local class whose EnclosingMethod names a DIFFERENT
-                // class than the one being walked is declared in an
-                // enclosing scope (the new site sits inside an inlined
-                // anonymous body): hoist the declaration out instead of
-                // splicing it into the anon method.
-                let hoist_out = enclosing_method_of(&lpc)
-                    .map(|(c, _)| c != pc.internal_name)
-                    .unwrap_or(false);
-                let dedup: &mut Vec<Stmt> = pending;
-                // Emit the class declaration once (dedup by name).
-                if !dedup.iter().any(|d| matches!(d, Stmt::ClassDecl { name, .. } if *name == simple)) {
-                    let mut header = fam
-                        .nested
-                        .get(cls)
-                        .and_then(|n| n.sig_header.clone())
-                        .unwrap_or_else(|| simple.clone());
-                    if fam.nested.get(cls).and_then(|n| n.sig_header.as_ref()).is_none() {
-                        let mut bases: Vec<String> = Vec::new();
-                        let p = Printer::new(&lpc, pool, empty_vt());
-                        if lpc.class_attr("Record").is_some() {
-                            // Local record: `record Name(components)`; the
-                            // implicit java.lang.Record supertype is not printed.
-                            header = format!("record {}{}", simple, record_components(&lpc, pool));
-                        } else {
-                            for &ii in &lpc.cf.interfaces {
-                                if let Some(n) = lpc.class_name(ii) {
-                                    bases.push(p.shorten(n));
-                                }
-                            }
-                            if bases.is_empty() {
-                                if let Some(sup) = lpc.super_name() {
-                                    if sup != "java/lang/Object" && sup != "java/lang/Record" {
-                                        header.push_str(" extends ");
-                                        header.push_str(&p.shorten(sup));
-                                    }
-                                }
-                            } else {
-                                if let Some(sup) = lpc.super_name() {
-                                    if sup != "java/lang/Object" && sup != "java/lang/Record" {
-                                        header.push_str(" extends ");
-                                        header.push_str(&p.shorten(sup));
-                                    }
-                                }
-                                header.push_str(" implements ");
-                                header.push_str(&bases.join(", "));
-                            }
-                        }
-                    }
-                    let mut buf = String::new();
-                    if emit_anon_body(&lpc, pool, fam, &captures, &mut buf, 0, true).is_ok() {
-                        let decl = Stmt::ClassDecl { name: simple.clone(), header, body: buf };
-                        if hoist_out {
-                            ANON_HOIST.with(|h| {
-                                let mut h = h.borrow_mut();
-                                if !h.iter().any(|d| matches!(d, Stmt::ClassDecl { name, .. } if *name == simple)) {
-                                    h.push(decl);
-                                }
-                            });
-                        } else {
-                            dedup.push(decl);
-                        }
-                    }
-                }
+                emit_local_class_decl(cls, &lpc, &simple, pc, pool, fam, &captures, pending);
                 *e = Expr::New {
                     cls: format!("\u{2}{}", simple),
                     ty: ty.clone(),
                     args: kept,
                     raw: false,
                 };
+            }
+        }
+        // A class literal is the ONLY mention of some local classes
+        // (jdk17 Module.moduleInfoClass: `clazz = DummyModuleInfo.class;`
+        // with no construction site): emit the declaration here or the
+        // name is unbound ("找不到符号").
+        Expr::Const(crate::expr::ConstVal::ClassLit(t)) => {
+            let internal = match t {
+                TypeRef::J(JavaType::Object(n)) => Some(n.clone()),
+                TypeRef::G(jcdc_jvm::GenericType::Class(cs)) => {
+                    Some(crate::method::classsig_internal(cs))
+                }
+                _ => None,
+            };
+            if let Some(internal) = internal {
+                if fam.locals.contains(internal.as_str()) {
+                    if let Some(lpc) = pool.get(&internal) {
+                        let simple = fam
+                            .nested
+                            .get(&internal)
+                            .map(|n| n.simple.clone())
+                            .unwrap_or_else(|| simple_name(&internal));
+                        emit_local_class_decl(
+                            &internal,
+                            &lpc,
+                            &simple,
+                            pc,
+                            pool,
+                            fam,
+                            &HashMap::new(),
+                            pending,
+                        );
+                    }
+                }
             }
         }
         Expr::New { args, .. } => args.iter_mut().for_each(|a| walk_expr_anon(a, pc, pool, fam, pending, vt)),
