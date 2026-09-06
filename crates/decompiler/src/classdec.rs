@@ -444,7 +444,7 @@ fn sig_class_header(lpc: &PoolClass, simple: &str, pool: &ClassPool) -> Option<S
     jcdc_jvm::render_type_params(&sig.params, &mut tp);
     h.push_str(&tp);
     let sup_is_object = matches!(&sig.superclass, G::Class(cs)
-        if cs.parts.first().map(|q| q.name == "Object").unwrap_or(false));
+        if cs.parts.first().map(|q| q.name == "Object" || q.name == "Record").unwrap_or(false));
     if !sup_is_object && matches!(&sig.superclass, G::Class(_) | G::Array(_) | G::TypeVar(_)) {
         h.push_str(" extends ");
         h.push_str(&p.type_name(&TypeRef::G(sig.superclass.clone())));
@@ -4177,35 +4177,67 @@ fn emit_local_class_decl(
     if dedup.iter().any(|d| matches!(d, Stmt::ClassDecl { name, .. } if *name == simple)) {
         return;
     }
-    let mut header = fam
-        .nested
-        .get(cls)
-        .and_then(|n| n.sig_header.clone())
-        .unwrap_or_else(|| simple.clone());
-    if fam.nested.get(cls).and_then(|n| n.sig_header.as_ref()).is_none() {
-        let mut bases: Vec<String> = Vec::new();
+    let is_rec = lpc.class_attr("Record").is_some();
+    let class_sig = lpc.class_attr("Signature").and_then(|b| {
+        if b.len() >= 2 {
+            lpc.utf8(u16::from_be_bytes([b[0], b[1]]))
+                .and_then(|x| parse_class_signature(x))
+        } else {
+            None
+        }
+    });
+    let mut header = if is_rec {
+        // Local record: `record Name<TP>(components) implements ..`. The
+        // sig_header path rendered `Name<T> extends Record implements ..`
+        // for generic local records — "类无法直接扩展 Record", component
+        // names unbound, and new-sites hit a 0-arg ctor (jdk26 classfile
+        // Util ForEachConsumer/WithCodeMethodHandler/WithFlagFieldHandler).
+        // The implicit java.lang.Record supertype is never printed, but
+        // declared interfaces ARE (`record CleanupAction(..) implements
+        // Runnable` — dropping it made the value unassignable to the
+        // method's Runnable return, jdk26
+        // AbstractMemorySegmentImpl.cleanupAction).
         let p = Printer::new(lpc, pool, empty_vt());
-        if lpc.class_attr("Record").is_some() {
-            // Local record: `record Name(components)`; the implicit
-            // java.lang.Record supertype is not printed, but declared
-            // interfaces ARE (`record CleanupAction(..) implements
-            // Runnable` — dropping it made the value unassignable to
-            // the method's Runnable return, jdk26
-            // AbstractMemorySegmentImpl.cleanupAction).
-            header = format!("record {}{}", simple, record_components(lpc, pool));
-            let mut rifaces: Vec<String> = Vec::new();
-            for &ii in &lpc.cf.interfaces {
-                if let Some(n) = lpc.class_name(ii) {
-                    if n != "java/lang/Record" {
-                        rifaces.push(p.shorten(n));
+        let mut h = format!("record {}", simple);
+        if let Some(sig) = &class_sig {
+            let mut tp = String::new();
+            jcdc_jvm::render_type_params(&sig.params, &mut tp);
+            h.push_str(&tp);
+        }
+        h.push_str(&record_components(lpc, pool));
+        let rifaces: Vec<String> = match &class_sig {
+            Some(sig) if !sig.interfaces.is_empty() => sig
+                .interfaces
+                .iter()
+                .map(|i| p.type_name(&TypeRef::G(i.clone())))
+                .collect(),
+            _ => {
+                let mut v = Vec::new();
+                for &ii in &lpc.cf.interfaces {
+                    if let Some(n) = lpc.class_name(ii) {
+                        if n != "java/lang/Record" {
+                            v.push(p.shorten(n));
+                        }
                     }
                 }
+                v
             }
-            if !rifaces.is_empty() {
-                header.push_str(" implements ");
-                header.push_str(&rifaces.join(", "));
-            }
-        } else {
+        };
+        if !rifaces.is_empty() {
+            h.push_str(" implements ");
+            h.push_str(&rifaces.join(", "));
+        }
+        h
+    } else {
+        fam.nested
+            .get(cls)
+            .and_then(|n| n.sig_header.clone())
+            .unwrap_or_else(|| simple.clone())
+    };
+    if !is_rec && fam.nested.get(cls).and_then(|n| n.sig_header.as_ref()).is_none() {
+        let mut bases: Vec<String> = Vec::new();
+        let p = Printer::new(lpc, pool, empty_vt());
+        {
             for &ii in &lpc.cf.interfaces {
                 if let Some(n) = lpc.class_name(ii) {
                     bases.push(p.shorten(n));
