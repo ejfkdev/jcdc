@@ -3920,8 +3920,24 @@ fn emit_local_class_decl(
         let p = Printer::new(lpc, pool, empty_vt());
         if lpc.class_attr("Record").is_some() {
             // Local record: `record Name(components)`; the implicit
-            // java.lang.Record supertype is not printed.
+            // java.lang.Record supertype is not printed, but declared
+            // interfaces ARE (`record CleanupAction(..) implements
+            // Runnable` — dropping it made the value unassignable to
+            // the method's Runnable return, jdk26
+            // AbstractMemorySegmentImpl.cleanupAction).
             header = format!("record {}{}", simple, record_components(lpc, pool));
+            let mut rifaces: Vec<String> = Vec::new();
+            for &ii in &lpc.cf.interfaces {
+                if let Some(n) = lpc.class_name(ii) {
+                    if n != "java/lang/Record" {
+                        rifaces.push(p.shorten(n));
+                    }
+                }
+            }
+            if !rifaces.is_empty() {
+                header.push_str(" implements ");
+                header.push_str(&rifaces.join(", "));
+            }
         } else {
             for &ii in &lpc.cf.interfaces {
                 if let Some(n) = lpc.class_name(ii) {
@@ -4280,7 +4296,13 @@ fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature
             }
         }
     }
-    fn fix(e: &mut Expr, ret_g: &TypeRef, ret_er: &jcdc_jvm::JavaType, pool: &ClassPool) {
+    fn fix(
+        e: &mut Expr,
+        ret_g: &TypeRef,
+        ret_er: &jcdc_jvm::JavaType,
+        pool: &ClassPool,
+        sig: &jcdc_jvm::MethodSignature,
+    ) {
         // A conditional with a poly (lambda/method-ref) arm must NOT be
         // wrapped as a whole: the cast makes the conditional standalone
         // and javac rejects the poly arm ("此处不应为 lambda 表达式").
@@ -4289,58 +4311,90 @@ fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature
         // arm takes the method's return type directly.
         if let Expr::Cond { t, f, .. } = e {
             if matches!(**t, Expr::Lambda(_)) || matches!(**f, Expr::Lambda(_)) {
-                fix(t, ret_g, ret_er, pool);
-                fix(f, ret_g, ret_er, pool);
+                fix(t, ret_g, ret_er, pool, sig);
+                fix(f, ret_g, ret_er, pool, sig);
                 return;
             }
         }
-        if needs_witness(e, ret_g, ret_er, pool) {
-            let v = std::mem::replace(e, Expr::This);
-            *e = Expr::Cast { ty: ret_g.clone(), e: Box::new(v) };
+        if !needs_witness(e, ret_g, ret_er, pool) {
+            return;
         }
+        // A GENERIC CALL must never take the cast: the cast context
+        // starves its inference (it resolves to the bounds —
+        // BiConsumer<Object,..> — and the cast to the parameterized
+        // return is then REJECTED: "BiConsumer<Object,Downstream<? super
+        // Object>>无法转换为BiConsumer<A,Downstream<? super R>>", jdk26
+        // Gatherer.finisher). Prefer the explicit type witness; failing
+        // that, leave the call bare — the return position infers it
+        // (verified: both forms compile where the cast does not).
+        let generic_bare = matches!(e, Expr::Method { type_args, .. } if type_args.is_empty())
+            && is_generic_call(e, pool);
+        if generic_bare {
+            if let Expr::Method { cls, name, desc, type_args, owner, args, .. } = e {
+                if let TypeRef::G(want) = ret_g {
+                    let w = compute_witness(
+                        cls.as_str(),
+                        name.as_str(),
+                        desc,
+                        owner.as_deref(),
+                        want,
+                        pool,
+                        Some(&sig.params),
+                    );
+                    if let Some((wit, mapping)) = w {
+                        *type_args = wit;
+                        retype_witness_arg_casts(cls, name, desc, args, &mapping, pool);
+                        return;
+                    }
+                }
+            }
+            return;
+        }
+        let v = std::mem::replace(e, Expr::This);
+        *e = Expr::Cast { ty: ret_g.clone(), e: Box::new(v) };
     }
-    fn rec(s: &mut Stmt, ret_g: &TypeRef, ret_er: &jcdc_jvm::JavaType, pool: &ClassPool) {
+    fn rec(s: &mut Stmt, ret_g: &TypeRef, ret_er: &jcdc_jvm::JavaType, pool: &ClassPool, sig: &jcdc_jvm::MethodSignature) {
         match s {
-            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, ret_g, ret_er, pool)),
-            Stmt::Return(Some(e)) => fix(e, ret_g, ret_er, pool),
+            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, ret_g, ret_er, pool, sig)),
+            Stmt::Return(Some(e)) => fix(e, ret_g, ret_er, pool, sig),
             Stmt::If { then_stmt, else_stmt, .. } => {
-                rec(then_stmt, ret_g, ret_er, pool);
+                rec(then_stmt, ret_g, ret_er, pool, sig);
                 if let Some(x) = else_stmt {
-                    rec(x, ret_g, ret_er, pool);
+                    rec(x, ret_g, ret_er, pool, sig);
                 }
             }
             Stmt::While { body, .. }
             | Stmt::DoWhile { body, .. }
             | Stmt::ForEach { body, .. }
             | Stmt::Labeled { body, .. }
-            | Stmt::Synchronized { body, .. } => rec(body, ret_g, ret_er, pool),
+            | Stmt::Synchronized { body, .. } => rec(body, ret_g, ret_er, pool, sig),
             Stmt::For { init, body, .. } => {
-                init.iter_mut().for_each(|i| rec(i, ret_g, ret_er, pool));
-                rec(body, ret_g, ret_er, pool);
+                init.iter_mut().for_each(|i| rec(i, ret_g, ret_er, pool, sig));
+                rec(body, ret_g, ret_er, pool, sig);
             }
             Stmt::Switch { cases, default, .. } => {
                 for c in cases.iter_mut() {
                     for st in c.body.iter_mut() {
-                        rec(st, ret_g, ret_er, pool);
+                        rec(st, ret_g, ret_er, pool, sig);
                     }
                 }
                 if let Some(d) = default {
-                    rec(d, ret_g, ret_er, pool);
+                    rec(d, ret_g, ret_er, pool, sig);
                 }
             }
             Stmt::Try { body, catches, finally } => {
-                rec(body, ret_g, ret_er, pool);
+                rec(body, ret_g, ret_er, pool, sig);
                 for c in catches.iter_mut() {
-                    rec(&mut c.body, ret_g, ret_er, pool);
+                    rec(&mut c.body, ret_g, ret_er, pool, sig);
                 }
                 if let Some(f) = finally {
-                    rec(f, ret_g, ret_er, pool);
+                    rec(f, ret_g, ret_er, pool, sig);
                 }
             }
             _ => {}
         }
     }
-    rec(s, &ret_g, &ret_er, pool);
+    rec(s, &ret_g, &ret_er, pool, sig);
 }
 
 /// True when `(cls, name)` is one of the signature-polymorphic methods
