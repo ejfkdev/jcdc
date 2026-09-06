@@ -41,6 +41,14 @@ struct SeseCtx {
     /// loop headers currently being structured (a back-edge to one is a
     /// `continue`, never a copy_walk target).
     loop_stack: Vec<usize>,
+    /// Outermost try groups (mirrors walk's `top_groups`): the `active`
+    /// candidate list threaded into walk-based sub-builders so a try group
+    /// that STARTS inside a switch case or a copied tail still fires there
+    /// (URL$DefaultFactory.createURLStreamHandler: the reflection try lives
+    /// entirely inside the stage-2 switch default case; with active=[] the
+    /// case walk structured it bare and the catch was orphaned -> unreported
+    /// checked exceptions, a jdk11/17 corpus blocker).
+    top_groups: Vec<usize>,
     /// recursion depth (safety bound).
     depth: usize,
 }
@@ -127,6 +135,17 @@ impl<'a> Structurer<'a> {
             loop_members.insert(h, members);
         }
 
+        let top_groups: Vec<usize> = (0..self.groups.len())
+            .filter(|gi| {
+                let g = &self.groups[*gi];
+                !self.groups.iter().enumerate().any(|(oj, og)| {
+                    oj != *gi
+                        && og.start <= g.start
+                        && og.end >= g.end
+                        && (og.start != g.start || og.end != g.end)
+                })
+            })
+            .collect();
         let mut ctx = SeseCtx {
             universe,
             idom,
@@ -136,6 +155,7 @@ impl<'a> Structurer<'a> {
             loop_members,
             consumed: HashSet::new(),
             loop_stack: Vec::new(),
+            top_groups,
             depth: 0,
         };
         if std::env::var("JCDC_DBG_PAT").is_ok() {
@@ -423,7 +443,7 @@ impl<'a> Structurer<'a> {
                             cstop.insert(u);
                         }
                     }
-                    match self.copy_walk(cur, &cstop, &[], usize::MAX) {
+                    match self.copy_walk(cur, &cstop, &ctx.top_groups, usize::MAX) {
                         Some(r) => parts.push(r),
                         None => {
                             if !parts.is_empty() {
@@ -443,7 +463,20 @@ impl<'a> Structurer<'a> {
             // boolean short-circuits (`a && b`, `a || b`) and `c ? a : b`
             // into expressions instead of structuring them as control-flow
             // ifs with empty branches (the milestone-3 parity with walk).
+            // A block that is ALSO the exact start of a try group must be
+            // structured as the try first — walk checks groups before folds.
+            // Collapsing it as a value diamond skips the try entirely and
+            // orphans the handler (URL.createURLStreamHandler: stage-1 string
+            // switch dispatch folded, try [5,86) never fired, bare reflective
+            // call without its catch -> unreported checked exceptions; a jdk11/17
+            // corpus blocker). The diamond is re-folded inside the try body walk.
+            let fold_blocked_by_group = (0..self.groups.len()).any(|gi| {
+                self.groups[gi].start == self.cfg.blocks[cur].start
+                    && self.groups[gi].end >= self.cfg.blocks[cur].end
+                    && !self.handler_group.contains_key(&cur)
+            });
             if let Some(&merge) = self.fold_root_to_merge.get(&cur) {
+                if !fold_blocked_by_group {
                 if let Some((_root, vis)) = self.fold_regions.get(&merge) {
                     if !self.results[cur].stmts.is_empty() {
                         parts.push(Region::Basic { block: cur });
@@ -454,6 +487,7 @@ impl<'a> Structurer<'a> {
                     ctx.consumed.insert(cur);
                     cur = merge;
                     continue;
+                }
                 }
             }
             let b = &self.cfg.blocks[cur];
@@ -717,7 +751,7 @@ impl<'a> Structurer<'a> {
                         &ctx.universe,
                         stop,
                         follow,
-                        &[],
+                        &ctx.top_groups,
                         &mut claimed,
                     );
                     ctx.consumed = claimed;
