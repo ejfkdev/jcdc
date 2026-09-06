@@ -7170,11 +7170,13 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
             );
             if valueish && hn != "java/lang/Object" && hn != "java/lang/String" {
                 let inner = std::mem::replace(value, Expr::This);
-                // For a generic target, cast to the TARGET type: the raw
-                // value-erasure cast is not assignable to it ("SpeciesData
-                // 无法转换为S"); `(S) e` / `(List<E>) e` is unchecked but
-                // always legal.
-                let cast_ty = if matches!(want, TypeRef::G(_)) {
+                // A type-var target needs the cast to the VARIABLE: the
+                // raw value-erasure cast is not assignable to it
+                // ("SpeciesData无法转换为S", jdk26 ClassSpecializer).
+                // A parameterized target keeps the RAW value cast — a
+                // `(G<args>)` cast of a differently-parameterized value
+                // is inconvertible, while the raw form assigns unchecked.
+                let cast_ty = if matches!(want, TypeRef::G(jcdc_jvm::GenericType::TypeVar(_))) {
                     want.clone()
                 } else {
                     TypeRef::J(have.clone())

@@ -4092,6 +4092,13 @@ fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature
         if matches!(e, Expr::Const(_) | Expr::Cast { .. }) {
             return false;
         }
+        // A call already carrying explicit type witnesses types itself
+        // (`Collections.<T>unmodifiableList(...)` IS List<T>); wrapping it
+        // in a cast re-freezes inference and kills diamond args inside
+        // ("无法推断ArrayList<>的类型参数", jdk17 Stream.toList).
+        if matches!(e, Expr::Method { type_args, .. } if !type_args.is_empty()) {
+            return false;
+        }
         // Lambda/method-ref arms are poly expressions: they take their
         // target type from the return position itself. Wrapping the
         // conditional in a witness cast turns it into a standalone
