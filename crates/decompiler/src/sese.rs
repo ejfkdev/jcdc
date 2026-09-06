@@ -662,12 +662,38 @@ impl<'a> Structurer<'a> {
                     ctx.consumed = claimed;
                     parts.push(try_region);
                     let gend = self.groups[gi].end;
+                    // structure_try absorbs a trailing terminator sitting at
+                    // exactly g.end into the body (the protected-range areturn
+                    // javac excludes; ALL its preds are body blocks). It is
+                    // now claimed and lives INSIDE the try; letting the
+                    // continuation search below pick it (it passes
+                    // start >= gend + consumed + is_term) re-emits the body's
+                    // own return after the try (ObjectStreamClass
+                    // getDeclaredSUID: trailing `return Long.valueOf(...)`
+                    // duplicated outside, real `return null` tail lost).
+                    // A shared terminator at gend that the CATCH also copied
+                    // (nestedTry) has a handler pred, is not absorbed, and
+                    // must still be re-copied here — hence the all-preds-
+                    // in-body mirror of the absorption rule.
+                    let absorbed_tail = self.cfg.block_at(gend).filter(|&b| {
+                        matches!(
+                            self.results[b].term,
+                            Term::Return(_) | Term::Throw(_)
+                        ) && self.results[b].stmts.is_empty()
+                            && !self.handler_group.contains_key(&b)
+                            && !self.cfg.blocks[b].pred.is_empty()
+                            && self.cfg.blocks[b]
+                                .pred
+                                .iter()
+                                .all(|p| self.body_group.get(p) == Some(&gi))
+                    });
                     let next = self.cfg.blocks.iter().find(|nb| {
                         let is_term = matches!(
                             self.results[nb.id].term,
                             Term::Return(_) | Term::Throw(_)
                         );
                         nb.start >= gend
+                            && Some(nb.id) != absorbed_tail
                             && ctx.universe.contains(&nb.id)
                             && !stop.contains(&nb.id)
                             // A handler block is normally skipped (it belongs to
