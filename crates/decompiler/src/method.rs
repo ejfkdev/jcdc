@@ -6664,19 +6664,13 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
         if matches!(value, Expr::Const(_)) {
             return;
         }
-        // @PolymorphicSignature methods (invokeBasic/invoke/invokeExact/
-        // linkTo*) statically return Object regardless of the call-site
-        // descriptor; assignments need the source cast.
-        let poly = matches!(value, Expr::Method { name, .. }
-            if name == "invoke" || name == "invokeExact" || name == "invokeBasic"
-                || name == "invokeWithArguments" || name.starts_with("linkTo"));
-        if poly {
-            if let JavaType::Object(n) = want.erased() {
-                if n != "java/lang/Object" {
-                    let inner = std::mem::replace(value, Expr::This);
-                    *value = Expr::Cast { ty: want.clone(), e: Box::new(inner) };
-                }
-            }
+        // @PolymorphicSignature calls (JVMS 2.9 closed set on
+        // MethodHandle/VarHandle) get their descriptor-return cast at EMIT
+        // level (classdec::polymorphic_ret_cast); wrapping here too would
+        // double-cast. Nothing else to fix up on these values.
+        if matches!(value, Expr::Method { cls, name, .. }
+            if crate::classdec::is_spec_polymorphic(cls, name))
+        {
             return;
         }
         // A raw checkcast around a GENERIC call breaks target-type

@@ -632,6 +632,13 @@ impl<'a> Printer<'a> {
                 }
             }
             Expr::Method { owner, cls, name, desc, args, is_static, is_special, is_super, type_args, .. } => {
+                // Signature-polymorphic calls need the descriptor return cast
+                // in source form (see classdec::polymorphic_ret_cast).
+                if let Some(t) = crate::classdec::polymorphic_ret_cast(cls, name, desc) {
+                    out.push('(');
+                    out.push_str(&self.type_name(&crate::expr::TypeRef::J(t)));
+                    out.push_str(") ");
+                }
                 if name == "<init>" && *is_special {
                     // super(...) / this(...)
                     let is_super_form = *is_super || cls != &self.pc.internal_name;

@@ -3121,6 +3121,55 @@ fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature
     rec(s, &ret_g, &ret_er);
 }
 
+/// True when `(cls, name)` is one of the signature-polymorphic methods
+/// closed-set defined by JVMS 2.9 (only java.lang.invoke.MethodHandle and
+/// java.lang.invoke.VarHandle carry @PolymorphicSignature). The pool is NOT
+/// consulted: corpus runs carry a jdk8 rt.jar classpath where VarHandle
+/// (JDK9+) is absent, so attribute lookup would miss exactly the classes
+/// that need it.
+pub(crate) fn is_spec_polymorphic(cls: &str, name: &str) -> bool {
+    match cls {
+        "java/lang/invoke/MethodHandle" => matches!(
+            name,
+            "invoke" | "invokeExact" | "invokeBasic" | "linkToVirtual"
+                | "linkToStatic" | "linkToSpecial" | "linkToInterface" | "linkToNative"
+        ),
+        "java/lang/invoke/VarHandle" => matches!(
+            name,
+            "get" | "set" | "getVolatile" | "setVolatile" | "getOpaque" | "setOpaque"
+                | "getAcquire" | "setRelease" | "compareAndSet" | "compareAndExchange"
+                | "compareAndExchangeAcquire" | "compareAndExchangeRelease"
+                | "weakCompareAndSet" | "weakCompareAndSetPlain" | "weakCompareAndSetAcquire"
+                | "weakCompareAndSetRelease" | "getAndSet" | "getAndSetAcquire"
+                | "getAndSetRelease" | "getAndAdd" | "getAndAddAcquire" | "getAndAddRelease"
+                | "getAndBitwiseOr" | "getAndBitwiseOrAcquire" | "getAndBitwiseOrRelease"
+                | "getAndBitwiseAnd" | "getAndBitwiseAndAcquire" | "getAndBitwiseAndRelease"
+                | "getAndBitwiseXor" | "getAndBitwiseXorAcquire" | "getAndBitwiseXorRelease"
+        ),
+        _ => false,
+    }
+}
+
+/// For a signature-polymorphic call (see `is_spec_polymorphic`), return the
+/// call-site descriptor's return type. The SOURCE form must carry an
+/// explicit cast: javac only gives such a call its descriptor return type
+/// when a cast is present — bare `((s = STATUS.getAndBitwiseOr(this, DONE))
+/// & SIGNAL)` types as Object and fails to compile (jdk ForkJoinTask
+/// family). The original source always casts AT the call site (even in
+/// plain assignments), so the printer emits it unconditionally. None for
+/// non-polymorphic calls or Object/void descriptors (no cast needed).
+pub(crate) fn polymorphic_ret_cast(
+    cls: &str,
+    name: &str,
+    desc: &jcdc_jvm::MethodDescriptor,
+) -> Option<jcdc_jvm::JavaType> {
+    match &desc.ret {
+        jcdc_jvm::JavaType::Object(_) | jcdc_jvm::JavaType::Void => None,
+        _ if is_spec_polymorphic(cls, name) => Some(desc.ret.clone()),
+        _ => None,
+    }
+}
+
 /// True when a generic return type actually differs from its erasure
 /// (type variable, generic array, or parameterized class).
 fn generic_ret_ish(g: &jcdc_jvm::GenericType) -> bool {
