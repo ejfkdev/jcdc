@@ -6228,7 +6228,7 @@ pub(crate) fn fix_lambda_captures(
     let collected = EXTERN_REDECL.with(|r| std::mem::take(&mut *r.borrow_mut()));
     EXTERN_REDECL.with(|r| *r.borrow_mut() = redecl_save);
     if !collected.is_empty() {
-        relocate_multi_site_decls(s, &collected);
+        relocate_multi_site_decls(s, &collected, fam, pool, vt);
     }
 }
 
@@ -6238,7 +6238,13 @@ pub(crate) fn fix_lambda_captures(
 /// hoists every local decl to the block head, so top placement keeps
 /// captures in scope) and before every statement — dominating all
 /// mention sites wherever they sit.
-fn relocate_multi_site_decls(s: &mut Stmt, names: &HashSet<String>) {
+fn relocate_multi_site_decls(
+    s: &mut Stmt,
+    names: &HashSet<String>,
+    fam: &Family,
+    pool: &ClassPool,
+    vt: &VarTable,
+) {
     fn pull(v: &mut Vec<Stmt>, names: &HashSet<String>, out: &mut Vec<Stmt>) {
         let mut i = 0;
         while i < v.len() {
@@ -6307,9 +6313,39 @@ fn relocate_multi_site_decls(s: &mut Stmt, names: &HashSet<String>) {
     if moved.is_empty() {
         return;
     }
+    // A local class only sees outer locals DEFINED before it: land the
+    // moved decl after the last definition of any captured local (jdk17
+    // Collectors.teeing0: PairBox captures c1Supplier..merger defined
+    // mid-method — a leading-slot insert put the decl before them,
+    // "找不到符号 变量 c1Supplier 位置: 类 PairBox"). Null-initialized
+    // hoisted decls are placeholders, not definitions.
     let mut pos = 0;
-    while pos < v.len() && matches!(v[pos], Stmt::LocalDef { .. } | Stmt::ClassDecl { .. }) {
+    while pos < v.len() && matches!(&v[pos], Stmt::ClassDecl { .. }) {
         pos += 1;
+    }
+    for name in names {
+        let caps = local_class_captures(name, fam, pool);
+        if caps.is_empty() {
+            continue;
+        }
+        let defines = |st: &Stmt| -> bool {
+            match st {
+                Stmt::LocalDef { var, init, .. } => {
+                    init.as_ref()
+                        .map(|e| !matches!(e, Expr::Const(crate::expr::ConstVal::Null)))
+                        .unwrap_or(true)
+                        && caps.iter().any(|n| vt.var(*var).name == *n)
+                }
+                Stmt::ExprStmt(Expr::Assign { target, .. }) => {
+                    matches!(&**target, Expr::Local { var, .. }
+                        if caps.iter().any(|n| vt.var(*var).name == *n))
+                }
+                _ => false,
+            }
+        };
+        if let Some(p) = v.iter().rposition(defines) {
+            pos = std::cmp::max(pos, p + 1);
+        }
     }
     for (k, d) in moved.into_iter().enumerate() {
         v.insert(pos + k, d);
@@ -8141,7 +8177,65 @@ fn raw_witness_generic_method_args(e: &mut Expr, pool: &ClassPool, pc: &PoolClas
     }
     let tvars: Vec<&str> = msig.params.iter().map(|p| p.name.as_str()).collect();
     let Expr::Method { args, .. } = e else { return };
-    for (a, pt) in args.iter_mut().zip(msig.args.iter()) {
+    // Concrete-pinning scan: a param typevar that ANOTHER arg pins with a
+    // concrete type (Arrays.sort(a, c): a:Object[] against param T[])
+    // collides with a wildcard-parameterized arg and needs the raw cast;
+    // when every co-mentioning arg carries outer typevars/wildcards the
+    // inference chain unifies cleanly and the raw cast would SEVER it
+    // (jdk17 Collectors.toUnmodifiableMap: toMap((Function) keyMapper,
+    // (Function) valueMapper) collapsed the downstream R to Object —
+    // "找不到符号 方法 entrySet() 类型为Object的变量 map").
+    fn tvar_names(g: &G, out: &mut Vec<String>) {
+        match g {
+            G::TypeVar(n) => out.push(n.clone()),
+            G::Array(i) => tvar_names(i, out),
+            G::Class(cs) => cs
+                .parts
+                .iter()
+                .for_each(|p| p.args.iter().for_each(|a| tvar_names(a, out))),
+            G::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
+            | G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => tvar_names(t, out),
+            _ => {}
+        }
+    }
+    fn carries_tvar_or_wildcard(t: &TypeRef) -> bool {
+        match t {
+            TypeRef::G(g) => match g {
+                G::TypeVar(_) | G::Wildcard(_) => true,
+                G::Array(i) => carries_tvar_or_wildcard(&TypeRef::G(*i.clone())),
+                G::Class(cs) => cs
+                    .parts
+                    .iter()
+                    .any(|p| p.args.iter().any(|a| carries_tvar_or_wildcard(&TypeRef::G(a.clone())))),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+    let pinned: Vec<bool> = {
+        let arg_types: Vec<TypeRef> = args.iter().map(|x| x.type_ref()).collect();
+        msig.args
+            .iter()
+            .enumerate()
+            .map(|(i, pt)| {
+                let mut tvs_i: Vec<String> = Vec::new();
+                tvar_names(pt, &mut tvs_i);
+                if tvs_i.is_empty() {
+                    return false;
+                }
+                (0..args.len()).any(|j| {
+                    if j == i {
+                        return false;
+                    }
+                    let mut tvs_j: Vec<String> = Vec::new();
+                    tvar_names(&msig.args[j], &mut tvs_j);
+                    let shares = tvs_j.iter().any(|n| tvs_i.contains(n));
+                    shares && !carries_tvar_or_wildcard(&arg_types[j])
+                })
+            })
+            .collect()
+    };
+    for (idx, (a, pt)) in args.iter_mut().zip(msig.args.iter()).enumerate() {
         let G::Class(cw) = pt else { continue };
         if cw.parts.iter().all(|p| p.args.is_empty()) || !has_tvar(pt, &tvars) {
             continue;
@@ -8164,6 +8258,9 @@ fn raw_witness_generic_method_args(e: &mut Expr, pool: &ClassPool, pc: &PoolClas
             continue;
         }
         if crate::method::classsig_internal(&ca) != crate::method::classsig_internal(cw) {
+            continue;
+        }
+        if !pinned[idx] {
             continue;
         }
         let raw = TypeRef::J(jcdc_jvm::JavaType::Object(crate::method::classsig_internal(&ca)));
