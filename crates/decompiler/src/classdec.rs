@@ -6502,6 +6502,27 @@ fn outer_this_map(pc: &PoolClass) -> HashMap<String, Expr> {
             }
         }
     }
+    // jdk26 nest-based inner classes drop the this$0 FIELD: the ctor
+    // param carries the enclosing instance and every read of it must
+    // still render as the qualified outer this (CallArranger
+    // BindingCalculator leaked `this.this$0.new StorageCalculator(..)`,
+    // COWArrayList Reversed DescendingIterator leaked `this.this$0.lock`
+    // — 找不到符号 变量 this$0).
+    if m.is_empty() && !nested_is_static(pc) && pc.internal_name.contains('$') {
+        if let Some((outer, _)) = pc.internal_name.rsplit_once('$') {
+            if !outer.is_empty() {
+                let sn = simple_name(outer);
+                let starts_digit =
+                    sn.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false);
+                let rep = if starts_digit {
+                    Expr::This
+                } else {
+                    Expr::Raw(format!("{}.this", qualified_this_tail(outer)))
+                };
+                m.insert("this$0".to_string(), rep);
+            }
+        }
+    }
     m
 }
 
