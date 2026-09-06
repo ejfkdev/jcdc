@@ -3549,23 +3549,29 @@ pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: 
 }
 
 /// Names of the outer locals a local class captures (its val$* fields).
+/// Same-simple-name siblings are UNIONed: the simple name alone cannot
+/// identify which local class a decl belongs to (jdk26 Gatherers has
+/// four `State` classes; picking the first gave the wrong capture set
+/// and mispositioned the decl at the method head).
 fn local_class_captures(name: &str, fam: &Family, pool: &ClassPool) -> Vec<String> {
+    let mut caps: Vec<String> = Vec::new();
     for (internal, nc) in fam.nested.iter() {
         if nc.simple == name && matches!(nc.kind, NestedKind::Local) {
             if let Some(lpc) = pool.get(internal) {
-                return lpc
-                    .cf
-                    .fields
-                    .iter()
-                    .filter_map(|f| {
-                        lpc.utf8(f.name_index)
-                            .and_then(|n| n.strip_prefix("val$").map(|x| x.to_string()))
-                    })
-                    .collect();
+                for f in &lpc.cf.fields {
+                    if let Some(v) = lpc
+                        .utf8(f.name_index)
+                        .and_then(|n| n.strip_prefix("val$").map(|x| x.to_string()))
+                    {
+                        if !caps.contains(&v) {
+                            caps.push(v);
+                        }
+                    }
+                }
             }
         }
     }
-    Vec::new()
+    caps
 }
 
 /// True when the expression references a local variable by one of `names`.
