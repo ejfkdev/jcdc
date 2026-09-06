@@ -7013,6 +7013,44 @@ fn instantiated_field_type(
     Some(TypeRef::G(inst))
 }
 
+/// The Signature return type variable of a generic method call, when the
+/// callee's return IS a bare type variable (inference at the assignment
+/// position binds it to the target — no cast needed, and an erasure cast
+/// would be illegal against a type-var target).
+fn generic_call_ret_typevar(a: &Expr, pool: &ClassPool) -> Option<String> {
+    let (cls, name, desc) = match a {
+        Expr::Method { cls, name, desc, .. } => (cls.as_str(), name.as_str(), desc),
+        _ => return None,
+    };
+    let mut s = String::new();
+    for t in &desc.args {
+        s.push_str(&t.to_descriptor());
+    }
+    let want_desc = format!("({}){}", s, desc.ret.to_descriptor());
+    let dpc = pool.get(cls)?;
+    let mi = (0..dpc.cf.methods.len()).find(|&i| {
+        dpc.method_name(i) == Some(name) && dpc.method_desc(i) == Some(want_desc.as_str())
+    })?;
+    let sig_bytes = dpc.cf.methods[mi].attributes.iter().find_map(|at| {
+        if dpc.utf8(at.attribute_name_index) == Some("Signature") {
+            Some(at.info.as_slice())
+        } else {
+            None
+        }
+    })?;
+    if sig_bytes.len() < 2 {
+        return None;
+    }
+    let idx = u16::from_be_bytes([sig_bytes[0], sig_bytes[1]]);
+    let msig = dpc
+        .utf8(idx)
+        .and_then(|x| jcdc_jvm::parse_method_signature(x))?;
+    match msig.ret {
+        jcdc_jvm::GenericType::TypeVar(v) => Some(v),
+        _ => None,
+    }
+}
+
 fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut Stmt) {
     fn target_ty(e: &Expr, vt: &VarTable) -> Option<TypeRef> {
         match e {
@@ -7100,6 +7138,15 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
         if value.type_ref() == *want {
             return;
         }
+        // A generic call whose signature return IS the target type
+        // variable needs no cast at all: the assignment position already
+        // types it (`topSpecies = findSpecies(tsk)`; any erasure cast is
+        // illegal there — "SpeciesData无法转换为S", jdk26 ClassSpecializer).
+        if let TypeRef::G(jcdc_jvm::GenericType::TypeVar(tv)) = want {
+            if generic_call_ret_typevar(value, pool).as_deref() == Some(tv.as_str()) {
+                return;
+            }
+        }
         // Erasures must line up (both arrays, or same class name).
         let have = value.type_ref().erased();
         let want_er = want.erased();
@@ -7123,7 +7170,16 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
             );
             if valueish && hn != "java/lang/Object" && hn != "java/lang/String" {
                 let inner = std::mem::replace(value, Expr::This);
-                *value = Expr::Cast { ty: TypeRef::J(have.clone()), e: Box::new(inner) };
+                // For a generic target, cast to the TARGET type: the raw
+                // value-erasure cast is not assignable to it ("SpeciesData
+                // 无法转换为S"); `(S) e` / `(List<E>) e` is unchecked but
+                // always legal.
+                let cast_ty = if matches!(want, TypeRef::G(_)) {
+                    want.clone()
+                } else {
+                    TypeRef::J(have.clone())
+                };
+                *value = Expr::Cast { ty: cast_ty, e: Box::new(inner) };
             }
         }
     }
