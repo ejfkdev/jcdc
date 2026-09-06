@@ -2254,7 +2254,7 @@ fn emit_method_with(
         Some(NestedKind::Local)
     );
     if is_ctor && is_local_class {
-        for i in ctor_capture_params(pc) {
+        for i in ctor_capture_params(pc, mi) {
             skip_params.insert(i);
         }
     }
@@ -4904,11 +4904,16 @@ fn self_simple_all_digits(pc: &PoolClass) -> bool {
 /// names are often absent (`arg1`), so the name-based skip in
 /// emit_method_with misses them — but a LOCAL class's emitted ctor must
 /// not declare them (source locals capture lexically).
-fn ctor_capture_params(apc: &PoolClass) -> HashSet<usize> {
+fn ctor_capture_params(apc: &PoolClass, mi: usize) -> HashSet<usize> {
     let mut captured: HashSet<usize> = HashSet::new();
-    let Some(mi) = (0..apc.cf.methods.len()).find(|&i| apc.method_name(i) == Some("<init>")) else {
+    // The CALLER's ctor index: scanning the class's FIRST <init> applied
+    // one ctor's capture positions to every sibling (jdk11
+    // ClassSpecializer$Factory$1Var: the (int,int) ctor's captures {0,3}
+    // skipped `prev` in the (String,Class,Var) ctor, emitting it as
+    // `Var arg4` while the body referenced prev — 找不到符号).
+    if apc.method_name(mi) != Some("<init>") {
         return captured;
-    };
+    }
     let Ok(Some(mb)) = decompile_method(apc, empty_pool(), mi) else {
         return captured;
     };
