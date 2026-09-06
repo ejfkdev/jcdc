@@ -1238,7 +1238,7 @@ fn supertype_is_sealed(pc: &PoolClass, pool: &ClassPool) -> bool {
 /// javac passes the outer instance straight to `super(...)`.
 /// True when the class's own InnerClasses entry marks it static. Class-file
 /// level access flags cannot express this (0x0008 there is ACC_SUPER).
-fn nested_is_static(pc: &PoolClass) -> bool {
+pub(crate) fn nested_is_static(pc: &PoolClass) -> bool {
     let Some(bytes) = pc.class_attr("InnerClasses") else { return false };
     let Some(attr) = parse_inner_classes(bytes) else { return false };
     attr.classes.iter().any(|e| {
@@ -1251,7 +1251,7 @@ fn nested_is_static(pc: &PoolClass) -> bool {
     })
 }
 
-fn outer_param_via_super(pc: &PoolClass, desc: &str) -> bool {
+pub(crate) fn outer_param_via_super(pc: &PoolClass, desc: &str) -> bool {
     let Some(md) = parse_method_descriptor(desc) else { return false };
     let Some(JavaType::Object(first)) = md.args.first() else { return false };
     // The parameter type must be the class's own this$0 field type...

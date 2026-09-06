@@ -634,27 +634,18 @@ impl<'a> Printer<'a> {
                 {
                     // `outerExpr.new Inner(rest...)` — the first ctor arg
                     // is the synthetic outer instance when the class has a
-                    // this$0 field.
-                    let has_this0 = self.pool.get(cls).map(|pcx| {
-                        pcx.cf.fields.iter().any(|f| {
-                            pcx.utf8(f.name_index).map(|n| n.starts_with("this$")).unwrap_or(false)
-                        })
-                    }).unwrap_or(false);
+                    // this$0 field, or when the ctor forwards it straight
+                    // to super (no field of its own; is_member_inner
+                    // detected it). Either way the qualified-new form
+                    // supplies the outer implicitly, so skip args[0].
                     self.expr(&args[0], 15, out);
                     out.push_str(".new ");
                     out.push_str(&inner_simple(cls));
                     out.push_str(diamond);
                     out.push('(');
-                    if has_this0 {
-                        match self.ctor_param_types(cls, 1, args.len() - 1, &args[1..]) {
-                            Some(pt) => self.args_typed(&args[1..], &pt, out),
-                            None => self.args(&args[1..], out),
-                        }
-                    } else {
-                        match self.ctor_param_types(cls, 0, args.len(), args) {
-                            Some(pt) => self.args_typed(args, &pt, out),
-                            None => self.args(args, out),
-                        }
+                    match self.ctor_param_types(cls, 1, args.len() - 1, &args[1..]) {
+                        Some(pt) => self.args_typed(&args[1..], &pt, out),
+                        None => self.args(&args[1..], out),
                     }
                     out.push(')');
                 } else {
@@ -1435,16 +1426,29 @@ impl<'a> Printer<'a> {
     }
 
     fn is_member_inner(&self, cls: &str) -> bool {
-        self.pool
-            .get(cls)
-            .map(|pc| {
-                pc.cf.fields.iter().any(|f| {
-                    pc.utf8(f.name_index)
-                        .map(|n| n.starts_with("this$"))
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false)
+        let Some(pc) = self.pool.get(cls) else { return false };
+        if pc.cf.fields.iter().any(|f| {
+            pc.utf8(f.name_index)
+                .map(|n| n.starts_with("this$"))
+                .unwrap_or(false)
+        }) {
+            return true;
+        }
+        // jdk21+ javac drops the this$0 field when the inner class never
+        // dereferences the outer instance itself: the ctor just forwards
+        // it to the superclass (jdk26 WeakHashMap$EntryIterator ->
+        // HashIterator). The ctor still takes the enclosing instance as
+        // its first parameter, so call sites need the qualified-new form.
+        if pc.is_enum() || !cls.contains('$') || crate::classdec::nested_is_static(&pc) {
+            return false;
+        }
+        (0..pc.cf.methods.len()).any(|mi| {
+            pc.method_name(mi) == Some("<init>")
+                && pc
+                    .method_desc(mi)
+                    .map(|d| crate::classdec::outer_param_via_super(&pc, d))
+                    .unwrap_or(false)
+        })
     }
 
     /// Instantiated SAM return for a cast to a generic functional
