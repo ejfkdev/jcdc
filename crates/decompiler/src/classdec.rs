@@ -2510,7 +2510,7 @@ fn emit_method_with(
             restore_enum_switches(&mut body, pc, pool);
             add_throw_witnesses(&mut body, msig.as_ref(), pool);
             strip_erasure_casts_generic_ret(&mut body, msig.as_ref(), pool);
-            witness_generic_returns(&mut body, msig.as_ref());
+            witness_generic_returns(&mut body, msig.as_ref(), pool);
             // Scope the extern-decl registry to THIS method's emission:
             // names extracted here must suppress re-declaration inside
             // lambda bodies printed below, but must not leak into other
@@ -4072,7 +4072,7 @@ pub(crate) fn g_has_wildcard(g: &jcdc_jvm::GenericType) -> bool {
 /// return expression in `(RetG) expr` (unchecked, compilable). Skips
 /// expressions already carrying the type-variable form (a poly conditional
 /// whose branches are G — those compile as-is).
-fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>) {
+fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, pool: &ClassPool) {
     use crate::expr::Expr;
     let Some(sig) = msig else { return };
     if !generic_ret_ish(&sig.ret) || !g_has_typevar(&sig.ret) {
@@ -4088,7 +4088,7 @@ fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature
     // field's own V (Entry<?,?>.value) is NOT the method's V — casts to a
     // type var are unchecked no-ops at runtime, so re-witnessing an
     // already-matching local is harmless.
-    fn needs_witness(e: &Expr, ret_g: &TypeRef, ret_er: &jcdc_jvm::JavaType) -> bool {
+    fn needs_witness(e: &Expr, ret_g: &TypeRef, ret_er: &jcdc_jvm::JavaType, pool: &ClassPool) -> bool {
         if matches!(e, Expr::Const(_) | Expr::Cast { .. }) {
             return false;
         }
@@ -4104,7 +4104,7 @@ fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature
         // witness, wrap the whole cond (`(T) (c ? a : b)` — Hashtable
         // Enumerator.next).
         if let Expr::Cond { t, f, .. } = e {
-            return needs_witness(t, ret_g, ret_er) || needs_witness(f, ret_g, ret_er);
+            return needs_witness(t, ret_g, ret_er, pool) || needs_witness(f, ret_g, ret_er, pool);
         }
         let ret_is_typevar = matches!(ret_g, TypeRef::G(g) if g_has_typevar(g));
         match e.type_ref() {
@@ -4116,23 +4116,43 @@ fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature
                 }
             }
             TypeRef::G(g) => {
-                if TypeRef::G(g.clone()).erased() != *ret_er {
+                // Identical parameterization: assignable as-is.
+                if &TypeRef::G(g.clone()) == ret_g {
                     return false;
                 }
-                // Same erasure: assignable only when the parameterizations
-                // are identical. Type vars/wildcards (CAP#1, a field's own
-                // V — Hashtable.get, sj17 List.of ListN<CAP#1>) AND
-                // concrete-but-different args (Spliterator<Object> ->
-                // Spliterator<T>, jdk11 Spliterators.emptySpliterator —
-                // the source's unchecked cast leaves no checkcast) all
-                // need the erased witness; casts to generic types are
-                // unchecked no-ops at runtime, so re-witnessing an
-                // already-matching local is harmless.
-                &TypeRef::G(g.clone()) != ret_g
+                // A raw value converts unchecked-but-legal to any
+                // parameterization of its erasure.
+                if let jcdc_jvm::GenericType::Class(cs) = &g {
+                    if cs.parts.iter().all(|p| p.args.is_empty()) {
+                        return false;
+                    }
+                }
+                let ev = TypeRef::G(g.clone()).erased();
+                if &ev == ret_er {
+                    // Same erasure, different parameterization: type
+                    // vars/wildcards (CAP#1, a field's own V —
+                    // Hashtable.get) AND concrete-but-different args
+                    // (Spliterator<Object> -> Spliterator<T>, jdk11
+                    // Spliterators.emptySpliterator — the source's
+                    // unchecked cast leaves no checkcast) all need the
+                    // erased witness; casts to generic types are unchecked
+                    // no-ops at runtime, so re-witnessing an
+                    // already-matching local is harmless.
+                    return true;
+                }
+                // Subclass erasure with incompatible parameterization
+                // (ListN<?> -> List<E>, jdk17 List.of(): "ListN<CAP#1>
+                // 无法转换为List<E>") — only an unchecked cast bridges.
+                match (&ev, ret_er) {
+                    (jcdc_jvm::JavaType::Object(_), jcdc_jvm::JavaType::Object(n)) => {
+                        is_subtype_of(pool, &ev, n)
+                    }
+                    _ => false,
+                }
             }
         }
     }
-    fn fix(e: &mut Expr, ret_g: &TypeRef, ret_er: &jcdc_jvm::JavaType) {
+    fn fix(e: &mut Expr, ret_g: &TypeRef, ret_er: &jcdc_jvm::JavaType, pool: &ClassPool) {
         // A conditional with a poly (lambda/method-ref) arm must NOT be
         // wrapped as a whole: the cast makes the conditional standalone
         // and javac rejects the poly arm ("此处不应为 lambda 表达式").
@@ -4141,58 +4161,58 @@ fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature
         // arm takes the method's return type directly.
         if let Expr::Cond { t, f, .. } = e {
             if matches!(**t, Expr::Lambda(_)) || matches!(**f, Expr::Lambda(_)) {
-                fix(t, ret_g, ret_er);
-                fix(f, ret_g, ret_er);
+                fix(t, ret_g, ret_er, pool);
+                fix(f, ret_g, ret_er, pool);
                 return;
             }
         }
-        if needs_witness(e, ret_g, ret_er) {
+        if needs_witness(e, ret_g, ret_er, pool) {
             let v = std::mem::replace(e, Expr::This);
             *e = Expr::Cast { ty: ret_g.clone(), e: Box::new(v) };
         }
     }
-    fn rec(s: &mut Stmt, ret_g: &TypeRef, ret_er: &jcdc_jvm::JavaType) {
+    fn rec(s: &mut Stmt, ret_g: &TypeRef, ret_er: &jcdc_jvm::JavaType, pool: &ClassPool) {
         match s {
-            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, ret_g, ret_er)),
-            Stmt::Return(Some(e)) => fix(e, ret_g, ret_er),
+            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, ret_g, ret_er, pool)),
+            Stmt::Return(Some(e)) => fix(e, ret_g, ret_er, pool),
             Stmt::If { then_stmt, else_stmt, .. } => {
-                rec(then_stmt, ret_g, ret_er);
+                rec(then_stmt, ret_g, ret_er, pool);
                 if let Some(x) = else_stmt {
-                    rec(x, ret_g, ret_er);
+                    rec(x, ret_g, ret_er, pool);
                 }
             }
             Stmt::While { body, .. }
             | Stmt::DoWhile { body, .. }
             | Stmt::ForEach { body, .. }
             | Stmt::Labeled { body, .. }
-            | Stmt::Synchronized { body, .. } => rec(body, ret_g, ret_er),
+            | Stmt::Synchronized { body, .. } => rec(body, ret_g, ret_er, pool),
             Stmt::For { init, body, .. } => {
-                init.iter_mut().for_each(|i| rec(i, ret_g, ret_er));
-                rec(body, ret_g, ret_er);
+                init.iter_mut().for_each(|i| rec(i, ret_g, ret_er, pool));
+                rec(body, ret_g, ret_er, pool);
             }
             Stmt::Switch { cases, default, .. } => {
                 for c in cases.iter_mut() {
                     for st in c.body.iter_mut() {
-                        rec(st, ret_g, ret_er);
+                        rec(st, ret_g, ret_er, pool);
                     }
                 }
                 if let Some(d) = default {
-                    rec(d, ret_g, ret_er);
+                    rec(d, ret_g, ret_er, pool);
                 }
             }
             Stmt::Try { body, catches, finally } => {
-                rec(body, ret_g, ret_er);
+                rec(body, ret_g, ret_er, pool);
                 for c in catches.iter_mut() {
-                    rec(&mut c.body, ret_g, ret_er);
+                    rec(&mut c.body, ret_g, ret_er, pool);
                 }
                 if let Some(f) = finally {
-                    rec(f, ret_g, ret_er);
+                    rec(f, ret_g, ret_er, pool);
                 }
             }
             _ => {}
         }
     }
-    rec(s, &ret_g, &ret_er);
+    rec(s, &ret_g, &ret_er, pool);
 }
 
 /// True when `(cls, name)` is one of the signature-polymorphic methods
@@ -6507,10 +6527,39 @@ fn generic_erasure(t: &jcdc_jvm::GenericType, params: &[jcdc_jvm::TypeParam]) ->
 }
 
 
+/// True when the erased type `ty` is `target` or a subtype of it (super
+/// AND interface chains via the pool; unknown classes are not subtypes).
+fn is_subtype_of(pool: &ClassPool, ty: &jcdc_jvm::JavaType, target: &str) -> bool {
+    let jcdc_jvm::JavaType::Object(n0) = ty else { return false };
+    let mut stack: Vec<String> = vec![n0.clone()];
+    let mut seen: HashSet<String> = HashSet::new();
+    while let Some(n) = stack.pop() {
+        if n == target {
+            return true;
+        }
+        if !seen.insert(n.clone()) {
+            continue;
+        }
+        let Some(pc) = pool.get(&n) else { continue };
+        if let Some(s) = pc.super_name() {
+            if !s.is_empty() {
+                stack.push(s.to_string());
+            }
+        }
+        for &i in &pc.cf.interfaces {
+            if let Some(iname) = pc.class_name(i) {
+                stack.push(iname.to_string());
+            }
+        }
+    }
+    false
+}
+
 /// A generic method whose return type is its own type variable, called in
 /// a `throw` statement, needs an explicit type witness (`String.<E>mk()`)
 /// — inference in throw position falls back to the bound and would fail
-/// the enclosing throws clause.
+/// the enclosing throws clause. Also retypes erasure casts on thrown
+/// values to the declared throws type variable (`throw (X) e`).
 fn add_throw_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, pool: &ClassPool) {
     let Some(sig) = msig else { return };
     if sig.params.is_empty() {
@@ -6524,6 +6573,24 @@ fn add_throw_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, p
             // Printing the erasure throws an exception the signature does
             // not declare ("未报告的异常错误Throwable", jdk17
             // Optional.orElseThrow). Retype the cast to the variable.
+            // When javac omitted the vacuous checkcast entirely (the value
+            // already has the bound's type — ForkJoinTask.uncheckedThrow
+            // `throw (T) t`), synthesize the cast.
+            let throws_typevar = sig.throws.iter().find_map(|t| {
+                match t {
+                    jcdc_jvm::GenericType::TypeVar(v) => {
+                        let bounded = sig.params.iter().any(|p| {
+                            p.name == *v
+                                && p.class_bound.as_ref().map(|b| {
+                                    TypeRef::G(b.clone()).erased()
+                                        == jcdc_jvm::JavaType::Object("java/lang/Throwable".into())
+                                }).unwrap_or(false)
+                        });
+                        if bounded { Some(v.clone()) } else { None }
+                    }
+                    _ => None,
+                }
+            });
             if let Expr::Cast { ty, e: _ } = e {
                 if let TypeRef::J(jcdc_jvm::JavaType::Object(cn)) = ty {
                     if let Some(v) = sig.throws.iter().find_map(|t| {
@@ -6544,6 +6611,31 @@ fn add_throw_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, p
                         *ty = TypeRef::G(jcdc_jvm::GenericType::TypeVar(v));
                         return;
                     }
+                }
+            } else if let Some(v) = &throws_typevar {
+                // A bare throw of a Throwable-typed value under `throws T`:
+                // legal source needs the vacuous `(T)` cast unless a
+                // concrete throws entry already covers the type.
+                let covered_by_concrete = sig.throws.iter().any(|t| {
+                    match t {
+                        jcdc_jvm::GenericType::Class(cs) => {
+                            let n = crate::method::classsig_internal(cs);
+                            is_subtype_of(pool, &e.type_ref().erased(), &n)
+                        }
+                        _ => false,
+                    }
+                });
+                let already_var = matches!(e.type_ref(), TypeRef::G(jcdc_jvm::GenericType::TypeVar(_)));
+                if !covered_by_concrete
+                    && !already_var
+                    && is_subtype_of(pool, &e.type_ref().erased(), "java/lang/Throwable")
+                {
+                    let inner = std::mem::replace(e, Expr::This);
+                    *e = Expr::Cast {
+                        ty: TypeRef::G(jcdc_jvm::GenericType::TypeVar(v.clone())),
+                        e: Box::new(inner),
+                    };
+                    return;
                 }
             }
             if let Expr::Method { cls, name, desc, type_args, .. } = e {
