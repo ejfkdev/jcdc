@@ -247,7 +247,6 @@ impl<'a> Structurer<'a> {
             if stop.contains(&t)
                 || ctx.consumed.contains(&t)
                 || ctx.loop_stack.contains(&t)
-                || ctx.loop_headers.contains(&t)
             {
                 continue;
             }
@@ -268,15 +267,17 @@ impl<'a> Structurer<'a> {
             if stop.contains(&x) || ctx.consumed.contains(&x) {
                 continue;
             }
-            // A loop header is never a merge candidate: a branch that jumps
-            // to it is a `continue` (the back edge fires on the NEXT
-            // iteration), not a fall-through confluence. During a body walk
-            // the header is not yet consumed, so without this guard a pair of
-            // continue-branches "merges" at the header or at each other
-            // THROUGH the header, both branch regions elide to empty, and the
-            // real tail runs unconditionally (StringUTF16.codePointCount
-            // losing both `continue`s).
-            if ctx.loop_headers.contains(&x) || ctx.loop_stack.contains(&x) {
+            // A loop header is never a merge candidate WHILE INSIDE its
+            // loop: a branch that jumps to it is a `continue` (the back
+            // edge fires on the NEXT iteration), not a fall-through
+            // confluence. During a body walk the header sits on the
+            // loop_stack, so this guard keeps StringUTF16.codePointCount's
+            // `continue`s. OUTSIDE the loop (switch cases that all
+            // `goto` a loop head laid out after the switch — jdk11
+            // Subject.populateSet) the header IS the switch follow: the
+            // cases break into it and the loop structures ONCE after the
+            // switch instead of being copy-duplicated into every case.
+            if ctx.loop_stack.contains(&x) {
                 continue;
             }
             // A candidate that DOMINATES ANY branch target (reflexively: is
@@ -378,10 +379,7 @@ impl<'a> Structurer<'a> {
         }
         let mut best: Option<usize> = None;
         for &cand in ctx.universe.iter() {
-            if ctx.consumed.contains(&cand)
-                || ctx.loop_headers.contains(&cand)
-                || ctx.loop_stack.contains(&cand)
-            {
+            if ctx.consumed.contains(&cand) || ctx.loop_stack.contains(&cand) {
                 continue;
             }
             // (Shared terminators ARE eligible here: a branch merging at
@@ -975,6 +973,10 @@ impl<'a> Structurer<'a> {
                     // case swallows the tail as `++i; continue` and the rest
                     // spin forever).
                     let succs = self.cfg.blocks[cur].succ.clone();
+                    if std::env::var("JCDC_DBG_GOTO").is_ok() {
+                        eprintln!("SWFOLLOW cur={} ipdom={:?} vx={} succs={:?} stop={:?}",
+                            cur, ctx.ipdom.get(&cur), ctx.vx, succs, stop);
+                    }
                     let follow = self
                         .sese_ipdom(ctx, cur)
                         .filter(|f| !stop.contains(f))

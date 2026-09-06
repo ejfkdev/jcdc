@@ -2063,6 +2063,10 @@ impl<'a> Structurer<'a> {
         active: &[usize],
         claimed: &mut HashSet<usize>,
     ) -> Region {
+        if std::env::var("JCDC_DBG_GOTO").is_ok() {
+            eprintln!("SWITCHENTRY block={} start={} follow={:?} universe={} stop={:?} claimed={:?}",
+                block, self.cfg.blocks[block].start, follow, universe.len(), stop, claimed);
+        }
         let last = self.cfg.blocks[block].ins.last();
         let (pairs, default_pc): (Vec<(i64, u16)>, u16) =
             match (targets, last.and_then(|i| i.switch_data.as_deref())) {

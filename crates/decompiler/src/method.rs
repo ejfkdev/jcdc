@@ -479,7 +479,11 @@ fn ensure_declared(vt: &VarTable, body: &mut Stmt) {
         .into_iter()
         .map(|v| Stmt::LocalDef {
             var: v,
-            init: default_init_for(vt, v),
+            init: if captured_by_anon(body, v) {
+                None
+            } else {
+                default_init_for(vt, v)
+            },
             is_final: false,
             force_type: true,
         })
@@ -3610,7 +3614,17 @@ fn hoist_escaped_vars(body: &mut Stmt, vt: &VarTable) {
         v.into_iter()
             .map(|var| Stmt::LocalDef {
                 var,
-                init: default_init_for(vt, var),
+                // Anon/lambda-captured locals must stay effectively final:
+                // a `= null` default plus the branch assignments makes the
+                // capture illegal ("从内部类引用的本地变量必须是最终变量
+                // 或实际上的最终变量", jdk11 Subject.populateSet iterator).
+                // The source used a blank declaration assigned once per
+                // path; javac's definite-assignment check re-proves it.
+                init: if captured_by_anon(body, var) {
+                    None
+                } else {
+                    default_init_for(vt, var)
+                },
                 is_final: false,
                 force_type: true,
             })
@@ -6186,6 +6200,135 @@ fn strip_kind(s: &mut Stmt, enters: bool) {
 /// Default initializer for synthetic (compiler-temporary) variables so the
 /// decompiled method passes javac's definite-assignment checks. Real LVT
 /// variables keep bare declarations (their source form).
+/// True when `v` flows into an anonymous-class ctor argument (a val$
+/// capture) or a lambda capture list: such locals must remain effectively
+/// final in source form.
+fn captured_by_anon(s: &Stmt, v: u32) -> bool {
+    fn refs(e: &Expr, v: u32) -> bool {
+        match e {
+            Expr::Local { var, .. } => *var == v,
+            Expr::Method { owner, args, .. } => {
+                owner.as_deref().map(|o| refs(o, v)).unwrap_or(false)
+                    || args.iter().any(|a| refs(a, v))
+            }
+            Expr::Field { owner: Some(o), .. } => refs(o, v),
+            Expr::Bin { l, r, .. } | Expr::Assign { target: l, value: r, .. } => {
+                refs(l, v) || refs(r, v)
+            }
+            Expr::Cond { c, t, f } => refs(c, v) || refs(t, v) || refs(f, v),
+            Expr::Un { e: x, .. }
+            | Expr::Cast { e: x, .. }
+            | Expr::InstanceOf { e: x, .. }
+            | Expr::PreIncDec { e: x, .. }
+            | Expr::PostIncDec { e: x, .. } => refs(x, v),
+            Expr::ArrayIndex { array, index } => refs(array, v) || refs(index, v),
+            Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+                args.iter().any(|a| refs(a, v))
+            }
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter().any(|d| refs(d, v))
+                    || init
+                        .as_ref()
+                        .map(|vals| vals.iter().any(|x| refs(x, v)))
+                        .unwrap_or(false)
+            }
+            Expr::StringConcat(parts) => parts.iter().any(|pp| match pp {
+                crate::expr::ConcatPart::Str(x) => refs(x, v),
+                _ => false,
+            }),
+            Expr::Lambda(l) => l.captures.iter().any(|a| refs(a, v)),
+            _ => false,
+        }
+    }
+    fn is_anon_cls(cls: &str) -> bool {
+        if cls.starts_with('\u{2}') {
+            return true;
+        }
+        cls.rsplit('$')
+            .next()
+            .map(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or(false)
+    }
+    fn ex(e: &Expr, v: u32) -> bool {
+        match e {
+            Expr::New { cls, args, .. } if is_anon_cls(cls) => {
+                args.iter().any(|a| refs(a, v))
+            }
+            Expr::AnonNew { args, .. } => args.iter().any(|a| refs(a, v)),
+            Expr::Lambda(l) => l.captures.iter().any(|a| refs(a, v)),
+            Expr::Method { owner, args, .. } => {
+                owner.as_deref().map(|o| ex(o, v)).unwrap_or(false)
+                    || args.iter().any(|a| ex(a, v))
+            }
+            Expr::Field { owner: Some(o), .. } => ex(o, v),
+            Expr::Bin { l, r, .. } | Expr::Assign { target: l, value: r, .. } => {
+                ex(l, v) || ex(r, v)
+            }
+            Expr::Cond { c, t, f } => ex(c, v) || ex(t, v) || ex(f, v),
+            Expr::Un { e: x, .. }
+            | Expr::Cast { e: x, .. }
+            | Expr::InstanceOf { e: x, .. }
+            | Expr::PreIncDec { e: x, .. }
+            | Expr::PostIncDec { e: x, .. } => ex(x, v),
+            Expr::ArrayIndex { array, index } => ex(array, v) || ex(index, v),
+            Expr::New { args, .. } => args.iter().any(|a| ex(a, v)),
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter().any(|d| ex(d, v))
+                    || init
+                        .as_ref()
+                        .map(|vals| vals.iter().any(|x| ex(x, v)))
+                        .unwrap_or(false)
+            }
+            Expr::StringConcat(parts) => parts.iter().any(|pp| match pp {
+                crate::expr::ConcatPart::Str(x) => ex(x, v),
+                _ => false,
+            }),
+            _ => false,
+        }
+    }
+    fn st(s: &Stmt, v: u32) -> bool {
+        match s {
+            Stmt::Block(x) => x.iter().any(|i| st(i, v)),
+            Stmt::ExprStmt(e) => ex(e, v),
+            Stmt::LocalDef { init: Some(e), .. } => ex(e, v),
+            Stmt::Return(Some(e)) | Stmt::Throw(e) => ex(e, v),
+            Stmt::If { cond, then_stmt, else_stmt } => {
+                ex(cond, v)
+                    || st(then_stmt, v)
+                    || else_stmt.as_deref().map(|e2| st(e2, v)).unwrap_or(false)
+            }
+            Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => ex(cond, v) || st(body, v),
+            Stmt::For { init, cond, update, body } => {
+                init.iter().any(|i| st(i, v))
+                    || cond.as_ref().map(|c| ex(c, v)).unwrap_or(false)
+                    || update.iter().any(|u| ex(u, v))
+                    || st(body, v)
+            }
+            Stmt::ForEach { iterable, body, .. } => ex(iterable, v) || st(body, v),
+            Stmt::Switch { selector, cases, default, .. } => {
+                ex(selector, v)
+                    || cases.iter().any(|c| c.body.iter().any(|b| st(b, v)))
+                    || default.as_deref().map(|d| st(d, v)).unwrap_or(false)
+            }
+            Stmt::Try { body, catches, finally } => {
+                st(body, v)
+                    || catches.iter().any(|c| st(&c.body, v))
+                    || finally.as_deref().map(|f| st(f, v)).unwrap_or(false)
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter().any(|r| st(r, v))
+                    || st(body, v)
+                    || catches.iter().any(|c| st(&c.body, v))
+                    || finally.as_deref().map(|f| st(f, v)).unwrap_or(false)
+            }
+            Stmt::Synchronized { lock, body } => ex(lock, v) || st(body, v),
+            Stmt::Labeled { body, .. } => st(body, v),
+            _ => false,
+        }
+    }
+    st(s, v)
+}
+
 fn default_init_for(vt: &VarTable, v: u32) -> Option<Expr> {
     default_init_for_vt(vt, v)
 }
