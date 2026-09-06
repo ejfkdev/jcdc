@@ -4715,6 +4715,82 @@ thread_local! {
     static NUMERIC_CTX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Under a numeric parent, a booleanized condition must re-wrap as an
+/// int `? 1 : 0` conditional; otherwise the boolean form is returned.
+fn wrap_num(numeric_parent: bool, b: crate::expr::Expr) -> crate::expr::Expr {
+    use crate::expr::{ConstVal, Expr};
+    if !numeric_parent {
+        return b;
+    }
+    Expr::Cond {
+        c: Box::new(b),
+        t: Box::new(Expr::Const(ConstVal::Int(1))),
+        f: Box::new(Expr::Const(ConstVal::Int(0))),
+    }
+}
+
+/// Fold an already-built condition's nested 0/1 int diamonds to boolean
+/// form (`isLinker ? (customized ? 0 : 1) : 0` -> `isLinker && !customized`).
+fn boolify_cond_deep(e: crate::expr::Expr) -> crate::expr::Expr {
+    use crate::expr::{ConstVal, Expr, UnOp};
+    let mk_not = |x: Expr| match x {
+        Expr::Un { op: UnOp::Not, e } => *e,
+        other => Expr::Un { op: UnOp::Not, e: Box::new(other) },
+    };
+    match e {
+        Expr::Cond { c, t, f } => {
+            let c2 = boolify_cond_deep(*c);
+            let one_zero = matches!(&*t, Expr::Const(ConstVal::Int(1)))
+                && matches!(&*f, Expr::Const(ConstVal::Int(0)));
+            let zero_one = matches!(&*t, Expr::Const(ConstVal::Int(0)))
+                && matches!(&*f, Expr::Const(ConstVal::Int(1)));
+            if one_zero {
+                return c2;
+            }
+            if zero_one {
+                return mk_not(c2);
+            }
+            let is01 = |x: &Expr| {
+                matches!(x, Expr::Const(ConstVal::Int(0 | 1)))
+                    || matches!(x, Expr::Cond { t: tt, f: ff, .. }
+                        if matches!(&**tt, Expr::Const(ConstVal::Int(0 | 1)))
+                            && matches!(&**ff, Expr::Const(ConstVal::Int(0 | 1))))
+            };
+            let bool_of = |x: Expr| -> Expr {
+                if let Expr::Cond { c: xc, t: xt, f: xf } = &x {
+                    let oz = matches!(&**xt, Expr::Const(ConstVal::Int(1)))
+                        && matches!(&**xf, Expr::Const(ConstVal::Int(0)));
+                    let zo = matches!(&**xt, Expr::Const(ConstVal::Int(0)))
+                        && matches!(&**xf, Expr::Const(ConstVal::Int(1)));
+                    if oz {
+                        return boolify_cond_deep((**xc).clone());
+                    }
+                    if zo {
+                        return mk_not(boolify_cond_deep((**xc).clone()));
+                    }
+                }
+                boolify_cond_deep(x)
+            };
+            let t_is1 = matches!(&*t, Expr::Const(ConstVal::Int(1)));
+            let t_is0 = matches!(&*t, Expr::Const(ConstVal::Int(0)));
+            let f_is1 = matches!(&*f, Expr::Const(ConstVal::Int(1)));
+            let f_is0 = matches!(&*f, Expr::Const(ConstVal::Int(0)));
+            if t_is1 && is01(&f) {
+                Expr::Bin { op: crate::expr::BinOp::LogOr, l: Box::new(c2), r: Box::new(bool_of(*f)), ty: None }
+            } else if t_is0 && is01(&f) {
+                Expr::Bin { op: crate::expr::BinOp::LogAnd, l: Box::new(mk_not(c2)), r: Box::new(bool_of(*f)), ty: None }
+            } else if is01(&t) && f_is1 {
+                Expr::Bin { op: crate::expr::BinOp::LogOr, l: Box::new(mk_not(c2)), r: Box::new(bool_of(*t)), ty: None }
+            } else if is01(&t) && f_is0 {
+                Expr::Bin { op: crate::expr::BinOp::LogAnd, l: Box::new(c2), r: Box::new(bool_of(*t)), ty: None }
+            } else {
+                Expr::Cond { c: Box::new(c2), t: boolify_cond_deep(*t).into(), f: boolify_cond_deep(*f).into() }
+            }
+        }
+        other => other,
+    }
+}
+
 fn booleanize_deep(e: &mut crate::expr::Expr) {
     use crate::expr::{BinOp, ConstVal, Expr, UnOp};
     match e {
@@ -4768,6 +4844,25 @@ fn booleanize_deep(e: &mut crate::expr::Expr) {
                         if (matches!(&**t, Expr::Const(ConstVal::Int(0 | 1)))
                             && matches!(&**f, Expr::Const(ConstVal::Int(0 | 1)))))
             };
+            // A 0/1 ternary glued into a logical operator must appear in
+            // BOOLEAN form (`a && (b ? 0 : 1)` is "二元运算符&&的操作数
+            // 类型错误", jdk17 Invokers INARG_LIMIT): `x ? 1 : 0` -> x,
+            // `x ? 0 : 1` -> !x.
+            let boolify = |x: &Expr| -> Expr {
+                if let Expr::Cond { c: xc, t: xt, f: xf } = x {
+                    let one_zero = matches!(&**xt, Expr::Const(ConstVal::Int(1)))
+                        && matches!(&**xf, Expr::Const(ConstVal::Int(0)));
+                    let zero_one = matches!(&**xt, Expr::Const(ConstVal::Int(0)))
+                        && matches!(&**xf, Expr::Const(ConstVal::Int(1)));
+                    if one_zero {
+                        return (**xc).clone();
+                    }
+                    if zero_one {
+                        return mk_not((**xc).clone());
+                    }
+                }
+                x.clone()
+            };
             // `c ? 1 : 0` may only collapse to `c` when the value is used
             // as a truth value; under arithmetic/bitwise operators the int
             // form must survive (`refKind * 2 + (isInterface ? 1 : 0)`).
@@ -4775,24 +4870,54 @@ fn booleanize_deep(e: &mut crate::expr::Expr) {
             let repl = match (&**t, &**f) {
                 (t_, f_) if is_true(t_) && is_false(f_) && !numeric_parent => Some(cc.clone()),
                 (t_, f_) if is_false(t_) && is_true(f_) && !numeric_parent => Some(mk_not(cc.clone())),
+                // Under arithmetic/bitwise parents the int `? 1 : 0` /
+                // `? 0 : 1` form must SURVIVE as an int; fold only the
+                // condition to its boolean shape (jdk17 Invokers:
+                // `OUTARG_LIMIT + (isLinker && !customized ? 1 : 0)`).
+                (t_, f_) if is_true(t_) && is_false(f_) && numeric_parent => {
+                    Some(Expr::Cond {
+                        c: Box::new(boolify_cond_deep(cc.clone())),
+                        t: Box::new(Expr::Const(ConstVal::Int(1))),
+                        f: Box::new(Expr::Const(ConstVal::Int(0))),
+                    })
+                }
+                (t_, f_) if is_false(t_) && is_true(f_) && numeric_parent => {
+                    Some(Expr::Cond {
+                        c: Box::new(mk_not(boolify_cond_deep(cc.clone()))),
+                        t: Box::new(Expr::Const(ConstVal::Int(1))),
+                        f: Box::new(Expr::Const(ConstVal::Int(0))),
+                    })
+                }
                 // Mixed: one side is a boolean constant, the other a
                 // boolean expression → short-circuit operator.
-                (t_, f_) if is_true(t_) && is_bool(f_) => Some(Expr::Bin {
-                    op: BinOp::LogOr, l: Box::new(cc.clone()), r: f.clone(), ty: None,
-                }),
-                (t_, f_) if is_false(t_) && is_bool(f_) => Some(Expr::Bin {
-                    op: BinOp::LogAnd,
-                    l: Box::new(mk_not(cc.clone())),
-                    r: f.clone(), ty: None,
-                }),
-                (t_, f_) if is_bool(t_) && is_true(f_) => Some(Expr::Bin {
-                    op: BinOp::LogOr,
-                    l: Box::new(mk_not(cc.clone())),
-                    r: t.clone(), ty: None,
-                }),
-                (t_, f_) if is_bool(t_) && is_false(f_) => Some(Expr::Bin {
-                    op: BinOp::LogAnd, l: Box::new(cc.clone()), r: t.clone(), ty: None,
-                }),
+                (t_, f_) if is_true(t_) && is_bool(f_) => Some(wrap_num(
+                    numeric_parent,
+                    Expr::Bin {
+                        op: BinOp::LogOr, l: Box::new(cc.clone()), r: Box::new(boolify(f_)), ty: None,
+                    },
+                )),
+                (t_, f_) if is_false(t_) && is_bool(f_) => Some(wrap_num(
+                    numeric_parent,
+                    Expr::Bin {
+                        op: BinOp::LogAnd,
+                        l: Box::new(mk_not(cc.clone())),
+                        r: Box::new(boolify(f_)), ty: None,
+                    },
+                )),
+                (t_, f_) if is_bool(t_) && is_true(f_) => Some(wrap_num(
+                    numeric_parent,
+                    Expr::Bin {
+                        op: BinOp::LogOr,
+                        l: Box::new(mk_not(cc.clone())),
+                        r: Box::new(boolify(t_)), ty: None,
+                    },
+                )),
+                (t_, f_) if is_bool(t_) && is_false(f_) => Some(wrap_num(
+                    numeric_parent,
+                    Expr::Bin {
+                        op: BinOp::LogAnd, l: Box::new(cc.clone()), r: Box::new(boolify(t_)), ty: None,
+                    },
+                )),
                 _ => None,
             };
             if let Some(r) = repl {
