@@ -158,15 +158,6 @@ impl<'a> Structurer<'a> {
             top_groups,
             depth: 0,
         };
-        if std::env::var("JCDC_DBG_PAT").is_ok() {
-            let probe = format!("{:?}", self.cfg.blocks.iter().map(|b| (&self.results[b.id].stmts, &self.results[b.id].term)).collect::<Vec<_>>());
-            if probe.contains("hexDigits") {
-                for b in &self.cfg.blocks {
-                    eprintln!("DBGBLK {} [{}..{}) succ={:?} pred={:?} ret={} throw={} stmts={}", b.id, b.start, b.end, b.succ, b.pred, matches!(self.results[b.id].term, Term::Return(_)), matches!(self.results[b.id].term, Term::Throw(_)), self.results[b.id].stmts.len());
-                }
-                for (&h, mem) in ctx.loop_members.iter() { eprintln!("DBGLOOP h={} mem={:?}", h, mem); }
-            }
-        }
         let r = self.sese_region(self.cfg.entry, &HashSet::new(), &mut ctx);
         r
     }

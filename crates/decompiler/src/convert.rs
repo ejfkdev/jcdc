@@ -343,9 +343,6 @@ impl<'a> Converter<'a> {
                             Stmt::Continue(lbl)
                         }
                         Jump::RawGoto(t) => {
-                            if std::env::var("JCDC_DBG_RG").is_ok() {
-                                eprintln!("RG t={} cur={} last={} follows={:?} copytail={} term_t={:?} stmts_t={}", t, self.cur_block, self.goto_is_last, self.if_follows, self.reaches_copy_tail(t), matches!(self.results[t].term, Term::Return(_)|Term::Throw(_)), self.results[t].stmts.len());
-                            }
                             if std::env::var("JCDC_DBG_GOTO").is_ok() {
                                 eprintln!("RAWGOTO t={} copied_tails={:?} if_follows={:?} last={}", t, self.copied_tails, self.if_follows, self.goto_is_last);
                             }
