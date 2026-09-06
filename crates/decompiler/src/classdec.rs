@@ -2031,6 +2031,20 @@ fn emit_field_impl(pc: &PoolClass, pool: &ClassPool, fi: usize, out: &mut String
                             *type_args = w;
                         }
                         Some(call)
+                    } else if args_have_generic_new(std::slice::from_ref(init_e), pool)
+                        || is_generic_call(init_e, pool)
+                    {
+                        // A generic-call initializer (or one carrying a
+                        // diamond new) target-types itself at the field
+                        // assignment: javac infers through the whole
+                        // nested chain. A synthesized cast freezes the
+                        // OUTER call only — the diamond inside still
+                        // infers <Object,Object> and the cast becomes
+                        // inconvertible ("Map<Object,Object>无法转换为
+                        // Map<Key,PermissionCollection>", jdk11
+                        // ProtectionDomain cache; jdk17 System.classes).
+                        // Leave the bare source form.
+                        None
                     } else {
                         Some(Expr::Cast {
                             ty: TypeRef::G(gt),

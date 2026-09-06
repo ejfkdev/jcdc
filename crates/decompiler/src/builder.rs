@@ -757,6 +757,28 @@ impl<'a> Builder<'a> {
                 Opcode::Checkcast => {
                     let v = pop(&mut stack)?;
                     let ty = self.cp_type(in0.a as u16)?;
+                    // javac reifies the covariant array clone() with an
+                    // erased checkcast; in source form clone() carries the
+                    // receiver's array type statically. Retype the cast to
+                    // the receiver's GENERIC array so nested inference
+                    // keeps the element type (`Arrays.asList((Class[])
+                    // ptypes.clone())` froze T=Class — "List<Class>
+                    // 无法转换为List<? extends Class<?>>", jdk17
+                    // MethodType.parameterList).
+                    let ty = match (&v, &ty) {
+                        (
+                            Expr::Method { name, owner: Some(o), .. },
+                            TypeRef::J(jcdc_jvm::JavaType::Array(_)),
+                        ) if name == "clone" => match o.type_ref() {
+                            TypeRef::G(g @ jcdc_jvm::GenericType::Array(_))
+                                if TypeRef::G(g.clone()).erased() == ty.erased() =>
+                            {
+                                TypeRef::G(g)
+                            }
+                            _ => ty,
+                        },
+                        _ => ty,
+                    };
                     stack.push(Expr::Cast { ty, e: Box::new(v) });
                 }
                 Opcode::Instanceof => {
