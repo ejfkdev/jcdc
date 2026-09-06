@@ -3356,10 +3356,8 @@ pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: 
                     };
                     v.iter().rposition(defines).map(|p| p + 1).unwrap_or(0)
                 };
-                let mut first_use = (0..v.len())
-                    .filter(|&j| !matches!(&v[j], Stmt::ClassDecl { .. }))
-                    .find(|&j| stmt_mentions_local(&v[j], &marker, &name, vt, fam))
-                    .unwrap_or(v.len());
+                let mut first_use =
+                    first_local_mention(v, &marker, &name, vt, fam).unwrap_or(v.len());
                 if first_use < capture_end {
                     // The early mentions sit in hoisted `= null` decls:
                     // move them past the insertion point (their runtime
@@ -3369,10 +3367,8 @@ pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: 
                     let mut moved = Vec::new();
                     let mut capture_end = capture_end;
                     loop {
-                        let fu = (0..v.len())
-                            .filter(|&j| !matches!(&v[j], Stmt::ClassDecl { .. }))
-                            .find(|&j| stmt_mentions_local(&v[j], &marker, &name, vt, fam))
-                            .unwrap_or(v.len());
+                        let fu =
+                            first_local_mention(v, &marker, &name, vt, fam).unwrap_or(v.len());
                         if fu >= capture_end || fu >= v.len() {
                             break;
                         }
@@ -3385,10 +3381,8 @@ pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: 
                         moved.push(v.remove(fu));
                         capture_end -= 1;
                     }
-                    let fu = (0..v.len())
-                        .filter(|&j| !matches!(&v[j], Stmt::ClassDecl { .. }))
-                        .find(|&j| stmt_mentions_local(&v[j], &marker, &name, vt, fam))
-                        .unwrap_or(v.len());
+                    let fu =
+                        first_local_mention(v, &marker, &name, vt, fam).unwrap_or(v.len());
                     let pos = std::cmp::min(std::cmp::max(fu, capture_end), v.len());
                     v.insert(pos, decl);
                     let mut at = pos + 1;
@@ -3575,6 +3569,40 @@ fn g_mentions_local(g: &jcdc_jvm::GenericType, name: &str, fam: &Family) -> bool
 /// local class (post-walk marker `\u{2}Name`) or mentions its simple
 /// name in any rendered TYPE (hoisted LocalDef decls, casts, array
 /// creates, instanceof, method type witnesses).
+/// First index in `v` mentioning the local class `name`: either a real
+/// statement mention (marker new / type reference) or ANOTHER ClassDecl
+/// whose rendered text names it — a local class is in scope only from
+/// its declaration onward, so a sibling decl that references it (jdk26
+/// Gatherers: State's field type ArrayDeque<MapConcurrentTask>) forces
+/// the referenced decl to be inserted at-or-before the sibling.
+fn first_local_mention(
+    v: &[Stmt],
+    marker: &str,
+    name: &str,
+    vt: &VarTable,
+    fam: &Family,
+) -> Option<usize> {
+    v.iter().position(|s| match s {
+        Stmt::ClassDecl { name: n2, header, body } => {
+            *n2 != name && (text_mentions_name(header, name) || text_mentions_name(body, name))
+        }
+        other => stmt_mentions_local(other, marker, name, vt, fam),
+    })
+}
+
+/// True when `text` contains `name` as a whole identifier.
+fn text_mentions_name(text: &str, name: &str) -> bool {
+    let b = text.as_bytes();
+    let n = name.as_bytes();
+    if n.is_empty() || b.len() < n.len() {
+        return false;
+    }
+    let id = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    b.windows(n.len()).enumerate().any(|(i, w)| {
+        w == n && (i == 0 || !id(b[i - 1])) && (i + n.len() == b.len() || !id(b[i + n.len()]))
+    })
+}
+
 fn stmt_mentions_local(s: &Stmt, marker: &str, name: &str, vt: &VarTable, fam: &Family) -> bool {
     let mut found = false;
     fn ty_hit(t: &TypeRef, name: &str, fam: &Family, found: &mut bool) {
@@ -3849,10 +3877,8 @@ fn walk_stmt_anon(
                             }
                         };
                         let marker = format!("\u{2}{}", name);
-                        let first_use = (0..v.len())
-                            .filter(|&x| !matches!(&v[x], Stmt::ClassDecl { .. }))
-                            .find(|&x| stmt_mentions_local(&v[x], &marker, &name, vt, fam))
-                            .unwrap_or(j);
+                        let first_use =
+                            first_local_mention(v, &marker, &name, vt, fam).unwrap_or(j);
                         if std::env::var("JCDC_DBG_ANON").is_ok() {
                             eprintln!("RELOC name={} j={} first_use={} vlen={} depth={}", name, j, first_use, v.len(), ANON_BODY_DEPTH.with(|d| d.get()));
                         }
@@ -4063,18 +4089,70 @@ fn emit_local_class_decl(
         }
     }
     let mut buf = String::new();
-    if emit_anon_body(lpc, pool, fam, captures, &mut buf, 0, true).is_ok() {
-        let decl = Stmt::ClassDecl { name: simple.clone(), header, body: buf };
-        if hoist_out {
-            ANON_HOIST.with(|h| {
-                let mut h = h.borrow_mut();
-                if !h.iter().any(|d| matches!(d, Stmt::ClassDecl { name, .. } if *name == simple)) {
-                    h.push(decl);
-                }
-            });
-        } else {
-            dedup.push(decl);
+    // Sibling local classes: this class's body may declare-use another
+    // local class of the SAME outer method (jdk26 Gatherers.mapConcurrent:
+    // State.integrate does `new MapConcurrentTask(..)`, and State's field
+    // type is ArrayDeque<MapConcurrentTask>). The inner walk hoists that
+    // decl onto ANON_HOIST (its EnclosingMethod names the outer class, not
+    // this one) but no build_anon_new follows to drain it — the decl was
+    // lost entirely (19 "找不到符号"). Drain same-enclosing decls here and
+    // put them BEFORE this class's own decl: a local class is in scope
+    // only from its declaration onward, and the source declares the
+    // sibling first (MapConcurrentTask at line 358, State at 366).
+    let own_enc = enclosing_method_of(lpc);
+    let hoist_mark = ANON_HOIST.with(|h| h.borrow().len());
+    let emitted = emit_anon_body(lpc, pool, fam, captures, &mut buf, 0, true);
+    if emitted.is_err() {
+        ANON_HOIST.with(|h| h.borrow_mut().truncate(hoist_mark));
+        return;
+    }
+    let siblings: Vec<Stmt> = ANON_HOIST.with(|h| {
+        let mut h = h.borrow_mut();
+        if h.len() <= hoist_mark {
+            return Vec::new();
         }
+        let mut keep: Vec<Stmt> = Vec::new();
+        let mut taken: Vec<Stmt> = Vec::new();
+        for d in h.drain(hoist_mark..) {
+            let is_sibling = match (&d, &own_enc) {
+                (Stmt::ClassDecl { name, .. }, Some(enc)) => fam
+                    .nested
+                    .iter()
+                    .filter(|(_, nc)| nc.simple == *name)
+                    .filter_map(|(internal, _)| pool.get(internal))
+                    .any(|cpc| enclosing_method_of(&cpc).as_ref() == Some(enc)),
+                _ => false,
+            };
+            if is_sibling {
+                taken.push(d);
+            } else {
+                keep.push(d);
+            }
+        }
+        h.extend(keep);
+        taken
+    });
+    for d in siblings.into_iter().rev() {
+        let dup = match &d {
+            Stmt::ClassDecl { name, .. } => dedup
+                .iter()
+                .any(|x| matches!(x, Stmt::ClassDecl { name: n2, .. } if n2 == name)),
+            _ => false,
+        };
+        if !dup {
+            dedup.insert(0, d);
+        }
+    }
+    let decl = Stmt::ClassDecl { name: simple.clone(), header, body: buf };
+    if hoist_out {
+        ANON_HOIST.with(|h| {
+            let mut h = h.borrow_mut();
+            if !h.iter().any(|d| matches!(d, Stmt::ClassDecl { name, .. } if *name == simple)) {
+                h.push(decl);
+            }
+        });
+    } else {
+        dedup.push(decl);
     }
 }
 
