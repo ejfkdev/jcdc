@@ -1495,7 +1495,11 @@ fn is_synthetic_record_method(pc: &PoolClass, pool: &ClassPool, mi: usize) -> bo
             let stmts = stmt_vec(&mb.body);
             let trivial = !stmts.is_empty()
                 && stmts.iter().all(|st| match st {
-                    Stmt::ExprStmt(Expr::Method { name: n, .. }) if n == "<init>" => true,
+                    Stmt::ExprStmt(Expr::Method { name: n, cls, .. })
+                        if n == "<init>" && cls != &pc.internal_name =>
+                    {
+                        true
+                    }
                     Stmt::ExprStmt(Expr::Method { name: n, cls, .. })
                         if n == "requireNonNull" && cls == "java/util/Objects" => true,
                     Stmt::ExprStmt(Expr::Assign { target, .. }) => {
@@ -1511,13 +1515,20 @@ fn is_synthetic_record_method(pc: &PoolClass, pool: &ClassPool, mi: usize) -> bo
             }
         }
     }
-    // Canonical constructor: body is only super() + field copies.
+    // Canonical constructor: body is only super() + field copies. A
+    // THIS-delegation (`VMStorage(byte,short,int) { this(.., null); }`,
+    // jdk26 records) is a real source constructor — skipping it left
+    // call sites constructing an arity that no longer exists.
     if name == "<init>" {
         if let Ok(Some(mb)) = decompile_method(pc, pool, mi) {
             let stmts = stmt_vec(&mb.body);
             let trivial = !stmts.is_empty()
                 && stmts.iter().all(|st| match st {
-                    Stmt::ExprStmt(Expr::Method { name: n, .. }) if n == "<init>" => true,
+                    Stmt::ExprStmt(Expr::Method { name: n, cls, .. })
+                        if n == "<init>" && cls != &pc.internal_name =>
+                    {
+                        true
+                    }
                     Stmt::ExprStmt(Expr::Assign { target, .. }) => matches!(&**target, Expr::Field { .. }),
                     Stmt::Return(None) => true,
                     Stmt::Comment(_) => true,
