@@ -201,42 +201,59 @@ impl VarTable {
             use jcdc_classfile::instruction::{decode_all, Opcode};
             let mut gaps: Vec<(u16, u16, u16, JavaType)> = Vec::new();
             for ins in decode_all(&code.code) {
-                let (slot, ty) = match ins.op {
-                    Opcode::Iload | Opcode::Istore | Opcode::Iinc => (ins.a as u16, JavaType::Int),
-                    Opcode::Iload0 | Opcode::Istore0 => (0, JavaType::Int),
-                    Opcode::Iload1 | Opcode::Istore1 => (1, JavaType::Int),
-                    Opcode::Iload2 | Opcode::Istore2 => (2, JavaType::Int),
-                    Opcode::Iload3 | Opcode::Istore3 => (3, JavaType::Int),
-                    Opcode::Lload | Opcode::Lstore => (ins.a as u16, JavaType::Long),
-                    Opcode::Lload0 | Opcode::Lstore0 => (0, JavaType::Long),
-                    Opcode::Lload1 | Opcode::Lstore1 => (1, JavaType::Long),
-                    Opcode::Lload2 | Opcode::Lstore2 => (2, JavaType::Long),
-                    Opcode::Lload3 | Opcode::Lstore3 => (3, JavaType::Long),
-                    Opcode::Fload | Opcode::Fstore => (ins.a as u16, JavaType::Float),
-                    Opcode::Fload0 | Opcode::Fstore0 => (0, JavaType::Float),
-                    Opcode::Fload1 | Opcode::Fstore1 => (1, JavaType::Float),
-                    Opcode::Fload2 | Opcode::Fstore2 => (2, JavaType::Float),
-                    Opcode::Fload3 | Opcode::Fstore3 => (3, JavaType::Float),
-                    Opcode::Dload | Opcode::Dstore => (ins.a as u16, JavaType::Double),
-                    Opcode::Dload0 | Opcode::Dstore0 => (0, JavaType::Double),
-                    Opcode::Dload1 | Opcode::Dstore1 => (1, JavaType::Double),
-                    Opcode::Dload2 | Opcode::Dstore2 => (2, JavaType::Double),
-                    Opcode::Dload3 | Opcode::Dstore3 => (3, JavaType::Double),
-                    Opcode::Aload | Opcode::Astore => {
-                        (ins.a as u16, JavaType::Object("java/lang/Object".into()))
-                    }
-                    Opcode::Aload0 | Opcode::Astore0 => {
-                        (0, JavaType::Object("java/lang/Object".into()))
-                    }
-                    Opcode::Aload1 | Opcode::Astore1 => {
-                        (1, JavaType::Object("java/lang/Object".into()))
-                    }
-                    Opcode::Aload2 | Opcode::Astore2 => {
-                        (2, JavaType::Object("java/lang/Object".into()))
-                    }
-                    Opcode::Aload3 | Opcode::Astore3 => {
-                        (3, JavaType::Object("java/lang/Object".into()))
-                    }
+                let a = ins.a as u16;
+                let (slot, ty, is_store) = match ins.op {
+                    Opcode::Iinc => (a, JavaType::Int, true),
+                    Opcode::Iload => (a, JavaType::Int, false),
+                    Opcode::Istore => (a, JavaType::Int, true),
+                    Opcode::Iload0 => (0, JavaType::Int, false),
+                    Opcode::Istore0 => (0, JavaType::Int, true),
+                    Opcode::Iload1 => (1, JavaType::Int, false),
+                    Opcode::Istore1 => (1, JavaType::Int, true),
+                    Opcode::Iload2 => (2, JavaType::Int, false),
+                    Opcode::Istore2 => (2, JavaType::Int, true),
+                    Opcode::Iload3 => (3, JavaType::Int, false),
+                    Opcode::Istore3 => (3, JavaType::Int, true),
+                    Opcode::Lload => (a, JavaType::Long, false),
+                    Opcode::Lstore => (a, JavaType::Long, true),
+                    Opcode::Lload0 => (0, JavaType::Long, false),
+                    Opcode::Lstore0 => (0, JavaType::Long, true),
+                    Opcode::Lload1 => (1, JavaType::Long, false),
+                    Opcode::Lstore1 => (1, JavaType::Long, true),
+                    Opcode::Lload2 => (2, JavaType::Long, false),
+                    Opcode::Lstore2 => (2, JavaType::Long, true),
+                    Opcode::Lload3 => (3, JavaType::Long, false),
+                    Opcode::Lstore3 => (3, JavaType::Long, true),
+                    Opcode::Fload => (a, JavaType::Float, false),
+                    Opcode::Fstore => (a, JavaType::Float, true),
+                    Opcode::Fload0 => (0, JavaType::Float, false),
+                    Opcode::Fstore0 => (0, JavaType::Float, true),
+                    Opcode::Fload1 => (1, JavaType::Float, false),
+                    Opcode::Fstore1 => (1, JavaType::Float, true),
+                    Opcode::Fload2 => (2, JavaType::Float, false),
+                    Opcode::Fstore2 => (2, JavaType::Float, true),
+                    Opcode::Fload3 => (3, JavaType::Float, false),
+                    Opcode::Fstore3 => (3, JavaType::Float, true),
+                    Opcode::Dload => (a, JavaType::Double, false),
+                    Opcode::Dstore => (a, JavaType::Double, true),
+                    Opcode::Dload0 => (0, JavaType::Double, false),
+                    Opcode::Dstore0 => (0, JavaType::Double, true),
+                    Opcode::Dload1 => (1, JavaType::Double, false),
+                    Opcode::Dstore1 => (1, JavaType::Double, true),
+                    Opcode::Dload2 => (2, JavaType::Double, false),
+                    Opcode::Dstore2 => (2, JavaType::Double, true),
+                    Opcode::Dload3 => (3, JavaType::Double, false),
+                    Opcode::Dstore3 => (3, JavaType::Double, true),
+                    Opcode::Aload => (a, JavaType::Object("java/lang/Object".into()), false),
+                    Opcode::Astore => (a, JavaType::Object("java/lang/Object".into()), true),
+                    Opcode::Aload0 => (0, JavaType::Object("java/lang/Object".into()), false),
+                    Opcode::Astore0 => (0, JavaType::Object("java/lang/Object".into()), true),
+                    Opcode::Aload1 => (1, JavaType::Object("java/lang/Object".into()), false),
+                    Opcode::Astore1 => (1, JavaType::Object("java/lang/Object".into()), true),
+                    Opcode::Aload2 => (2, JavaType::Object("java/lang/Object".into()), false),
+                    Opcode::Astore2 => (2, JavaType::Object("java/lang/Object".into()), true),
+                    Opcode::Aload3 => (3, JavaType::Object("java/lang/Object".into()), false),
+                    Opcode::Astore3 => (3, JavaType::Object("java/lang/Object".into()), true),
                     _ => continue,
                 };
                 let pc0 = ins.pc;
@@ -245,7 +262,17 @@ impl VarTable {
                     .get(slot as usize)
                     .map(|segs| {
                         segs.iter().any(|(rs, re, _)| {
-                            (pc0 >= *rs && pc0 < *re) || (pc0 < *rs && *rs - pc0 <= 8)
+                            (pc0 >= *rs && pc0 < *re)
+                                // javac starts an LVT range just AFTER the
+                                // storing instruction, so a nearby STORE
+                                // belongs to the next range. A nearby LOAD
+                                // does not: it reads a value stored EARLIER
+                                // (a return-value temp whose iload sits just
+                                // before the next catch param's LVT range,
+                                // jdk17 ForkJoinTask.exec `return rex` —
+                                // forward attribution turned `return true`
+                                // into returning the exception).
+                                || (is_store && pc0 < *rs && *rs - pc0 <= 8)
                         })
                     })
                     .unwrap_or(false);
