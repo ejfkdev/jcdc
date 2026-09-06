@@ -651,11 +651,23 @@ impl<'a> Converter<'a> {
                     Stmt::While { cond: while_cond, body: Box::new(inner) }
                 } else if taken_is_exit {
                     // Exit branch runs statements before leaving:
-                    // while (true) { if (!C) { stmts; break; } body }
+                    // while (true) { if (C_exit) { stmts; break; } body }
+                    // `cond` IS the exit test here (the taken side exits —
+                    // negate(cond) inverted the guard: jdk17 CHM
+                    // comparableClassFor emitted `if (i < len) return null`
+                    // inside while(true), inverting the loop). The break is
+                    // only appended when the exit statements do not already
+                    // terminate (return null + break = unreachable stmt).
                     let mut ex = exit_stmts;
-                    ex.push(Stmt::Break(None));
+                    let already_term = matches!(
+                        ex.last(),
+                        Some(Stmt::Return(_)) | Some(Stmt::Throw(_)) | Some(Stmt::Break(_))
+                    );
+                    if !already_term {
+                        ex.push(Stmt::Break(None));
+                    }
                     let guard = Stmt::If {
-                        cond: negate(cond),
+                        cond: cond.clone(),
                         then_stmt: Box::new(Stmt::Block(ex)),
                         else_stmt: None,
                     };
