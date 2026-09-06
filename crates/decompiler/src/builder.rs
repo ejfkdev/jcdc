@@ -1374,8 +1374,28 @@ impl<'a> Builder<'a> {
         // (`Map.ofEntries(e1, e2)` vs `Map.ofEntries(new Entry[]{...})`).
         if method_is_varargs(&cls, &name, &d, self.pool, self.pc) {
             if let Some(Expr::NewArray { init: Some(_), .. }) = args.last() {
+                let comp = match mdesc.args.last() {
+                    Some(JavaType::Array(c)) => Some((**c).clone()),
+                    _ => None,
+                };
                 if let Some(Expr::NewArray { init: Some(vals), .. }) = args.pop() {
-                    args.extend(vals);
+                    // Spread Int constants from a folded byte[]/short[]/
+                    // char[] initializer re-cast to the component type:
+                    // varargs positions do NOT constant-narrow ("varargs
+                    // 不匹配; 从int转换到byte可能会有损失", jdk26
+                    // PKCS9Attribute.add(.., 22)).
+                    let narrow = matches!(
+                        comp,
+                        Some(JavaType::Byte) | Some(JavaType::Short) | Some(JavaType::Char)
+                    );
+                    args.extend(vals.into_iter().map(|v| {
+                        if narrow && matches!(v, Expr::Const(ConstVal::Int(_))) {
+                            if let Some(c) = &comp {
+                                return Expr::Cast { ty: TypeRef::J(c.clone()), e: Box::new(v) };
+                            }
+                        }
+                        v
+                    }));
                 }
             }
         }
