@@ -1315,7 +1315,16 @@ impl<'a> Structurer<'a> {
                     // a throwing default), losing break resolution for the
                     // remaining cases.
                     let follow = self.postdom_ipdom(universe, cur)
-                        .or_else(|| self.switch_follow(cur, universe));
+                        .or_else(|| self.switch_follow(cur, universe))
+                        // Inside a copied/shared-tail region the confluence
+                        // sits in `stop` (the enclosing flow owns it), so
+                        // the universe-bound searches miss it and every
+                        // case's terminal goto degrades to fall-through
+                        // (jdk11 Calendar.createCalendar catch-copy switch
+                        // lost its breaks). A stop block that ALL live
+                        // cases escape to is still the logical follow for
+                        // break resolution.
+                        .or_else(|| self.switch_stop_confluence(cur, universe, stop));
                     let sw = self.structure_switch(cur, selector, &targets, universe, stop, follow, active, claimed);
                     parts.push(sw);
                     match follow {
@@ -1451,6 +1460,58 @@ impl<'a> Structurer<'a> {
     /// boolean diamonds (`a && b || c`) whose shared push blocks would
     /// otherwise be consumed silently by the first reaching branch.
     /// Confluence block of a switch's non-terminating case flows.
+    /// The single stop/out-of-universe block that every live (non
+    /// return/throw) case target escapes to. Used as a switch follow for
+    /// break resolution when the real confluence lies beyond the current
+    /// region's universe.
+    pub(crate) fn switch_stop_confluence(
+        &self,
+        cur: usize,
+        universe: &HashSet<usize>,
+        stop: &HashSet<usize>,
+    ) -> Option<usize> {
+        let mut common: Option<usize> = None;
+        let mut saw_live = false;
+        for &t in &self.cfg.blocks[cur].succ {
+            if self.is_terminator_block(t) {
+                continue;
+            }
+            saw_live = true;
+            // Forward BFS within the universe; collect the first blocks
+            // that leave it (stop members or out-of-universe succs).
+            let mut escapes: HashSet<usize> = HashSet::new();
+            let mut seen: HashSet<usize> = HashSet::new();
+            let mut q: Vec<usize> = vec![t];
+            seen.insert(t);
+            while let Some(b) = q.pop() {
+                for &s2 in &self.cfg.blocks[b].succ {
+                    if !universe.contains(&s2) || stop.contains(&s2) {
+                        escapes.insert(s2);
+                    } else if seen.insert(s2) {
+                        q.push(s2);
+                    }
+                }
+            }
+            // A live target that IS itself a stop/out-of-universe block
+            // (the default jumping straight to the confluence) escapes to
+            // itself.
+            if !universe.contains(&t) || stop.contains(&t) {
+                escapes.clear();
+                escapes.insert(t);
+            }
+            if escapes.len() != 1 {
+                return None;
+            }
+            let e = *escapes.iter().next().unwrap();
+            match common {
+                None => common = Some(e),
+                Some(c) if c == e => {}
+                Some(_) => return None,
+            }
+        }
+        if saw_live { common } else { None }
+    }
+
     fn switch_follow(&self, cur: usize, universe: &HashSet<usize>) -> Option<usize> {
         let mut dists: Vec<HashMap<usize, u32>> = Vec::new();
         for &s0 in &self.cfg.blocks[cur].succ {

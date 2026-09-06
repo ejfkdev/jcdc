@@ -1579,7 +1579,7 @@ fn resolve_catch_vars(vt: &mut VarTable, s: &mut Stmt) {
                             vt.add_catch_var(slot, "e".to_string(), TypeRef::J(exc_ty))
                         };
                         remove_first_stmt(&mut c.body);
-                        rewrite_var(&mut c.body, v, new_var);
+                        rewrite_var_until_assign(&mut c.body, v, new_var);
                         c.var = new_var;
                     } else if std::env::var("JCDC_DBG_CATCH").is_ok() {
                         eprintln!("no store at handler head: {:?}", first_stmt_peek(&c.body));
@@ -1622,7 +1622,7 @@ fn resolve_catch_vars(vt: &mut VarTable, s: &mut Stmt) {
                             vt.add_catch_var(slot, "e".to_string(), TypeRef::J(exc_ty))
                         };
                         remove_first_stmt(&mut c.body);
-                        rewrite_var(&mut c.body, v, new_var);
+                        rewrite_var_until_assign(&mut c.body, v, new_var);
                         c.var = new_var;
                     } else if std::env::var("JCDC_DBG_CATCH").is_ok() {
                         eprintln!("no store at handler head: {:?}", first_stmt_peek(&c.body));
@@ -1669,6 +1669,59 @@ fn resolve_catch_vars(vt: &mut VarTable, s: &mut Stmt) {
 }
 
 /// Rename every reference of variable `from` to `to` inside `s`.
+/// rewrite_var, bounded to the leading statements before the first
+/// (re)assignment of `from`: a catch handler whose slot is shared with an
+/// ordinary local carries the exception identity only until the normal
+/// flow reassigns the slot (jdk11 Calendar.createCalendar: the handler
+/// stores the exception into `cal`'s slot, immediately overwrites it with
+/// `cal = null` and falls into the shared method tail — a full rewrite
+/// painted the whole tail as the exception var: "BuddhistCalendar无法转换
+/// 为IllegalArgumentException"). Compound statements containing any
+/// assignment of `from` stop the rewrite conservatively.
+fn rewrite_var_until_assign(s: &mut Stmt, from: u32, to: u32) -> bool {
+    match s {
+        Stmt::Block(v) => {
+            for x in v.iter_mut() {
+                if !rewrite_var_until_assign(x, from, to) {
+                    return false;
+                }
+            }
+            true
+        }
+        Stmt::ExprStmt(e) => {
+            let assigns = matches!(e,
+                Expr::Assign { target, .. }
+                if matches!(&**target, Expr::Local { var, .. } if *var == from));
+            if assigns {
+                // RHS still reads the exception; the store rebinds the
+                // slot to the normal local — rewrite the value, keep the
+                // target, and stop.
+                if let Expr::Assign { value, .. } = e {
+                    let mut tmp = Stmt::ExprStmt((**value).clone());
+                    rewrite_var(&mut tmp, from, to);
+                    if let (Stmt::ExprStmt(rv), Expr::Assign { value, .. }) = (tmp, &mut *e) {
+                        *value = Box::new(rv);
+                    }
+                }
+                return false;
+            }
+            if stmt_assigns_var(s, from) {
+                return false;
+            }
+            rewrite_var(s, from, to);
+            true
+        }
+        Stmt::LocalDef { var, .. } if *var == from => false,
+        other => {
+            if stmt_assigns_var(other, from) {
+                return false;
+            }
+            rewrite_var(other, from, to);
+            true
+        }
+    }
+}
+
 fn rewrite_var(s: &mut Stmt, from: u32, to: u32) {
     fn rw_expr(e: &mut Expr, from: u32, to: u32, ty: &TypeRef) {
         if let Expr::Local { var, ty: t } = e {

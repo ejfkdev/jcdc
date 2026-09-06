@@ -987,7 +987,12 @@ impl<'a> Structurer<'a> {
                         // .computeFieldOffsets: fall-through cases and
                         // dangling break labels).
                         .or_else(|| self.live_merge(ctx, &succs, stop))
-                        .or_else(|| self.convergent_merge(ctx, &succs, stop));
+                        .or_else(|| self.convergent_merge(ctx, &succs, stop))
+                        // Copied/shared-tail regions: the confluence lives
+                        // in `stop` (enclosing flow owns it) — still the
+                        // logical follow for case `break` resolution (jdk11
+                        // Calendar.createCalendar catch-copy switch).
+                        .or_else(|| self.switch_stop_confluence(cur, &ctx.universe, stop));
                     let mut claimed = ctx.consumed.clone();
                     let sw = self.structure_switch(
                         cur,
