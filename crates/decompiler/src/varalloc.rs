@@ -130,10 +130,20 @@ impl VarTable {
                     if synthetic_name(&e.2) {
                         return e.0 <= m.1 + 16 && m.0 <= e.1 + 16;
                     }
-                    // Same ordinary name in one slot: merge only when no
-                    // DIFFERENT variable on that slot lives between the two
-                    // ranges — merging across one would swallow its pcs
-                    // (e.g. slot 7: dst[96..317], b[438..461], dst[580..605]).
+                    // Same ordinary name in one slot: merge only when the
+                    // ranges OVERLAP or nearly touch (the compiler split
+                    // one variable's live range around a branch) — merging
+                    // DISJOINT ranges fabricates liveness across the gap
+                    // and swallows other slot occupants there (jdk11
+                    // ResourceBundle.getCandidateLocales: two sibling
+                    // `for (String v : variants)` loops merged, and the
+                    // string-switch int index living in the gap between
+                    // them became `v = -1` on a String). A different
+                    // variable between the ranges also blocks the merge
+                    // (slot 7: dst[96..317], b[438..461], dst[580..605]).
+                    if !(m.0 <= e.1 + 16 && e.0 <= m.1 + 16) {
+                        return false;
+                    }
                     let lo = m.1.min(e.1);
                     let hi = m.0.max(e.0);
                     !all.iter().any(|o| {
