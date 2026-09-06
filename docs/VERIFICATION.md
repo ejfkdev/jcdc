@@ -252,6 +252,33 @@ features 56/56 双路绿；cargo test 绿。仍共同阻塞：`List.sort` 裸 ca
   Enum.valueOf——root cause D 同族）与常量定型（Unsafe boolean→byte、
   JarFile ctor int 参数）、重载消歧（ObjectInputFilter doPrivileged）。
 
+**SESE 侧 try-in-switch 修复（c39a3f06）**：SESE 调 `structure_switch`/
+`copy_walk` 时 active 传空——保护段完全落在 switch case 内部的 try 组
+永远无法在 case walk 里触发（walk 的组检查只匹配 active 表），case 被裸
+结构化、handler 被孤儿化：jdk17 `URL$DefaultFactory.createURLStreamHandler`
+的反射 try 丢失 → 「未报告的异常错误」（SESE 侧 jdk11/17 corpus 家族阻塞，
+`Provider.java` 同因）。修复：按 walk 同款过滤器构造 `top_groups` 并传入
+两个子构建器。已验证输出与 walk 同形（try/catch 完整）。
+
+**泛型/lambda 两共享修复（classdec/emit，双路受益）**：
+① 泛型返回方法的**擦除 cast 剥离**：Signature 返回为泛型（`T[]` 等）时，
+bytecode checkcast 到擦除类型的 cast 在 return 位置是非法源文（Object[]
+不能转 T[]）；当内层表达式已携带泛型源类型（G 型局部/字段/调用、泛型调用、
+泛型数组上的 `clone()`——由 return 目标定型的 poly 表达式）则剥掉 cast。
+`Class.getEnumConstants` 现与 JDK 源码逐字一致。② **lambda SAM 参数对齐**：
+impl 方法签名 =（captures..., SAM 参数...），旧对齐只接受等长（无捕获），
+任何带捕获的 lambda 印成 `(x0,x1) -> {..k..v..}`（未定义符号；
+`ConcurrentMap.replaceAll`）。改取 impl 参数名的**尾部 SAM 切片**。
+
+**corpus 家族级现状（jdk11 Provider 家族 4309 类闭包重编译）**：上述修复
+逐个消除了 URLClassPath(anon)/String.split(unreachable)/Unsafe(bool2byte)/
+Debug(final)/Class.getEnumConstants/ObjectInputStream.valueOf/
+WeakHashMap.CAP#1/ConcurrentMap.replaceAll 各层错误；剩余 ~100 错误散布
+~10 文件（ClassSpecializer 匿名派生类名 `Factory$1Var` 引用无声明、
+Enum.getDeclaringClass 泛型三元 witness、ObjectInputFilter doPrivileged
+重载歧义、FileSystem/Module/Package 等待逐个归因）——多家族长尾，属跨会话
+专项（root cause D 亲族），walk/SESE 共同。
+
 **step 6 后全量冒烟**：rt.jar 12608 文件 / 0 panic / 0 error / 0 hang /
 exit=0，888s（~14.8min，约为 walk ~10min 的 1.5×；step 4/5 的守卫剪枝使
 其比 step 3 时的 ~19min 更快）。**最终二进制（aa6ab069）双路冒烟**：
