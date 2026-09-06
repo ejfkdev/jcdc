@@ -60,6 +60,10 @@ pub struct NestedClass {
     pub simple: String,
     pub kind: NestedKind,
     pub access: ClassAccessFlags,
+    /// Source header rendered from the class Signature (generic
+    /// supertypes + type params) when available; the inline local-class
+    /// walker falls back to its erased rendering.
+    pub sig_header: Option<String>,
 }
 
 pub struct Family {
@@ -102,20 +106,22 @@ impl Family {
                     fam.anonymous.insert(name.clone());
                     fam.nested.insert(
                         name.clone(),
-                        NestedClass { name: name.clone(), simple, kind, access },
+                        NestedClass { name: name.clone(), simple, kind, access, sig_header: None },
                     );
                 }
                 NestedKind::Local => {
                     fam.locals.insert(name.clone());
+                    let sig_header = sig_class_header(&pc, &simple, pool);
                     fam.nested.insert(
                         name.clone(),
-                        NestedClass { name: name.clone(), simple, kind, access },
+                        NestedClass { name: name.clone(), simple, kind, access, sig_header },
                     );
                 }
                 NestedKind::Member => {
+                    let sig_header = sig_class_header(&pc, &simple, pool);
                     fam.nested.insert(
                         name.clone(),
-                        NestedClass { name: name.clone(), simple, kind, access },
+                        NestedClass { name: name.clone(), simple, kind, access, sig_header },
                     );
                 }
             }
@@ -400,6 +406,61 @@ fn accessor_replacement(e: &Expr, _pc: &PoolClass, pool: &ClassPool, depth: u8) 
     }
 }
 
+/// (class internal name, method name) from the EnclosingMethod attribute.
+fn enclosing_method_of(pc: &PoolClass) -> Option<(String, String)> {
+    let b = pc.class_attr("EnclosingMethod")?;
+    if b.len() < 4 {
+        return None;
+    }
+    let ci = u16::from_be_bytes([b[0], b[1]]);
+    let mi = u16::from_be_bytes([b[2], b[3]]);
+    let cls = pc.class_name(ci)?.to_string();
+    let (mname, _) = pc.name_and_type(mi)?;
+    Some((cls, mname.to_string()))
+}
+
+/// Source header for a local/member class rendered from its class
+/// Signature: `Name<Params> extends Super<S> implements A<X>, B`. The
+/// walker's erased fallback drops the superclass whenever an interface
+/// exists and renders raw interface names — jdk11 ReduceOps' local
+/// `class ReducingSink extends Box<U> implements AccumulatingSink<T, U,
+/// ReducingSink>` printed as `class ReducingSink implements
+/// ReduceOps.AccumulatingSink`: raw interface => "not abstract and does
+/// not override combine", lost Box<U> => every `state` reference died
+/// (56 symbol errors + 13 override errors in ReduceOps alone).
+fn sig_class_header(lpc: &PoolClass, simple: &str, pool: &ClassPool) -> Option<String> {
+    use jcdc_jvm::GenericType as G;
+    let sig_bytes = lpc.class_attr("Signature")?;
+    if sig_bytes.len() < 2 {
+        return None;
+    }
+    let sig = lpc
+        .utf8(u16::from_be_bytes([sig_bytes[0], sig_bytes[1]]))
+        .and_then(|x| parse_class_signature(x))?;
+    let vt = empty_vt();
+    let p = Printer::new(lpc, pool, &vt);
+    let mut h = String::from(simple);
+    let mut tp = String::new();
+    jcdc_jvm::render_type_params(&sig.params, &mut tp);
+    h.push_str(&tp);
+    let sup_is_object = matches!(&sig.superclass, G::Class(cs)
+        if cs.parts.first().map(|q| q.name == "Object").unwrap_or(false));
+    if !sup_is_object && matches!(&sig.superclass, G::Class(_) | G::Array(_) | G::TypeVar(_)) {
+        h.push_str(" extends ");
+        h.push_str(&p.type_name(&TypeRef::G(sig.superclass.clone())));
+    }
+    if !sig.interfaces.is_empty() {
+        h.push_str(" implements ");
+        let names: Vec<String> = sig
+            .interfaces
+            .iter()
+            .map(|i| p.type_name(&TypeRef::G(i.clone())))
+            .collect();
+        h.push_str(&names.join(", "));
+    }
+    Some(h)
+}
+
 fn classify_nested(name: &str, rest: &str, pc: &PoolClass) -> (NestedKind, String, ClassAccessFlags) {
     if rest.contains("lambda$") {
         return (NestedKind::Lambda, rest.to_string(), pc.access());
@@ -578,6 +639,19 @@ thread_local! {
 
 thread_local! {
     static EMIT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// While an anonymous-class body is being emitted: local-class
+    /// declarations that lexically belong to the OUTER method (their
+    /// EnclosingMethod names the outer class, not the anon's) collect
+    /// here so build_anon_new can hand them to the outer pending list —
+    /// the declaration must sit before the anonymous `new`, in the
+    /// enclosing method scope, or the anon's own type arguments cannot
+    /// resolve it (jdk11 ReduceOps: `new ReduceOp<T, U, ReducingSink>()
+    /// { ... }` with `class ReducingSink` declared inside the anon's
+    /// makeSink — "cannot find symbol ReducingSink" x56).
+    static ANON_HOIST: std::cell::RefCell<Vec<Stmt>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 struct EmitGuard(String);
@@ -2862,7 +2936,7 @@ fn walk_expr_anon(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, fam: &Family, 
         Expr::New { cls, args, raw: false, .. } if fam.anonymous.contains(cls.as_str()) => {
             match pool.get(cls) {
                 Some(apc) => {
-                    if let Some(anon) = build_anon_new(&apc, args.clone(), pc, pool, fam, vt) {
+                    if let Some(anon) = build_anon_new(&apc, args.clone(), pc, pool, fam, vt, pending) {
                         *e = anon;
                     } else if std::env::var("JCDC_DBG_ANON").is_ok() {
                         eprintln!("ANON inline declined {}", cls);
@@ -2884,36 +2958,67 @@ fn walk_expr_anon(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, fam: &Family, 
                     .unwrap_or_else(|| simple_name(cls));
                 let (kept, captures) = analyze_anon_ctor(&lpc, args.clone());
                 let captures = render_captures(captures, pc, pool, vt);
+                // A local class whose EnclosingMethod names a DIFFERENT
+                // class than the one being walked is declared in an
+                // enclosing scope (the new site sits inside an inlined
+                // anonymous body): hoist the declaration out instead of
+                // splicing it into the anon method.
+                let hoist_out = enclosing_method_of(&lpc)
+                    .map(|(c, _)| c != pc.internal_name)
+                    .unwrap_or(false);
+                let dedup: &mut Vec<Stmt> = pending;
                 // Emit the class declaration once (dedup by name).
-                if !pending.iter().any(|d| matches!(d, Stmt::ClassDecl { name, .. } if *name == simple)) {
-                    let mut header = simple.clone();
-                    let mut bases: Vec<String> = Vec::new();
-                    let p = Printer::new(&lpc, pool, empty_vt());
-                    if lpc.class_attr("Record").is_some() {
-                        // Local record: `record Name(components)`; the
-                        // implicit java.lang.Record supertype is not printed.
-                        header = format!("record {}{}", simple, record_components(&lpc, pool));
-                    } else {
-                        for &ii in &lpc.cf.interfaces {
-                            if let Some(n) = lpc.class_name(ii) {
-                                bases.push(p.shorten(n));
-                            }
-                        }
-                        if bases.is_empty() {
-                            if let Some(sup) = lpc.super_name() {
-                                if sup != "java/lang/Object" && sup != "java/lang/Record" {
-                                    header.push_str(" extends ");
-                                    header.push_str(&p.shorten(sup));
+                if !dedup.iter().any(|d| matches!(d, Stmt::ClassDecl { name, .. } if *name == simple)) {
+                    let mut header = fam
+                        .nested
+                        .get(cls)
+                        .and_then(|n| n.sig_header.clone())
+                        .unwrap_or_else(|| simple.clone());
+                    if fam.nested.get(cls).and_then(|n| n.sig_header.as_ref()).is_none() {
+                        let mut bases: Vec<String> = Vec::new();
+                        let p = Printer::new(&lpc, pool, empty_vt());
+                        if lpc.class_attr("Record").is_some() {
+                            // Local record: `record Name(components)`; the
+                            // implicit java.lang.Record supertype is not printed.
+                            header = format!("record {}{}", simple, record_components(&lpc, pool));
+                        } else {
+                            for &ii in &lpc.cf.interfaces {
+                                if let Some(n) = lpc.class_name(ii) {
+                                    bases.push(p.shorten(n));
                                 }
                             }
-                        } else {
-                            header.push_str(" implements ");
-                            header.push_str(&bases.join(", "));
+                            if bases.is_empty() {
+                                if let Some(sup) = lpc.super_name() {
+                                    if sup != "java/lang/Object" && sup != "java/lang/Record" {
+                                        header.push_str(" extends ");
+                                        header.push_str(&p.shorten(sup));
+                                    }
+                                }
+                            } else {
+                                if let Some(sup) = lpc.super_name() {
+                                    if sup != "java/lang/Object" && sup != "java/lang/Record" {
+                                        header.push_str(" extends ");
+                                        header.push_str(&p.shorten(sup));
+                                    }
+                                }
+                                header.push_str(" implements ");
+                                header.push_str(&bases.join(", "));
+                            }
                         }
                     }
                     let mut buf = String::new();
                     if emit_anon_body(&lpc, pool, fam, &captures, &mut buf, 0).is_ok() {
-                        pending.push(Stmt::ClassDecl { name: simple.clone(), header, body: buf });
+                        let decl = Stmt::ClassDecl { name: simple.clone(), header, body: buf };
+                        if hoist_out {
+                            ANON_HOIST.with(|h| {
+                                let mut h = h.borrow_mut();
+                                if !h.iter().any(|d| matches!(d, Stmt::ClassDecl { name, .. } if *name == simple)) {
+                                    h.push(decl);
+                                }
+                            });
+                        } else {
+                            dedup.push(decl);
+                        }
                     }
                 }
                 *e = Expr::New {
@@ -3386,6 +3491,7 @@ fn build_anon_new(
     pool: &ClassPool,
     fam: &Family,
     outer_vt: &VarTable,
+    outer_pending: &mut Vec<Stmt>,
 ) -> Option<Expr> {
     // Prefer the generic ClassSignature: anonymous classes record their
     // instantiated interface/superclass there, and the emitted body only
@@ -3423,12 +3529,23 @@ fn build_anon_new(
     let captures = render_captures(captures, outer_pc, pool, outer_vt);
 
     let mut body = String::new();
+    let hoist_mark = ANON_HOIST.with(|h| h.borrow().len());
     if let Err(e) = emit_anon_body(apc, pool, fam, &captures, &mut body, 0) {
         if std::env::var("JCDC_DBG_ANON").is_ok() {
             eprintln!("ANON build fail {}: {}", apc.internal_name, e);
         }
+        ANON_HOIST.with(|h| h.borrow_mut().truncate(hoist_mark));
         return None;
     }
+    // Local-class declarations belonging to the OUTER method surfaced
+    // during the body walk: splice them into the outer pending list so
+    // they land before the statement containing this anonymous new.
+    ANON_HOIST.with(|h| {
+        let mut h = h.borrow_mut();
+        if h.len() > hoist_mark {
+            outer_pending.extend(h.drain(hoist_mark..));
+        }
+    });
     let _ = outer_pc;
 
     Some(Expr::AnonNew { cls: apc.internal_name.clone(), base, args: kept_args, body })
