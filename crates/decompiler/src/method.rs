@@ -4598,20 +4598,57 @@ fn booleanize_deep(e: &mut crate::expr::Expr) {
                 }
             }
         }
-        Expr::Method { args, .. } | Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+        Expr::Method { args, desc, .. } => {
+            // An argument at an INT-typed parameter position must keep its
+            // int form: `out.write(v ? 1 : 0)` folded to `out.write(v)`
+            // selects no overload ("对于write(boolean), 找不到合适的方法",
+            // jdk11 DataOutputStream.writeBoolean; Formatter
+            // localizedMagnitude's int offset param). Boolean parameters
+            // (and reference positions, which are rare for 0/1 ternaries)
+            // keep the collapse.
+            for (i, a) in args.iter_mut().enumerate() {
+                let numeric_param = desc
+                    .args
+                    .get(i)
+                    .map(|p| {
+                        matches!(
+                            p,
+                            JavaType::Int | JavaType::Long | JavaType::Short
+                                | JavaType::Byte | JavaType::Char | JavaType::Float
+                                | JavaType::Double
+                        )
+                    })
+                    .unwrap_or(false);
+                if numeric_param {
+                    NUMERIC_CTX.with(|n| n.set(n.get() + 1));
+                    booleanize_deep(a);
+                    NUMERIC_CTX.with(|n| n.set(n.get() - 1));
+                } else {
+                    booleanize_deep(a);
+                }
+            }
+        }
+        Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
             for a in args.iter_mut() {
                 booleanize_deep(a);
             }
         }
         Expr::NewArray { dims, init, .. } => {
-            dims.iter_mut().for_each(booleanize_deep);
+            // Sizes are int positions: no boolean collapse.
+            for d in dims.iter_mut() {
+                NUMERIC_CTX.with(|n| n.set(n.get() + 1));
+                booleanize_deep(d);
+                NUMERIC_CTX.with(|n| n.set(n.get() - 1));
+            }
             if let Some(vals) = init {
                 vals.iter_mut().for_each(booleanize_deep);
             }
         }
         Expr::ArrayIndex { array, index } => {
             booleanize_deep(array);
+            NUMERIC_CTX.with(|n| n.set(n.get() + 1));
             booleanize_deep(index);
+            NUMERIC_CTX.with(|n| n.set(n.get() - 1));
         }
         Expr::Cast { e: x, .. } | Expr::InstanceOf { e: x, .. } => booleanize_deep(x),
         Expr::Field { owner: Some(o), .. } => booleanize_deep(o),
