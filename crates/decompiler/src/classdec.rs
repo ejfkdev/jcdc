@@ -3751,12 +3751,17 @@ fn stmt_mentions_local(s: &Stmt, marker: &str, name: &str, vt: &VarTable, fam: &
                 ty_hit(base, name, fam, found);
                 args.iter().for_each(|a| walk_e(a, marker, name, fam, found));
             }
-            Expr::Method { owner, args, type_args, .. } => {
+            Expr::Method { owner, cls, args, type_args, .. } => {
                 if let Some(o) = owner {
                     walk_e(o, marker, name, fam, found);
                 }
                 args.iter().for_each(|a| walk_e(a, marker, name, fam, found));
                 if type_args.iter().any(|t| t.contains(name)) {
+                    *found = true;
+                }
+                if !*found
+                    && fam.nested.get(cls.as_str()).map(|x| x.simple.as_str()) == Some(name)
+                {
                     *found = true;
                 }
             }
@@ -3776,7 +3781,16 @@ fn stmt_mentions_local(s: &Stmt, marker: &str, name: &str, vt: &VarTable, fam: &
                 ty_hit(ty, name, fam, found);
                 dims.iter().for_each(|d| walk_e(d, marker, name, fam, found));
             }
-            Expr::Field { owner: Some(o), .. } => walk_e(o, marker, name, fam, found),
+            Expr::Field { owner, cls, .. } => {
+                if let Some(o) = owner {
+                    walk_e(o, marker, name, fam, found);
+                }
+                if !*found
+                    && fam.nested.get(cls.as_str()).map(|x| x.simple.as_str()) == Some(name)
+                {
+                    *found = true;
+                }
+            }
             Expr::ArrayIndex { array, index } => {
                 walk_e(array, marker, name, fam, found);
                 walk_e(index, marker, name, fam, found);
@@ -4288,6 +4302,30 @@ fn walk_expr_anon(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, fam: &Family, 
     if std::env::var("JCDC_DBG_ANON").is_ok() {
         if let Expr::New { cls, raw, .. } = e {
             eprintln!("ANON see new {} raw={} in_fam={}", cls, raw, fam.anonymous.contains(cls.as_str()));
+        }
+    }
+    // A local class mentioned only through a static member access
+    // (`Holder.INSTANCE` — jdk26 LinuxAArch64Linker.getInstance) has no
+    // `new` site and no class literal to trigger the decl: emit it here
+    // or the name is unbound ("找不到符号 变量 Holder").
+    if !fam.locals.is_empty() {
+        let member_cls = match e {
+            Expr::Field { cls, owner: None, .. } | Expr::Method { cls, owner: None, .. } => {
+                Some(cls.as_str())
+            }
+            _ => None,
+        };
+        if let Some(cls) = member_cls {
+            if fam.locals.contains(cls) {
+                if let Some(lpc) = pool.get(cls) {
+                    let simple = fam
+                        .nested
+                        .get(cls)
+                        .map(|n| n.simple.clone())
+                        .unwrap_or_else(|| simple_name(cls));
+                    emit_local_class_decl(cls, &lpc, &simple, pc, pool, fam, &HashMap::new(), pending);
+                }
+            }
         }
     }
     match e {
@@ -5674,6 +5712,52 @@ fn emit_anon_body(
             continue;
         }
         emit_field_init(apc, pool, fi, out, indent + 1, ctor_inits.get(&fname))?;
+    }
+    // Local classes of 16+ class files keep static state: the Holder
+    // idiom (`class Holder { static final X INSTANCE = ..; }`, jdk26
+    // LinuxAArch64Linker) carries its initializers in <clinit>; dropping
+    // it left a blank `private static final` field. Emit the surviving
+    // stores as a static block (the assertions store rides the instance
+    // field emitted above). Pre-16 local classes cannot hold statics —
+    // their <clinit> is only the assertions field.
+    if apc.cf.major_version >= 60 {
+        let clinit_mi = (0..apc.cf.methods.len()).find(|&mi| apc.method_name(mi) == Some("<clinit>"));
+        if let Some(mi) = clinit_mi {
+            if let Ok(Some(mb)) = decompile_method(apc, pool, mi) {
+                let mut body = mb.body.clone();
+                strip_static_init_returns(&mut body);
+                let mut pending: Vec<Stmt> = Vec::new();
+                let mut declared: HashSet<String> = HashSet::new();
+                walk_stmt_anon(&mut body, apc, pool, fam, &mut pending, &mb.vt, &mut declared);
+                fn drop_assert_stores(v: &mut Vec<Stmt>) {
+                    v.retain(|st| {
+                        !matches!(st, Stmt::ExprStmt(Expr::Assign { target, .. })
+                            if matches!(&**target, Expr::Field { name, is_static: true, .. }
+                                if name == "$assertionsDisabled" || name == ASSERT_FIELD))
+                    });
+                }
+                match &mut body {
+                    Stmt::Block(v) => drop_assert_stores(v),
+                    Stmt::ExprStmt(Expr::Assign { target, .. })
+                        if matches!(&**target, Expr::Field { name, is_static: true, .. }
+                            if name == "$assertionsDisabled" || name == ASSERT_FIELD) =>
+                    {
+                        body = Stmt::Block(vec![]);
+                    }
+                    _ => {}
+                }
+                let text = Printer::new(apc, pool, &mb.vt)
+                    .with_indent(indent + 2)
+                    .into_string(&body);
+                if !text.trim().is_empty() {
+                    out.push_str(&"    ".repeat(indent + 1));
+                    out.push_str("static {\n");
+                    out.push_str(&text);
+                    out.push_str(&"    ".repeat(indent + 1));
+                    out.push_str("}\n");
+                }
+            }
+        }
     }
     // Methods with capture substitution.
     let skip = methods_to_skip(apc, pool, false, is_rec, &ClassOptions::default());
