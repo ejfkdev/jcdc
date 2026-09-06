@@ -1583,6 +1583,36 @@ fn anon_field_inits(
     // Local reads to this.this$N field reads (and drop the synthetic
     // stores) BEFORE capture substitution, or the param name survives as
     // a Raw `this$0` (LinkedHashMap$LinkedHashIterator field inits).
+    // Field inits can also read the capture PARAMS directly (before any
+    // putfield mirror), and javac may leave synthetic params unnamed in
+    // the LVT (`arg0`): map each capture param Local to its replacement
+    // via the ctor's own putfield statements (this$N -> outer-this expr,
+    // val$N -> the captured expression) BEFORE the strip/junk passes
+    // remove those stores (jdk26 WeakHashMap$HashIterator
+    // `index = !arg0.isEmpty() ? arg0.table.length : 0`).
+    {
+        let otm = outer_this_map(apc);
+        let mut rep: HashMap<u32, Expr> = HashMap::new();
+        for st in stmt_vec(&body) {
+            if let Stmt::ExprStmt(Expr::Assign { target, value, .. }) = st {
+                if let Expr::Field { name, is_static: false, .. } = target.as_ref() {
+                    let r = if name.starts_with("this$") {
+                        otm.get(name.as_str())
+                    } else if name.starts_with("val$") {
+                        captures.get(name.as_str())
+                    } else {
+                        None
+                    };
+                    if let (Some(e), Expr::Local { var, .. }) = (r, value.as_ref()) {
+                        rep.insert(*var, e.clone());
+                    }
+                }
+            }
+        }
+        if !rep.is_empty() {
+            rewrite_param_locals(&mut body, &rep);
+        }
+    }
     strip_inner_ctor_artifacts(&mut body, &mb.vt);
     substitute_captures(&mut body, captures, pool);
     let vt = &mb.vt;
@@ -1604,6 +1634,135 @@ fn anon_field_inits(
         }
     }
     map
+}
+
+/// Replace Local reads of the given var ids with the mapped expressions.
+fn rewrite_param_locals(s: &mut Stmt, rep: &HashMap<u32, Expr>) {
+    fn ew(e: &mut Expr, rep: &HashMap<u32, Expr>) {
+        if let Expr::Local { var, .. } = e {
+            if let Some(r) = rep.get(var) {
+                *e = r.clone();
+                return;
+            }
+        }
+        match e {
+            Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+                args.iter_mut().for_each(|a| ew(a, rep))
+            }
+            Expr::Method { owner, args, .. } => {
+                if let Some(o) = owner {
+                    ew(o, rep);
+                }
+                args.iter_mut().for_each(|a| ew(a, rep));
+            }
+            Expr::Field { owner: Some(o), .. } => ew(o, rep),
+            Expr::ArrayIndex { array, index } => {
+                ew(array, rep);
+                ew(index, rep);
+            }
+            Expr::Cast { e: i, .. } | Expr::InstanceOf { e: i, .. } | Expr::Un { e: i, .. }
+            | Expr::PreIncDec { e: i, .. } | Expr::PostIncDec { e: i, .. } => ew(i, rep),
+            Expr::Bin { l, r, .. } => {
+                ew(l, rep);
+                ew(r, rep);
+            }
+            Expr::Cond { c, t, f } => {
+                ew(c, rep);
+                ew(t, rep);
+                ew(f, rep);
+            }
+            Expr::Assign { target, value, .. } => {
+                ew(target, rep);
+                ew(value, rep);
+            }
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter_mut().for_each(|d| ew(d, rep));
+                if let Some(vals) = init {
+                    vals.iter_mut().for_each(|v| ew(v, rep));
+                }
+            }
+            Expr::StringConcat(parts) => parts.iter_mut().for_each(|p| {
+                if let crate::expr::ConcatPart::Str(i) = p {
+                    ew(i, rep);
+                }
+            }),
+            Expr::Lambda(l) => l.captures.iter_mut().for_each(|c| ew(c, rep)),
+            Expr::Invokedynamic { args, .. } => args.iter_mut().for_each(|a| ew(a, rep)),
+            _ => {}
+        }
+    }
+    fn sw(s: &mut Stmt, rep: &HashMap<u32, Expr>) {
+        match s {
+            Stmt::Block(v) => v.iter_mut().for_each(|x| sw(x, rep)),
+            Stmt::ExprStmt(e) => ew(e, rep),
+            Stmt::LocalDef { init: Some(e), .. } => ew(e, rep),
+            Stmt::Return(Some(e)) | Stmt::Throw(e) => ew(e, rep),
+            Stmt::If { cond, then_stmt, else_stmt } => {
+                ew(cond, rep);
+                sw(then_stmt, rep);
+                if let Some(x) = else_stmt {
+                    sw(x, rep);
+                }
+            }
+            Stmt::While { cond, body } => {
+                ew(cond, rep);
+                sw(body, rep);
+            }
+            Stmt::DoWhile { body, cond } => {
+                sw(body, rep);
+                ew(cond, rep);
+            }
+            Stmt::For { init, cond, update, body } => {
+                init.iter_mut().for_each(|i| sw(i, rep));
+                if let Some(c) = cond {
+                    ew(c, rep);
+                }
+                update.iter_mut().for_each(|u| ew(u, rep));
+                sw(body, rep);
+            }
+            Stmt::ForEach { iterable, body, .. } => {
+                ew(iterable, rep);
+                sw(body, rep);
+            }
+            Stmt::Switch { selector, cases, default, .. } => {
+                ew(selector, rep);
+                for c in cases.iter_mut() {
+                    c.body.iter_mut().for_each(|st| sw(st, rep));
+                }
+                if let Some(d) = default {
+                    sw(d, rep);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                sw(body, rep);
+                for c in catches.iter_mut() {
+                    sw(&mut c.body, rep);
+                }
+                if let Some(f) = finally {
+                    sw(f, rep);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                for r in resources.iter_mut() {
+                    sw(r, rep);
+                }
+                sw(body, rep);
+                for c in catches.iter_mut() {
+                    sw(&mut c.body, rep);
+                }
+                if let Some(f) = finally {
+                    sw(f, rep);
+                }
+            }
+            Stmt::Synchronized { lock, body } => {
+                ew(lock, rep);
+                sw(body, rep);
+            }
+            Stmt::Labeled { body, .. } => sw(body, rep),
+            _ => {}
+        }
+    }
+    sw(s, rep)
 }
 
 /// Replace leftover `Local` references (anonymous ctor parameters with no
@@ -1884,13 +2043,16 @@ fn emit_method_with(
             }
         }
     }
-    // LOCAL classes: capture-carrying ctor params (this$*/val$* stores)
-    // are synthetic — the source ctor never declares them.
+    // Ctor params that javac synthesized to carry captures (stored
+    // straight into this$*/val$* fields) are hidden from source for
+    // anonymous AND local classes; they are also omitted from the ctor's
+    // Signature attribute, which the arg alignment below relies on.
     let is_local_class = matches!(
         fam.nested.get(&pc.internal_name).map(|n| n.kind),
         Some(NestedKind::Local)
     );
-    if is_ctor && is_local_class {
+    let is_anon_class = self_simple_all_digits(pc);
+    if is_ctor && (is_local_class || is_anon_class) {
         for i in ctor_capture_params(pc) {
             skip_params.insert(i);
         }
@@ -2024,28 +2186,32 @@ fn emit_method_with(
             .map(|d| d.args.iter().map(|t| TypeRef::J(t.clone())).collect())
             .unwrap_or_default(),
     };
-    // Constructors: javac's Signature attribute omits the LEADING
-    // synthetic parameters — (name, ordinal) for enums, the forwarded
-    // enclosing instance (this$0) for inner classes — while skip_params
-    // and param_names are indexed in DESCRIPTOR space. Align by padding
-    // the Signature types with the descriptor's leading types; without
-    // this the outer-param skip ate the first REAL parameter (jdk11
-    // TreeMap: `KeyIterator()` printed with no params but a
-    // `super(first)` body; SubMapIterator printed fence's type under
-    // first's name — "cannot find symbol fence").
+    // Constructors: javac's Signature attribute omits ALL synthetic
+    // parameters — LEADING (name, ordinal) for enums and the forwarded
+    // enclosing instance (this$0), plus TRAILING val$ capture params
+    // (jdk11 WhileOps$1Op: Signature 3 args, descriptor 4 — padding only
+    // the front shifted every type one param left: `Op(AbstractPipeline,
+    // AbstractPipeline<?,T,?> inputShape, StreamShape opFlags)`).
+    // skip_params and param_names are descriptor-indexed: rebuild the
+    // type list over the descriptor, feeding Signature types to the
+    // non-skipped positions in order (the TreeMap KeyIterator/
+    // SubMapIterator leading case falls out of the same rule).
     if is_ctor {
         if let Some(md) = &mdesc {
             if arg_types.len() != md.args.len() {
-                let from_sig = msig.is_some() && arg_types.len() < md.args.len();
-                if from_sig {
-                    let k = md.args.len() - arg_types.len();
-                    let mut padded: Vec<TypeRef> =
-                        md.args.iter().take(k).map(|t| TypeRef::J(t.clone())).collect();
-                    padded.append(&mut arg_types);
-                    arg_types = padded;
-                } else {
-                    arg_types = md.args.iter().map(|t| TypeRef::J(t.clone())).collect();
-                }
+                let mut sig_types = std::mem::take(&mut arg_types).into_iter();
+                arg_types = md
+                    .args
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        if skip_params.contains(&i) {
+                            TypeRef::J(t.clone())
+                        } else {
+                            sig_types.next().unwrap_or_else(|| TypeRef::J(t.clone()))
+                        }
+                    })
+                    .collect();
             }
         }
     }
@@ -3843,8 +4009,18 @@ fn strip_erasure_casts_generic_ret(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodS
             }
             Expr::Cast { ty, e: inner } => {
                 if &ty.erased() == ret_er {
-                    let droppable = matches!(inner.type_ref(), TypeRef::G(_))
-                        || is_generic_call(inner, pool)
+                    // Only GENERICS-ONLY casts (inner erasure == cast
+                    // erasure — javac emits no checkcast for those, so
+                    // they are our own synthesis) may be dropped. A cast
+                    // whose erasure DIFFERS from the value's type is a
+                    // real bytecode downcast that the source needs:
+                    // jdk11 Set.copyOf's `return (Set<E>) coll;` (coll:
+                    // Collection<CAP#1>) was stripped to `return coll;`
+                    // — "Collection<CAP#1> cannot be converted to Set<E>"
+                    // (the vP jdk11 first blocker, both paths).
+                    let erasure_only = inner.type_ref().erased() == ty.erased();
+                    let droppable = (matches!(inner.type_ref(), TypeRef::G(_)) && erasure_only)
+                        || (is_generic_call(inner, pool) && erasure_only)
                         || matches!(&**inner, Expr::Method { name, owner: Some(o), .. }
                             if name == "clone" && matches!(o.type_ref(), TypeRef::G(_)));
                     if droppable {
@@ -4085,6 +4261,12 @@ fn analyze_anon_ctor(apc: &PoolClass, args: Vec<Expr>) -> (Vec<Expr>, HashMap<St
         .map(|(_, a)| a)
         .collect();
     (kept, captures)
+}
+
+fn self_simple_all_digits(pc: &PoolClass) -> bool {
+    simple_name(&pc.internal_name)
+        .chars()
+        .all(|c| c.is_ascii_digit())
 }
 
 /// Descriptor-param indices of ctor parameters that javac synthesized to
