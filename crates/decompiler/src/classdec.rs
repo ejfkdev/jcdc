@@ -4116,8 +4116,19 @@ fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature
                 }
             }
             TypeRef::G(g) => {
-                (g_has_typevar(&g) || g_has_wildcard(&g))
-                    && TypeRef::G(g.clone()).erased() == *ret_er
+                if TypeRef::G(g.clone()).erased() != *ret_er {
+                    return false;
+                }
+                // Same erasure: assignable only when the parameterizations
+                // are identical. Type vars/wildcards (CAP#1, a field's own
+                // V — Hashtable.get, sj17 List.of ListN<CAP#1>) AND
+                // concrete-but-different args (Spliterator<Object> ->
+                // Spliterator<T>, jdk11 Spliterators.emptySpliterator —
+                // the source's unchecked cast leaves no checkcast) all
+                // need the erased witness; casts to generic types are
+                // unchecked no-ops at runtime, so re-witnessing an
+                // already-matching local is harmless.
+                &TypeRef::G(g.clone()) != ret_g
             }
         }
     }
