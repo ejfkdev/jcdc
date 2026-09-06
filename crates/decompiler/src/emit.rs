@@ -17,11 +17,20 @@ pub struct Printer<'a> {
     lambda_depth: usize,
     /// True when the enclosing method returns boolean.
     pub ret_bool: bool,
+    /// True while rendering the ROOT of an expression statement: a
+    /// signature-polymorphic call there must stay bare (`NEXT.compareAndSet
+    /// (b, n, p);`) — `(boolean) call();` is not a legal statement.
+    suppress_poly_cast: bool,
+    /// True while rendering the direct child of a cast expression: a cast
+    /// gives the diamond NO target type, so ` (T) new X<>(args)` infers
+    /// Object bounds and then fails the cast — while the bare/raw form
+    /// `(T) new X(args)` compiles (unchecked).
+    suppress_diamond: bool,
 }
 
 impl<'a> Printer<'a> {
     pub fn new(pc: &'a PoolClass, pool: &'a ClassPool, vt: &'a VarTable) -> Self {
-        Printer { pc, pool, vt, out: String::new(), indent: 0, lambda_depth: 0, ret_bool: false }
+        Printer { pc, pool, vt, out: String::new(), indent: 0, lambda_depth: 0, ret_bool: false, suppress_poly_cast: false, suppress_diamond: false }
     }
 
     pub fn with_ret_bool(mut self, b: bool) -> Self {
@@ -94,7 +103,11 @@ impl<'a> Printer<'a> {
             }
             Stmt::ExprStmt(e) => {
                 let mut line = String::new();
+                if matches!(e, Expr::Method { .. }) {
+                    self.suppress_poly_cast = true;
+                }
                 self.expr(e, 0, &mut line);
+                self.suppress_poly_cast = false;
                 line.push(';');
                 self.line(&line);
             }
@@ -447,6 +460,9 @@ impl<'a> Printer<'a> {
         match s {
             Stmt::ExprStmt(e) => {
                 let mut p = self.sub();
+                if matches!(e, Expr::Method { .. }) {
+                    p.suppress_poly_cast = true;
+                }
                 p.expr(e, 1, out);
             }
             Stmt::LocalDef { var, init, .. } => {
@@ -477,6 +493,8 @@ impl<'a> Printer<'a> {
             indent: 0,
             lambda_depth: self.lambda_depth,
             ret_bool: self.ret_bool,
+            suppress_poly_cast: self.suppress_poly_cast,
+            suppress_diamond: self.suppress_diamond,
         }
     }
 
@@ -496,9 +514,13 @@ impl<'a> Printer<'a> {
             }
             Expr::This => out.push_str("this"),
             Expr::New { cls, args, .. } => {
+                let no_diamond = self.suppress_diamond;
+                self.suppress_diamond = false;
+                let diamond = if no_diamond { "" } else { self.diamond_for(cls) };
                 if let Some(local) = cls.strip_prefix('\u{2}') {
                     out.push_str("new ");
                     out.push_str(local);
+                    out.push_str(diamond);
                     out.push('(');
                     self.args(args, out);
                     out.push(')');
@@ -517,6 +539,7 @@ impl<'a> Printer<'a> {
                     self.expr(&args[0], 15, out);
                     out.push_str(".new ");
                     out.push_str(&inner_simple(cls));
+                    out.push_str(diamond);
                     out.push('(');
                     if has_this0 {
                         match self.ctor_param_types(cls, 1, args.len() - 1) {
@@ -542,6 +565,7 @@ impl<'a> Printer<'a> {
                         self.shorten(cls)
                     };
                     out.push_str(&shown);
+                    out.push_str(diamond);
                     out.push('(');
                     if member_this {
                         match self.ctor_param_types(cls, 1, args.len() - 1) {
@@ -633,11 +657,18 @@ impl<'a> Printer<'a> {
             }
             Expr::Method { owner, cls, name, desc, args, is_static, is_special, is_super, type_args, .. } => {
                 // Signature-polymorphic calls need the descriptor return cast
-                // in source form (see classdec::polymorphic_ret_cast).
-                if let Some(t) = crate::classdec::polymorphic_ret_cast(cls, name, desc) {
-                    out.push('(');
-                    out.push_str(&self.type_name(&crate::expr::TypeRef::J(t)));
-                    out.push_str(") ");
+                // in source form (see classdec::polymorphic_ret_cast) — except
+                // at the root of an expression statement, where the bare call
+                // is the only legal form. Consume the flag so a poly call
+                // NESTED in the args still gets its cast.
+                let bare_stmt_root = self.suppress_poly_cast;
+                self.suppress_poly_cast = false;
+                if !bare_stmt_root {
+                    if let Some(t) = crate::classdec::polymorphic_ret_cast(cls, name, desc) {
+                        out.push('(');
+                        out.push_str(&self.type_name(&crate::expr::TypeRef::J(t)));
+                        out.push_str(") ");
+                    }
                 }
                 if name == "<init>" && *is_special {
                     // super(...) / this(...)
@@ -734,7 +765,11 @@ impl<'a> Printer<'a> {
                 out.push('(');
                 out.push_str(&self.type_name(ty));
                 out.push_str(") ");
+                if matches!(&**e, Expr::New { .. }) {
+                    self.suppress_diamond = true;
+                }
                 self.expr(e, 14, out);
+                self.suppress_diamond = false;
             }
             Expr::InstanceOf { e, ty } => {
                 self.expr(e, 10, out);
@@ -1055,6 +1090,8 @@ impl<'a> Printer<'a> {
                             indent: self.indent,
                             lambda_depth: self.lambda_depth + 1,
                             ret_bool: false,
+                            suppress_poly_cast: false,
+                            suppress_diamond: false,
                         };
                         if let Some(e) = single_expr {
                             if l.sam_desc.ret == jcdc_jvm::JavaType::Boolean {
@@ -1121,6 +1158,34 @@ impl<'a> Printer<'a> {
                 })
             })
             .unwrap_or(false)
+    }
+
+    /// `<>` when `new cls(...)` should carry a diamond: the class is
+    /// generic (class-level Signature with type params) and THIS file is
+    /// Java 7+. A bare generic new compiles under old-style inference
+    /// (standalone, not target-typed), which collapses to Object when
+    /// implicitly-typed lambda args are involved — jdk11 Collectors.
+    /// summingInt's `new CollectorImpl<>(() -> new int[1], (a, t) -> ...)`
+    /// fails as bare `new CollectorImpl(...)` ("array required, but found
+    /// Object", 72 errors in the concurrent-family closure). Bytecode
+    /// cannot distinguish diamond from bare, so always prefer the diamond
+    /// for generic classes.
+    fn diamond_for(&self, cls: &str) -> &'static str {
+        if self.pc.cf.major_version < 51 {
+            return "";
+        }
+        let Some(pc) = self.pool.get(cls) else { return ""; };
+        let generic = pc
+            .class_attr("Signature")
+            .map(|b| {
+                b.len() >= 2
+                    && pc.utf8(u16::from_be_bytes([b[0], b[1]]))
+                        .and_then(|s| jcdc_jvm::parse_class_signature(s))
+                        .map(|sig| !sig.params.is_empty())
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if generic { "<>" } else { "" }
     }
 
     /// Shorten an internal class name for emission: java.lang.* and same
