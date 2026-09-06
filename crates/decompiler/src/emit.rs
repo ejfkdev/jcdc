@@ -31,6 +31,10 @@ pub struct Printer<'a> {
     /// returns may need `(R) value` witnesses (jdk17 Collectors
     /// `(Function<I,R>) i -> i`).
     lambda_sam_ret: Option<TypeRef>,
+    /// The method's generic signature return (functional-interface or
+    /// array form): a lambda in RETURN position has no cast node to hang
+    /// the SAM witness on, so the Return arm derives it from this.
+    ret_sam: Option<TypeRef>,
     /// True when the enclosing method returns char: int constants in the
     /// returned expression render as char literals (bytecode chars are
     /// ints; `return cond ? 63 : 105;` in a char method is a lossy
@@ -45,7 +49,7 @@ pub struct Printer<'a> {
 
 impl<'a> Printer<'a> {
     pub fn new(pc: &'a PoolClass, pool: &'a ClassPool, vt: &'a VarTable) -> Self {
-        Printer { pc, pool, vt, out: String::new(), indent: 0, lambda_depth: 0, ret_bool: false, suppress_poly_cast: false, suppress_diamond: false, lambda_sam_ret: None, ret_char: false, ret_byte: false, ret_short: false }
+        Printer { pc, pool, vt, out: String::new(), indent: 0, lambda_depth: 0, ret_bool: false, suppress_poly_cast: false, suppress_diamond: false, lambda_sam_ret: None, ret_sam: None, ret_char: false, ret_byte: false, ret_short: false }
     }
 
     pub fn with_ret_bool(mut self, b: bool) -> Self {
@@ -53,6 +57,10 @@ impl<'a> Printer<'a> {
         self
     }
 
+    pub fn with_ret_sam(mut self, t: Option<TypeRef>) -> Self {
+        self.ret_sam = t;
+        self
+    }
     pub fn with_ret_char(mut self, b: bool) -> Self {
         self.ret_char = b;
         self
@@ -235,7 +243,19 @@ impl<'a> Printer<'a> {
                 } else if self.ret_short {
                     self.expr_narrow(e, &jcdc_jvm::JavaType::Short, &mut line);
                 } else {
+                    // Lambda in return position of a generic method: the
+                    // SAM return witnesses the erased body value
+                    // (castingIdentity `return i -> (R) i`, toArray
+                    // `() -> (T[]) new Object[]{..}` — jdk17 Collectors).
+                    if let (Some(TypeRef::G(g)), Expr::Lambda(l)) = (&self.ret_sam, e) {
+                        self.lambda_sam_ret = match g {
+                            jcdc_jvm::GenericType::Class(_) => self.sam_ret_cast(g, &l.sam_name),
+                            jcdc_jvm::GenericType::Array(_) => Some(TypeRef::G(g.clone())),
+                            _ => None,
+                        };
+                    }
                     self.expr(e, 1, &mut line);
+                    self.lambda_sam_ret = None;
                 }
                 line.push(';');
                 self.line(&line);
@@ -589,6 +609,7 @@ impl<'a> Printer<'a> {
             suppress_poly_cast: self.suppress_poly_cast,
             suppress_diamond: self.suppress_diamond,
             lambda_sam_ret: self.lambda_sam_ret.clone(),
+            ret_sam: self.ret_sam.clone(),
         }
     }
 
@@ -1323,6 +1344,7 @@ impl<'a> Printer<'a> {
                             suppress_poly_cast: false,
                             suppress_diamond: false,
                             lambda_sam_ret: None,
+                            ret_sam: None,
                         };
                         if let Some(e) = single_expr {
                             if l.sam_desc.ret == jcdc_jvm::JavaType::Boolean {

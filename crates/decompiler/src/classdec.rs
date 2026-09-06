@@ -2683,11 +2683,20 @@ fn emit_method_with(
                 || msig.as_ref().map(|g| matches!(&g.ret, jcdc_jvm::GenericType::Primitive('C'))).unwrap_or(false);
             let ret_byte = mdesc.as_ref().map(|d| d.ret == jcdc_jvm::JavaType::Byte).unwrap_or(false);
             let ret_short = mdesc.as_ref().map(|d| d.ret == jcdc_jvm::JavaType::Short).unwrap_or(false);
+            // Generic signature return in functional-interface or array
+            // form: feeds the Return arm's lambda SAM witness.
+            let ret_sam = msig.as_ref().and_then(|sig| match &sig.ret {
+                g @ (jcdc_jvm::GenericType::Class(_) | jcdc_jvm::GenericType::Array(_)) => {
+                    Some(TypeRef::G(g.clone()))
+                }
+                _ => None,
+            });
             let text = Printer::new(pc, pool, &mb.vt)
                 .with_indent(indent + 1)
                 .with_ret_bool(ret_bool)
                 .with_ret_char(ret_char)
                 .with_ret_narrow(ret_byte, ret_short)
+                .with_ret_sam(ret_sam)
                 .into_string(&body);
             EXTERN_DECL.with(|x| *x.borrow_mut() = extern_save);
             out.push_str(&text);
