@@ -2540,6 +2540,9 @@ fn emit_method_with(
                 // this(...) calls (invalid Java). Collapse them back into a
                 // single leading delegation when every path delegates.
                 collapse_ctor_delegation(&mut body, pc);
+                if is_local_class {
+                    prune_local_ctor_delegation(&mut body, pc, mi);
+                }
             }
             substitute_captures(&mut body, captures, pool);
             // Ctor artifact stripping runs BEFORE the outer-this
@@ -3020,6 +3023,69 @@ fn strip_enum_super(body: &mut Stmt) {
         }
     }
     stmts.retain(|s| !s.is_empty_block());
+}
+
+/// Local-class ctor this(..) delegation: the target ctor's synthesized
+/// capture params are stripped from its printed signature (they are
+/// substituted capture expressions), so the delegating call must drop
+/// the matching args or the source ctor takes more params than any
+/// declared ctor accepts (jdk26 Gatherers Composite.impl State:
+/// `this(c1, c2, true, true, arg0..arg11)` against a 4-param State —
+/// "找不到合适的构造器"). Mirrors the skip sets emit_method_with
+/// applies to the target: val$/this$-named params plus direct
+/// capture-store params.
+fn prune_local_ctor_delegation(body: &mut Stmt, pc: &PoolClass, mi_self: usize) {
+    let stmts = match body {
+        Stmt::Block(v) => v,
+        _ => return,
+    };
+    let Some(first) = stmts.first_mut() else { return };
+    let Stmt::ExprStmt(Expr::Method { name, cls, args, desc, .. }) = first else {
+        return;
+    };
+    if name != "<init>" || cls != &pc.internal_name {
+        return;
+    }
+    // Locate the target ctor by its descriptor.
+    let target = (0..pc.cf.methods.len()).find(|&mi2| {
+        mi2 != mi_self && pc.method_name(mi2) == Some("<init>")
+            && pc.method_desc(mi2)
+                .and_then(parse_method_descriptor)
+                .map(|md| md.args.len() == desc.args.len() && md.ret == desc.ret)
+                .unwrap_or(false)
+            && pc.method_desc(mi2).is_some()
+    });
+    let Some(mi2) = target else { return };
+    let Some(md2) = pc.method_desc(mi2).and_then(parse_method_descriptor) else {
+        return;
+    };
+    if md2.args.len() != args.len() {
+        return;
+    }
+    let mut skip: HashSet<usize> = ctor_capture_params(pc, mi2);
+    let mut slot = 1u16;
+    for (i, a) in md2.args.iter().enumerate() {
+        let pname = ctor_param_name(pc, mi2, i, slot);
+        if pname.starts_with("this$") || pname.starts_with("val$") {
+            skip.insert(i);
+        }
+        slot += a.slot_size() as u16;
+    }
+    if skip.is_empty() || skip.len() >= args.len() {
+        return;
+    }
+    let mut i = 0;
+    args.retain(|_| {
+        let keep = !skip.contains(&i);
+        i += 1;
+        keep
+    });
+    i = 0;
+    desc.args.retain(|_| {
+        let keep = !skip.contains(&i);
+        i += 1;
+        keep
+    });
 }
 
 fn method_param_names(pc: &PoolClass, mi: usize, desc: &str) -> Vec<String> {
@@ -5015,8 +5081,30 @@ fn analyze_anon_ctor(apc: &PoolClass, args: Vec<Expr>) -> (Vec<Expr>, HashMap<St
     // ctors applied the FIRST ctor's capture positions to every new site
     // (jdk11 Var: `new Var(vn, vt, className)` — prev dropped, className
     // kept — "String无法转换为Var").
-    let ctor = (0..apc.cf.methods.len())
-        .find(|&mi| {
+    //
+    // Same-arity ties: prefer the ctor that directly STORES the captures.
+    // A delegating ctor hands them through this(..) — picking it left the
+    // captures map empty and every val$ ref leaked unsubstituted (jdk26
+    // Gatherers Composite.impl State: two 16-param ctors, the first
+    // delegates; 24 "找不到符号 变量 val$leftStateless").
+    fn capture_store_count(apc: &PoolClass, mi: usize) -> usize {
+        decompile_method(apc, empty_pool(), mi)
+            .ok()
+            .flatten()
+            .map(|mb| {
+                stmt_vec(&mb.body)
+                    .iter()
+                    .filter(|st| {
+                        matches!(st, Stmt::ExprStmt(Expr::Assign { target, .. })
+                            if matches!(&**target, Expr::Field { name, is_static: false, .. }
+                                if name.starts_with("this$") || name.starts_with("val$")))
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+    let arity_matches: Vec<usize> = (0..apc.cf.methods.len())
+        .filter(|&mi| {
             apc.method_name(mi) == Some("<init>")
                 && apc
                     .method_desc(mi)
@@ -5024,7 +5112,17 @@ fn analyze_anon_ctor(apc: &PoolClass, args: Vec<Expr>) -> (Vec<Expr>, HashMap<St
                     .map(|md| md.args.len() == args.len())
                     .unwrap_or(false)
         })
-        .or_else(|| (0..apc.cf.methods.len()).find(|&mi| apc.method_name(mi) == Some("<init>")));
+        .collect();
+    let ctor = match arity_matches.len() {
+        0 => (0..apc.cf.methods.len()).find(|&mi| apc.method_name(mi) == Some("<init>")),
+        1 => Some(arity_matches[0]),
+        _ => Some(
+            *arity_matches
+                .iter()
+                .max_by_key(|&&mi| capture_store_count(apc, mi))
+                .unwrap(),
+        ),
+    };
     if let Some(mi) = ctor {
         if let Ok(Some(mb)) = decompile_method(apc, empty_pool(), mi) {
             // param var name -> index
@@ -5046,6 +5144,74 @@ fn analyze_anon_ctor(apc: &PoolClass, args: Vec<Expr>) -> (Vec<Expr>, HashMap<St
                                     if let Some(e) = args.get(*pi) {
                                         captures.insert(fname.clone(), e.clone());
                                         captured_idx.insert(*pi);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Delegating ctor: the capture stores live in the this(..)
+            // target. Map the delegation's plain-local args back through
+            // THIS ctor's params to the call-site args and harvest there
+            // (jdk26 State joinLeft `new State(4 args)` matches no
+            // bytecode arity and fell back to the 16-param delegator:
+            // kept args must stay the 4 declared ones, captures come from
+            // the delegatee's stores).
+            if captures.is_empty() {
+                let deleg = stmt_vec(&mb.body).iter().find_map(|st| match st {
+                    Stmt::ExprStmt(Expr::Method { name, cls, desc, args: dargs, is_special: true, .. })
+                        if name == "<init>" && cls == &apc.internal_name =>
+                    {
+                        Some((desc.args.len(), dargs.clone()))
+                    }
+                    _ => None,
+                });
+                if let Some((dargc, dargs)) = deleg {
+                    let target_mi = (0..apc.cf.methods.len()).find(|&mi2| {
+                        mi2 != mi
+                            && apc.method_name(mi2) == Some("<init>")
+                            && apc
+                                .method_desc(mi2)
+                                .and_then(parse_method_descriptor)
+                                .map(|md| md.args.len() == dargc)
+                                .unwrap_or(false)
+                    });
+                    if let Some(mi2) = target_mi {
+                        if let Ok(Some(mb2)) = decompile_method(apc, empty_pool(), mi2) {
+                            let mut p2: Vec<String> = Vec::new();
+                            for v in &mb2.vt.vars {
+                                if v.is_param && v.name != "this" {
+                                    p2.push(v.name.clone());
+                                }
+                            }
+                            for st in stmt_vec(&mb2.body) {
+                                if let Stmt::ExprStmt(Expr::Assign { target, value, .. }) = st {
+                                    if let Expr::Field { name: fname, is_static: false, .. } = &*target {
+                                        if !(fname.starts_with("this$") || fname.starts_with("val$")) {
+                                            continue;
+                                        }
+                                        if let Expr::Local { var, .. } = &*value {
+                                            let vname = mb2.vt.var(*var).name.clone();
+                                            let Some(k) = p2.iter().position(|n| *n == vname) else {
+                                                continue;
+                                            };
+                                            // delegation arg k must be a plain
+                                            // param local of THIS ctor
+                                            let Some(Expr::Local { var: dv, .. }) = dargs.get(k) else {
+                                                continue;
+                                            };
+                                            let dname = mb.vt.var(*dv).name.clone();
+                                            let Some((_, pi)) =
+                                                param_names.iter().find(|(n, _)| *n == dname)
+                                            else {
+                                                continue;
+                                            };
+                                            if let Some(e) = args.get(*pi) {
+                                                captures.insert(fname.clone(), e.clone());
+                                                captured_idx.insert(*pi);
+                                            }
+                                        }
                                     }
                                 }
                             }
