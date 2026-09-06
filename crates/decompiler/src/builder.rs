@@ -1283,6 +1283,9 @@ impl<'a> Builder<'a> {
         next_pc: u16,
         val: Expr,
     ) -> Option<Expr> {
+        if std::env::var("JCDC_NO_DUP_INLINE").is_ok() {
+            return Some(val);
+        }
         let marked = !stack.is_empty()
             && DUP_MARKS.with(|m| m.borrow_mut().remove(&(stack.len() - 1)));
         if !marked {
@@ -1292,6 +1295,15 @@ impl<'a> Builder<'a> {
             Some(v) => v,
             None => return Some(val),
         };
+        // PARAMETER reassignments only: `this(.., arguments = copyOf(..))`
+        // (flexible-ctor shape) is the source pattern this recovers.
+        // Inlining LOCAL stores (`(c = x.getClass()) != String.class`)
+        // reshapes conditions and corrupted downstream loop folding
+        // (census +850: ConcurrentHashMap foreach mangle) — locals keep
+        // the statement form.
+        if !self.vt.var(v).is_param {
+            return Some(val);
+        }
         let _survivor = stack.pop();
         dup_marks_clear_at_or_above(stack.len());
         stack.push(Expr::Assign {

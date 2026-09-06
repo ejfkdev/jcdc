@@ -2986,7 +2986,13 @@ fn cast_narrowing_assigns(vt: &VarTable, s: &mut Stmt) {
         matches!(t, JavaType::Byte | JavaType::Short | JavaType::Char)
     }
     fn fix(value: &mut Expr, want: &JavaType) {
-        if !matches!(value, Expr::Local { .. } | Expr::Method { .. } | Expr::Field { .. } | Expr::ArrayIndex { .. }) {
+        // Conditionals included: `byte b = c ? 5 : 9;` is a LOSSY int
+        // conditional even though both constants fit — the source worked
+        // because the branches were byte-typed CONSTANT VARIABLES
+        // (jdk17 MemberName `clazz.isInterface() ? REF_invokeInterface :
+        // REF_invokeVirtual`); with the constants inlined the whole
+        // conditional needs the narrowing cast.
+        if !matches!(value, Expr::Local { .. } | Expr::Method { .. } | Expr::Field { .. } | Expr::ArrayIndex { .. } | Expr::Cond { .. }) {
             return;
         }
         if value.type_ref().erased() != JavaType::Int {
