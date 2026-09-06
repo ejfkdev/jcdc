@@ -360,6 +360,14 @@ impl<'a> Structurer<'a> {
         let mut parts: Vec<Region> = Vec::new();
         let mut cur = entry;
         let mut guard = 0usize;
+        // True when the walk advanced into `cur` through an explicit Goto
+        // terminator (vs. natural fall-through): a jump into a stop must be
+        // materialized as a Goto region (the converter resolves it to
+        // break/continue, elides it as if-follow fallthrough, or inlines a
+        // shared return/throw via term_copy) — silently ending the region
+        // DROPS the jump (jdk17 String LATIN1 fast-path `goto 839` lost its
+        // `return;` against the stop=shared-exit, double-assigning finals).
+        let mut last_via_goto = false;
         loop {
             guard += 1;
             if deep || guard > ctx.universe.len() * 4 + 64 {
@@ -388,6 +396,8 @@ impl<'a> Structurer<'a> {
                 // (Legacy6 `if (a==2 && b==2) break outer;` -> infinite loop).
                 if cur == entry && stop.contains(&entry) && parts.is_empty() {
                     parts.push(Region::Goto { target: entry });
+                } else if last_via_goto && stop.contains(&cur) && !parts.is_empty() {
+                    parts.push(Region::Goto { target: cur });
                 }
                 break;
             }
@@ -471,6 +481,7 @@ impl<'a> Structurer<'a> {
                     }
                     ctx.consumed.insert(cur);
                     cur = merge;
+                    last_via_goto = false;
                     continue;
                 }
                 }
@@ -481,6 +492,7 @@ impl<'a> Structurer<'a> {
                 match b.succ.first().copied() {
                     Some(n) => {
                         cur = n;
+                        last_via_goto = false;
                         continue;
                     }
                     None => break,
@@ -547,6 +559,7 @@ impl<'a> Structurer<'a> {
                             // structuring it is monotone and recovers the tail
                             // return (nestedTry's `return sb.toString()`).
                             cur = nb.id;
+                            last_via_goto = false;
                             continue;
                         }
                         None => break,
@@ -677,6 +690,29 @@ impl<'a> Structurer<'a> {
                     let follow = self
                         .sese_ipdom(ctx, cur)
                         .filter(|f| ctx.universe.contains(f) && !stop.contains(f))
+                        // A shared TERMINATOR as follow means some branch
+                        // never completes normally — it must be a branch that
+                        // flows to f within this region's stop set. When a
+                        // target instead escapes to a stop (a jump OUT: the
+                        // enclosing if-follow / loop exit), f post-dominates
+                        // only through the other branch, and choosing it
+                        // elides that branch's terminator as "natural
+                        // fall-through" while re-emitting it AFTER the if —
+                        // jdk17 String(byte[],int,int,Charset) lost the
+                        // LATIN1 fast-path `return;` (goto 839 = shared
+                        // ctor-exit) inside `else { assigns }`, double-
+                        // assigning the final fields ("variable value might
+                        // already have been assigned") and blocking every
+                        // jdk17 corpus family. follow=None keeps the return
+                        // inside the branch (walk-parity).
+                        .filter(|f| {
+                            !matches!(self.results[*f].term, Term::Return(_) | Term::Throw(_))
+                                || [taken, fall].iter().all(|&t| {
+                                    stop.contains(&t)
+                                        || ctx.consumed.contains(&t)
+                                        || self.reaches_within(ctx, t, *f, stop)
+                                })
+                        })
                         .or_else(|| self.convergent_merge(ctx, &[taken, fall], stop));
                     let mut bstop: HashSet<usize> = stop.iter().copied().collect();
                     if let Some(f) = follow {
@@ -699,6 +735,7 @@ impl<'a> Structurer<'a> {
                     match follow {
                         Some(f) if reach.contains(&f) => {
                             cur = f;
+                            last_via_goto = false;
                             continue;
                         }
                         _ => break,
@@ -706,6 +743,7 @@ impl<'a> Structurer<'a> {
                 }
                 Term::Goto | Term::Fallthrough => {
                     parts.push(Region::Basic { block: cur });
+                    last_via_goto = matches!(self.results[cur].term, Term::Goto);
                     match self.cfg.blocks[cur].succ.first().copied() {
                         Some(n) => {
                             cur = n;
@@ -753,6 +791,7 @@ impl<'a> Structurer<'a> {
                     match follow {
                         Some(f) if reach.contains(&f) => {
                             cur = f;
+                            last_via_goto = false;
                             continue;
                         }
                         _ => break,
