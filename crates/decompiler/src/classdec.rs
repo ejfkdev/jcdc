@@ -412,37 +412,75 @@ fn classify_nested(name: &str, rest: &str, pc: &PoolClass) -> (NestedKind, Strin
                     .map(|n| n == name)
                     .unwrap_or(false);
                 if is_self {
-                    let simple = if e.inner_name_index == 0 {
+                    let simple_raw = if e.inner_name_index == 0 {
                         rest.rsplit('$').next().unwrap_or(rest).to_string()
                     } else {
                         pc.utf8(e.inner_name_index).unwrap_or(rest).to_string()
                     };
-                    // Digit-leading simple names are desugared anonymous
-                    // classes (no source identifier can start with a
-                    // digit); inline them at their `new` sites.
-                    let digit_led = simple
-                        .chars()
-                        .next()
-                        .map(|c| c.is_ascii_digit())
-                        .unwrap_or(false);
-                    let kind = if e.inner_name_index == 0 || digit_led {
+                    // Digit-leading simple names are desugared (no source
+                    // identifier can start with a digit): all digits =
+                    // anonymous (inline at `new` sites); digits + identifier =
+                    // javac's local-class encoding `Outer$1Var` (a NAMED
+                    // local class — declared at its use site, stripped name).
+                    if simple_raw.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                        let (kind, simple) = split_desugared_name(&simple_raw, true);
+                        return (kind, simple, e.inner_class_access_flags);
+                    }
+                    let kind = if e.inner_name_index == 0 {
                         NestedKind::Anonymous
                     } else if e.outer_class_info_index == 0 {
                         NestedKind::Local
                     } else {
                         NestedKind::Member
                     };
-                    return (kind, simple, e.inner_class_access_flags);
+                    return (kind, simple_raw, e.inner_class_access_flags);
                 }
             }
         }
     }
-    // Heuristic fallback: all-digit simple name → anonymous, else member.
+    // Heuristic fallback (no self InnerClasses entry — javac omits it for
+    // some local classes, e.g. ClassSpecializer$Factory$1Var): all-digit
+    // simple name → anonymous; digits+identifier → local class with the
+    // digit prefix stripped; else member.
     let simple_last = rest.rsplit('$').next().unwrap_or(rest);
-    if !simple_last.is_empty() && simple_last.chars().all(|c| c.is_ascii_digit()) {
-        (NestedKind::Anonymous, simple_last.to_string(), pc.access())
+    let (kind, simple) = split_desugared_name(simple_last, false);
+    let kind = if matches!(kind, NestedKind::Anonymous) && !simple_last.chars().all(|c| c.is_ascii_digit()) {
+        // digits+identifier with no attribute evidence: local class.
+        kind
+    } else if matches!(kind, NestedKind::Local) {
+        kind
+    } else if !simple_last.is_empty() && simple_last.chars().all(|c| c.is_ascii_digit()) {
+        NestedKind::Anonymous
+    } else if simple_last.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        NestedKind::Local
     } else {
-        (NestedKind::Member, simple_last.to_string(), pc.access())
+        NestedKind::Member
+    };
+    (kind, simple, pc.access())
+}
+
+/// Classify a desugared nested simple name: all digits → Anonymous;
+/// leading digits followed by a valid identifier → Local (name = digits
+/// stripped, javac's `Outer$1Var` encoding of a method-local class);
+/// otherwise `fallback_anon` decides (an absent inner_name means anonymous).
+fn split_desugared_name(simple: &str, fallback_anon: bool) -> (NestedKind, String) {
+    let dlen = simple.chars().take_while(|c| c.is_ascii_digit()).count();
+    if dlen == 0 {
+        return (
+            if fallback_anon { NestedKind::Anonymous } else { NestedKind::Member },
+            simple.to_string(),
+        );
+    }
+    if dlen == simple.len() {
+        return (NestedKind::Anonymous, simple.to_string());
+    }
+    let tail = &simple[dlen..];
+    let valid_ident = tail.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_' || c == '$').unwrap_or(false)
+        && tail.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+    if valid_ident {
+        (NestedKind::Local, tail.to_string())
+    } else {
+        (NestedKind::Member, simple.to_string())
     }
 }
 
@@ -1582,7 +1620,15 @@ fn emit_field_impl(pc: &PoolClass, pool: &ClassPool, fi: usize, out: &mut String
         line.push_str("private ");
     }
     if acc.contains(FieldAccessFlags::STATIC) {
-        line.push_str("static ");
+        // javac synthesizes `$assertionsDisabled` as static final even in
+        // (non-static) INNER classes, but source-level static members are
+        // illegal there before Java 16 ("static declaration in inner class").
+        // Emit the renamed field as an instance final so the family
+        // recompiles; boolean reads inside instance methods resolve the same.
+        let inner_assert = raw_name == "$assertionsDisabled" && class_has_this0(pc);
+        if !inner_assert {
+            line.push_str("static ");
+        }
     }
     if acc.contains(FieldAccessFlags::FINAL) {
         line.push_str("final ");

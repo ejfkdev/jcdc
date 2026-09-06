@@ -1153,10 +1153,20 @@ impl<'a> Printer<'a> {
                 if let Some(first) = segs.next() {
                     let rest: Vec<&str> = segs.collect();
                     if rest.iter().any(|r| r.starts_with(|c: char| c.is_ascii_digit())) {
-                        // Local/synthetic class (digit-led segment): the
-                        // simple name is not a valid identifier, so print
-                        // the qualified binary name (with `$`), which Java
-                        // accepts as an identifier.
+                        // Local/synthetic class (digit-led segment): javac
+                        // encodes a method-local class as `Outer$1Name`; its
+                        // source name is the digit prefix stripped, declared
+                        // `class Name` at its use site and referenced only
+                        // within that scope. Printing the binary name leaves
+                        // an unresolvable symbol (ClassSpecializer$Factory$1Var).
+                        if let Some(last) = internal.rsplit('$').next() {
+                            let stripped = last.trim_start_matches(|c: char| c.is_ascii_digit());
+                            if !stripped.is_empty()
+                                && !stripped.chars().next().unwrap().is_ascii_digit()
+                            {
+                                return stripped.to_string();
+                            }
+                        }
                         return internal.replace('/', ".");
                     }
                     let _ = first;
