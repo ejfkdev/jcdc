@@ -1273,9 +1273,20 @@ fn methods_to_skip(
             skip.insert(mi);
             continue;
         }
-        // Synthetic outer-instance constructor of a member inner class.
+        // Synthetic outer-instance constructor of a member inner class —
+        // only when it is the class's SOLE ctor: javac mirrors every
+        // source ctor with an outer-param variant and synthesizes a
+        // default only when the source declares none. With siblings, the
+        // trivial one IS the source no-arg ctor; skipping it left
+        // `new Inet6AddressHolder()` against a 5-param-only class (jdk11
+        // Inet6Address, 5 errors).
         if name == "<init>" && class_has_this0(pc) && is_trivial_inner_ctor(pc, pool, mi) {
-            skip.insert(mi);
+            let nctors = (0..pc.cf.methods.len())
+                .filter(|&m| pc.method_name(m) == Some("<init>"))
+                .count();
+            if nctors == 1 {
+                skip.insert(mi);
+            }
         }
     }
     skip
