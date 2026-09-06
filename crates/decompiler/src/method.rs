@@ -6811,7 +6811,14 @@ fn disambiguate_nested_locals(vt: &mut VarTable, body: &Stmt) {
     // var id -> current printed name
     let mut scopes: Vec<std::collections::HashMap<String, u32>> =
         vec![std::collections::HashMap::new()];
-    disambig_walk(vt, body, &mut scopes);
+    // Names ever given to OTHER vars (renames mutate vt globally, so a
+    // var's EARLIER decl sites print under the new name too): a rename
+    // candidate must avoid all of them, not just the visible scopes
+    // (asm ClassReader: var43 re-declared under var42 took "x1" from a
+    // popped sibling scope where var44 already held it — var43's first
+    // decl then collided with var44's in a still-enclosing scope).
+    let mut used: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    disambig_walk(vt, body, &mut scopes, &mut used);
 }
 
 fn visible_name_owner(scopes: &[std::collections::HashMap<String, u32>], name: &str) -> Option<u32> {
@@ -6822,11 +6829,13 @@ fn disambig_walk(
     vt: &mut VarTable,
     s: &Stmt,
     scopes: &mut Vec<std::collections::HashMap<String, u32>>,
+    used: &mut std::collections::HashMap<String, u32>,
 ) {
     fn declare(
         vt: &mut VarTable,
         var: u32,
         scopes: &mut Vec<std::collections::HashMap<String, u32>>,
+        used: &mut std::collections::HashMap<String, u32>,
     ) {
         let name = vt.vars[var as usize].name.clone();
         if let Some(owner) = visible_name_owner(scopes, &name) {
@@ -6835,22 +6844,29 @@ fn disambig_walk(
                 let mut k = 1;
                 loop {
                     let cand = format!("{}{}", name, k);
-                    if visible_name_owner(scopes, &cand).is_none() {
+                    let taken_visible = visible_name_owner(scopes, &cand).is_some();
+                    let taken_used = used
+                        .get(&cand)
+                        .map(|o| *o != var)
+                        .unwrap_or(false);
+                    if !taken_visible && !taken_used {
                         vt.vars[var as usize].name = cand.clone();
-                        scopes.last_mut().unwrap().insert(cand, var);
+                        scopes.last_mut().unwrap().insert(cand.clone(), var);
+                        used.insert(cand, var);
                         return;
                     }
                     k += 1;
                 }
             }
         }
-        scopes.last_mut().unwrap().insert(name, var);
+        scopes.last_mut().unwrap().insert(name.clone(), var);
+        used.insert(name, var);
     }
     match s {
         Stmt::Block(v) => {
             scopes.push(std::collections::HashMap::new());
             for x in v {
-                disambig_walk(vt, x, scopes);
+                disambig_walk(vt, x, scopes, used);
             }
             scopes.pop();
         }
@@ -6858,75 +6874,75 @@ fn disambig_walk(
             if let Some(e) = init {
                 let _ = e;
             }
-            declare(vt, *var, scopes);
+            declare(vt, *var, scopes, used);
         }
         Stmt::ForEach { var, iterable, body, .. } => {
             let _ = iterable;
             scopes.push(std::collections::HashMap::new());
-            declare(vt, *var, scopes);
-            disambig_walk(vt, body, scopes);
+            declare(vt, *var, scopes, used);
+            disambig_walk(vt, body, scopes, used);
             scopes.pop();
         }
         Stmt::For { init, body, .. } => {
             scopes.push(std::collections::HashMap::new());
             for i in init {
-                disambig_walk(vt, i, scopes);
+                disambig_walk(vt, i, scopes, used);
             }
-            disambig_walk(vt, body, scopes);
+            disambig_walk(vt, body, scopes, used);
             scopes.pop();
         }
         Stmt::If { then_stmt, else_stmt, .. } => {
-            disambig_walk(vt, then_stmt, scopes);
+            disambig_walk(vt, then_stmt, scopes, used);
             if let Some(e) = else_stmt {
-                disambig_walk(vt, e, scopes);
+                disambig_walk(vt, e, scopes, used);
             }
         }
-        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => disambig_walk(vt, body, scopes),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => disambig_walk(vt, body, scopes, used),
         Stmt::Try { body, catches, finally } => {
-            disambig_walk(vt, body, scopes);
+            disambig_walk(vt, body, scopes, used);
             for c in catches {
                 scopes.push(std::collections::HashMap::new());
                 if c.var != u32::MAX && (c.var as usize) < vt.vars.len() {
-                    declare(vt, c.var, scopes);
+                    declare(vt, c.var, scopes, used);
                 }
-                disambig_walk(vt, &c.body, scopes);
+                disambig_walk(vt, &c.body, scopes, used);
                 scopes.pop();
             }
             if let Some(f) = finally {
-                disambig_walk(vt, f, scopes);
+                disambig_walk(vt, f, scopes, used);
             }
         }
         Stmt::TryWithResources { resources, body, catches, finally } => {
             for res in resources {
-                disambig_walk(vt, res, scopes);
+                disambig_walk(vt, res, scopes, used);
             }
-            disambig_walk(vt, body, scopes);
+            disambig_walk(vt, body, scopes, used);
             for c in catches {
                 scopes.push(std::collections::HashMap::new());
                 if c.var != u32::MAX && (c.var as usize) < vt.vars.len() {
-                    declare(vt, c.var, scopes);
+                    declare(vt, c.var, scopes, used);
                 }
-                disambig_walk(vt, &c.body, scopes);
+                disambig_walk(vt, &c.body, scopes, used);
                 scopes.pop();
             }
             if let Some(f) = finally {
-                disambig_walk(vt, f, scopes);
+                disambig_walk(vt, f, scopes, used);
             }
         }
         Stmt::Switch { cases, default, .. } => {
             for c in cases {
                 scopes.push(std::collections::HashMap::new());
                 for st in &c.body {
-                    disambig_walk(vt, st, scopes);
+                    disambig_walk(vt, st, scopes, used);
                 }
                 scopes.pop();
             }
             if let Some(d) = default {
-                disambig_walk(vt, d, scopes);
+                disambig_walk(vt, d, scopes, used);
             }
         }
         Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => {
-            disambig_walk(vt, body, scopes)
+            disambig_walk(vt, body, scopes, used)
         }
         _ => {}
     }
