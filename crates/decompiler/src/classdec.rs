@@ -3081,8 +3081,11 @@ fn walk_enum_inits(s: &Stmt, map: &mut HashMap<String, EnumInit>, pc: &PoolClass
                     let body_cls = if cls != &pc.internal_name { Some(cls.clone()) } else { None };
                     // Resolve the enum ctor descriptor so boolean/char
                     // constant arguments render as `true`/`'x'`, not 1/120.
+                    // Same-arity overloads ((String,String,String...) vs
+                    // (String,String,boolean) — jdk26 KnownOIDs) are scored
+                    // by constant/parameter compatibility, not first-wins.
                     let ctor_params: Option<Vec<jcdc_jvm::JavaType>> = (0..pc.cf.methods.len())
-                        .find_map(|mi| {
+                        .filter_map(|mi| {
                             if pc.method_name(mi) != Some("<init>") {
                                 return None;
                             }
@@ -3093,6 +3096,23 @@ fn walk_enum_inits(s: &Stmt, map: &mut HashMap<String, EnumInit>, pc: &PoolClass
                             } else {
                                 None
                             }
+                        })
+                        .max_by_key(|cand| {
+                            use crate::expr::ConstVal as CV;
+                            cand.iter()
+                                .enumerate()
+                                .map(|(i, pt)| match (&args[i], pt) {
+                                    (Expr::Const(CV::Int(n)), jcdc_jvm::JavaType::Boolean)
+                                        if *n == 0 || *n == 1 => 4,
+                                    (Expr::Const(CV::Int(_)), jcdc_jvm::JavaType::Char) => 4,
+                                    (Expr::Const(CV::Int(_)), jcdc_jvm::JavaType::Int) => 2,
+                                    (Expr::Const(CV::Int(_)), jcdc_jvm::JavaType::Array(_)) => 0,
+                                    (Expr::Const(CV::Str(_)), jcdc_jvm::JavaType::Object(n))
+                                        if n == "java/lang/String" => 2,
+                                    (Expr::NewArray { .. }, jcdc_jvm::JavaType::Array(_)) => 3,
+                                    _ => 1,
+                                })
+                                .sum::<i32>()
                         });
                     let extra: Vec<String> = args
                         .iter()
