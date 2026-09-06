@@ -4549,6 +4549,39 @@ fn analyze_anon_ctor(apc: &PoolClass, args: Vec<Expr>) -> (Vec<Expr>, HashMap<St
             }
         }
     }
+    // jdk21+ javac drops the this$0 FIELD when the anon body never
+    // dereferences the outer instance: the ctor still RECEIVES it (param
+    // 0, type = an enclosing $-prefix class) but only requireNonNull's
+    // and pops it. The store-scan above misses it and the outer `this`
+    // leaks into the new-site args ("匿名类实现接口; 不能有参数", jdk26
+    // ClassFileImpl.transformClass). At an anon new site the enclosing
+    // instance is always implicit, so drop a leading param of enclosing
+    // type. (A static-context anon passing a real outer-typed value to
+    // its super ctor would defeat this, but then javac would have kept a
+    // use for it beyond requireNonNull — accepted edge.)
+    if let Some(mi) = ctor {
+        if !captured_idx.contains(&0) {
+            if let Some(d) = apc.method_desc(mi) {
+                if let Some(md) = parse_method_descriptor(d) {
+                    if let Some(JavaType::Object(first)) = md.args.first() {
+                        let name = &apc.internal_name;
+                        let mut prefix = name.as_str();
+                        let mut encloses = false;
+                        while let Some(i) = prefix.rfind('$') {
+                            prefix = &prefix[..i];
+                            if prefix == first {
+                                encloses = true;
+                                break;
+                            }
+                        }
+                        if encloses {
+                            captured_idx.insert(0);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let kept: Vec<Expr> = args
         .into_iter()
         .enumerate()

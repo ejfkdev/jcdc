@@ -4019,6 +4019,9 @@ fn dedupe_finally(s: &mut Stmt) {
                         // finally content = handler statements minus trailing throw
                         let mut fin = stmt_vec_take(&mut catches[li].body);
                         remove_trailing_throw(&mut fin);
+                        for st in fin.iter_mut() {
+                            remove_trailing_rethrow_stmt(st, rv);
+                        }
                         // the exception store may remain as first stmt; drop it
                         if matches!(fin.first(), Some(Stmt::LocalDef { .. }) | Some(Stmt::ExprStmt(Expr::Assign { .. }))) {
                             // keep only if it references rv beyond the throw...
@@ -4065,6 +4068,9 @@ fn dedupe_finally(s: &mut Stmt) {
                         // finally content = handler statements minus trailing throw
                         let mut fin = stmt_vec_take(&mut catches[li].body);
                         remove_trailing_throw(&mut fin);
+                        for st in fin.iter_mut() {
+                            remove_trailing_rethrow_stmt(st, rv);
+                        }
                         // the exception store may remain as first stmt; drop it
                         if matches!(fin.first(), Some(Stmt::LocalDef { .. }) | Some(Stmt::ExprStmt(Expr::Assign { .. }))) {
                             // keep only if it references rv beyond the throw...
@@ -4108,13 +4114,35 @@ fn dedupe_finally(s: &mut Stmt) {
                 };
                 if let Some(fin) = fin {
                     if !fin.is_empty() {
+                        // Compare in normalized form: the inline normal-path
+                        // copy and the handler copy bind DIFFERENT catch vars
+                        // (jdk11 FilterOutputStream.close: e5 vs e4) and the
+                        // inline copy's branches end in the method's trailing
+                        // `return;` the handler copy lacks. Remap local ids
+                        // by traversal order, erase catch var names, and drop
+                        // value-less trailing Return/Throw at block tails.
+                        let mut fin_norm = fin.clone();
+                        {
+                            let mut map: HashMap<u32, u32> = HashMap::new();
+                            let mut next = 0u32;
+                            for st in fin_norm.iter_mut() {
+                                norm_stmt_for_dedupe(st, &mut map, &mut next);
+                            }
+                        }
                         let mut j = i + 1;
                         let mut k = 0;
-                        while j < v.len() && k < fin.len() && v[j] == fin[k] {
+                        while j < v.len() && k < fin_norm.len() {
+                            let mut cand = v[j].clone();
+                            let mut map: HashMap<u32, u32> = HashMap::new();
+                            let mut next = 0u32;
+                            norm_stmt_for_dedupe(&mut cand, &mut map, &mut next);
+                            if cand != fin_norm[k] {
+                                break;
+                            }
                             j += 1;
                             k += 1;
                         }
-                        if k == fin.len() && k > 0 {
+                        if k == fin_norm.len() && k > 0 {
                             v.drain(i + 1..j);
                         }
                     }
@@ -4154,17 +4182,199 @@ fn stmt_vec_take(s: &mut Stmt) -> Vec<Stmt> {
     }
 }
 
+/// Normalize a statement for finally-copy dedupe comparison: remap local
+/// var ids by traversal order (two structurally identical finally copies
+/// bind different catch vars), erase per-copy catch var names, and drop
+/// value-less trailing Return/Throw at block tails (the normal-path copy
+/// ends in the method's `return;`, the handler copy in the rethrow).
+fn norm_stmt_for_dedupe(s: &mut Stmt, map: &mut HashMap<u32, u32>, next: &mut u32) {
+    fn bind(map: &mut HashMap<u32, u32>, next: &mut u32, v: u32) -> u32 {
+        if let Some(&i) = map.get(&v) {
+            return i;
+        }
+        let i = *next;
+        *next += 1;
+        map.insert(v, i);
+        i
+    }
+    fn ne(e: &mut Expr, map: &mut HashMap<u32, u32>, next: &mut u32) {
+        match e {
+            Expr::Local { var, .. } => {
+                *var = bind(map, next, *var);
+            }
+            Expr::Cond { c, t, f } => {
+                ne(c, map, next);
+                ne(t, map, next);
+                ne(f, map, next);
+            }
+            Expr::Bin { l, r, .. } => {
+                ne(l, map, next);
+                ne(r, map, next);
+            }
+            Expr::Un { e: x, .. }
+            | Expr::Cast { e: x, .. }
+            | Expr::InstanceOf { e: x, .. }
+            | Expr::PreIncDec { e: x, .. }
+            | Expr::PostIncDec { e: x, .. } => ne(x, map, next),
+            Expr::Assign { target, value, .. } => {
+                ne(target, map, next);
+                ne(value, map, next);
+            }
+            Expr::Method { owner, args, .. } => {
+                if let Some(o) = owner {
+                    ne(o, map, next);
+                }
+                args.iter_mut().for_each(|a| ne(a, map, next));
+            }
+            Expr::Field { owner: Some(o), .. } => ne(o, map, next),
+            Expr::ArrayIndex { array, index } => {
+                ne(array, map, next);
+                ne(index, map, next);
+            }
+            Expr::New { args, .. } => args.iter_mut().for_each(|a| ne(a, map, next)),
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter_mut().for_each(|d| ne(d, map, next));
+                if let Some(vals) = init {
+                    vals.iter_mut().for_each(|x| ne(x, map, next));
+                }
+            }
+            Expr::StringConcat(parts) => {
+                for p in parts.iter_mut() {
+                    if let crate::expr::ConcatPart::Str(x) = p {
+                        ne(x, map, next);
+                    }
+                }
+            }
+            Expr::Lambda(l) => l.captures.iter_mut().for_each(|c| ne(c, map, next)),
+            _ => {}
+        }
+    }
+    match s {
+        Stmt::Block(v) => {
+            for x in v.iter_mut() {
+                norm_stmt_for_dedupe(x, map, next);
+            }
+            while matches!(
+                v.last(),
+                Some(Stmt::Return(None)) | Some(Stmt::Throw(_))
+            ) {
+                v.pop();
+            }
+        }
+        Stmt::ExprStmt(e) => ne(e, map, next),
+        Stmt::LocalDef { var, init, .. } => {
+            *var = bind(map, next, *var);
+            if let Some(i) = init {
+                ne(i, map, next);
+            }
+        }
+        Stmt::Return(Some(e)) => ne(e, map, next),
+        Stmt::Throw(e) => ne(e, map, next),
+        Stmt::If { cond, then_stmt, else_stmt } => {
+            ne(cond, map, next);
+            norm_stmt_for_dedupe(then_stmt, map, next);
+            if let Some(x) = else_stmt {
+                norm_stmt_for_dedupe(x, map, next);
+            }
+        }
+        Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+            ne(cond, map, next);
+            norm_stmt_for_dedupe(body, map, next);
+        }
+        Stmt::For { init, cond, update, body } => {
+            init.iter_mut().for_each(|x| norm_stmt_for_dedupe(x, map, next));
+            if let Some(c) = cond {
+                ne(c, map, next);
+            }
+            update.iter_mut().for_each(|u| ne(u, map, next));
+            norm_stmt_for_dedupe(body, map, next);
+        }
+        Stmt::ForEach { iterable, body, .. } => {
+            ne(iterable, map, next);
+            norm_stmt_for_dedupe(body, map, next);
+        }
+        Stmt::Switch { selector, cases, default, .. } => {
+            ne(selector, map, next);
+            for c in cases.iter_mut() {
+                c.body.iter_mut().for_each(|x| norm_stmt_for_dedupe(x, map, next));
+            }
+            if let Some(d) = default {
+                norm_stmt_for_dedupe(d, map, next);
+            }
+        }
+        Stmt::Try { body, catches, finally } => {
+            norm_stmt_for_dedupe(body, map, next);
+            for c in catches.iter_mut() {
+                c.var = bind(map, next, c.var);
+                c.var_name = None;
+                norm_stmt_for_dedupe(&mut c.body, map, next);
+            }
+            if let Some(f) = finally {
+                norm_stmt_for_dedupe(f, map, next);
+            }
+        }
+        Stmt::TryWithResources { resources, body, catches, finally } => {
+            resources.iter_mut().for_each(|r| norm_stmt_for_dedupe(r, map, next));
+            norm_stmt_for_dedupe(body, map, next);
+            for c in catches.iter_mut() {
+                c.var = bind(map, next, c.var);
+                c.var_name = None;
+                norm_stmt_for_dedupe(&mut c.body, map, next);
+            }
+            if let Some(f) = finally {
+                norm_stmt_for_dedupe(f, map, next);
+            }
+        }
+        Stmt::Synchronized { lock, body } => {
+            ne(lock, map, next);
+            norm_stmt_for_dedupe(body, map, next);
+        }
+        Stmt::Labeled { body, .. } => norm_stmt_for_dedupe(body, map, next),
+        _ => {}
+    }
+}
+
 fn trailing_rethrow_var(s: &Stmt) -> Option<u32> {
-    let v = match s {
-        Stmt::Block(v) => v,
-        other => return match other {
-            Stmt::Throw(Expr::Local { var, .. }) => Some(*var),
-            _ => None,
-        },
-    };
-    match v.last() {
-        Some(Stmt::Throw(Expr::Local { var, .. })) => Some(*var),
+    match s {
+        Stmt::Throw(Expr::Local { var, .. }) => Some(*var),
+        Stmt::Block(v) => v.last().and_then(trailing_rethrow_var),
+        // The shared rethrow tail of a finally copy can be distributed
+        // INTO the branches of a trailing if/else by the structurer
+        // (jdk11 FilterOutputStream.close: both arms end `throw e3`):
+        // recognize the shape when both branches rethrow the same var.
+        Stmt::If { then_stmt, else_stmt: Some(e), .. } => {
+            let a = trailing_rethrow_var(then_stmt)?;
+            let b = trailing_rethrow_var(e)?;
+            if a == b {
+                Some(a)
+            } else {
+                None
+            }
+        }
         _ => None,
+    }
+}
+
+/// Remove every trailing `throw rv` at the tail positions of `s` (the
+/// distributed finally-rethrow shape: nested if/else branch tails).
+fn remove_trailing_rethrow_stmt(s: &mut Stmt, rv: u32) {
+    match s {
+        Stmt::Throw(Expr::Local { var, .. }) if *var == rv => *s = Stmt::Block(vec![]),
+        Stmt::Block(v) => {
+            while matches!(v.last(), Some(Stmt::Throw(Expr::Local { var, .. })) if *var == rv) {
+                v.pop();
+            }
+            if let Some(last) = v.last_mut() {
+                remove_trailing_rethrow_stmt(last, rv);
+            }
+        }
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            remove_trailing_rethrow_stmt(then_stmt, rv);
+            if let Some(e) = else_stmt {
+                remove_trailing_rethrow_stmt(e, rv);
+            }
+        }
+        _ => {}
     }
 }
 
