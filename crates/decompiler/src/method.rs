@@ -6869,12 +6869,14 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
                 // `e.next = (Entry<K,V>) x;` — a generic field write whose
                 // cast erases away; re-insert against the instantiated
                 // field type.
-                Expr::Field { owner, cls, name, is_static: false, .. } => {
-                    if let Some(want) =
-                        instantiated_field_type(owner.as_deref(), cls, name, pool, pc)
-                    {
-                        fix(value, &want, pool);
-                    }
+                Expr::Field { owner, cls, name, ty, is_static: false, .. } => {
+                    // Fall back to the raw field type for non-generic
+                    // fields: an int field assigned a boolean expression
+                    // needs the `? 1 : 0` rewrap (jdk26 BigInteger
+                    // `this.signum = this.mag.length != 0;`).
+                    let want = instantiated_field_type(owner.as_deref(), cls, name, pool, pc)
+                        .unwrap_or_else(|| ty.clone());
+                    fix(value, &want, pool);
                 }
                 // `tArr[i] = (T) v;` — the element cast erases away.
                 Expr::ArrayIndex { array, .. } => {

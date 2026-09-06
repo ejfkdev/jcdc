@@ -871,6 +871,17 @@ fn emit_class(
         // is hidden).
         let mut inits = anon_field_inits(pc, pool, &outer_this_map(pc));
         for v in inits.values_mut() {
+            // Recovered initializers can still carry bare `this$N` reads
+            // (jdk11 LinkedHashMap$LinkedHashIterator `next = this$0.head;`
+            // — symbol not found): fold the outer-this chains again on the
+            // recovered expressions.
+            let mut wrap = Stmt::ExprStmt(std::mem::replace(v, Expr::This));
+            let otm = outer_this_map(pc);
+            substitute_captures(&mut wrap, &otm, pool);
+            *v = match wrap {
+                Stmt::ExprStmt(e) => e,
+                _ => Expr::This,
+            };
             let mut pending: Vec<Stmt> = Vec::new();
             walk_expr_anon(v, pc, pool, fam, &mut pending, &empty_vt());
         }
@@ -1567,6 +1578,12 @@ fn anon_field_inits(
     };
     let Ok(Some(mb)) = decompile_method(apc, pool, mi) else { return map };
     let mut body = mb.body.clone();
+    // The ctor reads the outer instance through its PARAMETER slot before
+    // the putfield mirror (`aload_1; getfield head`): normalize those
+    // Local reads to this.this$N field reads (and drop the synthetic
+    // stores) BEFORE capture substitution, or the param name survives as
+    // a Raw `this$0` (LinkedHashMap$LinkedHashIterator field inits).
+    strip_inner_ctor_artifacts(&mut body, &mb.vt);
     substitute_captures(&mut body, captures, pool);
     let vt = &mb.vt;
     for st in stmt_vec(&body) {
@@ -1757,7 +1774,7 @@ fn emit_field_impl(pc: &PoolClass, pool: &ClassPool, fi: usize, out: &mut String
                     let mut call = init_e.clone();
                     let witnessed = match &mut call {
                         Expr::Method { cls, name, desc, type_args, .. } if type_args.is_empty() => {
-                            compute_witness(cls, name, desc, None, &gt, pool)
+                            compute_witness(cls, name, desc, None, &gt, pool, None)
                         }
                         _ => None,
                     };
@@ -4489,6 +4506,19 @@ fn walk_stmt_subst(s: &mut Stmt, caps: &HashMap<String, Expr>, pool: &ClassPool)
             walk_expr_subst(lock, caps, pool);
             walk_stmt_subst(body, caps, pool);
         }
+        // Coverage gaps: a Labeled body (SESE/walk label emission wraps
+        // loops — sun KQueuePort$EventHandlerTask.poll's `L1: do {..}`
+        // kept raw `this.this$0.kqfd` reads, symbol not found) and the
+        // value/monitor forms.
+        Stmt::Labeled { body, .. } => walk_stmt_subst(body, caps, pool),
+        Stmt::Assert { cond, msg } => {
+            walk_expr_subst(cond, caps, pool);
+            if let Some(m) = msg {
+                walk_expr_subst(m, caps, pool);
+            }
+        }
+        Stmt::TernaryValue { e } => walk_expr_subst(e, caps, pool),
+        Stmt::MonitorEnter(e) | Stmt::MonitorExit(e) => walk_expr_subst(e, caps, pool),
         _ => {}
     }
 }
@@ -6161,7 +6191,7 @@ fn add_return_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, 
             };
             match &mut *slot {
                 Expr::Method { cls, name, desc, type_args, owner, .. } if type_args.is_empty() => {
-                    compute_witness(cls.as_str(), name.as_str(), desc, owner.as_deref(), want, pool)
+                    compute_witness(cls.as_str(), name.as_str(), desc, owner.as_deref(), want, pool, Some(&sig.params))
                 }
                 _ => None,
             }
@@ -6199,6 +6229,7 @@ fn compute_witness(
     _owner: Option<&Expr>,
     want: &jcdc_jvm::GenericType,
     pool: &ClassPool,
+    caller_params: Option<&[jcdc_jvm::TypeParam]>,
 ) -> Option<(Vec<String>, Vec<(String, jcdc_jvm::GenericType)>)> {
     let dpc = pool.get(cls)?;
     let want_desc = {
@@ -6234,10 +6265,42 @@ fn compute_witness(
     // Every method type parameter must be bound by the unification, and
     // only to a denotable type — a wildcard bound means inference should
     // come from the call arguments/target instead (keep the cast form).
+    fn trivial_bound(p: &jcdc_jvm::TypeParam) -> bool {
+        if !p.interface_bounds.is_empty() {
+            return false;
+        }
+        match &p.class_bound {
+            None => true,
+            Some(jcdc_jvm::GenericType::Class(cs)) => {
+                cs.parts.len() == 1 && cs.parts[0].name == "Object" && cs.parts[0].args.is_empty()
+            }
+            Some(jcdc_jvm::GenericType::TypeVar(_)) => false,
+            _ => false,
+        }
+    }
     let mut out = Vec::with_capacity(msig.params.len());
     for p in &msig.params {
         match mapping.iter().find(|(n, _)| n == &p.name) {
             Some((_, jcdc_jvm::GenericType::Wildcard(_))) => return None,
+            Some((_, t @ jcdc_jvm::GenericType::TypeVar(tn))) => {
+                // An explicit type argument must SATISFY the callee's
+                // declared bound: `Collections.<T>min(..)` where min
+                // requires `T extends Comparable<? super T>` and the
+                // caller's own T is unbound is rejected by javac
+                // ("explicit type argument T does not conform"). Without
+                // the witness, inference falls back to the raw-cast form
+                // the source used (`(T) min((Collection) coll)`).
+                if !trivial_bound(p) {
+                    let caller_bounded = caller_params
+                        .and_then(|cps| cps.iter().find(|cp| &cp.name == tn))
+                        .map(|cp| !trivial_bound(cp))
+                        .unwrap_or(true); // unknown caller: keep old behavior
+                    if !caller_bounded {
+                        return None;
+                    }
+                }
+                out.push(t.to_java());
+            }
             Some((_, t)) => out.push(t.to_java()),
             None => return None,
         }
