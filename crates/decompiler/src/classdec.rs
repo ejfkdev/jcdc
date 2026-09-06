@@ -1995,6 +1995,7 @@ fn emit_method_with(
             restore_enum_switches(&mut body, pc, pool);
             add_throw_witnesses(&mut body, msig.as_ref(), pool);
             strip_erasure_casts_generic_ret(&mut body, msig.as_ref(), pool);
+            witness_generic_returns(&mut body, msig.as_ref());
             line.push_str(" {\n");
             out.push_str(&line);
             let ret_bool = mdesc.as_ref().map(|d| d.ret == jcdc_jvm::JavaType::Boolean).unwrap_or(false)
@@ -2714,6 +2715,110 @@ fn collapse_this_chain(e: &Expr, pool: &ClassPool) -> Option<String> {
 /// True when the expression is a call to a GENERIC method: its static type
 /// at any argument position comes from inference, so inserting our own cast
 /// would freeze a capture identity javac would otherwise unify.
+fn g_has_typevar(g: &jcdc_jvm::GenericType) -> bool {
+    use jcdc_jvm::GenericType as G;
+    match g {
+        G::TypeVar(_) => true,
+        G::Array(i) => g_has_typevar(i),
+        G::Class(cs) => cs.parts.iter().any(|p| p.args.iter().any(g_has_typevar)),
+        G::Wildcard(w) => match w {
+            jcdc_jvm::WildcardBound::Extends(i) | jcdc_jvm::WildcardBound::Super(i) => {
+                g_has_typevar(i)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn g_has_wildcard(g: &jcdc_jvm::GenericType) -> bool {
+    use jcdc_jvm::GenericType as G;
+    match g {
+        G::Wildcard(_) => true,
+        G::Array(i) => g_has_wildcard(i),
+        G::Class(cs) => cs.parts.iter().any(|p| p.args.iter().any(g_has_wildcard)),
+        _ => false,
+    }
+}
+
+/// A return expression whose static type is a WILDCARD parameterization
+/// (`Class<?>`) does not satisfy a type-variable return (`Class<E>`) — javac
+/// rejects the poly conditional outright ("条件表达式中的类型错误",
+/// Enum.getDeclaringClass). No checkcast exists in the bytecode (same
+/// erasure), so the cast must be reconstructed from the Signature: wrap the
+/// return expression in `(RetG) expr` (unchecked, compilable). Skips
+/// expressions already carrying the type-variable form (a poly conditional
+/// whose branches are G — those compile as-is).
+fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>) {
+    use crate::expr::Expr;
+    let Some(sig) = msig else { return };
+    if !generic_ret_ish(&sig.ret) || !g_has_typevar(&sig.ret) {
+        return;
+    }
+    let ret_g = TypeRef::G(sig.ret.clone());
+    let ret_er = ret_g.erased();
+    fn fix(e: &mut Expr, ret_g: &TypeRef, ret_er: &jcdc_jvm::JavaType) {
+        if matches!(e, Expr::Const(_) | Expr::Cast { .. }) {
+            return;
+        }
+        let t = e.type_ref();
+        let need = match &t {
+            TypeRef::J(j) => j == ret_er,
+            TypeRef::G(g) => {
+                !g_has_typevar(g)
+                    && g_has_wildcard(g)
+                    && TypeRef::G(g.clone()).erased() == *ret_er
+            }
+        };
+        if need {
+            let v = std::mem::replace(e, Expr::This);
+            *e = Expr::Cast { ty: ret_g.clone(), e: Box::new(v) };
+        }
+    }
+    fn rec(s: &mut Stmt, ret_g: &TypeRef, ret_er: &jcdc_jvm::JavaType) {
+        match s {
+            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, ret_g, ret_er)),
+            Stmt::Return(Some(e)) => fix(e, ret_g, ret_er),
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                rec(then_stmt, ret_g, ret_er);
+                if let Some(x) = else_stmt {
+                    rec(x, ret_g, ret_er);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::Labeled { body, .. }
+            | Stmt::Synchronized { body, .. } => rec(body, ret_g, ret_er),
+            Stmt::For { init, body, .. } => {
+                init.iter_mut().for_each(|i| rec(i, ret_g, ret_er));
+                rec(body, ret_g, ret_er);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    for st in c.body.iter_mut() {
+                        rec(st, ret_g, ret_er);
+                    }
+                }
+                if let Some(d) = default {
+                    rec(d, ret_g, ret_er);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                rec(body, ret_g, ret_er);
+                for c in catches.iter_mut() {
+                    rec(&mut c.body, ret_g, ret_er);
+                }
+                if let Some(f) = finally {
+                    rec(f, ret_g, ret_er);
+                }
+            }
+            _ => {}
+        }
+    }
+    rec(s, &ret_g, &ret_er);
+}
+
 /// True when a generic return type actually differs from its erasure
 /// (type variable, generic array, or parameterized class).
 fn generic_ret_ish(g: &jcdc_jvm::GenericType) -> bool {
