@@ -168,12 +168,6 @@ impl<'a> Structurer<'a> {
             }
         }
         let r = self.sese_region(self.cfg.entry, &HashSet::new(), &mut ctx);
-        if std::env::var("JCDC_DBG_PAT").is_ok() {
-            let probe = format!("{:?}", self.cfg.blocks.iter().map(|b| (&self.results[b.id].stmts, &self.results[b.id].term)).collect::<Vec<_>>());
-            if probe.contains("hexDigits") {
-                eprintln!("DBGREGION {:?}", r);
-            }
-        }
         r
     }
 
@@ -648,7 +642,16 @@ impl<'a> Structurer<'a> {
                 // Continue after the loop at the header's natural exit (if it
                 // is within this region's reach and not an enclosing stop).
                 match natural_follow.first().copied() {
-                    Some(f) if !stop.contains(&f) && reach.contains(&f) && !ctx.consumed.contains(&f) => {
+                    // No `!consumed` gate: a follow already consumed by a
+                    // sibling branch (the shared single-return block after
+                    // `if (c) return X; else { loop }`, Class.methodToString)
+                    // is handled by the loop-top consumed policy — a shared
+                    // Return/Throw gets CopyStmts (inlined at this arrival),
+                    // a header becomes `continue`, anything else copy_walk/
+                    // Goto. Gating on !consumed silently dropped the else
+                    // path's return (missing-return compile error; walk
+                    // keeps the tail).
+                    Some(f) if !stop.contains(&f) && reach.contains(&f) => {
                         cur = f;
                         continue;
                     }
@@ -703,7 +706,7 @@ impl<'a> Structurer<'a> {
                         ternary,
                     });
                     match follow {
-                        Some(f) if reach.contains(&f) && !ctx.consumed.contains(&f) => {
+                        Some(f) if reach.contains(&f) => {
                             cur = f;
                             continue;
                         }
@@ -757,7 +760,7 @@ impl<'a> Structurer<'a> {
                     ctx.consumed = claimed;
                     parts.push(sw);
                     match follow {
-                        Some(f) if reach.contains(&f) && !ctx.consumed.contains(&f) => {
+                        Some(f) if reach.contains(&f) => {
                             cur = f;
                             continue;
                         }
