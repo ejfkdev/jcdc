@@ -657,6 +657,12 @@ thread_local! {
     /// `FixedWindow::new` inside vs `FixedWindow::finish` outside).
     static EXTERN_DECL: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+
+    /// Local-class names whose decl was extracted at one statement and
+    /// MENTIONED again at a later statement of the same method: the decl
+    /// must move to a position dominating both sites.
+    static EXTERN_REDECL: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
 }
 
 thread_local! {
@@ -4090,6 +4096,16 @@ fn emit_local_class_decl(
     pending: &mut Vec<Stmt>,
 ) {
     let simple = simple.to_string();
+    // Already extracted to an EARLIER statement of this method
+    // (EXTERN_DECL is method-scoped): record the second mention site so
+    // fix_lambda_captures can relocate the decl to a position dominating
+    // both (jdk26 Gatherers Composite.impl: State extracted inside the
+    // if-branch, mentioned again by the tail return after the chain —
+    // 6 "找不到符号 类 State" at the tail).
+    if EXTERN_DECL.with(|x| x.borrow().contains(&simple)) {
+        EXTERN_REDECL.with(|r| r.borrow_mut().insert(simple.clone()));
+        return;
+    }
     // A local class whose EnclosingMethod names a DIFFERENT class than
     // the one being walked is declared in an enclosing scope (the new
     // site sits inside an inlined anonymous body): hoist the declaration
@@ -5168,15 +5184,110 @@ fn analyze_anon_ctor(apc: &PoolClass, args: Vec<Expr>) -> (Vec<Expr>, HashMap<St
                     _ => None,
                 });
                 if let Some((dargc, dargs)) = deleg {
-                    let target_mi = (0..apc.cf.methods.len()).find(|&mi2| {
-                        mi2 != mi
-                            && apc.method_name(mi2) == Some("<init>")
-                            && apc
-                                .method_desc(mi2)
-                                .and_then(parse_method_descriptor)
-                                .map(|md| md.args.len() == dargc)
-                                .unwrap_or(false)
-                    });
+                    // Pure-forward params: used ONLY as plain delegation
+                    // args. Declared params participate in computed
+                    // delegation args (jdk26 State: leftStateless feeds
+                    // `!leftStateless ? leftInitializer.get() : null` AND
+                    // doubles as the val$leftStateless capture source —
+                    // marking it captured emptied the kept args:
+                    // `() -> new State()` against a 12-param ctor).
+                    let mut used_elsewhere: HashSet<u32> = HashSet::new();
+                    fn collect_locals(e: &Expr, out: &mut HashSet<u32>) {
+                        match e {
+                            Expr::Local { var, .. } => {
+                                out.insert(*var);
+                            }
+                            Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+                                args.iter().for_each(|a| collect_locals(a, out));
+                            }
+                            Expr::Method { owner, args, .. } => {
+                                if let Some(o) = owner {
+                                    collect_locals(o, out);
+                                }
+                                args.iter().for_each(|a| collect_locals(a, out));
+                            }
+                            Expr::Field { owner: Some(o), .. } => collect_locals(o, out),
+                            Expr::ArrayIndex { array, index } => {
+                                collect_locals(array, out);
+                                collect_locals(index, out);
+                            }
+                            Expr::Cast { e: i, .. }
+                            | Expr::InstanceOf { e: i, .. }
+                            | Expr::Un { e: i, .. }
+                            | Expr::PreIncDec { e: i, .. }
+                            | Expr::PostIncDec { e: i, .. } => collect_locals(i, out),
+                            Expr::Bin { l, r, .. } => {
+                                collect_locals(l, out);
+                                collect_locals(r, out);
+                            }
+                            Expr::Cond { c, t, f } => {
+                                collect_locals(c, out);
+                                collect_locals(t, out);
+                                collect_locals(f, out);
+                            }
+                            Expr::Assign { target, value, .. } => {
+                                collect_locals(target, out);
+                                collect_locals(value, out);
+                            }
+                            Expr::NewArray { dims, init, .. } => {
+                                dims.iter().for_each(|d| collect_locals(d, out));
+                                if let Some(vals) = init {
+                                    vals.iter().for_each(|x| collect_locals(x, out));
+                                }
+                            }
+                            Expr::NewMultiArray { dims, .. } => {
+                                dims.iter().for_each(|d| collect_locals(d, out));
+                            }
+                            Expr::StringConcat(parts) => parts.iter().for_each(|pp| {
+                                if let crate::expr::ConcatPart::Str(i) = pp {
+                                    collect_locals(i, out);
+                                }
+                            }),
+                            Expr::Lambda(l) => {
+                                l.captures.iter().for_each(|c| collect_locals(c, out));
+                            }
+                            Expr::Invokedynamic { args, .. } => {
+                                args.iter().for_each(|a| collect_locals(a, out));
+                            }
+                            _ => {}
+                        }
+                    }
+                    fn collect_stmt_locals(st: &Stmt, selfcls: &str, out: &mut HashSet<u32>) {
+                        match st {
+                            Stmt::ExprStmt(Expr::Method { name, cls, is_special: true, args, .. })
+                                if name == "<init>" && cls == selfcls =>
+                            {
+                                for a in args {
+                                    match a {
+                                        Expr::Local { .. } => {}
+                                        other => collect_locals(other, out),
+                                    }
+                                }
+                            }
+                            Stmt::ExprStmt(e) => collect_locals(e, out),
+                            Stmt::LocalDef { init: Some(e), .. } => collect_locals(e, out),
+                            Stmt::Return(Some(e)) => collect_locals(e, out),
+                            Stmt::Throw(e) => collect_locals(e, out),
+                            Stmt::Block(v) => {
+                                v.iter().for_each(|x| collect_stmt_locals(x, selfcls, out));
+                            }
+                            _ => {}
+                        }
+                    }
+                    for st in stmt_vec(&mb.body) {
+                        collect_stmt_locals(&st, &apc.internal_name, &mut used_elsewhere);
+                    }
+                    let target_mi = (0..apc.cf.methods.len())
+                        .filter(|&mi2| {
+                            mi2 != mi
+                                && apc.method_name(mi2) == Some("<init>")
+                                && apc
+                                    .method_desc(mi2)
+                                    .and_then(parse_method_descriptor)
+                                    .map(|md| md.args.len() == dargc)
+                                    .unwrap_or(false)
+                        })
+                        .find(|&mi2| capture_store_count(apc, mi2) > 0);
                     if let Some(mi2) = target_mi {
                         if let Ok(Some(mb2)) = decompile_method(apc, empty_pool(), mi2) {
                             let mut p2: Vec<String> = Vec::new();
@@ -5209,7 +5320,13 @@ fn analyze_anon_ctor(apc: &PoolClass, args: Vec<Expr>) -> (Vec<Expr>, HashMap<St
                                             };
                                             if let Some(e) = args.get(*pi) {
                                                 captures.insert(fname.clone(), e.clone());
-                                                captured_idx.insert(*pi);
+                                                // A declared param that DOUBLES
+                                                // as a capture source stays in
+                                                // the kept args: only pure
+                                                // forwards are stripped.
+                                                if !used_elsewhere.contains(dv) {
+                                                    captured_idx.insert(*pi);
+                                                }
                                             }
                                         }
                                     }
@@ -5254,6 +5371,20 @@ fn analyze_anon_ctor(apc: &PoolClass, args: Vec<Expr>) -> (Vec<Expr>, HashMap<St
             }
         }
     }
+    if std::env::var("JCDC_DBG_ANON").is_ok() {
+        eprintln!(
+            "ANALYZE cls={} ctor={:?} arity={} captures={} captured_idx={:?}",
+            apc.internal_name,
+            ctor,
+            args.len(),
+            captures.len(),
+            {
+                let mut v: Vec<usize> = captured_idx.iter().copied().collect();
+                v.sort();
+                v
+            }
+        );
+    }
     let kept: Vec<Expr> = args
         .into_iter()
         .enumerate()
@@ -5274,6 +5405,121 @@ fn self_simple_all_digits(pc: &PoolClass) -> bool {
 /// names are often absent (`arg1`), so the name-based skip in
 /// emit_method_with misses them — but a LOCAL class's emitted ctor must
 /// not declare them (source locals capture lexically).
+fn collect_expr_locals(e: &Expr, out: &mut HashSet<u32>) {
+    match e {
+        Expr::Local { var, .. } => {
+            out.insert(*var);
+        }
+        Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+            args.iter().for_each(|a| collect_expr_locals(a, out));
+        }
+        Expr::Method { owner, args, .. } => {
+            if let Some(o) = owner {
+                collect_expr_locals(o, out);
+            }
+            args.iter().for_each(|a| collect_expr_locals(a, out));
+        }
+        Expr::Field { owner: Some(o), .. } => collect_expr_locals(o, out),
+        Expr::ArrayIndex { array, index } => {
+            collect_expr_locals(array, out);
+            collect_expr_locals(index, out);
+        }
+        Expr::Cast { e: i, .. }
+        | Expr::InstanceOf { e: i, .. }
+        | Expr::Un { e: i, .. }
+        | Expr::PreIncDec { e: i, .. }
+        | Expr::PostIncDec { e: i, .. } => collect_expr_locals(i, out),
+        Expr::Bin { l, r, .. } => {
+            collect_expr_locals(l, out);
+            collect_expr_locals(r, out);
+        }
+        Expr::Cond { c, t, f } => {
+            collect_expr_locals(c, out);
+            collect_expr_locals(t, out);
+            collect_expr_locals(f, out);
+        }
+        Expr::Assign { target, value, .. } => {
+            collect_expr_locals(target, out);
+            collect_expr_locals(value, out);
+        }
+        Expr::NewArray { dims, init, .. } => {
+            dims.iter().for_each(|d| collect_expr_locals(d, out));
+            if let Some(vals) = init {
+                vals.iter().for_each(|x| collect_expr_locals(x, out));
+            }
+        }
+        Expr::NewMultiArray { dims, .. } => dims.iter().for_each(|d| collect_expr_locals(d, out)),
+        Expr::StringConcat(parts) => parts.iter().for_each(|pp| {
+            if let crate::expr::ConcatPart::Str(i) = pp {
+                collect_expr_locals(i, out);
+            }
+        }),
+        Expr::Lambda(l) => l.captures.iter().for_each(|c| collect_expr_locals(c, out)),
+        Expr::Invokedynamic { args, .. } => args.iter().for_each(|a| collect_expr_locals(a, out)),
+        _ => {}
+    }
+}
+
+fn collect_stmt_locals(st: &Stmt, selfcls: &str, out: &mut HashSet<u32>) {
+    match st {
+        Stmt::ExprStmt(Expr::Method { name, cls, is_special: true, args, .. })
+            if name == "<init>" && cls == selfcls =>
+        {
+            for a in args {
+                match a {
+                    Expr::Local { .. } => {}
+                    other => collect_expr_locals(other, out),
+                }
+            }
+        }
+        Stmt::ExprStmt(e) => collect_expr_locals(e, out),
+        Stmt::LocalDef { init: Some(e), .. } => collect_expr_locals(e, out),
+        Stmt::Return(Some(e)) => collect_expr_locals(e, out),
+        Stmt::Throw(e) => collect_expr_locals(e, out),
+        Stmt::Block(v) => v.iter().for_each(|x| collect_stmt_locals(x, selfcls, out)),
+        _ => {}
+    }
+}
+
+/// Indices of ctor params that ONLY ride a this(..) delegation as plain
+/// locals: synthesized capture forwards of a delegating local-class ctor
+/// (the delegatee stores them into val$ fields). Stripped from the
+/// printed signature exactly like direct-store capture params.
+fn delegation_forward_params(apc: &PoolClass, mb: &crate::method::MethodBody) -> HashSet<usize> {
+    let mut fwd: HashSet<usize> = HashSet::new();
+    let deleg = stmt_vec(&mb.body).iter().find_map(|st| match st {
+        Stmt::ExprStmt(Expr::Method { name, cls, is_special: true, args, .. })
+            if name == "<init>" && cls == &apc.internal_name =>
+        {
+            Some(args.clone())
+        }
+        _ => None,
+    });
+    let Some(dargs) = deleg else { return fwd };
+    let mut used_elsewhere: HashSet<u32> = HashSet::new();
+    for st in stmt_vec(&mb.body) {
+        collect_stmt_locals(&st, &apc.internal_name, &mut used_elsewhere);
+    }
+    let param_vars: Vec<u32> = mb
+        .vt
+        .vars
+        .iter()
+        .filter(|v| v.is_param && v.name != "this")
+        .map(|v| v.id)
+        .collect();
+    for a in &dargs {
+        if let Expr::Local { var, .. } = a {
+            if used_elsewhere.contains(var) {
+                continue;
+            }
+            if let Some(i) = param_vars.iter().position(|p| p == var) {
+                fwd.insert(i);
+            }
+        }
+    }
+    fwd
+}
+
 fn ctor_capture_params(apc: &PoolClass, mi: usize) -> HashSet<usize> {
     let mut captured: HashSet<usize> = HashSet::new();
     // The CALLER's ctor index: scanning the class's FIRST <init> applied
@@ -5308,6 +5554,9 @@ fn ctor_capture_params(apc: &PoolClass, mi: usize) -> HashSet<usize> {
                 }
             }
         }
+    }
+    if captured.is_empty() {
+        captured.extend(delegation_forward_params(apc, &mb));
     }
     captured
 }
@@ -5919,7 +6168,97 @@ pub(crate) fn fix_lambda_captures(
             _ => {}
         }
     }
+    let redecl_save = EXTERN_REDECL.with(|r| std::mem::take(&mut *r.borrow_mut()));
     fix_stmt(s, vt, pc, pool, fam, &multi, &mut counter);
+    let collected = EXTERN_REDECL.with(|r| std::mem::take(&mut *r.borrow_mut()));
+    EXTERN_REDECL.with(|r| *r.borrow_mut() = redecl_save);
+    if !collected.is_empty() {
+        relocate_multi_site_decls(s, &collected);
+    }
+}
+
+/// Move local-class decls mentioned at several statements of one method
+/// to the method-top block, after the leading hoisted local definitions
+/// (their substituted capture expressions reference those locals; jcdc
+/// hoists every local decl to the block head, so top placement keeps
+/// captures in scope) and before every statement — dominating all
+/// mention sites wherever they sit.
+fn relocate_multi_site_decls(s: &mut Stmt, names: &HashSet<String>) {
+    fn pull(v: &mut Vec<Stmt>, names: &HashSet<String>, out: &mut Vec<Stmt>) {
+        let mut i = 0;
+        while i < v.len() {
+            if let Stmt::ClassDecl { name, .. } = &v[i] {
+                if names.contains(name) {
+                    out.push(v.remove(i));
+                    continue;
+                }
+            }
+            pull_one(&mut v[i], names, out);
+            i += 1;
+        }
+    }
+    fn pull_one(s: &mut Stmt, names: &HashSet<String>, out: &mut Vec<Stmt>) {
+        match s {
+            Stmt::Block(v) => pull(v, names, out),
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                pull_one(then_stmt, names, out);
+                if let Some(e) = else_stmt {
+                    pull_one(e, names, out);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => pull_one(body, names, out),
+            Stmt::For { init, body, .. } => {
+                init.iter_mut().for_each(|x| pull_one(x, names, out));
+                pull_one(body, names, out);
+            }
+            Stmt::ForEach { body, .. } => pull_one(body, names, out),
+            Stmt::Labeled { body, .. } => pull_one(body, names, out),
+            Stmt::Synchronized { body, .. } => pull_one(body, names, out),
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    c.body.iter_mut().for_each(|x| pull_one(x, names, out));
+                }
+                if let Some(d) = default {
+                    pull_one(d, names, out);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                pull_one(body, names, out);
+                for c in catches.iter_mut() {
+                    pull_one(&mut c.body, names, out);
+                }
+                if let Some(f) = finally {
+                    pull_one(f, names, out);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                for r in resources.iter_mut() {
+                    pull_one(r, names, out);
+                }
+                pull_one(body, names, out);
+                for c in catches.iter_mut() {
+                    pull_one(&mut c.body, names, out);
+                }
+                if let Some(f) = finally {
+                    pull_one(f, names, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let Stmt::Block(v) = s else { return };
+    let mut moved = Vec::new();
+    pull(v, names, &mut moved);
+    if moved.is_empty() {
+        return;
+    }
+    let mut pos = 0;
+    while pos < v.len() && matches!(v[pos], Stmt::LocalDef { .. } | Stmt::ClassDecl { .. }) {
+        pos += 1;
+    }
+    for (k, d) in moved.into_iter().enumerate() {
+        v.insert(pos + k, d);
+    }
 }
 
 /// Map this$N fields of a member inner class to `Outer.this` raw exprs.
