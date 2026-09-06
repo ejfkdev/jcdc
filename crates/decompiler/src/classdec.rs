@@ -2019,7 +2019,9 @@ fn emit_field_impl(pc: &PoolClass, pool: &ClassPool, fi: usize, out: &mut String
                     // can break nested inference (`Map.ofEntries(...)`).
                     let mut call = init_e.clone();
                     let witnessed = match &mut call {
-                        Expr::Method { cls, name, desc, type_args, .. } if type_args.is_empty() => {
+                        Expr::Method { cls, name, desc, type_args, args, .. }
+                            if type_args.is_empty() && !args_have_generic_new(args, pool) =>
+                        {
                             compute_witness(cls, name, desc, None, &gt, pool, None)
                         }
                         _ => None,
@@ -7496,6 +7498,59 @@ fn walk_stmt_exprs(
 /// type inference for a generic method; replace it with an explicit type
 /// witness `getIterator::<...>` rendered as `.<T>name(...)`, and drop the
 /// now-redundant cast.
+/// True when any argument (recursively) is a `new` of a GENERIC class:
+/// such a diamond is inference-sensitive, and an explicit type witness on
+/// the enclosing call would give it contradictory bounds ("无法推断
+/// ArrayList<>的类型参数", jdk17 Stream.toList `Collections.<T>
+/// unmodifiableList(new ArrayList<>(Arrays.asList(toArray())))` — the
+/// bare call plus the erasure cast is the compilable source form).
+fn args_have_generic_new(args: &[Expr], pool: &ClassPool) -> bool {
+    fn has(e: &Expr, pool: &ClassPool) -> bool {
+        match e {
+            Expr::New { cls, args, .. } => {
+                if is_generic_class(cls, pool) {
+                    return true;
+                }
+                args.iter().any(|a| has(a, pool))
+            }
+            Expr::AnonNew { args, .. } => args.iter().any(|a| has(a, pool)),
+            Expr::Method { owner, args, .. } => {
+                owner.as_deref().map(|o| has(o, pool)).unwrap_or(false)
+                    || args.iter().any(|a| has(a, pool))
+            }
+            Expr::Cast { e: x, .. }
+            | Expr::Un { e: x, .. }
+            | Expr::InstanceOf { e: x, .. } => has(x, pool),
+            Expr::Cond { c, t, f } => has(c, pool) || has(t, pool) || has(f, pool),
+            Expr::Bin { l, r, .. } => has(l, pool) || has(r, pool),
+            Expr::ArrayIndex { array, index } => has(array, pool) || has(index, pool),
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter().any(|d| has(d, pool))
+                    || init.as_ref().map(|v| v.iter().any(|x| has(x, pool))).unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+    args.iter().any(|a| has(a, pool))
+}
+
+fn is_generic_class(cls: &str, pool: &ClassPool) -> bool {
+    pool.get(cls)
+        .map(|pcx| {
+            pcx.class_attr("Signature")
+                .map(|b| {
+                    b.len() >= 2
+                        && pcx
+                            .utf8(u16::from_be_bytes([b[0], b[1]]))
+                            .and_then(|s| parse_class_signature(s))
+                            .map(|sig| !sig.params.is_empty())
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
 fn add_return_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, pool: &ClassPool) {
     let Some(sig) = msig else { return };
     fn walk(s: &mut Stmt, sig: &jcdc_jvm::MethodSignature, pool: &ClassPool) {
@@ -7565,8 +7620,12 @@ fn add_return_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, 
                 _ => return,
             };
             match &mut *slot {
-                Expr::Method { cls, name, desc, type_args, owner, .. } if type_args.is_empty() => {
-                    compute_witness(cls.as_str(), name.as_str(), desc, owner.as_deref(), want, pool, Some(&sig.params))
+                Expr::Method { cls, name, desc, type_args, owner, args, .. } if type_args.is_empty() => {
+                    if args_have_generic_new(args, pool) {
+                        None
+                    } else {
+                        compute_witness(cls.as_str(), name.as_str(), desc, owner.as_deref(), want, pool, Some(&sig.params))
+                    }
                 }
                 _ => None,
             }
