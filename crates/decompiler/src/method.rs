@@ -5098,6 +5098,20 @@ fn match_j7(v: &[Stmt], i: usize) -> Option<J7Plan> {
         if dbg { eprintln!("TWR reject: no resource def found"); }
         return None;
     };
+    // A TWR resource is FINAL: reassignment inside the body means a
+    // hand-rolled try (sun PKCS7: `bais = new ByteArrayInputStream(..);
+    // ..; bais.close(); bais = null;` inside a plain try/catch — the
+    // bogus `try (bais = null)` form fails with "resource may not have
+    // been assigned" x13). And a real TWR resource decl is never
+    // initialized to null.
+    if stmt_assigns_var(body, r_var) {
+        if dbg { eprintln!("TWR reject: resource reassigned in body"); }
+        return None;
+    }
+    if matches!(&v[ri], Stmt::LocalDef { init: Some(Expr::Const(ConstVal::Null)), .. }) {
+        if dbg { eprintln!("TWR reject: null resource init"); }
+        return None;
+    }
     // Body must not mention the primary var (user code never sees it).
     if let Some(pv) = primary_var {
         if stmt_uses_var(body, pv) {
@@ -5132,6 +5146,86 @@ fn apply_j7(v: &mut Vec<Stmt>, i: usize, plan: &J7Plan) {
             catches: plan.keep_catches.clone(),
             finally: None,
         };
+    }
+}
+
+/// True when any nested statement ASSIGNS to `var` (target position).
+fn stmt_assigns_var(s: &Stmt, var: u32) -> bool {
+    fn eu(e: &Expr, var: u32) -> bool {
+        match e {
+            Expr::Assign { target, .. } => {
+                matches!(&**target, Expr::Local { var: v, .. } if *v == var)
+            }
+            Expr::PreIncDec { e: i, .. } | Expr::PostIncDec { e: i, .. } => {
+                matches!(&**i, Expr::Local { var: v, .. } if *v == var)
+            }
+            _ => false,
+        }
+    }
+    fn ex(e: &Expr, var: u32) -> bool {
+        if eu(e, var) {
+            return true;
+        }
+        match e {
+            Expr::Assign { value, .. } => ex(value, var),
+            Expr::Method { owner, args, .. } => {
+                owner.as_deref().map(|o| ex(o, var)).unwrap_or(false)
+                    || args.iter().any(|a| ex(a, var))
+            }
+            Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+                args.iter().any(|a| ex(a, var))
+            }
+            Expr::Bin { l, r, .. } => ex(l, var) || ex(r, var),
+            Expr::Cond { c, t, f } => ex(c, var) || ex(t, var) || ex(f, var),
+            Expr::Cast { e: i, .. } | Expr::Un { e: i, .. }
+            | Expr::PreIncDec { e: i, .. } | Expr::PostIncDec { e: i, .. } => ex(i, var),
+            Expr::ArrayIndex { array, index } => ex(array, var) || ex(index, var),
+            Expr::Field { owner: Some(o), .. } => ex(o, var),
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter().any(|d| ex(d, var))
+                    || init.as_ref().map(|vals| vals.iter().any(|x| ex(x, var))).unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+    match s {
+        Stmt::Block(v) => v.iter().any(|x| stmt_assigns_var(x, var)),
+        Stmt::ExprStmt(e) => ex(e, var),
+        Stmt::LocalDef { init: Some(e), .. } => ex(e, var),
+        Stmt::Return(Some(e)) | Stmt::Throw(e) => ex(e, var),
+        Stmt::If { cond, then_stmt, else_stmt } => {
+            ex(cond, var)
+                || stmt_assigns_var(then_stmt, var)
+                || else_stmt.as_ref().map(|e| stmt_assigns_var(e, var)).unwrap_or(false)
+        }
+        Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+            ex(cond, var) || stmt_assigns_var(body, var)
+        }
+        Stmt::For { init, cond, update, body } => {
+            init.iter().any(|i| stmt_assigns_var(i, var))
+                || cond.as_ref().map(|c| ex(c, var)).unwrap_or(false)
+                || update.iter().any(|u| ex(u, var))
+                || stmt_assigns_var(body, var)
+        }
+        Stmt::ForEach { iterable, body, .. } => ex(iterable, var) || stmt_assigns_var(body, var),
+        Stmt::Switch { selector, cases, default, .. } => {
+            ex(selector, var)
+                || cases.iter().any(|c| c.body.iter().any(|st| stmt_assigns_var(st, var)))
+                || default.as_ref().map(|d| stmt_assigns_var(d, var)).unwrap_or(false)
+        }
+        Stmt::Try { body, catches, finally } => {
+            stmt_assigns_var(body, var)
+                || catches.iter().any(|c| stmt_assigns_var(&c.body, var))
+                || finally.as_ref().map(|f| stmt_assigns_var(f, var)).unwrap_or(false)
+        }
+        Stmt::TryWithResources { body, catches, finally, .. } => {
+            stmt_assigns_var(body, var)
+                || catches.iter().any(|c| stmt_assigns_var(&c.body, var))
+                || finally.as_ref().map(|f| stmt_assigns_var(f, var)).unwrap_or(false)
+        }
+        Stmt::Synchronized { lock, body } => ex(lock, var) || stmt_assigns_var(body, var),
+        Stmt::Labeled { body, .. } => stmt_assigns_var(body, var),
+        _ => false,
     }
 }
 

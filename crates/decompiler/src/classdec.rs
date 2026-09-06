@@ -5397,6 +5397,12 @@ fn delegation_value(
                     {
                         call = Some(e.clone());
                     }
+                    // Nested if-chains fold into a conditional value
+                    // (javac wraps the dispatch chain in blocks).
+                    Stmt::If { .. } => {
+                        let iv = delegation_value(st, tmpl, own, fallback)?;
+                        val = Some(iv);
+                    }
                     Stmt::Return(_) | Stmt::Comment(_) => {}
                     _ => return None,
                 }
@@ -5428,6 +5434,11 @@ fn delegation_value(
             }
             Some(args[0].clone())
         }
+        // A fall-through branch can be a BARE assignment (no block):
+        // `str = decode(..)` flows to the trailing delegation.
+        Stmt::ExprStmt(Expr::Assign { value, .. }) => Some((**value).clone()),
+        Stmt::LocalDef { init: Some(e), .. } => Some(e.clone()),
+        Stmt::Block(v) if v.len() == 1 => delegation_value(&v[0], tmpl, own, fallback),
         _ => None,
     }
 }
@@ -6283,6 +6294,13 @@ fn retype_witness_arg_casts(
         match t {
             jcdc_jvm::GenericType::Class(cs) => cs.parts.iter().any(|p| !p.args.is_empty()),
             jcdc_jvm::GenericType::Array(i) => parameterized(i),
+            // An array OF a type variable (`T[]`) is generic — skipping it
+            // left the erasure checkcast around a generic-call argument
+            // in place: jdk Collection.toArray(IntFunction) rendered
+            // `this.<T>toArray((Object[]) generator.apply(0))` — with the
+            // explicit witness pinning the formal to T[], the Object[]
+            // cast made the call inapplicable ("no suitable method").
+            jcdc_jvm::GenericType::TypeVar(_) => true,
             _ => false,
         }
     }
