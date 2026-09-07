@@ -450,6 +450,8 @@ pub fn decompile_method(
     hoist_escaped_vars(&mut body, &vt);
     cleanup(&mut body);
     prune_dead_breaks(&mut body);
+    prune_post_loop_label_breaks(&mut body);
+    cleanup(&mut body);
     disambiguate_nested_locals(&mut vt, &body);
     prune_unreachable(&mut body);
     cleanup(&mut body);
@@ -7309,6 +7311,155 @@ fn is_inflight_throw(s: &Stmt) -> bool {
 /// Java forbids a local declaration from shadowing another local of the
 /// SAME method in an enclosing scope. When two distinct variables (slots)
 /// share an LVT name and end up nested, rename the inner one.
+/// `L: do {..} while (c); break L;` — loop-exit edges materialized as a
+/// labeled break right AFTER the loop they name are do-while rotation
+/// residue: illegal Java ("在 switch 或 loop 外部中断") and redundant
+/// (control already falls through). Drop them (jdk17 GregorianCalendar
+/// cutover-month case; xml Parser state machine).
+pub(crate) fn prune_post_loop_label_breaks(s: &mut Stmt) {
+    fn clear_break(st: &mut Stmt) {
+        match st {
+            s @ Stmt::Break(Some(_)) => {
+                *s = Stmt::Block(vec![]);
+            }
+            Stmt::Block(inner) => {
+                if !inner.is_empty() {
+                    clear_break(&mut inner[0]);
+                    inner.retain(|x| !x.is_empty_block());
+                }
+            }
+            _ => {}
+        }
+    }
+    fn unwrap_single(v: &Stmt) -> &Stmt {
+        let mut cur = v;
+        loop {
+            match cur {
+                Stmt::Block(inner) if inner.len() == 1 => cur = &inner[0],
+                other => return other,
+            }
+        }
+    }
+    fn is_break_of(st: &Stmt, label: &str) -> bool {
+        match unwrap_single(st) {
+            Stmt::Break(Some(l)) => l == label,
+            _ => false,
+        }
+    }
+    fn label_of(st: &Stmt) -> Option<&str> {
+        match st {
+            Stmt::Labeled { label, body } => match unwrap_single(body) {
+                Stmt::While { .. } | Stmt::DoWhile { .. } | Stmt::For { .. } | Stmt::ForEach { .. } => {
+                    Some(label.as_str())
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    fn prune_in(v: &mut Vec<Stmt>) {
+        let mut i = 0;
+        while i + 1 < v.len() {
+            let label_owned = label_of(&v[i]).map(|l| l.to_string());
+            if std::env::var("JCDC_DBG_PRUNE").is_ok() {
+                if let Some(l) = &label_owned {
+                    eprintln!("PRUNE label={} next_is_break={}", l, is_break_of(&v[i + 1], l));
+                }
+            }
+            if let Some(label) = label_owned {
+                if is_break_of(&v[i + 1], &label) {
+                    clear_break(&mut v[i + 1]);
+                    if v[i + 1].is_empty_block() {
+                        v.remove(i + 1);
+                    }
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        for x in v.iter_mut() {
+            prune_post_loop_label_breaks(x);
+        }
+    }
+    if let Stmt::Block(v) = s {
+        prune_in(v);
+    } else {
+        match s {
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                prune_post_loop_label_breaks(then_stmt);
+                if let Some(e) = else_stmt {
+                    prune_post_loop_label_breaks(e);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+                prune_post_loop_label_breaks(body);
+            }
+            Stmt::For { init, body, .. } => {
+                init.iter_mut().for_each(prune_post_loop_label_breaks);
+                prune_post_loop_label_breaks(body);
+            }
+            Stmt::ForEach { body, .. } => prune_post_loop_label_breaks(body),
+            Stmt::Labeled { label, body } => {
+                // The printer pins the label to the body's FIRST line: a
+                // Block([loop, break label]) prints as `label: do..while;
+                // break label;` — the break escapes its own label scope
+                // ("未定义的标签"). Drop the redundant break right after
+                // the loop (fall-through is the same edge).
+                if let Stmt::Block(v) = body.as_mut() {
+                    let mut i = 0;
+                    while i + 1 < v.len() {
+                        let is_loop = matches!(
+                            unwrap_single(&v[i]),
+                            Stmt::While { .. } | Stmt::DoWhile { .. } | Stmt::For { .. }
+                                | Stmt::ForEach { .. }
+                        );
+                        if is_loop && is_break_of(&v[i + 1], label) {
+                            clear_break(&mut v[i + 1]);
+                            if v[i + 1].is_empty_block() {
+                                v.remove(i + 1);
+                            }
+                            continue;
+                        }
+                        i += 1;
+                    }
+                }
+                prune_post_loop_label_breaks(body);
+            }
+            Stmt::Synchronized { body, .. } => {
+                prune_post_loop_label_breaks(body);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    prune_in(&mut c.body);
+                }
+                if let Some(d) = default {
+                    prune_post_loop_label_breaks(d);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                prune_post_loop_label_breaks(body);
+                for c in catches.iter_mut() {
+                    prune_post_loop_label_breaks(&mut c.body);
+                }
+                if let Some(f) = finally {
+                    prune_post_loop_label_breaks(f);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter_mut().for_each(prune_post_loop_label_breaks);
+                prune_post_loop_label_breaks(body);
+                for c in catches.iter_mut() {
+                    prune_post_loop_label_breaks(&mut c.body);
+                }
+                if let Some(f) = finally {
+                    prune_post_loop_label_breaks(f);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn disambiguate_nested_locals(vt: &mut VarTable, body: &Stmt) {
     // var id -> current printed name
     let mut scopes: Vec<std::collections::HashMap<String, u32>> =

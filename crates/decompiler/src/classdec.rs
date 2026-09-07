@@ -2750,6 +2750,10 @@ fn emit_method_with(
             // now; retry the return witnesses (idempotent).
             add_return_witnesses(&mut body, msig.as_ref(), pool);
             restore_enum_switches(&mut body, pc, pool);
+            // Switch restoration reassembles case blocks AFTER the method
+            // pipeline: rerun the post-loop label-break prune there (jdk17
+            // GregorianCalendar case 2 `L2: do..while; break L2;`).
+            crate::method::prune_post_loop_label_breaks(&mut body);
             add_throw_witnesses(&mut body, msig.as_ref(), pool);
             strip_erasure_casts_generic_ret(&mut body, msig.as_ref(), pool);
             witness_generic_returns(&mut body, msig.as_ref(), pool);
