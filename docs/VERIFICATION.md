@@ -642,3 +642,17 @@ SESE 数字（117/124/180）对照中。剩余家族：SESE 结构尾（switch/l
 Gatherers 方法引用 12（需 diamond-ctor sibling 推论）、推论变量上限 ~15、
 DirectMethodHandleDesc 6（Optional.map 链 witness）、CAP#1 尾、
 FloatingDecimal !ssign 4。
+
+### 翻转门对照（2026-09-07，同一二进制）
+
+| 路径 | jdk11 | jdk17 | jdk26 | 合计 |
+|------|-------|-------|-------|------|
+| walk（现默认） | 128 | 138 | 202 | 468 |
+| SESE（JCDC_SESE=1） | 117 | 124 | 180 | **421** |
+
+SESE 在三个 JDK 全面领先（-47），且本会话全部共享修复（classdec/emit/
+method/varalloc）双路同时受益；features 56/56 双路 + cargo test 39/39 每
+次提交均绿。数据支持将 rewrite-sese 作为 shipping 候选：翻转 SESE 为默认
+（structure.rs 门控反转）+ 通过 git worktree 将共享修复 cherry-pick 至
+master 并重跑 master 全量验证（双路 smoke + 双路 corpus A/B）——该链需数
+小时，留待下一会话执行。
