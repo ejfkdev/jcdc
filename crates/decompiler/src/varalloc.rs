@@ -97,7 +97,8 @@ impl VarTable {
             // only merge when their ranges are adjacent. Ordinary names are
             // the same source variable split into multiple ranges by the
             // compiler (e.g. around try-with-resources scaffolding) and
-            // always merge.
+            // merge when the ranges are near or the gap between them is
+            // clean (no foreign occupant, no accesses).
             fn synthetic_name(n: &str) -> bool {
                 let b = n.as_bytes();
                 b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'$' || *c == b'_')
@@ -109,6 +110,74 @@ impl VarTable {
             lvt.sort_by_key(|(s0, _, _, _, sl)| (*sl, *s0));
             let all = lvt.clone();
             let lvtt_ref = &lvtt;
+            // (slot, pc, is_store) for every typed local access, in pc
+            // order — used to keep a long-gap merge honest about accesses
+            // inside the gap.
+            let accesses: Vec<(u16, u16, bool)> = code_attribute(pc, m_idx)
+                .map(|code| {
+                    use jcdc_classfile::instruction::{decode_all, Opcode};
+                    decode_all(&code.code)
+                        .into_iter()
+                        .filter_map(|ins| {
+                            let (slot, is_store) = match ins.op {
+                                Opcode::Iinc => (ins.a as u16, true),
+                                Opcode::Iload => (ins.a as u16, false),
+                                Opcode::Istore => (ins.a as u16, true),
+                                Opcode::Iload0 => (0, false),
+                                Opcode::Istore0 => (0, true),
+                                Opcode::Iload1 => (1, false),
+                                Opcode::Istore1 => (1, true),
+                                Opcode::Iload2 => (2, false),
+                                Opcode::Istore2 => (2, true),
+                                Opcode::Iload3 => (3, false),
+                                Opcode::Istore3 => (3, true),
+                                Opcode::Lload => (ins.a as u16, false),
+                                Opcode::Lstore => (ins.a as u16, true),
+                                Opcode::Lload0 => (0, false),
+                                Opcode::Lstore0 => (0, true),
+                                Opcode::Lload1 => (1, false),
+                                Opcode::Lstore1 => (1, true),
+                                Opcode::Lload2 => (2, false),
+                                Opcode::Lstore2 => (2, true),
+                                Opcode::Lload3 => (3, false),
+                                Opcode::Lstore3 => (3, true),
+                                Opcode::Fload => (ins.a as u16, false),
+                                Opcode::Fstore => (ins.a as u16, true),
+                                Opcode::Fload0 => (0, false),
+                                Opcode::Fstore0 => (0, true),
+                                Opcode::Fload1 => (1, false),
+                                Opcode::Fstore1 => (1, true),
+                                Opcode::Fload2 => (2, false),
+                                Opcode::Fstore2 => (2, true),
+                                Opcode::Fload3 => (3, false),
+                                Opcode::Fstore3 => (3, true),
+                                Opcode::Dload => (ins.a as u16, false),
+                                Opcode::Dstore => (ins.a as u16, true),
+                                Opcode::Dload0 => (0, false),
+                                Opcode::Dstore0 => (0, true),
+                                Opcode::Dload1 => (1, false),
+                                Opcode::Dstore1 => (1, true),
+                                Opcode::Dload2 => (2, false),
+                                Opcode::Dstore2 => (2, true),
+                                Opcode::Dload3 => (3, false),
+                                Opcode::Dstore3 => (3, true),
+                                Opcode::Aload => (ins.a as u16, false),
+                                Opcode::Astore => (ins.a as u16, true),
+                                Opcode::Aload0 => (0, false),
+                                Opcode::Astore0 => (0, true),
+                                Opcode::Aload1 => (1, false),
+                                Opcode::Astore1 => (1, true),
+                                Opcode::Aload2 => (2, false),
+                                Opcode::Astore2 => (2, true),
+                                Opcode::Aload3 => (3, false),
+                                Opcode::Astore3 => (3, true),
+                                _ => return None,
+                            };
+                            Some((slot, ins.pc, is_store))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             for e in lvt.drain(..) {
                 let same_var = |m: &(u16, u16, String, String, u16)| {
                     if m.4 != e.4 || m.2 != e.2 || m.3 != e.3 {
@@ -130,18 +199,36 @@ impl VarTable {
                     if synthetic_name(&e.2) {
                         return e.0 <= m.1 + 16 && m.0 <= e.1 + 16;
                     }
-                    // Same ordinary name in one slot: merge only when the
-                    // ranges OVERLAP or nearly touch (the compiler split
-                    // one variable's live range around a branch) — merging
-                    // DISJOINT ranges fabricates liveness across the gap
+                    let near = m.0 <= e.1 + 16 && e.0 <= m.1 + 16;
+                    // Same ordinary name in one slot across a LONG gap:
+                    // javac splits a variable's live range around
+                    // try-with-resources exception scaffolding (jdk7
+                    // Legacy7.twr: r[53..86] and r[129..149] — the gap
+                    // holds the close/addSuppressed duplication). Merge
+                    // anyway when the gap is CLEAN: no foreign LVT
+                    // occupant (checked below) and no bytecode access to
+                    // the slot strictly inside the gap. The 8-byte store
+                    // lead-in of e's own range is exempt (javac starts
+                    // the range just after the storing instruction).
+                    // Without the merge the two identities declare the
+                    // same name in nested scopes: disambiguation renames
+                    // the body decl (r1) and the post-try read binds the
+                    // hoisted `= null` twin — twr() returned null.
+                    // Disjoint ranges whose gap is NOT clean still must
+                    // not merge: that fabricates liveness across the gap
                     // and swallows other slot occupants there (jdk11
                     // ResourceBundle.getCandidateLocales: two sibling
                     // `for (String v : variants)` loops merged, and the
                     // string-switch int index living in the gap between
-                    // them became `v = -1` on a String). A different
-                    // variable between the ranges also blocks the merge
-                    // (slot 7: dst[96..317], b[438..461], dst[580..605]).
-                    if !(m.0 <= e.1 + 16 && e.0 <= m.1 + 16) {
+                    // them became `v = -1` on a String).
+                    let gap_clean = m.1 <= e.0
+                        && !accesses.iter().any(|(sl, apc, _)| {
+                            *sl == e.4
+                                && *apc > m.1
+                                && *apc < e.0
+                                && e.0.saturating_sub(*apc) > 8
+                        });
+                    if !near && !gap_clean {
                         return false;
                     }
                     let lo = m.1.min(e.1);

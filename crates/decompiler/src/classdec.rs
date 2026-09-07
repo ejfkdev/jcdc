@@ -9373,7 +9373,12 @@ fn raw_witness_generic_method_args(e: &mut Expr, pool: &ClassPool, pc: &PoolClas
                     return false;
                 }
                 (0..args.len()).any(|j| {
-                    if j == i {
+                    // VARARGS calls carry more expanded args than the
+                    // Signature has formals (Arrays.asList("a","b") vs
+                    // (T[])List<T>): the variadic tail's formal is always
+                    // G::Array, which the cast loop below skips anyway,
+                    // so tail args simply never pin.
+                    if j == i || j >= msig.args.len() {
                         return false;
                     }
                     let mut tvs_j: Vec<String> = Vec::new();
@@ -9729,6 +9734,13 @@ pub(crate) fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolC
                         jcdc_jvm::JavaType::Void => jcdc_jvm::GenericType::Primitive('V'),
                     }
                 }
+                // A PARAMETERIZED literal type (`Class<Object[]>`) must
+                // keep its full G form: flattening G->J erased the
+                // parameterization and Arrays.copyOf's comparison lost
+                // its (Object) casts.
+                if let TypeRef::G(g) = t {
+                    return Some(("java/lang/Class".to_string(), vec![g.clone()]));
+                }
                 let g = match t {
                     TypeRef::J(jt) => jt_to_g(jt),
                     TypeRef::G(g) => g.clone(),
@@ -9816,8 +9828,142 @@ pub(crate) fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolC
             }
         }
     }
+    /// A wildcard-parameterized argument at a GENERIC method's
+    /// method-typevar-parameterized formal is a capture-conversion javac
+    /// frequently fails (jdk11 Collections: `min(coll)` with
+    /// coll:Collection<? extends T> unbounded — "推论变量 T#2 具有不兼容的
+    /// 上限"; binarySearch's List<? extends T> against
+    /// List<? extends Comparable<? super T#2>>). The source carried a RAW
+    /// erasure cast (`(Collection) coll` / `(List<? extends Comparable
+    /// <? super T>>) list`) that javac elides from the bytecode when the
+    /// erasures coincide. Restore the raw form: the call becomes
+    /// unchecked-applicable exactly like the source.
+    fn raw_witness_capture_call_args(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
+        let (cls, name, desc) = match &*e {
+            Expr::Method { cls, name, desc, type_args, .. } if type_args.is_empty() => {
+                (cls.clone(), name.clone(), desc.clone())
+            }
+            _ => return,
+        };
+        if name == "<init>" {
+            return;
+        }
+        let want_desc = format!(
+            "({}){}",
+            desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+            desc.ret.to_descriptor()
+        );
+        let dpc;
+        let dref: &PoolClass = if cls == pc.internal_name {
+            pc
+        } else {
+            match pool.get(&cls) {
+                Some(p) => {
+                    dpc = p;
+                    &dpc
+                }
+                None => return,
+            }
+        };
+        let Some(mi) = (0..dref.cf.methods.len())
+            .find(|&i| dref.method_name(i) == Some(name.as_str()) && desc_raw(dref, i) == want_desc)
+        else {
+            return;
+        };
+        let Some(msig) = method_signature_of(dref, mi) else {
+            return;
+        };
+        if msig.params.is_empty() {
+            return;
+        }
+        let tvar_names: Vec<String> = msig.params.iter().map(|p| p.name.clone()).collect();
+        let Expr::Method { args, .. } = e else { return };
+        for (i, a) in args.iter_mut().enumerate() {
+            if matches!(a, Expr::Cast { .. } | Expr::Const(_) | Expr::Lambda(_)) {
+                continue;
+            }
+            if is_generic_call(a, pool) {
+                continue;
+            }
+            let TypeRef::G(jcdc_jvm::GenericType::Class(ca)) = a.type_ref() else {
+                continue;
+            };
+            if !ca.parts.iter().any(|p| p.args.iter().any(crate::classdec::g_has_wildcard)) {
+                continue;
+            }
+            let Some(formal) = msig.args.get(i) else { continue };
+            if !matches!(
+                formal,
+                jcdc_jvm::GenericType::Class(_) | jcdc_jvm::GenericType::Array(_)
+            ) || !g_mentions_tvar_named(formal, &tvar_names)
+            {
+                continue;
+            }
+            // Fire only when capture conversion is plausibly doomed: a
+            // mentioned callee typevar with a NON-TRIVIAL bound (min's
+            // `T#2 extends Comparable<? super T#2>`) or nested inside a
+            // parameterized class in the formal (binarySearch's
+            // `List<? extends Comparable<? super T#2>>`). Unbounded
+            // direct formals (`checkedEntry(Entry<? extends K,..>)`)
+            // capture-instantiate fine — a raw cast there broke
+            // CheckedEntrySet's accept chain instead.
+            fn tvar_depth(g: &jcdc_jvm::GenericType, names: &[String], depth: usize) -> usize {
+                use jcdc_jvm::GenericType as G;
+                match g {
+                    G::TypeVar(n) if names.iter().any(|t| t == n) => depth,
+                    G::Array(i) => tvar_depth(i, names, depth),
+                    G::Class(cs) => cs
+                        .parts
+                        .iter()
+                        .flat_map(|p| p.args.iter())
+                        .map(|a| tvar_depth(a, names, depth + 1))
+                        .max()
+                        .unwrap_or(0),
+                    G::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
+                    | G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => {
+                        tvar_depth(t, names, depth)
+                    }
+                    _ => 0,
+                }
+            }
+            fn nontrivial_bound(p: &jcdc_jvm::TypeParam) -> bool {
+                if !p.interface_bounds.is_empty() {
+                    return true;
+                }
+                match &p.class_bound {
+                    None => false,
+                    Some(jcdc_jvm::GenericType::Class(cs)) => {
+                        !(cs.parts.len() == 1
+                            && cs.parts[0].name == "Object"
+                            && cs.parts[0].args.is_empty())
+                    }
+                    Some(jcdc_jvm::GenericType::TypeVar(_)) => true,
+                    _ => false,
+                }
+            }
+            let mentioned: Vec<String> = tvar_names
+                .iter()
+                .filter(|n| {
+                    g_mentions_tvar_named(formal, std::slice::from_ref(n))
+                })
+                .cloned()
+                .collect();
+            let nested = tvar_depth(formal, &tvar_names, 0) >= 2;
+            let bounded = msig
+                .params
+                .iter()
+                .any(|p| mentioned.iter().any(|m| m == &p.name) && nontrivial_bound(p));
+            if !nested && !bounded {
+                continue;
+            }
+            let raw = TypeRef::J(TypeRef::G(formal.clone()).erased());
+            let inner = std::mem::replace(a, Expr::This);
+            *a = Expr::Cast { ty: raw, e: Box::new(inner) };
+        }
+    }
     fn fix_expr(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
         incomparable_class_cmp(e, pool);
+        raw_witness_capture_call_args(e, pool, pc);
         let params = instantiated_method_params(e, pool, pc);
         // An Object descriptor param that instantiates to something else is
         // the ERASURE of a generic parameter (accept(T) → (Object)V), not
