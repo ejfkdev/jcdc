@@ -8855,6 +8855,84 @@ fn instantiated_method_params(
     // declared as Sink<T>.accept(T)) — BFS down the super chain, carrying
     // each hop's type arguments, until a class actually declares
     // name+d_str with a usable Signature.
+    //
+    // Gate: only walk when the START class cannot host the call at source
+    // level itself — no own method with name+d_str at all (bridges count:
+    // when the receiver's parameterized type exposes an applicable bridge,
+    // the call was source-resolved THERE and walking would re-instantiate
+    // against sloppily-typed owner generics: `(T) this.state` for
+    // combiner.apply — ReduceOps/ReferencePipeline/Collections x25).
+    let start_walk = {
+        let owned0;
+        let cref0: &PoolClass = if decl == pc.internal_name {
+            pc
+        } else {
+            match pool.get(&decl) {
+                Some(p) => {
+                    owned0 = p;
+                    &owned0
+                }
+                None => return None,
+            }
+        };
+        !(0..cref0.cf.methods.len())
+            .any(|i| cref0.method_name(i) == Some(name) && desc_raw(cref0, i) == d_str)
+    };
+    if !start_walk {
+        // Old direct-resolution behavior: require the Signature-carrying
+        // declaration right on the receiver class.
+        let owned0;
+        let cref0: &PoolClass = if decl == pc.internal_name {
+            pc
+        } else {
+            match pool.get(&decl) {
+                Some(p) => {
+                    owned0 = p;
+                    &owned0
+                }
+                None => return None,
+            }
+        };
+        let mi0 = (0..cref0.cf.methods.len()).find(|&i| {
+            cref0.method_name(i) == Some(name) && desc_raw(cref0, i) == d_str
+        })?;
+        let sb0 = cref0.cf.methods[mi0].attributes.iter().find_map(|a| {
+            if cref0.utf8(a.attribute_name_index) == Some("Signature") {
+                Some(a.info.as_slice())
+            } else {
+                None
+            }
+        })?;
+        if sb0.len() < 2 {
+            return None;
+        }
+        let msig0 = cref0
+            .utf8(u16::from_be_bytes([sb0[0], sb0[1]]))
+            .and_then(|x| jcdc_jvm::parse_method_signature(x))?;
+        if !msig0.params.is_empty() {
+            return None;
+        }
+        let cp0 = cref0.class_attr("Signature").and_then(|b| {
+            if b.len() < 2 {
+                return None;
+            }
+            cref0
+                .utf8(u16::from_be_bytes([b[0], b[1]]))
+                .and_then(|x| parse_class_signature(x))
+        })?;
+        if cp0.params.len() != args.len() {
+            return None;
+        }
+        let inst0: Vec<jcdc_jvm::GenericType> = msig0
+            .args
+            .iter()
+            .map(|t| crate::method::subst_typevars(t, &cp0.params, &args))
+            .collect();
+        if inst0.iter().any(crate::method::has_nested_wildcard) {
+            return None;
+        }
+        return Some(inst0);
+    }
     let mut queue: std::collections::VecDeque<(String, Vec<jcdc_jvm::GenericType>)> =
         std::collections::VecDeque::new();
     queue.push_back((decl.clone(), args.clone()));
