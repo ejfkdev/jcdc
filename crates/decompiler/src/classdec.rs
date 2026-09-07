@@ -1385,7 +1385,10 @@ fn is_trivial_inner_ctor(pc: &PoolClass, pool: &ClassPool, mi: usize) -> bool {
         .filter_map(|f| pc.utf8(f.name_index).map(|s| s.to_string()))
         .collect();
     stmts.iter().all(|st| match st {
-        Stmt::ExprStmt(Expr::Method { name: n, .. }) if n == "<init>" => true,
+        Stmt::ExprStmt(Expr::Method { name: n, args, .. }) if n == "<init>" => {
+                args.len() <= 2
+                    && args.iter().all(|a| matches!(a, Expr::This | Expr::Local { .. }))
+            }
         Stmt::ExprStmt(Expr::Method { name: n, cls, .. })
             if n == "requireNonNull" && cls == "java/util/Objects" => true,
         Stmt::ExprStmt(Expr::Assign { target, .. }) => match &**target {
@@ -1675,10 +1678,18 @@ fn is_synthetic_record_method(pc: &PoolClass, pool: &ClassPool, mi: usize) -> bo
             let stmts = stmt_vec(&mb.body);
             let trivial = !stmts.is_empty()
                 && stmts.iter().all(|st| match st {
-                    Stmt::ExprStmt(Expr::Method { name: n, cls, .. })
+                    Stmt::ExprStmt(Expr::Method { name: n, cls, args, .. })
                         if n == "<init>" && cls != &pc.internal_name =>
                     {
-                        true
+                        // Only a synthetic delegation (outer-instance /
+                        // marker passthrough) is trivial: super(outer,
+                        // SRC_BIDI) carries a source-level super call
+                        // (jdk11 UCharacterProperty BiDiIntProperty's ctor
+                        // vanished, leaving the class without one).
+                        args.len() <= 2
+                            && args
+                                .iter()
+                                .all(|a| matches!(a, Expr::This | Expr::Local { .. }))
                     }
                     Stmt::ExprStmt(Expr::Method { name: n, cls, .. })
                         if n == "requireNonNull" && cls == "java/util/Objects" => true,
@@ -1704,10 +1715,18 @@ fn is_synthetic_record_method(pc: &PoolClass, pool: &ClassPool, mi: usize) -> bo
             let stmts = stmt_vec(&mb.body);
             let trivial = !stmts.is_empty()
                 && stmts.iter().all(|st| match st {
-                    Stmt::ExprStmt(Expr::Method { name: n, cls, .. })
+                    Stmt::ExprStmt(Expr::Method { name: n, cls, args, .. })
                         if n == "<init>" && cls != &pc.internal_name =>
                     {
-                        true
+                        // Only a synthetic delegation (outer-instance /
+                        // marker passthrough) is trivial: super(outer,
+                        // SRC_BIDI) carries a source-level super call
+                        // (jdk11 UCharacterProperty BiDiIntProperty's ctor
+                        // vanished, leaving the class without one).
+                        args.len() <= 2
+                            && args
+                                .iter()
+                                .all(|a| matches!(a, Expr::This | Expr::Local { .. }))
                     }
                     Stmt::ExprStmt(Expr::Assign { target, .. }) => matches!(&**target, Expr::Field { .. }),
                     Stmt::Return(None) => true,
@@ -10293,6 +10312,34 @@ fn method_ref_inst_type_args(
                     jcdc_jvm::JavaType::Double => G::Primitive('D'),
                     jcdc_jvm::JavaType::Void => G::Primitive('V'),
                 }
+            }
+            // An instantiated type that is a RAW GENERIC class
+            // (Stream.<Set>map from an erased instantiatedMethodType)
+            // poisons the downstream chain with rawtype inference —
+            // javac's real type argument was parameterized and is not
+            // recoverable from the descriptor. Only allow raw forms of
+            // NON-generic classes (ConstantDesc), primitives and arrays.
+            let raw_generic = |jt: &jcdc_jvm::JavaType| -> bool {
+                if let jcdc_jvm::JavaType::Object(n) = jt {
+                    if let Some(cpc) = pool.get(n) {
+                        return cpc
+                            .class_attr("Signature")
+                            .and_then(|b| {
+                                if b.len() >= 2 {
+                                    cpc.utf8(u16::from_be_bytes([b[0], b[1]]))
+                                        .and_then(|x| parse_class_signature(x))
+                                } else {
+                                    None
+                                }
+                            })
+                            .map(|cs| !cs.params.is_empty())
+                            .unwrap_or(false);
+                    }
+                }
+                false
+            };
+            if inst.args.iter().any(&raw_generic) || raw_generic(&inst.ret) {
+                return None;
             }
             // SAM class typevar name -> instantiated concrete type.
             let mut sam_vals: Vec<(String, G)> = Vec::new();
