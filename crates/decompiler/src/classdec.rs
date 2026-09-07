@@ -2841,7 +2841,7 @@ fn emit_method_with(
             // ctor-arg witnesses (jdk11 ClassValue.refreshVersion's
             // `new Entry<>(v2, (T) value)` arrives via an inlined
             // access$000 ctor accessor).
-            fix_diamond_localdefs(&mut body, &mb.vt, pool);
+            fix_diamond_localdefs(&mut body, &mb.vt, pool, pc);
             // Accessor inlining can expose the real generic callee only
             // now; retry the return witnesses (idempotent).
             add_return_witnesses(&mut body, msig.as_ref(), pool, pc);
@@ -9821,14 +9821,30 @@ fn instantiated_ctor_params_core(
     if class_params.len() != inst_args.len() {
         return None;
     }
-    let mi = (0..dpc.cf.methods.len()).find(|&i| {
-        dpc.method_name(i) == Some("<init>")
-            && dpc
-                .method_desc(i)
-                .and_then(|d| parse_method_descriptor(d))
-                .map(|md| md.args.len() == nargs)
-                .unwrap_or(false)
-    })?;
+    // Among same-arity ctors prefer one WITH a Signature attribute:
+    // javac omits it when the generic form equals the descriptor, and a
+    // primitive-form sibling (HashMap(int) vs HashMap(Map<? extends K,
+    // ? extends V>)) would otherwise win the table-order scan and bail
+    // the whole resolution (jdk17 PropertyResourceBundle lookup diamond).
+    let has_sig = |i: usize| {
+        dpc.cf.methods[i]
+            .attributes
+            .iter()
+            .any(|a| dpc.utf8(a.attribute_name_index) == Some("Signature"))
+    };
+    let arity_ok = |i: usize| {
+        dpc.method_desc(i)
+            .and_then(|d| parse_method_descriptor(d))
+            .map(|md| md.args.len() == nargs)
+            .unwrap_or(false)
+    };
+    let mi = (0..dpc.cf.methods.len())
+        .find(|&i| dpc.method_name(i) == Some("<init>") && arity_ok(i) && has_sig(i))
+        .or_else(|| {
+            (0..dpc.cf.methods.len())
+                .find(|&i| dpc.method_name(i) == Some("<init>") && arity_ok(i))
+        });
+    let mi = mi?;
     let sig_bytes = dpc.cf.methods[mi].attributes.iter().find_map(|a| {
         if dpc.utf8(a.attribute_name_index) == Some("Signature") {
             Some(a.info.as_slice())
@@ -10067,6 +10083,37 @@ fn apply_param_casts(
                     }
                     if matches!(a, Expr::Cast { .. } | Expr::Const(_)) {
                         continue;
+                    }
+                    // An actual whose erasure is a SUBTYPE of a wildcard-
+                    // parameterized formal's class needs the RAW source
+                    // cast: the precise form is inconvertible and the bare
+                    // actual poisons diamond/inference (jdk17
+                    // PropertyResourceBundle this.lookup = new HashMap<>
+                    // ((Map) properties) — with the bare Properties actual
+                    // the diamond's K got an Object upper bound against
+                    // the String equality constraint, 无法推断HashMap<>).
+                    if let (
+                        TypeRef::J(jcdc_jvm::JavaType::Object(an)),
+                        jcdc_jvm::GenericType::Class(cw),
+                    ) = (&a.type_ref(), &want)
+                    {
+                        let cw_internal = crate::method::classsig_internal(cw);
+                        if cw.parts.iter().any(|p| {
+                            p.args.iter().any(crate::classdec::g_has_wildcard)
+                        }) && an != &cw_internal
+                            && !matches!(a, Expr::Cast { .. } | Expr::Const(_) | Expr::Lambda(_))
+                            && is_subtype_of(
+                                pool,
+                                &jcdc_jvm::JavaType::Object(an.clone()),
+                                &cw_internal,
+                            )
+                        {
+                            let raw =
+                                TypeRef::J(jcdc_jvm::JavaType::Object(cw_internal.clone()));
+                            let inner = std::mem::replace(a, Expr::This);
+                            *a = Expr::Cast { ty: raw, e: Box::new(inner) };
+                            continue;
+                        }
                     }
                     // Erasures must line up. A TypeVar formal erases to
                     // its leftmost BOUND, not Object (jdk11 Nodes.
@@ -11018,7 +11065,7 @@ pub(crate) fn cast_wildcard_call_args(
         }
         walk_expr_children(e, pool, pc, &mut |x, p2, c2| fix_expr(x, p2, c2, caller_params));
     }
-    fix_diamond_localdefs(s, vt, pool);
+    fix_diamond_localdefs(s, vt, pool, pc);
     walk_stmt_exprs(s, pool, pc, &mut |x, p2, c2| fix_expr(x, p2, c2, caller_params));
 }
 
@@ -11129,7 +11176,7 @@ fn diamond_args_from_target(
     None
 }
 
-fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &ClassPool) {
+fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &ClassPool, pc: &PoolClass) {
     fn inst_from(
         ty: &TypeRef,
         value: &Expr,
@@ -11197,6 +11244,20 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
             let target = match &*inner {
                 Expr::Assign { target, value, .. } => match &**target {
                     Expr::Local { var, .. } => inst_from(&vt.var(*var).ty, value, pool),
+                    // Diamond new assigned to an INSTANCE field: the
+                    // field's instantiated Signature type is the diamond's
+                    // target (jdk17 PropertyResourceBundle: this.lookup =
+                    // new HashMap<>(properties) against Map<String,Object>).
+                    Expr::Field { owner, cls, name, is_static: false, .. } => {
+                        crate::method::instantiated_field_type(
+                            owner.as_deref(),
+                            cls,
+                            name,
+                            pool,
+                            pc,
+                        )
+                        .and_then(|ty| inst_from(&ty, value, pool))
+                    }
                     _ => None,
                 },
                 _ => None,
@@ -11209,48 +11270,48 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
                 }
             }
         }
-        Stmt::Block(v) => v.iter_mut().for_each(|x| fix_diamond_localdefs(x, vt, pool)),
+        Stmt::Block(v) => v.iter_mut().for_each(|x| fix_diamond_localdefs(x, vt, pool, pc)),
         Stmt::If { then_stmt, else_stmt, .. } => {
-            fix_diamond_localdefs(then_stmt, vt, pool);
+            fix_diamond_localdefs(then_stmt, vt, pool, pc);
             if let Some(x) = else_stmt {
-                fix_diamond_localdefs(x, vt, pool);
+                fix_diamond_localdefs(x, vt, pool, pc);
             }
         }
         Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::ForEach { body, .. }
         | Stmt::Labeled { body, .. } | Stmt::Synchronized { body, .. } => {
-            fix_diamond_localdefs(body, vt, pool)
+            fix_diamond_localdefs(body, vt, pool, pc)
         }
         Stmt::For { init, body, .. } => {
-            init.iter_mut().for_each(|i| fix_diamond_localdefs(i, vt, pool));
-            fix_diamond_localdefs(body, vt, pool);
+            init.iter_mut().for_each(|i| fix_diamond_localdefs(i, vt, pool, pc));
+            fix_diamond_localdefs(body, vt, pool, pc);
         }
         Stmt::Switch { cases, default, .. } => {
             for c in cases.iter_mut() {
-                c.body.iter_mut().for_each(|st| fix_diamond_localdefs(st, vt, pool));
+                c.body.iter_mut().for_each(|st| fix_diamond_localdefs(st, vt, pool, pc));
             }
             if let Some(d) = default {
-                fix_diamond_localdefs(d, vt, pool);
+                fix_diamond_localdefs(d, vt, pool, pc);
             }
         }
         Stmt::Try { body, catches, finally } => {
-            fix_diamond_localdefs(body, vt, pool);
+            fix_diamond_localdefs(body, vt, pool, pc);
             for c in catches.iter_mut() {
-                fix_diamond_localdefs(&mut c.body, vt, pool);
+                fix_diamond_localdefs(&mut c.body, vt, pool, pc);
             }
             if let Some(f) = finally {
-                fix_diamond_localdefs(f, vt, pool);
+                fix_diamond_localdefs(f, vt, pool, pc);
             }
         }
         Stmt::TryWithResources { resources, body, catches, finally } => {
             for r in resources.iter_mut() {
-                fix_diamond_localdefs(r, vt, pool);
+                fix_diamond_localdefs(r, vt, pool, pc);
             }
-            fix_diamond_localdefs(body, vt, pool);
+            fix_diamond_localdefs(body, vt, pool, pc);
             for c in catches.iter_mut() {
-                fix_diamond_localdefs(&mut c.body, vt, pool);
+                fix_diamond_localdefs(&mut c.body, vt, pool, pc);
             }
             if let Some(f) = finally {
-                fix_diamond_localdefs(f, vt, pool);
+                fix_diamond_localdefs(f, vt, pool, pc);
             }
         }
         _ => {}
