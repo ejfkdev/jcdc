@@ -8967,6 +8967,26 @@ fn instantiated_method_params(
             resolved = Some((cur, cur_args));
             break;
         }
+        // Expanding with fewer instantiation args than the class declares
+        // typevars leaves FOREIGN typevars unsubstituted (raw-owner call
+        // BinaryOperator.apply with args=[] would carry BinaryOperator's
+        // own `(T)` into the param casts — ReduceOps `(T) this.state`).
+        // Such a path carries no real instantiation; drop it.
+        let own_params = cref
+            .class_attr("Signature")
+            .and_then(|b| {
+                if b.len() >= 2 {
+                    cref.utf8(u16::from_be_bytes([b[0], b[1]]))
+                        .and_then(|x| parse_class_signature(x))
+                } else {
+                    None
+                }
+            })
+            .map(|cs| cs.params.len())
+            .unwrap_or(0);
+        if own_params > cur_args.len() {
+            continue;
+        }
         for (sn, sargs) in class_supers_args(cref, &cur_args) {
             if seen.insert(sn.clone()) {
                 queue.push_back((sn, sargs));
@@ -9019,6 +9039,48 @@ fn instantiated_method_params(
     // Captured owner arguments can nest wildcards, which is not valid Java.
     if inst.iter().any(crate::method::has_nested_wildcard) {
         return None;
+    }
+    // The instantiated parameter types must be expressible at the call
+    // site: a typevar only renders legally when the enclosing class
+    // declares it (CAST_BANNED_TVARS covers static contexts downstream).
+    fn mentions_tvar(g: &jcdc_jvm::GenericType) -> bool {
+        use jcdc_jvm::GenericType as G;
+        match g {
+            G::TypeVar(_) => true,
+            G::Array(i) => mentions_tvar(i),
+            G::Class(cs) => cs.parts.iter().any(|p| p.args.iter().any(mentions_tvar)),
+            G::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
+            | G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => mentions_tvar(t),
+            _ => false,
+        }
+    }
+    if inst.iter().any(mentions_tvar) {
+        let in_scope: HashSet<String> = pc
+            .class_attr("Signature")
+            .and_then(|b| {
+                if b.len() >= 2 {
+                    pc.utf8(u16::from_be_bytes([b[0], b[1]]))
+                        .and_then(|x| parse_class_signature(x))
+                } else {
+                    None
+                }
+            })
+            .map(|cs| cs.params.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default();
+        fn all_tvars_in(g: &jcdc_jvm::GenericType, scope: &HashSet<String>) -> bool {
+            use jcdc_jvm::GenericType as G;
+            match g {
+                G::TypeVar(n) => scope.contains(n),
+                G::Array(i) => all_tvars_in(i, scope),
+                G::Class(cs) => cs.parts.iter().all(|p| p.args.iter().all(|a| all_tvars_in(a, scope))),
+                G::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
+                | G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => all_tvars_in(t, scope),
+                _ => true,
+            }
+        }
+        if !inst.iter().all(|t| all_tvars_in(t, &in_scope)) {
+            return None;
+        }
     }
     Some(inst)
 }
