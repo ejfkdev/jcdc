@@ -2306,6 +2306,74 @@ fn emit_field_impl(pc: &PoolClass, pool: &ClassPool, fi: usize, out: &mut String
     Ok(())
 }
 
+/// Instance-final fields whose declaration prints a ConstantValue
+/// initializer: javac still emits the putfield into every ctor, which
+/// the source form must not keep — the field is final and already
+/// initialized ("无法为 final 变量 BITARRAYMASK 分配值" — jdk11
+/// MergeCollation x3, ProcessHandleImpl x2, AccessorGenerator x2,
+/// jdk17 MemoryCache QueueCacheEntry, jdk26 LinuxRISCV64CallArranger x2).
+/// Drop `this.F = <const>;` for exactly those F in ctor bodies.
+fn prune_const_final_ctor_assigns(s: &mut Stmt, pc: &PoolClass) {
+    let names: HashSet<String> = pc
+        .cf
+        .fields
+        .iter()
+        .filter(|f| {
+            !f.access_flags.contains(FieldAccessFlags::STATIC)
+                && f.access_flags.contains(FieldAccessFlags::FINAL)
+                && f.attributes
+                    .iter()
+                    .any(|a| pc.utf8(a.attribute_name_index) == Some("ConstantValue"))
+        })
+        .filter_map(|f| pc.utf8(f.name_index).map(|n| n.to_string()))
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    fn is_target_assign(st: &Stmt, names: &HashSet<String>) -> bool {
+        let Stmt::ExprStmt(Expr::Assign { target, op: crate::expr::AssignOp::Plain, value }) = st
+        else {
+            return false;
+        };
+        if !matches!(value.as_ref(), Expr::Const(_)) {
+            return false;
+        }
+        match target.as_ref() {
+            Expr::Field { owner, name, is_static: false, .. } => {
+                (owner.is_none() || matches!(owner.as_deref(), Some(Expr::This)))
+                    && names.contains(name)
+            }
+            _ => false,
+        }
+    }
+    fn rec(s: &mut Stmt, names: &HashSet<String>) {
+        match s {
+            Stmt::Block(v) => {
+                v.retain(|st| !is_target_assign(st, names));
+                v.iter_mut().for_each(|x| rec(x, names));
+            }
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                rec(then_stmt, names);
+                if let Some(e) = else_stmt {
+                    rec(e, names);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                rec(body, names);
+                for c in catches.iter_mut() {
+                    rec(&mut c.body, names);
+                }
+                if let Some(f) = finally {
+                    rec(f, names);
+                }
+            }
+            Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => rec(body, names),
+            _ => {}
+        }
+    }
+    rec(s, &names);
+}
+
 fn emit_method(
     pc: &PoolClass,
     pool: &ClassPool,
@@ -2674,6 +2742,7 @@ fn emit_method_with(
                 }
                 // anonymous/local subclass: drop a no-arg super() call
                 strip_trivial_super(&mut body, pc);
+                prune_const_final_ctor_assigns(&mut body, pc);
                 // javac evaluates a delegated `this(expr)` argument before
                 // the call, which decompiles into assignments + mid-body
                 // this(...) calls (invalid Java). Collapse them back into a
@@ -9240,7 +9309,12 @@ fn witness_ambiguous_lambda_args(e: &mut Expr, pool: &ClassPool, pc: &PoolClass)
         }
     }
     for (i, a) in args.iter_mut().enumerate() {
-        if !ambiguous[i] || !matches!(a, Expr::Lambda(_)) {
+        // VARARGS calls carry more expanded args than the descriptor has
+        // formals (ObjectInputStream's `readObject(String...)`-style sites):
+        // the tail args map to the array formal — never SAM-ambiguous
+        // positions, and indexing ambiguous/desc.args past the formal count
+        // panicked (MethodHandles, ObjectInputStream, ModuleInfo...).
+        if i >= ambiguous.len() || !ambiguous[i] || !matches!(a, Expr::Lambda(_)) {
             continue;
         }
         let mut sam = TypeRef::J(desc.args[i].clone());
@@ -9828,6 +9902,172 @@ pub(crate) fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolC
             }
         }
     }
+    /// An owner whose static type is wildcard-parameterized at a formal
+    /// that lands in INPUT position: javac capture-converts the owner to
+    /// a fresh CAP#1 and the source-typed actual becomes inconvertible
+    /// (jdk11 UnmodifiableMap.getOrDefault: field m is
+    /// Map<? extends K, ? extends V>, formal V substitutes to
+    /// `? extends V`, actual defaultValue:V — "V无法转换为CAP#1"). The
+    /// source carried a de-wildcarded owner cast that leaves NO bytecode
+    /// trace when the erasures coincide (`((Map<K, V>)m)`). Restore it:
+    /// ? extends X / ? super X strip to X. The cast is a legal same-
+    /// erasure downcast; every formal that mentioned a stripped wildcard
+    /// now accepts the source-typed actuals.
+    fn owner_wildcard_cast(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
+        use jcdc_jvm::GenericType as G;
+        fn subst_g(
+            g: &G,
+            names: &[jcdc_jvm::TypeParam],
+            args: &[G],
+        ) -> G {
+            match g {
+                G::TypeVar(n) => names
+                    .iter()
+                    .position(|p| &p.name == n)
+                    .and_then(|i| args.get(i))
+                    .cloned()
+                    .unwrap_or_else(|| g.clone()),
+                G::Class(cs) => G::Class(jcdc_jvm::ClassSig {
+                    package: cs.package.clone(),
+                    parts: cs
+                        .parts
+                        .iter()
+                        .map(|p| jcdc_jvm::ClassSigPart {
+                            name: p.name.clone(),
+                            args: p.args.iter().map(|a| subst_g(a, names, args)).collect(),
+                        })
+                        .collect(),
+                }),
+                G::Array(i) => G::Array(Box::new(subst_g(i, names, args))),
+                G::Wildcard(jcdc_jvm::WildcardBound::Extends(t)) => {
+                    G::Wildcard(jcdc_jvm::WildcardBound::Extends(Box::new(subst_g(t, names, args))))
+                }
+                G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => {
+                    G::Wildcard(jcdc_jvm::WildcardBound::Super(Box::new(subst_g(t, names, args))))
+                }
+                other => other.clone(),
+            }
+        }
+        let (cls, name, desc_str) = match &*e {
+            Expr::Method {
+                cls,
+                name,
+                desc,
+                owner: Some(_),
+                is_static: false,
+                is_super: false,
+                type_args,
+                ..
+            } if type_args.is_empty() => (
+                cls.clone(),
+                name.clone(),
+                format!(
+                    "({}){}",
+                    desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+                    desc.ret.to_descriptor()
+                ),
+            ),
+            _ => return,
+        };
+        if name == "<init>" {
+            return;
+        }
+        let Expr::Method { owner: Some(owner), args, .. } = e else {
+            return;
+        };
+        if matches!(**owner, Expr::Cast { .. }) {
+            return;
+        }
+        let TypeRef::G(G::Class(cs)) = owner.type_ref() else {
+            return;
+        };
+        let Some(last) = cs.parts.last() else { return };
+        // Only `? extends X` in input position breaks capture; an unbounded
+        // `?` has no source-typed actual to conflict with and no sensible
+        // strip target.
+        if !last
+            .args
+            .iter()
+            .any(|a| matches!(a, G::Wildcard(jcdc_jvm::WildcardBound::Extends(_))))
+            || last
+                .args
+                .iter()
+                .any(|a| matches!(a, G::Wildcard(jcdc_jvm::WildcardBound::Any)))
+        {
+            return;
+        }
+        let dpc;
+        let dref: &PoolClass = if cls == pc.internal_name {
+            pc
+        } else {
+            match pool.get(&cls) {
+                Some(p) => {
+                    dpc = p;
+                    &dpc
+                }
+                None => return,
+            }
+        };
+        let Some(mi) = (0..dref.cf.methods.len())
+            .find(|&i| dref.method_name(i) == Some(name.as_str()) && desc_raw(dref, i) == desc_str)
+        else {
+            return;
+        };
+        let Some(msig) = method_signature_of(dref, mi) else {
+            return;
+        };
+        if msig.args.len() != args.len() {
+            return;
+        }
+        let class_params = dref
+            .class_attr("Signature")
+            .and_then(|b| {
+                if b.len() < 2 {
+                    return None;
+                }
+                let i2 = u16::from_be_bytes([b[0], b[1]]);
+                dref.utf8(i2).and_then(|s| jcdc_jvm::parse_class_signature(s))
+            })
+            .map(|s| s.params)
+            .unwrap_or_default();
+        if class_params.len() != last.args.len() {
+            return;
+        }
+        // Fire only on a concrete capture failure: a formal that substitutes
+        // to exactly `? extends X` against an actual whose type is exactly
+        // X. (`? super X` formals accept X fine — capture yields a supertype.)
+        let broken = msig.args.iter().zip(args.iter()).any(|(formal, actual)| {
+            let subst = subst_g(formal, &class_params, &last.args);
+            match (&subst, actual.type_ref()) {
+                (
+                    G::Wildcard(jcdc_jvm::WildcardBound::Extends(x)),
+                    TypeRef::G(ag),
+                ) => **x == ag,
+                _ => false,
+            }
+        });
+        if !broken {
+            return;
+        }
+        let mut fixed = cs.clone();
+        {
+            let Some(lp) = fixed.parts.last_mut() else {
+                return;
+            };
+            for a in lp.args.iter_mut() {
+                match std::mem::replace(a, G::Primitive('V')) {
+                    G::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
+                    | G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => *a = *t,
+                    other => *a = other,
+                }
+            }
+        }
+        let inner = std::mem::replace(&mut **owner, Expr::This);
+        **owner = Expr::Cast {
+            ty: TypeRef::G(G::Class(fixed)),
+            e: Box::new(inner),
+        };
+    }
     /// A wildcard-parameterized argument at a GENERIC method's
     /// method-typevar-parameterized formal is a capture-conversion javac
     /// frequently fails (jdk11 Collections: `min(coll)` with
@@ -9964,6 +10204,7 @@ pub(crate) fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolC
     fn fix_expr(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
         incomparable_class_cmp(e, pool);
         raw_witness_capture_call_args(e, pool, pc);
+        owner_wildcard_cast(e, pool, pc);
         let params = instantiated_method_params(e, pool, pc);
         // An Object descriptor param that instantiates to something else is
         // the ERASURE of a generic parameter (accept(T) → (Object)V), not

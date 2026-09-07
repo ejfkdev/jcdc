@@ -110,6 +110,12 @@ impl VarTable {
             lvt.sort_by_key(|(s0, _, _, _, sl)| (*sl, *s0));
             let all = lvt.clone();
             let lvtt_ref = &lvtt;
+            // Handler start pcs: an LVT range beginning at one is a catch
+            // parameter binding — scope-local by nature, never a split
+            // live range of an outer variable.
+            let handler_starts: Vec<u16> = code_attribute(pc, m_idx)
+                .map(|code| code.exception_table.iter().map(|t| t.handler_pc).collect())
+                .unwrap_or_default();
             // (slot, pc, is_store) for every typed local access, in pc
             // order — used to keep a long-gap merge honest about accesses
             // inside the gap.
@@ -214,6 +220,16 @@ impl VarTable {
                     // same name in nested scopes: disambiguation renames
                     // the body decl (r1) and the post-try read binds the
                     // hoisted `= null` twin — twr() returned null.
+                    // Catch-parameter ranges (starting at a handler pc or
+                    // just after its astore — the LVT range begins where
+                    // the binding is live, one or two bytes past the
+                    // handler pc) never long-gap merge: same-named catch
+                    // params of sibling handlers are DISTINCT variables
+                    // (jdk17 UnixUserDefinedFileAttributeView.size: two
+                    // `x: UnixException` handlers at 37 and 68 merged
+                    // across the int return temp's gap — the bogus
+                    // identity's hoisted decl hijacked the int store and
+                    // swallowed the catch binding, int↔UnixException x2).
                     // Disjoint ranges whose gap is NOT clean still must
                     // not merge: that fabricates liveness across the gap
                     // and swallows other slot occupants there (jdk11
@@ -221,7 +237,14 @@ impl VarTable {
                     // `for (String v : variants)` loops merged, and the
                     // string-switch int index living in the gap between
                     // them became `v = -1` on a String).
+                    let at_handler = |rs: u16| {
+                        handler_starts
+                            .iter()
+                            .any(|h| rs == *h || rs == h + 1 || rs == h + 2)
+                    };
                     let gap_clean = m.1 <= e.0
+                        && !at_handler(m.0)
+                        && !at_handler(e.0)
                         && !accesses.iter().any(|(sl, apc, _)| {
                             *sl == e.4
                                 && *apc > m.1
