@@ -434,6 +434,7 @@ pub fn decompile_method(
     // types in Local expressions.
     let ret_ty = desc.ret.clone();
     infer_var_types(&mut vt, &mut body, &ret_ty, pc);
+    prune_dead_synth_stores(&mut body, &vt);
     cast_generic_locals(&vt, pool, pc, &mut body);
     cast_object_returns(&mut body, &ret_ty);
     cast_narrowing_assigns(&vt, &mut body);
@@ -645,6 +646,208 @@ fn expr_uses(e: &Expr, used: &mut std::collections::HashSet<u32>) {
         }),
         Expr::Invokedynamic { args, .. } => args.iter().for_each(|a| expr_uses(a, used)),
     }
+}
+
+/// Drop dead stores/declarations of SYNTHETIC gap temps: the
+/// monitorenter store of `synchronized` lands in a slot the block body
+/// reuses for a real local, and the gap temp inherits that local's type
+/// (jdk11 SecurityManager.checkPackageDefinition `String[] var3_42 =
+/// packageDefinitionLock;`, KeepAliveCache `Iterator var2_14 = this;`,
+/// AbstractSelectableChannel `SelectionKey[] var2_11 = keyLock` —
+/// X无法转换为Y x3). The monitor value is never loaded back, so the
+/// store is dead; only prune when the temp has no reads anywhere.
+fn prune_dead_synth_stores(s: &mut Stmt, vt: &VarTable) {
+    use std::collections::HashSet;
+    fn collect_expr_reads(e: &Expr, read: &mut HashSet<u32>) {
+        match e {
+            Expr::Local { var, .. } => {
+                read.insert(*var);
+            }
+            Expr::Assign { target, value, op } => {
+                match target.as_ref() {
+                    // A plain local store does not read its target;
+                    // compound ops and array/field stores read.
+                    Expr::Local { .. } if *op == crate::expr::AssignOp::Plain => {}
+                    other => collect_expr_reads(other, read),
+                }
+                collect_expr_reads(value, read);
+            }
+            other => expr_uses(other, read),
+        }
+    }
+    fn collect_stmt_reads(s: &Stmt, read: &mut HashSet<u32>) {
+        match s {
+            Stmt::Block(v) => v.iter().for_each(|x| collect_stmt_reads(x, read)),
+            Stmt::ExprStmt(e) => collect_expr_reads(e, read),
+            Stmt::LocalDef { init, .. } => {
+                if let Some(e) = init {
+                    collect_expr_reads(e, read);
+                }
+            }
+            Stmt::Return(e) => {
+                if let Some(x) = e {
+                    collect_expr_reads(x, read);
+                }
+            }
+            Stmt::Throw(e) => collect_expr_reads(e, read),
+            Stmt::If { cond, then_stmt, else_stmt } => {
+                collect_expr_reads(cond, read);
+                collect_stmt_reads(then_stmt, read);
+                if let Some(x) = else_stmt {
+                    collect_stmt_reads(x, read);
+                }
+            }
+            Stmt::While { cond, body } => {
+                collect_expr_reads(cond, read);
+                collect_stmt_reads(body, read);
+            }
+            Stmt::DoWhile { body, cond } => {
+                collect_stmt_reads(body, read);
+                collect_expr_reads(cond, read);
+            }
+            Stmt::For { init, cond, update, body } => {
+                init.iter().for_each(|x| collect_stmt_reads(x, read));
+                if let Some(c) = cond {
+                    collect_expr_reads(c, read);
+                }
+                update.iter().for_each(|u| collect_expr_reads(u, read));
+                collect_stmt_reads(body, read);
+            }
+            Stmt::ForEach { var, iterable, body, .. } => {
+                read.insert(*var);
+                collect_expr_reads(iterable, read);
+                collect_stmt_reads(body, read);
+            }
+            Stmt::Switch { selector, cases, default, .. } => {
+                collect_expr_reads(selector, read);
+                for c in cases {
+                    c.body.iter().for_each(|st| collect_stmt_reads(st, read));
+                }
+                if let Some(d) = default {
+                    collect_stmt_reads(d, read);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                collect_stmt_reads(body, read);
+                for c in catches {
+                    if c.var != u32::MAX {
+                        read.insert(c.var);
+                    }
+                    collect_stmt_reads(&c.body, read);
+                }
+                if let Some(f) = finally {
+                    collect_stmt_reads(f, read);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter().for_each(|x| collect_stmt_reads(x, read));
+                collect_stmt_reads(body, read);
+                for c in catches {
+                    if c.var != u32::MAX {
+                        read.insert(c.var);
+                    }
+                    collect_stmt_reads(&c.body, read);
+                }
+                if let Some(f) = finally {
+                    collect_stmt_reads(f, read);
+                }
+            }
+            Stmt::Synchronized { lock, body } => {
+                collect_expr_reads(lock, read);
+                collect_stmt_reads(body, read);
+            }
+            Stmt::MonitorEnter(e) | Stmt::MonitorExit(e) => collect_expr_reads(e, read),
+            Stmt::Labeled { body, .. } => collect_stmt_reads(body, read),
+            _ => {}
+        }
+    }
+    fn is_cand(s: &Stmt, vt: &VarTable) -> Option<u32> {
+        let var = match s {
+            Stmt::ExprStmt(Expr::Assign { target, op: crate::expr::AssignOp::Plain, .. }) => {
+                match target.as_ref() {
+                    Expr::Local { var, .. } => *var,
+                    _ => return None,
+                }
+            }
+            Stmt::LocalDef { var, .. } => *var,
+            _ => return None,
+        };
+        let info = vt.var(var);
+        if info.synthetic_name && !info.is_param {
+            Some(var)
+        } else {
+            None
+        }
+    }
+    let mut read: HashSet<u32> = HashSet::new();
+    collect_stmt_reads(&*s, &mut read);
+    fn prune(s: &mut Stmt, vt: &VarTable, read: &HashSet<u32>) {
+        match s {
+            Stmt::Block(v) => {
+                v.retain(|st| match is_cand(st, vt) {
+                    Some(var) => read.contains(&var),
+                    None => true,
+                });
+                v.iter_mut().for_each(|x| prune(x, vt, read));
+            }
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                prune(then_stmt, vt, read);
+                if let Some(x) = else_stmt {
+                    prune(x, vt, read);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::Labeled { body, .. } => prune(body, vt, read),
+            Stmt::For { init, body, .. } => {
+                init.iter_mut().for_each(|x| prune(x, vt, read));
+                prune(body, vt, read);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    let mut i = 0;
+                    while i < c.body.len() {
+                        let keep = match is_cand(&c.body[i], vt) {
+                            Some(var) => read.contains(&var),
+                            None => true,
+                        };
+                        if keep {
+                            prune(&mut c.body[i], vt, read);
+                            i += 1;
+                        } else {
+                            c.body.remove(i);
+                        }
+                    }
+                }
+                if let Some(d) = default {
+                    prune(d, vt, read);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                prune(body, vt, read);
+                for c in catches.iter_mut() {
+                    prune(&mut c.body, vt, read);
+                }
+                if let Some(f) = finally {
+                    prune(f, vt, read);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter_mut().for_each(|x| prune(x, vt, read));
+                prune(body, vt, read);
+                for c in catches.iter_mut() {
+                    prune(&mut c.body, vt, read);
+                }
+                if let Some(f) = finally {
+                    prune(f, vt, read);
+                }
+            }
+            Stmt::Synchronized { body, .. } => prune(body, vt, read),
+            _ => {}
+        }
+    }
+    prune(s, vt, &read);
 }
 
 /// Scope-aware deduplication: a variable already declared in an enclosing

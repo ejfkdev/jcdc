@@ -203,6 +203,20 @@ impl<'a> Builder<'a> {
                 Opcode::Istore | Opcode::Lstore | Opcode::Fstore | Opcode::Dstore | Opcode::Astore => {
                     let slot = in0.a as u16;
                     let val = pop(&mut stack)?;
+                    // `dup; astore N; monitorenter`: synchronized
+                    // scaffolding holding the monitor for the exit paths —
+                    // the structured Synchronized stmt owns the lock expr.
+                    // Keeping it leaked a dead `varN_pc = monitor` stmt
+                    // typed from the local the slot is later reused for
+                    // (jdk11 SecurityManager String[] var = lockObj,
+                    // KeepAliveCache Iterator var = this,
+                    // AbstractSelectableChannel SelectionKey[] var =
+                    // keyLock — X无法转换为Y x3).
+                    if matches!(op, Opcode::Astore)
+                        && matches!(ins.get(i).map(|x| x.op), Some(Opcode::Monitorenter))
+                    {
+                        continue;
+                    }
                     match self.inline_dup_store(&mut stack, slot, in0.pc, next_pc, val) {
                         Some(left) => self.store(&mut stmts, slot, in0.pc, next_pc, left)?,
                         None => {}
@@ -243,6 +257,10 @@ impl<'a> Builder<'a> {
                 Opcode::Astore0 | Opcode::Astore1 | Opcode::Astore2 | Opcode::Astore3 => {
                     let slot = (op as u8 - Opcode::Astore0 as u8) as u16;
                     let val = pop(&mut stack)?;
+                    // synchronized scaffolding (see the wide Astore arm).
+                    if matches!(ins.get(i).map(|x| x.op), Some(Opcode::Monitorenter)) {
+                        continue;
+                    }
                     match self.inline_dup_store(&mut stack, slot, in0.pc, next_pc, val) {
                         Some(left) => self.store(&mut stmts, slot, in0.pc, next_pc, left)?,
                         None => {}
