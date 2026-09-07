@@ -10736,7 +10736,22 @@ pub(crate) fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolC
                     (
                         Expr::Field { .. },
                         TypeRef::G(jcdc_jvm::GenericType::Class(ics)),
-                    ) => crate::method::classsig_internal(&ics) == *ci,
+                    ) => {
+                        crate::method::classsig_internal(&ics) == *ci
+                            // A WILDCARD-parameterized read keeps its raw
+                            // cast: `(SetN) ImmutableCollections.EMPTY_SET`
+                            // strips SetN<?>'s capture so the value assigns
+                            // unchecked to Set<E> (jdk17 Set.of case 0 —
+                            // SetN<CAP#1>无法转换为Set<E>; the source casts
+                            // (Set<E>) which javac elides). Concrete/typevar
+                            // args (leftChild) stay droppable.
+                            && !ics.parts.iter().any(|p| {
+                                p.args.iter().any(|a| {
+                                    matches!(a, jcdc_jvm::GenericType::Wildcard(_))
+                                        || g_has_wildcard(a)
+                                })
+                            })
+                    }
                     _ => false,
                 },
                 None => false,
