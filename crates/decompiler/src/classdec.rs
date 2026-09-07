@@ -1054,6 +1054,7 @@ fn emit_class(
                 fix_lambda_captures(&mut body, &mut mb.vt, pc, pool, fam);
                 restore_enum_switches(&mut body, pc, pool);
                 hoist_clinit_returns(&mut body);
+                prune_tail_bare_returns(&mut body);
                 let stmts = stmt_vec(&body);
                 let mut all_assigns = !stmts.is_empty();
                 let mut folded: HashMap<String, Expr> = HashMap::new();
@@ -2962,6 +2963,87 @@ fn prune_post_exit_dead(s: &mut Stmt) {
         }
         _ => {}
     }
+}
+
+/// Safety net after hoist_clinit_returns: a bare `return;` left in TAIL
+/// position (nothing follows in its block/branch — `if (c) { return; }
+/// else { throw ..; }` as the whole clinit, jdk17 ClassLoaders
+/// AppClassLoader) is illegal source ("返回外部方法") and dropping it is
+/// exactly the fall-through semantics. Non-tail returns are hoist's job;
+/// loop bodies never count as tail (dropping there would continue).
+fn prune_tail_bare_returns(s: &mut Stmt) {
+    fn prune(s: &mut Stmt, tail: bool) {
+        match s {
+            Stmt::Return(None) => {
+                if tail {
+                    *s = Stmt::Block(vec![]);
+                }
+            }
+            Stmt::Block(v) => {
+                if tail {
+                    while matches!(v.last(), Some(Stmt::Return(None))) {
+                        v.pop();
+                    }
+                }
+                let n = v.len();
+                for (i, x) in v.iter_mut().enumerate() {
+                    prune(x, tail && i + 1 == n);
+                }
+                v.retain(|x| !x.is_empty_block());
+            }
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                prune(then_stmt, tail);
+                if let Some(e) = else_stmt {
+                    prune(e, tail);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::ForEach { body, .. } => {
+                prune(body, false);
+            }
+            Stmt::For { init, body, .. } => {
+                init.iter_mut().for_each(|x| prune(x, false));
+                prune(body, false);
+            }
+            Stmt::Labeled { body, .. } | Stmt::Synchronized { body, .. } => prune(body, tail),
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    if tail {
+                        while matches!(c.body.last(), Some(Stmt::Return(None))) {
+                            c.body.pop();
+                        }
+                    }
+                    let n = c.body.len();
+                    for (i, x) in c.body.iter_mut().enumerate() {
+                        prune(x, tail && i + 1 == n);
+                    }
+                }
+                if let Some(d) = default {
+                    prune(d, tail);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                prune(body, tail);
+                for c in catches.iter_mut() {
+                    prune(&mut c.body, tail);
+                }
+                if let Some(f) = finally {
+                    prune(f, tail);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter_mut().for_each(|x| prune(x, false));
+                prune(body, tail);
+                for c in catches.iter_mut() {
+                    prune(&mut c.body, tail);
+                }
+                if let Some(f) = finally {
+                    prune(f, tail);
+                }
+            }
+            _ => {}
+        }
+    }
+    prune(s, true);
 }
 
 fn hoist_clinit_returns(s: &mut Stmt) {
