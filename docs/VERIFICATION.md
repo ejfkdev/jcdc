@@ -617,3 +617,28 @@ Optional.map 链 witness（ClassPrinterImpl）、Object 栈合并变量推断尾
 
 回归教训再+2：调用参数位的窄化 cast 不可省（与赋值位规则相反）；
 witness 只能挂在有可命名目标类型的上下文，独立位置钉死推论。
+
+### 2026-09-07 第四波收尾（普查 117/124/180，total 421，会话累计 -75%）
+
+1. **strip_outer_super_arg 槽位门**：只有 slot-1 的 outer 参数可从 super(..)
+   剥离——裸 is_param 判定把真实参数当 outer 吃掉（ExplodedImage PathNode
+   super(name,attrs)、StackStreamFactory ClassBuffer super(batchSize)——三
+   JDK -56，本会话最大单点收益）。
+2. **赋值目标类型查 VarTable**：booleanize 在 embedded Local ty 冻结后翻
+   转 vt（Security boolean var = 1 → true）。
+3. **prune_post_loop_label_breaks**：紧跟自身循环之后的带标签 break 是
+   do-while 旋转残渣（非法且冗余）；switch 恢复（classdec）与 lambda 体
+   打印（emit）之后都要重跑（GregorianCalendar case 2 L2 未定义标签）。
+4. **局部类 decl drain 包装单语句体**：裸 Return 体让 drain 的 decl 落地
+   失败被丢弃（jdk26 Utils 局部 record VarHandleCache Holder 模式——静态
+   字段 + static 块 + Function 实现完整恢复，mini 0 错）。
+
+会话轨迹：1679 → 421（jdk11 352→117，jdk17 398→124，jdk26 929→180）。
+32 个 fix commit，每次提交前 features 56/56 双路 + cargo test 39/39。
+
+**翻转门数据**：walk 路径三 JDK 普查（census_walk.sh，re_walk.log）与本
+SESE 数字（117/124/180）对照中。剩余家族：SESE 结构尾（switch/loop 外部
+中断 ~19、返回外部方法 ~7、case 支配 4、空 then 无条件 throw 语义）、
+Gatherers 方法引用 12（需 diamond-ctor sibling 推论）、推论变量上限 ~15、
+DirectMethodHandleDesc 6（Optional.map 链 witness）、CAP#1 尾、
+FloatingDecimal !ssign 4。
