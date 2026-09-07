@@ -8267,7 +8267,7 @@ pub(crate) fn has_nested_wildcard(t: &jcdc_jvm::GenericType) -> bool {
 /// expression's parameterization (e.g. owner `Entry<K,V>` + field
 /// `next: Entry<TK,TV>` → `Entry<K,V>`). None when not resolvable or when
 /// the field type carries no type variables (no cast could be needed).
-fn instantiated_field_type(
+pub(crate) fn instantiated_field_type(
     owner: Option<&Expr>,
     cls: &str,
     name: &str,
@@ -8299,57 +8299,78 @@ fn instantiated_field_type(
         },
         None => (cls.to_string(), Vec::new()),
     };
-    let dpc;
-    let dref: &PoolClass = if decl == pc.internal_name {
-        pc
-    } else {
-        dpc = pool.get(&decl)?;
-        &dpc
-    };
-    let f = dref.cf.fields.iter().find(|f| {
-        !f.access_flags.contains(jcdc_classfile::FieldAccessFlags::STATIC)
-            && dref.utf8(f.name_index) == Some(name)
-    })?;
-    let sig_bytes = f.attributes.iter().find_map(|a| {
-        if dref.utf8(a.attribute_name_index) == Some("Signature") {
-            Some(a.info.as_slice())
-        } else {
-            None
+    // Field lookup walks the super chain carrying per-hop instantiation:
+    // an F-bounded inherited field (jdk11 Nodes.CollectorTask.leftChild:
+    // declared on AbstractTask<P_IN,P_OUT,R,K> as K, instantiated to
+    // CollectorTask<P_IN,P_OUT,T_NODE,T_BUILDER>) must resolve through the
+    // declaring superclass, not just the receiver class's own fields.
+    let mut queue: std::collections::VecDeque<(String, Vec<jcdc_jvm::GenericType>)> =
+        std::collections::VecDeque::new();
+    queue.push_back((decl, args));
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while let Some((cur, cur_args)) = queue.pop_front() {
+        if !visited.insert(cur.clone()) {
+            continue;
         }
-    })?;
-    if sig_bytes.len() < 2 {
-        return None;
-    }
-    let idx = u16::from_be_bytes([sig_bytes[0], sig_bytes[1]]);
-    let sig_str = dref.utf8(idx)?;
-    let ft = jcdc_jvm::parse_field_signature(sig_str)?;
-    if !contains_typevar(&ft) {
-        return None;
-    }
-    let params = if decl == pc.internal_name {
-        pc.class_attr("Signature")
-    } else {
-        dref.class_attr("Signature")
-    }
-    .and_then(|b| {
-        if b.len() < 2 {
+        let dpc;
+        let dref: &PoolClass = if cur == pc.internal_name {
+            pc
+        } else {
+            match pool.get(&cur) {
+                Some(p) => {
+                    dpc = p;
+                    &dpc
+                }
+                None => continue,
+            }
+        };
+        let Some(f) = dref.cf.fields.iter().find(|f| {
+            !f.access_flags.contains(jcdc_classfile::FieldAccessFlags::STATIC)
+                && dref.utf8(f.name_index) == Some(name)
+        }) else {
+            queue.extend(crate::classdec::class_supers_args(dref, &cur_args));
+            continue;
+        };
+        let sig_bytes = f.attributes.iter().find_map(|a| {
+            if dref.utf8(a.attribute_name_index) == Some("Signature") {
+                Some(a.info.as_slice())
+            } else {
+                None
+            }
+        })?;
+        if sig_bytes.len() < 2 {
             return None;
         }
-        let i2 = u16::from_be_bytes([b[0], b[1]]);
-        dref.utf8(i2).and_then(|s| jcdc_jvm::parse_class_signature(s))
-    })?
-    .params;
-    if args.len() != params.len() {
-        return None;
+        let idx = u16::from_be_bytes([sig_bytes[0], sig_bytes[1]]);
+        let sig_str = dref.utf8(idx)?;
+        let ft = jcdc_jvm::parse_field_signature(sig_str)?;
+        if !contains_typevar(&ft) {
+            return None;
+        }
+        let params = dref
+            .class_attr("Signature")
+            .and_then(|b| {
+                if b.len() < 2 {
+                    return None;
+                }
+                let i2 = u16::from_be_bytes([b[0], b[1]]);
+                dref.utf8(i2).and_then(|s| jcdc_jvm::parse_class_signature(s))
+            })
+            .map(|s| s.params)
+            .unwrap_or_default();
+        if cur_args.len() != params.len() {
+            return None;
+        }
+        let inst = subst_typevars(&ft, &params, &cur_args);
+        // Substituting a captured (wildcard) owner argument can nest wildcards
+        // (`? super ? extends T`), which is not valid Java; leave such writes
+        // with their raw checkcast.
+        if has_nested_wildcard(&inst) {
+            return None;
+        }
+        return Some(TypeRef::G(inst));
     }
-    let inst = subst_typevars(&ft, &params, &args);
-    // Substituting a captured (wildcard) owner argument can nest wildcards
-    // (`? super ? extends T`), which is not valid Java; leave such writes
-    // with their raw checkcast.
-    if has_nested_wildcard(&inst) {
-        return None;
-    }
-    Some(TypeRef::G(inst))
+    None
 }
 
 /// The Signature return type variable of a generic method call, when the

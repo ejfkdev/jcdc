@@ -1636,6 +1636,74 @@ impl<'a> Printer<'a> {
                             } else {
                                 wrap_returns(&mut body, t);
                             }
+                        } else if let Some(inst) = &l.inst_sam_desc {
+                            if std::env::var("JCDC_DBG_LAMRET").is_ok() {
+                                eprintln!(
+                                    "LAMRET impl={}.{} inst_ret={:?} single={}",
+                                    l.impl_owner,
+                                    l.impl_name,
+                                    inst.ret,
+                                    single_expr.is_some()
+                                );
+                            }
+                            // The invokedynamic's instantiatedMethodType
+                            // records the lambda's inferred return at the
+                            // call site; a source upcast can be elided from
+                            // the bytecode when provable (jdk17
+                            // JrtFileSystem.iteratorOf: `(Path)` around
+                            // path.resolve(..) inside map(child -> ...) —
+                            // JrtPath <: Path needs no checkcast, but
+                            // without the cast map infers Stream<JrtPath>
+                            // and .iterator() fails the Iterator<Path>
+                            // return). Restore it when the expression body
+                            // is typed a strict subtype of the recorded
+                            // return.
+                            fn upcast_ok(
+                                e: &Expr,
+                                target: &jcdc_jvm::JavaType,
+                                pool: &ClassPool,
+                            ) -> bool {
+                                let jcdc_jvm::JavaType::Object(t) = target else {
+                                    return false;
+                                };
+                                let jcdc_jvm::JavaType::Object(e0) = e.type_ref().erased() else {
+                                    return false;
+                                };
+                                if &e0 == t {
+                                    return false;
+                                }
+                                let mut queue = vec![e0];
+                                let mut seen = std::collections::HashSet::new();
+                                while let Some(cur) = queue.pop() {
+                                    if !seen.insert(cur.clone()) {
+                                        continue;
+                                    }
+                                    let Some(p) = pool.get(&cur) else { continue };
+                                    for (sup, _) in crate::classdec::class_supers_args(&p, &[]) {
+                                        if &sup == t {
+                                            return true;
+                                        }
+                                        queue.push(sup);
+                                    }
+                                }
+                                false
+                            }
+                            let want = TypeRef::J(inst.ret.clone());
+                            if let Some(e) = &mut single_expr {
+                                if std::env::var("JCDC_DBG_LAMRET").is_ok() {
+                                    eprintln!(
+                                        "LAMRET2 inst_ret={:?} expr_ty={:?} sam_ok={} upcast_ok={}",
+                                        inst.ret,
+                                        e.type_ref(),
+                                        sam_ok(&want, e),
+                                        upcast_ok(e, &inst.ret, self.pool)
+                                    );
+                                }
+                                if sam_ok(&want, e) && upcast_ok(e, &inst.ret, self.pool) {
+                                    let v = std::mem::replace(e, Expr::This);
+                                    *e = Expr::Cast { ty: want, e: Box::new(v) };
+                                }
+                            }
                         }
                         let mut sub = Printer {
                             pc: self.pc,
