@@ -5403,9 +5403,27 @@ fn booleanize_deep(e: &mut crate::expr::Expr) {
                     _ => x.type_ref().erased() == JavaType::Boolean,
                 }
             };
+            // Ordering comparisons are numeric-only in Java: their operand
+            // positions must keep int `? 1 : 0` forms (jdk26
+            // FloatingDecimal: `i - start > (pt != 0 ? 1 : 0)` folded the
+            // RHS to boolean — "二元运算符 '<=' 的操作数类型错误").
+            // Eq/Ne operands are numeric when either side is a primitive
+            // number (bool==bool stays foldable).
+            let cmp_numeric = |a: &Expr, b: &Expr| {
+                let prim = |x: &Expr| {
+                    matches!(
+                        x.type_ref().erased(),
+                        JavaType::Int | JavaType::Long | JavaType::Short
+                            | JavaType::Byte | JavaType::Char | JavaType::Float
+                            | JavaType::Double
+                    )
+                };
+                prim(a) || prim(b)
+            };
             let numeric = match op {
-                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Ge | BinOp::Gt | BinOp::Le
-                | BinOp::RefEq | BinOp::RefNe | BinOp::LogAnd | BinOp::LogOr
+                BinOp::Lt | BinOp::Ge | BinOp::Gt | BinOp::Le => true,
+                BinOp::Eq | BinOp::Ne => cmp_numeric(l, r),
+                BinOp::RefEq | BinOp::RefNe | BinOp::LogAnd | BinOp::LogOr
                 | BinOp::StrCat => false,
                 BinOp::And | BinOp::Or | BinOp::Xor => !(bool_side(l, r) || bool_side(r, l)),
                 _ => true,

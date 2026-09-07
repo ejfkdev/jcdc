@@ -511,3 +511,71 @@ Object 非函数接口 27（`stackN = sink::accept` 方法引用落入 Object �
 被复制进循环条件（预先存在的 foreach+共享终结符 bug）、jdk11 局部类构造器
 参数名 arg4/LVT 脱节（ClassSpecializer$Factory$1Var prev）、Pattern 丢
 for(;;) 悬空标签、AnnotationReader stackNNN、Gatherers Downstream CAP。
+
+### 2026-09-07 深夜下半场（局部类机器大修，普查 223/231/413 → 158/169/244 附近）
+
+引擎不变：三 JDK 家族普查 → 修最大错误家族 → features 56/56 双路 + cargo
+test 39/39 → 提交 → 重跑普查。本段共 17 个 fix commit，全部围绕"局部类/
+匿名类发射机器"与"擦除 cast 毒性"两条主线：
+
+1. **兄弟局部类声明丢失**：emit_local_class_decl 排空 ANON_HOIST 中同
+   EnclosingMethod 的声明并置于自身之前（Gatherers.mapConcurrent 的
+   MapConcurrentTask 只被 State 体内引用，原先彻底丢失，19 错）；插入位
+   扫描同时看 ClassDecl 文本提及（局部类作用域自声明起）。
+2. **多站点声明重定位**：EXTERN_REDECL 记录第二次提及，fix_lambda_captures
+   尾部把声明移到方法顶（Composite.impl State 被 SESE 复制尾在 if 链后再次
+   引用——声明困在分支里）；位置计算用 captures 定义锚点（PairBox：声明必
+   须在 c1Supplier.. 定义之后）；local_class_captures 对同名兄弟取并集
+   （Gatherers 有四个 State）。
+3. **同 arity 构造器选择**：analyze_anon_ctor 在多个同参数构造器中选"直接
+   存 capture"的那个；委托构造器跟随 this(..) 链收割 capture，pure-forward
+   门（声明参数兼作 capture 源时保留在 kept args）；prune_local_ctor_
+   delegation 按目标构造器被剥离的 capture 位剪委托实参；ctor_capture_
+   params 同样跟随委托（打印签名与调用点保持一致）。
+4. **局部 record**：类 Signature 存在时渲染 `record Name<TP>(components)
+   implements ..`（sig_header 的 `extends Record` 非法；组件未声明；new 站
+   点撞 0 参构造器——classfile Util 三个 record 全灭 10→4）。
+5. **Holder 型局部类**：仅被静态成员访问提及（Holder.INSTANCE）也发射声
+   明；16+ 类文件的局部类 <clinit> 以 static 块发射。
+6. **assert 字段三联**：$assertionsDisabled 在匿名/局部体内保留为实例
+   final 字段；顶层类在常量池引用合成兄弟 holder（接口 ConstantGroup$1）
+   时自declare；引用一律裸名（Object. 前缀的 holder 引用不可解析）。
+7. **nest-based this$0**：无字段的内部类 outer_this_map 合成 this$0→
+   Outer.this 映射（CallArranger/COWArrayList）；lambda impl 体补 outer-
+   this 替换（ProxyGenerator 13 错）。
+8. **分支复制捕获**：capture 定义只存在于复制尾分支时，提升为块首 blank
+   声明+分支内赋值，类声明落在首个提及前（DoublePipeline FlatMap/fastPath
+   12 错）；重定位对已存在声明幂等。
+9. **擦除 cast 毒性**：raw-cast witness 仅在其它实参以具体类型钉住共享推
+   断变量时发射（Arrays.sort(a,c) 保留 (Comparator) c；toMap(keyMapper,
+   valueMapper) 裸传保推断链）；strip_selftype_checkcasts 丢弃自类型泛型
+   返回（BaseStream.onClose():S）后的 checkcast Owner——裸 cast 会毒化整
+   条泛型链（Files.find 的 entry→Object）。
+10. **嵌套匿名外层成员**：render_captures 的 this$N→Raw("this") 改为不可
+    见标记（打印为无主名——词法解析到外层匿名成员；实参位保留 this）
+    （KeyStore Builder getCalled/oldException 11 错）。
+11. **窄类型渲染**：char/boolean/byte/short 目标的 plain 赋值按目标渲染
+    （xml Parser mESt char 状态机 15×2 错）；局部类 new 站点经
+    LOCAL_CLASS_INTERNALS 查内部名走 typed ctor args（Qchar 39→'\''）；
+    boolean==int 栈合并等式以 !=0 归一（VirtualThread assert）；方法返回
+    位 lambda 按签名 ret 补 SAM 返回 witness（castingIdentity (R) i）。
+12. **合并 new 初始化**：非构造器方法里经栈合并变量到达的 invokespecial
+    <init> 在 INIT 位折叠（死 raw 孪生赋值删除、孪生变量改指已初始化对
+    象）——InflaterInputStream `super(stack233)` 变回 throw new
+    ZipException(msg)（显式构造器位置家族，-33）。
+13. **静态上下文类型变量 cast 禁令**：static 方法/clinit 内禁止引用类级
+    类型变量的参数 cast（未替换的字段签名参数化泄漏 (ReferenceKey<K>)）。
+14. **ClassReader 重名变量**：disambiguate_nested_locals 的重命名候选避
+    开"任何变量曾占用过的名字"（vt 重命名是全局的，同名多站点声明会在
+    仍然相互包围的作用域里撞车，asm ClassReader 12 错）。
+
+**回归教训（新增两条）**：返回位 diamond 参数 cast 普查 +35（cast 冻结
+推断的老病，已回滚，ReferencedKeyMap 由 raw-new+擦除 cast 路径治愈）；
+声明重定位/hoist 必须幂等——匿名 walk 在一次发射里跑多遍，第二遍的
+demote/hoist 会吃掉第一遍的 blank 声明。
+
+**剩余深水区**（普查 ~571 后）：Gatherers type-args 恢复（Integrator.of
+方法引用 witness、defaultFinisher 比较上下文 witness）、SESE 悬空标签/
+外部中断/空 then 无条件 throw（语义）、FloatingDecimal !ssign!=45 布尔化
+错树、匿名构造器内联 super() 形状（SplitConstantPool/ProcessBuilder）、
+Optional.map 链 witness（ClassPrinterImpl）、Object 栈合并变量推断尾。
