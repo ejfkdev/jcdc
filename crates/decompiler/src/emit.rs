@@ -1176,33 +1176,17 @@ impl<'a> Printer<'a> {
             }
             match param_types.get(i) {
                 Some(jcdc_jvm::JavaType::Boolean) => self.expr_bool(a, out),
-                Some(jcdc_jvm::JavaType::Char) => {
-                    if let Expr::Const(ConstVal::Int(n)) = a {
-                        if (0..=0xFFFF).contains(n) {
-                            let c = char::from_u32(*n as u32).unwrap_or('?');
-                            out.push('\'');
-                            out.push_str(&escape_char(c));
-                            out.push('\'');
-                            continue;
-                        }
-                    }
-                    self.expr(a, 1, out);
-                }
-                // Byte/short parameters: an int literal argument needs an
-                // explicit cast (invocation conversion never narrows).
+                // Char/narrow params: expr_char/expr_narrow render both
+                // constants AND conditional branches in the target form
+                // (jdk17 BasicAuthentication `super(!isProxy ? 115 : 112,
+                // ..)` — the char param needs `!isProxy ? 's' : 'p'`;
+                // a plain int ternary is "条件表达式中的类型错误").
+                Some(jcdc_jvm::JavaType::Char) => self.expr_char(a, out),
                 Some(jcdc_jvm::JavaType::Byte) => {
-                    if let Expr::Const(ConstVal::Int(n)) = a {
-                        out.push_str(&format!("(byte) {}", n));
-                        continue;
-                    }
-                    self.expr(a, 1, out);
+                    self.expr_narrow(a, &jcdc_jvm::JavaType::Byte, out)
                 }
                 Some(jcdc_jvm::JavaType::Short) => {
-                    if let Expr::Const(ConstVal::Int(n)) = a {
-                        out.push_str(&format!("(short) {}", n));
-                        continue;
-                    }
-                    self.expr(a, 1, out);
+                    self.expr_narrow(a, &jcdc_jvm::JavaType::Short, out)
                 }
                 _ => self.expr(a, 1, out),
             }
