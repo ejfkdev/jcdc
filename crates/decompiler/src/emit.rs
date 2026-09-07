@@ -1702,6 +1702,63 @@ impl<'a> Printer<'a> {
                 let sam_wrap = self.lambda_sam_ret.take();
                 match body_stmts {
                     Some(MethodBody { mut body, mut vt, .. }) => {
+                        // A captured outer local may have been RENAMED by
+                        // the outer method's lambda-scope disambiguation
+                        // (hoisted decl vs a lambda-body local collision);
+                        // the impl method's own LVT still carries the
+                        // ORIGINAL name, and the printed body resolves
+                        // lexically in the outer scope — sync the impl
+                        // param names to the outer vt's current names
+                        // (jdk26 UpcallLinker `doBindings` vs the renamed
+                        // `doBindings$1` decls: 找不到符号 x2).
+                        {
+                            // Non-this impl params are [captures..., SAM
+                            // params...]: the capture slice length is
+                            // params - param_names (param_names is the
+                            // indy's SAM arity; `this` is excluded from
+                            // both sides). Walking captures against ALL
+                            // params misaligns when the receiver rides in
+                            // l.captures (default-method lambdas: the SAM
+                            // param then takes a capture's name — jdk26
+                            // Predicate.and printed `t -> test(other)`).
+                            let nsam = l.param_names.len();
+                            let pvars: Vec<u32> = vt
+                                .vars
+                                .iter()
+                                .filter(|v| v.is_param && v.name != "this")
+                                .map(|v| v.id)
+                                .collect();
+                            let ncaps = pvars.len().saturating_sub(nsam);
+                            // An INSTANCE impl's captured receiver rides at
+                            // captures[0] but `this` is excluded from
+                            // pvars — offset the capture index (jdk26
+                            // CompletionStage exceptionallyAsync: without
+                            // it the executor param took fn's name).
+                            let cap_off = if l.impl_is_static
+                                || ncaps == l.captures.len()
+                            {
+                                0
+                            } else {
+                                l.captures.len().saturating_sub(ncaps)
+                            };
+                            for pi in 0..ncaps {
+                                if let Some(crate::expr::Expr::Local { var, .. }) =
+                                    l.captures.get(pi + cap_off)
+                                {
+                                    if let Some(outer) =
+                                        self.vt.vars.iter().find(|ov| ov.id == *var)
+                                    {
+                                        if let Some(v) =
+                                            vt.vars.iter_mut().find(|v| v.id == pvars[pi])
+                                        {
+                                            if outer.name != v.name {
+                                                v.name = outer.name.clone();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // Apply capture-snapshot renames: captured outer
                         // locals that are not effectively final were
                         // snapshotted into `final` copies before this

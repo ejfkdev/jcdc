@@ -2907,7 +2907,53 @@ fn emit_method_with(
             let captys_save =
                 CAPTURE_GENERIC_TYPES.with(|m| std::mem::take(&mut *m.borrow_mut()));
             fix_lambda_captures(&mut body, &mut mb.vt, pc, pool, fam);
+            // Snapshot names: the disambiguation renames OUTER locals whose
+            // hoisted decls collide with lambda-scope names, but inlined
+            // anon/local bodies capture the OLD names as RawT text (frozen
+            // at render time) — stale references (jdk26 UpcallLinker
+            // doBindings -> doBindings$1: 找不到符号 x2). Diff the VarTable
+            // and rewrite exact-matching RawT texts.
+            let names_before: HashMap<u32, String> =
+                mb.vt.vars.iter().map(|v| (v.id, v.name.clone())).collect();
             disambiguate_lambda_locals(pc, pool, &mut mb.vt, &mut body);
+            {
+                let renames: HashMap<String, String> = mb
+                    .vt
+                    .vars
+                    .iter()
+                    .filter_map(|v| {
+                        names_before
+                            .get(&v.id)
+                            .and_then(|old| {
+                                if *old != v.name {
+                                    Some((old.clone(), v.name.clone()))
+                                } else {
+                                    None
+                                }
+                            })
+                    })
+                    .collect();
+                if !renames.is_empty() {
+                    fn rewrite_rawt(
+                        e: &mut Expr,
+                        renames: &HashMap<String, String>,
+                        pool: &ClassPool,
+                        pc: &PoolClass,
+                    ) {
+                        if let Expr::RawT(text, _) = e {
+                            if let Some(n) = renames.get(text.as_str()) {
+                                *text = n.clone();
+                            }
+                        }
+                        walk_expr_children(e, pool, pc, &mut |x, p2, c2| {
+                            rewrite_rawt(x, renames, p2, c2)
+                        });
+                    }
+                    walk_stmt_exprs(&mut body, pool, pc, &mut |e, p2, c2| {
+                        rewrite_rawt(e, &renames, p2, c2)
+                    });
+                }
+            }
             line.push_str(" {\n");
             out.push_str(&line);
             let ret_bool = mdesc.as_ref().map(|d| d.ret == jcdc_jvm::JavaType::Boolean).unwrap_or(false)
