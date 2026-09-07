@@ -946,6 +946,15 @@ impl<'a> Printer<'a> {
                 out.push('(');
                 out.push_str(&self.type_name(ty));
                 out.push_str(") ");
+                // Inconvertible direct casts from mis-joined stack-merge
+                // vars (jdk26 AnnotationReader: `(SupertypeTarget)
+                // var3_341` with var3 typed Iterator — sealed targets
+                // reject the cross-cast): relay through Object, which is
+                // always legal and semantically identical (the runtime
+                // value IS the target type).
+                if self.needs_object_relay(ty, e) {
+                    out.push_str("(Object) ");
+                }
                 if matches!(&**e, Expr::New { .. }) {
                     self.suppress_diamond = true;
                 }
@@ -1659,6 +1668,33 @@ impl<'a> Printer<'a> {
 
     /// Shorten an internal class name for emission: java.lang.* and same
     /// package use simple names; others fully qualified dotted.
+    fn needs_object_relay(&self, ty: &TypeRef, e: &Expr) -> bool {
+        if matches!(e, Expr::Cast { .. } | Expr::Const(_)) {
+            return false;
+        }
+        let (
+            jcdc_jvm::JavaType::Object(from),
+            jcdc_jvm::JavaType::Object(to),
+        ) = (e.type_ref().erased(), ty.erased())
+        else {
+            return false;
+        };
+        if from == to || from == "java/lang/Object" || to == "java/lang/Object" {
+            return false;
+        }
+        let (Some(fpc), Some(tpc)) = (self.pool.get(&from), self.pool.get(&to)) else {
+            return false;
+        };
+        if crate::classdec::is_subtype_of(self.pool, &e.type_ref().erased(), &to)
+            || crate::classdec::is_subtype_of(self.pool, &ty.erased(), &from)
+        {
+            return false;
+        }
+        let sealed = |pc: &PoolClass| pc.class_attr("PermittedSubclasses").is_some();
+        let both_classes = !fpc.is_interface() && !tpc.is_interface();
+        both_classes || sealed(&fpc) || sealed(&tpc)
+    }
+
     pub fn shorten(&self, internal: &str) -> String {
         if internal.is_empty() {
             return String::new();

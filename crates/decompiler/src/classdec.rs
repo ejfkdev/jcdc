@@ -8293,7 +8293,7 @@ fn generic_erasure(t: &jcdc_jvm::GenericType, params: &[jcdc_jvm::TypeParam]) ->
 
 /// True when the erased type `ty` is `target` or a subtype of it (super
 /// AND interface chains via the pool; unknown classes are not subtypes).
-fn is_subtype_of(pool: &ClassPool, ty: &jcdc_jvm::JavaType, target: &str) -> bool {
+pub(crate) fn is_subtype_of(pool: &ClassPool, ty: &jcdc_jvm::JavaType, target: &str) -> bool {
     let jcdc_jvm::JavaType::Object(n0) = ty else { return false };
     let mut stack: Vec<String> = vec![n0.clone()];
     let mut seen: HashSet<String> = HashSet::new();
