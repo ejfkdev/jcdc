@@ -2857,6 +2857,7 @@ fn emit_method_with(
             // fall-through compiled to `break L31`).
             crate::method::prune_post_loop_label_breaks(&mut body);
             crate::method::demote_undefined_label_jumps(&mut body);
+            split_return_assigns(&mut body);
             add_throw_witnesses(&mut body, msig.as_ref(), pool);
             strip_erasure_casts_generic_ret(&mut body, msig.as_ref(), pool);
             witness_generic_returns(&mut body, msig.as_ref(), pool, pc);
@@ -3078,6 +3079,106 @@ fn prune_post_exit_dead(s: &mut Stmt) {
 /// AppClassLoader) is illegal source ("返回外部方法") and dropping it is
 /// exactly the fall-through semantics. Non-tail returns are hoist's job;
 /// loop bodies never count as tail (dropping there would continue).
+/// `return this.f = v;` (javac's dup+putfield+areturn for `this.f = v;
+/// return v;`) types the return as the ASSIGNMENT's static type — the
+/// field's — which fails a generic method return demanding a subtype
+/// (jdk26 LinkedHashMap.sequencedKeySet `return this.keySet = sks;` —
+/// Set<K>无法转换为SequencedSet<K>; the source stores then returns the
+/// local). Split back into the two-statement form when the value is
+/// side-effect-free; since the assign requires value <: field, the split
+/// is compilable wherever the merged form was.
+pub(crate) fn split_return_assigns(s: &mut Stmt) {
+    match s {
+        Stmt::Block(v) => {
+            let mut i = 0;
+            while i < v.len() {
+                split_return_assigns(&mut v[i]);
+                let mut replaced: Option<(Stmt, Stmt)> = None;
+                if let Stmt::Return(Some(Expr::Assign { target, op, value })) = &v[i] {
+                    if matches!(op, crate::expr::AssignOp::Plain)
+                        && matches!(&**value, Expr::Local { .. } | Expr::Const(_) | Expr::This)
+                    {
+                        replaced = Some((
+                            Stmt::ExprStmt(Expr::Assign {
+                                target: target.clone(),
+                                op: op.clone(),
+                                value: value.clone(),
+                            }),
+                            Stmt::Return(Some((**value).clone())),
+                        ));
+                    }
+                }
+                if let Some((a, b)) = replaced {
+                    v[i] = a;
+                    v.insert(i + 1, b);
+                    i += 1;
+                }
+                i += 1;
+            }
+        }
+        Stmt::Return(Some(inner @ Expr::Assign { .. })) => {
+            if let Expr::Assign { target, op, value } = &*inner {
+                if matches!(op, crate::expr::AssignOp::Plain)
+                    && matches!(&**value, Expr::Local { .. } | Expr::Const(_) | Expr::This)
+                {
+                    let a = Stmt::ExprStmt(Expr::Assign {
+                        target: target.clone(),
+                        op: op.clone(),
+                        value: value.clone(),
+                    });
+                    let b = Stmt::Return(Some((**value).clone()));
+                    *s = Stmt::Block(vec![a, b]);
+                }
+            }
+        }
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            split_return_assigns(then_stmt);
+            if let Some(e) = else_stmt {
+                split_return_assigns(e);
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::ForEach { body, .. }
+        | Stmt::Labeled { body, .. }
+        | Stmt::Synchronized { body, .. } => split_return_assigns(body),
+        Stmt::For { init, body, .. } => {
+            init.iter_mut().for_each(split_return_assigns);
+            split_return_assigns(body);
+        }
+        Stmt::Switch { cases, default, .. } => {
+            for c in cases.iter_mut() {
+                for st in c.body.iter_mut() {
+                    split_return_assigns(st);
+                }
+            }
+            if let Some(d) = default {
+                split_return_assigns(d);
+            }
+        }
+        Stmt::Try { body, catches, finally } => {
+            split_return_assigns(body);
+            for c in catches.iter_mut() {
+                split_return_assigns(&mut c.body);
+            }
+            if let Some(f) = finally {
+                split_return_assigns(f);
+            }
+        }
+        Stmt::TryWithResources { resources, body, catches, finally } => {
+            resources.iter_mut().for_each(split_return_assigns);
+            split_return_assigns(body);
+            for c in catches.iter_mut() {
+                split_return_assigns(&mut c.body);
+            }
+            if let Some(f) = finally {
+                split_return_assigns(f);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn prune_tail_bare_returns(s: &mut Stmt) {
     fn prune(s: &mut Stmt, tail: bool) {
         match s {

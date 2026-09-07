@@ -1779,6 +1779,7 @@ impl<'a> Printer<'a> {
                         );
                         crate::method::prune_post_loop_label_breaks(&mut body);
                         crate::method::demote_undefined_label_jumps(&mut body);
+                        crate::classdec::split_return_assigns(&mut body);
                         // Single-return body → expression lambda.
                         let mut single_expr = match &body {
                             Stmt::Return(Some(e)) => Some(e.clone()),
