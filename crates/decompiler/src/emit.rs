@@ -1054,11 +1054,29 @@ impl<'a> Printer<'a> {
                     // e.g. jdk26 Thread(ThreadGroup,Runnable,String,long,
                     // boolean) vs (...,long,Thread[])).
                     let _ = is_super_form;
+                    // Upcast restoration only for SELF delegation: this(..)
+                    // overload resolution binds the arg's static type (a
+                    // JarEntry arg would recurse into JarEntry(JarEntry)
+                    // instead of the descriptor's JarEntry(ZipEntry)).
+                    // super(..) resolution is unambiguous through the
+                    // generic formals — casting there broke FindOps
+                    // `super(parent, spliterator)` (K := FindTask<..>
+                    // accepts the arg fine; the raw erasure cast does not).
                     if desc.args.len() == args.len() {
-                        self.args_typed(args, &desc.args, out);
+                        if is_super_form {
+                            self.args_typed(args, &desc.args, out);
+                        } else {
+                            self.args_delegation(args, &desc.args, out);
+                        }
                     } else {
                         match self.ctor_param_types(cls, 0, args.len(), args) {
-                            Some(pt) => self.args_typed(args, &pt, out),
+                            Some(pt) => {
+                                if is_super_form {
+                                    self.args_typed(args, &pt, out);
+                                } else {
+                                    self.args_delegation(args, &pt, out);
+                                }
+                            }
                             None => self.args(args, out),
                         }
                     }
@@ -1439,6 +1457,53 @@ impl<'a> Printer<'a> {
     }
 
     /// Print call args applying boolean-parameter constant adjustment.
+    /// Delegation (this(..)/super(..)) args: typed rendering PLUS the
+    /// elided-upcast restoration when the arg's static type differs from
+    /// the descriptor formal — overload resolution binds the arg's type,
+    /// not the descriptor (jdk17 JarEntry copy ctor: `this(je)` resolves
+    /// recursively to JarEntry(JarEntry); the source `this((ZipEntry) je)`
+    /// upcast is elided from bytecode because je <: ZipEntry is provable).
+    fn args_delegation(
+        &mut self,
+        args: &[Expr],
+        param_types: &[jcdc_jvm::JavaType],
+        out: &mut String,
+    ) {
+        for (i, a) in args.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            match param_types.get(i) {
+                Some(pt @ jcdc_jvm::JavaType::Object(_)) => {
+                    let have = a.type_ref().erased();
+                    if &have != pt
+                        && !matches!(
+                            a,
+                            Expr::Cast { .. }
+                                | Expr::Const(_)
+                                | Expr::Lambda(_)
+                                | Expr::New { .. }
+                                | Expr::AnonNew { .. }
+                        )
+                    {
+                        out.push('(');
+                        out.push_str(&self.type_name(&TypeRef::J(pt.clone())));
+                        out.push_str(") ");
+                        self.expr(a, 14, out);
+                        continue;
+                    }
+                    self.expr(a, 1, out);
+                }
+                Some(jcdc_jvm::JavaType::Boolean) => self.expr_bool(a, out),
+                Some(jcdc_jvm::JavaType::Char) => self.expr_char(a, out),
+                Some(pt @ (jcdc_jvm::JavaType::Byte | jcdc_jvm::JavaType::Short)) => {
+                    self.expr_narrow_arg(a, pt, out)
+                }
+                _ => self.expr(a, 1, out),
+            }
+        }
+    }
+
     fn args_typed(&mut self, args: &[Expr], param_types: &[jcdc_jvm::JavaType], out: &mut String) {
         for (i, a) in args.iter().enumerate() {
             if i > 0 {

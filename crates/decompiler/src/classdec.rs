@@ -8416,6 +8416,20 @@ fn collapse_ctor_delegation(body: &mut Stmt, pc: &PoolClass) {
     if items.is_empty() {
         return;
     }
+    // A ctor whose FIRST statement is already the delegation (this(..) or
+    // super(..)) is in legal source form: the fold below targets only
+    // javac's DEFERRED-delegation shape (assignments/if-tree with tail
+    // `this(str)` leaves). Firing on the legal shape rewrote
+    // `this(je); attr = je.attr; certs = ..; signers = je.signers;`
+    // into `this(je.signers)` (jdk17 JarEntry copy ctor — the template
+    // came from the leading call and the "value" from the last field
+    // copy: 对于JarEntry(CodeSigner[]), 找不到合适的构造器). A ctor
+    // never has a second delegation after the first, so this is safe.
+    if let Some(Stmt::ExprStmt(Expr::Method { name, .. })) = items.first() {
+        if name == "<init>" {
+            return;
+        }
+    }
     // javac compiles a leading `this(<big conditional>)` into per-branch
     // delegations through a shared local: `[str = null;] if-tree with
     // leaves `str = X; this(str); return;` (branches may also FALL
