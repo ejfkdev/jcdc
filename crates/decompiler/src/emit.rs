@@ -85,10 +85,75 @@ impl<'a> Printer<'a> {
 
     /// Print an expression that appears in a boolean context; int 0/1
     /// constants become true/false.
+    fn bool_ish_expr(x: &Expr) -> bool {
+        match x {
+            Expr::Const(ConstVal::Int(n)) => *n == 0 || *n == 1,
+            Expr::Cond { t, f, .. } => {
+                matches!(&**t, Expr::Const(ConstVal::Int(0 | 1)))
+                    && matches!(&**f, Expr::Const(ConstVal::Int(0 | 1)))
+            }
+            Expr::Un { op: crate::expr::UnOp::Not, .. } | Expr::InstanceOf { .. } => true,
+            Expr::Bin { op, .. } => matches!(
+                op,
+                crate::expr::BinOp::Eq
+                    | crate::expr::BinOp::Ne
+                    | crate::expr::BinOp::Lt
+                    | crate::expr::BinOp::Ge
+                    | crate::expr::BinOp::Gt
+                    | crate::expr::BinOp::Le
+                    | crate::expr::BinOp::RefEq
+                    | crate::expr::BinOp::RefNe
+                    | crate::expr::BinOp::LogAnd
+                    | crate::expr::BinOp::LogOr
+            ),
+            other => other.type_ref().erased() == jcdc_jvm::JavaType::Boolean,
+        }
+    }
+
     pub fn expr_bool(&mut self, e: &Expr, out: &mut String) {
         match e {
             Expr::Const(ConstVal::Int(n)) => {
                 out.push_str(if *n != 0 { "true" } else { "false" });
+            }
+            // Bitwise ops over boolean-ish operands print as their
+            // logical form: javac computes `a != b` over booleans as
+            // IXOR of 0/1 ints (jdk17 DecimalFormat isNegative:
+            // `(c1 ? 1 : 0) ^ (c2 ? 1 : 0)` against a boolean local —
+            // "int无法转换为boolean").
+            Expr::Bin { op: bop, l, r, .. }
+                if matches!(
+                    bop,
+                    crate::expr::BinOp::Xor | crate::expr::BinOp::And | crate::expr::BinOp::Or
+                ) && Self::bool_ish_expr(l)
+                    && Self::bool_ish_expr(r) =>
+            {
+                let sym = match bop {
+                    crate::expr::BinOp::Xor => "^",
+                    crate::expr::BinOp::And => "&",
+                    _ => "|",
+                };
+                // Parenthesize composite sides: expr_bool renders `||`/
+                // `&&` conditions bare and ^ binds LOOSER than && but
+                // TIGHTER than || (a || b && c ^ d would regroup).
+                for (i, side) in [l.as_ref(), r.as_ref()].iter().enumerate() {
+                    if i > 0 {
+                        out.push(' ');
+                        out.push_str(sym);
+                        out.push(' ');
+                    }
+                    let needs = matches!(
+                        side,
+                        Expr::Bin { .. } | Expr::Cond { .. } | Expr::Assign { .. }
+                    );
+                    if needs {
+                        out.push('(');
+                    }
+                    self.expr_bool(side, out);
+                    if needs {
+                        out.push(')');
+                    }
+                }
+                return;
             }
             Expr::Cond { c, t, f } => {
                 // `x ? true : false` → x ; `x ? false : true` → !x
