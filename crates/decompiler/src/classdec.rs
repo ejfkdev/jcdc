@@ -5679,10 +5679,23 @@ fn strip_erasure_casts_generic_ret(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodS
                     // — "Collection<CAP#1> cannot be converted to Set<E>"
                     // (the vP jdk11 first blocker, both paths).
                     let erasure_only = inner.type_ref().erased() == ty.erased();
-                    let droppable = (matches!(inner.type_ref(), TypeRef::G(_)) && erasure_only)
-                        || (is_generic_call(inner, pool) && erasure_only)
-                        || matches!(&**inner, Expr::Method { name, owner: Some(o), .. }
-                            if name == "clone" && matches!(o.type_ref(), TypeRef::G(_)));
+                    // A generic call with diamond args must KEEP the cast:
+                    // bare in the return position, the target pins the
+                    // method's typevar (T := List<T>'s T) and the diamond
+                    // can no longer infer the standalone type the source
+                    // relied on (jdk17 Stream.toList — `new
+                    // ArrayList<>(asList(toArray()))` is ArrayList<Object>
+                    // under the cast, but List<Object> is not
+                    // List<? extends T> bare). witness_generic_returns
+                    // deliberately leaves diamond-bearing calls bare, so
+                    // nothing downstream would restore this cast.
+                    let diamond_arg_call = matches!(&**inner, Expr::Method { args, .. }
+                        if args_have_generic_new(args, pool));
+                    let droppable = !diamond_arg_call
+                        && ((matches!(inner.type_ref(), TypeRef::G(_)) && erasure_only)
+                            || (is_generic_call(inner, pool) && erasure_only)
+                            || matches!(&**inner, Expr::Method { name, owner: Some(o), .. }
+                                if name == "clone" && matches!(o.type_ref(), TypeRef::G(_))));
                     if droppable {
                         let v = std::mem::replace(&mut **inner, Expr::This);
                         *e = v;

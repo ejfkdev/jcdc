@@ -8749,17 +8749,28 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
         }
         let TypeRef::G(_) = want else {
             // A boolean value flowing into an int slot was `b ? 1 : 0` in
-            // source (the JVM stores both as ints).
-            if matches!(want, TypeRef::J(JavaType::Int))
-                && value.type_ref().erased() == JavaType::Boolean
+            // source (the JVM stores both as ints); into a byte/short
+            // slot it additionally needs the narrowing cast (jdk11
+            // StringCoding.Result.with: `this.coder = (byte)
+            // (!String.COMPACT_STRINGS ? 1 : 0)` folded to ixor —
+            // boolean无法转换为byte).
+            if matches!(
+                want,
+                TypeRef::J(JavaType::Int | JavaType::Byte | JavaType::Short)
+            ) && value.type_ref().erased() == JavaType::Boolean
                 && !matches!(value, Expr::Const(_))
             {
                 let inner = std::mem::replace(value, Expr::This);
-                *value = Expr::Cond {
+                let mut cond = Expr::Cond {
                     c: Box::new(inner),
                     t: Box::new(Expr::Const(crate::expr::ConstVal::Int(1))),
                     f: Box::new(Expr::Const(crate::expr::ConstVal::Int(0))),
                 };
+                if !matches!(want, TypeRef::J(JavaType::Int)) {
+                    let ty = want.clone();
+                    cond = Expr::Cast { ty, e: Box::new(cond) };
+                }
+                *value = cond;
                 return;
             }
             // Concrete target, unknown (plain Object) value: the flow
@@ -8870,7 +8881,21 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
             ) && matches!(value, Expr::Method { args, .. } if args.iter().any(|x| {
                 matches!(x, Expr::Method { name, args: ga, .. } if name == "getClass" && ga.is_empty())
             }));
-            if !crate::classdec::is_generic_call(value, pool) || reflective_array {
+            // A WILDCARD-bearing target over a generic call also needs
+            // the cast: the bare assignment lets the call's typevar
+            // collect the target's capture as a lower bound against its
+            // declared bound (jdk11 SortedOps.OfRef: source `(Comparator
+            // <? super T>) Comparator.naturalOrder()` — bare, T#1 gets
+            // 上限 Comparable<? super T#1> vs 下限 T#2). Map.ofEntries-style
+            // concrete targets keep the bare inference form.
+            let wildcard_want = matches!(want, TypeRef::G(jcdc_jvm::GenericType::Class(wcs))
+                if wcs.parts.iter().any(|p| p.args.iter().any(|a| {
+                    matches!(a, jcdc_jvm::GenericType::Wildcard(_))
+                })));
+            if !crate::classdec::is_generic_call(value, pool)
+                || reflective_array
+                || wildcard_want
+            {
                 let inner = std::mem::replace(value, Expr::This);
                 *value = Expr::Cast { ty: want.clone(), e: Box::new(inner) };
             }
