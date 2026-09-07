@@ -1182,11 +1182,22 @@ impl<'a> Printer<'a> {
                 // ..)` — the char param needs `!isProxy ? 's' : 'p'`;
                 // a plain int ternary is "条件表达式中的类型错误").
                 Some(jcdc_jvm::JavaType::Char) => self.expr_char(a, out),
+                // Byte/short parameters: an int literal argument needs an
+                // explicit cast (invocation conversion never narrows, even
+                // for in-range constants).
                 Some(jcdc_jvm::JavaType::Byte) => {
-                    self.expr_narrow(a, &jcdc_jvm::JavaType::Byte, out)
+                    if let Expr::Const(ConstVal::Int(n)) = a {
+                        out.push_str(&format!("(byte) {}", n));
+                        continue;
+                    }
+                    self.expr(a, 1, out);
                 }
                 Some(jcdc_jvm::JavaType::Short) => {
-                    self.expr_narrow(a, &jcdc_jvm::JavaType::Short, out)
+                    if let Expr::Const(ConstVal::Int(n)) = a {
+                        out.push_str(&format!("(short) {}", n));
+                        continue;
+                    }
+                    self.expr(a, 1, out);
                 }
                 _ => self.expr(a, 1, out),
             }

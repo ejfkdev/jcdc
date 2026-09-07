@@ -3776,6 +3776,7 @@ fn gather_evidence(
                     if !matches!(t, JavaType::Void) {
                         push_ev(ev, *var, Evidence::T(t));
                     }
+                    cond_branch_evidence(e, *var, ev);
                 }
                 if let Expr::Const(ConstVal::Int(n)) = e {
                     if *n == 0 || *n == 1 {
@@ -3894,6 +3895,25 @@ fn push_ev(ev: &mut Vec<Vec<Evidence>>, v: u32, e: Evidence) {
     }
 }
 
+/// A conditional assigned to a variable contributes BOTH branch types:
+/// `var = c ? new Small32(..) : new Fast32(..)` must join to the LUB
+/// (Object here — no hierarchy access), not keep the first branch's
+/// concrete type (jdk17 CodePointTrie: the decl printed Small32 and the
+/// Fast32 branch became "条件表达式中的类型错误").
+fn cond_branch_evidence(e: &Expr, var: u32, ev: &mut Vec<Vec<Evidence>>) {
+    if let Expr::Cond { t, f, .. } = e {
+        for br in [t.as_ref(), f.as_ref()] {
+            if matches!(br, Expr::Const(ConstVal::Null) | Expr::Lambda(_)) {
+                continue;
+            }
+            let bt = br.type_ref().erased();
+            if !matches!(bt, JavaType::Void) {
+                push_ev(ev, var, Evidence::T(bt));
+            }
+        }
+    }
+}
+
 fn gather_expr(e: &Expr, ev: &mut Vec<Vec<Evidence>>, assign_target: Option<u32>, bool_vars: &mut std::collections::HashSet<u32>) {
     match e {
         Expr::Raw(_) | Expr::RawT(..) => {}
@@ -3922,6 +3942,7 @@ fn gather_expr(e: &Expr, ev: &mut Vec<Vec<Evidence>>, assign_target: Option<u32>
                     if !matches!(t, JavaType::Void) {
                         push_ev(ev, *var, Evidence::T(t));
                     }
+                    cond_branch_evidence(value, *var, ev);
                 }
                 if let Expr::Const(ConstVal::Int(n)) = &**value {
                     if *n == 0 || *n == 1 {

@@ -423,7 +423,23 @@ impl Expr {
                 | BinOp::LogOr => JavaType::Boolean.into(),
                 _ => ty.clone().unwrap_or_else(|| l.type_ref()),
             },
-            Expr::Cond { t, .. } => t.type_ref(),
+            Expr::Cond { t, f, .. } => {
+                // Divergent reference branches join to their LUB; without
+                // hierarchy access that is plain Object (jdk17
+                // CodePointTrie: `c ? new Small32(..) : new Fast32(..)`
+                // typed the merge var Small32 and the sibling branch
+                // became "条件表达式中的类型错误").
+                let tt = t.type_ref();
+                let ft = f.type_ref();
+                match (&tt, &ft) {
+                    (TypeRef::J(JavaType::Object(a)), TypeRef::J(JavaType::Object(b)))
+                        if a != b =>
+                    {
+                        JavaType::Object("java/lang/Object".into()).into()
+                    }
+                    _ => tt,
+                }
+            }
             Expr::Assign { value, .. } => value.type_ref(),
             Expr::PreIncDec { e, .. } | Expr::PostIncDec { e, .. } => e.type_ref(),
             Expr::Lambda(_) => JavaType::Object("java/lang/Object".into()).into(),
