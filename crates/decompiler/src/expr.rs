@@ -364,6 +364,10 @@ pub enum Expr {
     /// Pre-rendered source fragment (used for captured expressions that are
     /// substituted across method contexts).
     Raw(String),
+    /// Pre-rendered capture text WITH the captured local's declared type:
+    /// comparisons inside local-class bodies need the operand's generic
+    /// type to drive witnesses (erased val$ field types cannot).
+    RawT(String, TypeRef),
     /// Unrecognized invokedynamic fallback.
     Invokedynamic {
         name: String,
@@ -424,6 +428,7 @@ impl Expr {
             Expr::PreIncDec { e, .. } | Expr::PostIncDec { e, .. } => e.type_ref(),
             Expr::Lambda(_) => JavaType::Object("java/lang/Object".into()).into(),
             Expr::Raw(_) => JavaType::Object("java/lang/Object".into()).into(),
+            Expr::RawT(_, ty) => ty.clone(),
             Expr::AnonNew { cls, .. } => JavaType::Object(cls.clone()).into(),
             Expr::StringConcat(_) => JavaType::Object("java/lang/String".into()).into(),
             Expr::Invokedynamic { desc, .. } => desc.ret.clone().into(),

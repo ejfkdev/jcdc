@@ -624,6 +624,7 @@ impl<'a> Printer<'a> {
             Expr::Const(c) => self.const_val(c, out),
             Expr::Raw(t) if t == "\u{3}" => out.push_str("this"),
             Expr::Raw(t) => out.push_str(t),
+            Expr::RawT(t, _) => out.push_str(t),
             Expr::Local { var, .. } => {
                 let info = self.vt.var(*var);
                 out.push_str(&info.name);
@@ -1332,6 +1333,37 @@ impl<'a> Printer<'a> {
                             }
                             vt = snap_vt;
                         }
+                        // Lambda impl params carry erased types (no LVTT
+                        // on synthetic methods): lift generic types from
+                        // the indy-site capture expressions, then restore
+                        // comparison witnesses the erased types would
+                        // starve (jdk26 Gatherers: `leftFinisher ==
+                        // Gatherer.defaultFinisher()` inside the finisher
+                        // lambdas — 不可比较的类型).
+                        {
+                            let mut pi = 0usize;
+                            let mut lifted = 0usize;
+                            for v in vt.vars.iter_mut() {
+                                if v.is_param && v.name != "this" {
+                                    if let Some(cap) = l.captures.get(pi) {
+                                        let ct = cap.type_ref();
+                                        if matches!(ct, TypeRef::G(_))
+                                            && !matches!(v.ty, TypeRef::G(_))
+                                        {
+                                            v.ty = ct;
+                                            lifted += 1;
+                                        }
+                                    }
+                                    pi += 1;
+                                }
+                            }
+                            if lifted > 0 {
+                                let types: Vec<TypeRef> =
+                                    vt.vars.iter().map(|vi| vi.ty.clone()).collect();
+                                crate::method::rewrite_local_types(&mut body, &types);
+                            }
+                        }
+                        crate::classdec::witness_comparison_operands(&mut body, None, self.pool);
                         {
                             let fam = crate::classdec::Family::collect(self.pc, self.pool);
                             let _depth = crate::classdec::lambda_body_depth_enter();
@@ -1692,7 +1724,7 @@ impl<'a> Printer<'a> {
         // them to a RAW class erases the whole generic member chain
         // (`((HashMap) HashMap.this).<T>keysToArray(..)` made the call
         // raw: "Object[]无法转换为T[]").
-        if matches!(o, Expr::Raw(_) | Expr::This) {
+        if matches!(o, Expr::Raw(_) | Expr::RawT(..) | Expr::This) {
             return false;
         }
         let jcdc_jvm::JavaType::Object(on) = o.type_ref().erased() else {

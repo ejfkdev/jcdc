@@ -592,7 +592,7 @@ fn expr_uses(e: &Expr, used: &mut std::collections::HashSet<u32>) {
         Expr::Local { var, .. } => {
             used.insert(*var);
         }
-        Expr::Const(_) | Expr::This | Expr::Raw(_) => {}
+        Expr::Const(_) | Expr::This | Expr::Raw(_) | Expr::RawT(..) => {}
         Expr::New { args, .. } | Expr::AnonNew { args, .. } => args.iter().for_each(|a| expr_uses(a, used)),
         Expr::NewArray { dims, init, .. } => {
             dims.iter().for_each(|d| expr_uses(d, used));
@@ -3221,7 +3221,7 @@ fn expr_refs_var_walk(e: &Expr, vars: &std::collections::HashSet<u32>, used: &mu
                 used.insert(*var);
             }
         }
-        Expr::Const(_) | Expr::This | Expr::Raw(_) => {}
+        Expr::Const(_) | Expr::This | Expr::Raw(_) | Expr::RawT(..) => {}
         Expr::New { args, .. } | Expr::AnonNew { args, .. } => args.iter().for_each(|a| expr_refs_var_walk(a, vars, used)),
         Expr::NewArray { dims, init, .. } => {
             dims.iter().for_each(|d| expr_refs_var_walk(d, vars, used));
@@ -3896,7 +3896,7 @@ fn push_ev(ev: &mut Vec<Vec<Evidence>>, v: u32, e: Evidence) {
 
 fn gather_expr(e: &Expr, ev: &mut Vec<Vec<Evidence>>, assign_target: Option<u32>, bool_vars: &mut std::collections::HashSet<u32>) {
     match e {
-        Expr::Raw(_) => {}
+        Expr::Raw(_) | Expr::RawT(..) => {}
         Expr::Local { var, .. } => {
             if let Some(t) = assign_target {
                 // self-reference guard: x = x contributes nothing new
@@ -3974,7 +3974,7 @@ fn gather_expr(e: &Expr, ev: &mut Vec<Vec<Evidence>>, assign_target: Option<u32>
     let _ = assign_target;
 }
 
-fn rewrite_local_types(s: &mut Stmt, types: &[TypeRef]) {
+pub(crate) fn rewrite_local_types(s: &mut Stmt, types: &[TypeRef]) {
     match s {
         Stmt::Block(v) => v.iter_mut().for_each(|x| rewrite_local_types(x, types)),
         Stmt::ExprStmt(e) => rewrite_expr(e, types),

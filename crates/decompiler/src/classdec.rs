@@ -679,6 +679,15 @@ thread_local! {
     /// 变量 K", jdk26 ReferencedKeyMap.internKey putIfAbsent).
     static CAST_BANNED_TVARS: std::cell::RefCell<Vec<String>> =
         std::cell::RefCell::new(Vec::new());
+
+    /// Capture TEXT -> first known GENERIC type: the winning local-class
+    /// emission is often the fix_lambda_captures throwaway walk, whose vt
+    /// carries erased lambda-param types; a later site (the outer method
+    /// body) knows the declared generic type. The witness upgrade below
+    /// runs per emission, so the recorded type upgrades every string
+    /// rendered afterwards.
+    static CAPTURE_GENERIC_TYPES: std::cell::RefCell<HashMap<String, TypeRef>> =
+        std::cell::RefCell::new(HashMap::new());
 }
 
 fn g_mentions_tvar_named(g: &jcdc_jvm::GenericType, names: &[String]) -> bool {
@@ -2706,6 +2715,11 @@ fn emit_method_with(
                                         rep.insert(*var, Expr::Raw(t.clone()));
                                     }
                                 }
+                                Expr::RawT(t, ty) => {
+                                    if let Expr::Local { var, .. } = value.as_ref() {
+                                        rep.insert(*var, Expr::RawT(t.clone(), ty.clone()));
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -2750,6 +2764,8 @@ fn emit_method_with(
             let extern_save = EXTERN_DECL.with(|x| x.borrow().clone());
             let internals_save =
                 LOCAL_CLASS_INTERNALS.with(|m| std::mem::take(&mut *m.borrow_mut()));
+            let captys_save =
+                CAPTURE_GENERIC_TYPES.with(|m| std::mem::take(&mut *m.borrow_mut()));
             fix_lambda_captures(&mut body, &mut mb.vt, pc, pool, fam);
             line.push_str(" {\n");
             out.push_str(&line);
@@ -2776,6 +2792,7 @@ fn emit_method_with(
                 .into_string(&body);
             EXTERN_DECL.with(|x| *x.borrow_mut() = extern_save);
             LOCAL_CLASS_INTERNALS.with(|m| *m.borrow_mut() = internals_save);
+            CAPTURE_GENERIC_TYPES.with(|m| *m.borrow_mut() = captys_save);
             out.push_str(&text);
             out.push_str(&pad);
             out.push_str("}\n");
@@ -5565,7 +5582,28 @@ fn render_captures(
             if !atomic {
                 text.push(')');
             }
-            (k, Expr::Raw(text))
+            // Keep the captured local's declared type on the Raw: the
+            // substituted expression stands in comparisons inside the
+            // class body (`leftFinisher == Gatherer.defaultFinisher()`),
+            // and the comparison witness needs the generic operand type
+            // to unify against (the erased val$ field type cannot drive
+            // it).
+            let mut ty = match &v {
+                Expr::Local { var, .. } => outer_vt.var(*var).ty.clone(),
+                _ => TypeRef::J(jcdc_jvm::JavaType::Object("java/lang/Object".into())),
+            };
+            CAPTURE_GENERIC_TYPES.with(|m| {
+                let mut m = m.borrow_mut();
+                match m.get(&text) {
+                    Some(g) if matches!(g, TypeRef::G(_)) => ty = g.clone(),
+                    _ => {
+                        if matches!(ty, TypeRef::G(_)) {
+                            m.insert(text.clone(), ty.clone());
+                        }
+                    }
+                }
+            });
+            (k, Expr::RawT(text, ty))
         })
         .collect()
 }
@@ -6440,7 +6478,31 @@ pub(crate) fn fix_lambda_captures(
                             let _depth = AnonBodyDepthGuard;
                             let _capture = LOCAL_DECL_SITES.with(|c| c.borrow_mut().take());
                             LOCAL_DECL_SITES.with(|c| *c.borrow_mut() = Some(Vec::new()));
-                            walk_stmt_anon(&mut cb, pc, pool, fam, &mut p2, &mb.vt, &mut d2);
+                            // Lambda impl methods carry erased param
+                            // types (no LVTT on synthetic methods): lift
+                            // the generic types from the LambdaExpr's
+                            // capture expressions (outer locals at the
+                            // indy site) so capture renderings — and the
+                            // comparison witnesses they drive — see the
+                            // declared parameterization.
+                            let mut lvt = mb.vt.clone();
+                            {
+                                let mut pi = 0usize;
+                                for v in lvt.vars.iter_mut() {
+                                    if v.is_param && v.name != "this" {
+                                        if let Some(cap) = l.captures.get(pi) {
+                                            let ct = cap.type_ref();
+                                            if matches!(ct, TypeRef::G(_))
+                                                && !matches!(v.ty, TypeRef::G(_))
+                                            {
+                                                v.ty = ct;
+                                            }
+                                        }
+                                        pi += 1;
+                                    }
+                                }
+                            }
+                            walk_stmt_anon(&mut cb, pc, pool, fam, &mut p2, &lvt, &mut d2);
                             // Capture local names whose decls live inside
                             // the lambda body and whose captures are lambda
                             // params (jdk26 Gatherers.map's `class Box`
@@ -7772,7 +7834,7 @@ fn strip_inner_ctor_artifacts(s: &mut Stmt, vt: &VarTable, outer_param: Option<(
                 // assign to a Raw outer-local name; an inner/local ctor can
                 // never legally assign an outer local, so any Raw target
                 // here is a capture store.
-                Expr::Raw(_) => true,
+                Expr::Raw(_) | Expr::RawT(..) => true,
                 _ => false,
             },
             Stmt::ExprStmt(Expr::Method { name, args, .. }) => {
@@ -9528,26 +9590,55 @@ fn add_return_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, 
 /// bare call infers <Object,Object>. The comparison operand supplies
 /// the wanted type; compute_witness unifies it with the callee's
 /// generic return (jdk26 Gatherers 12-14 errors).
-fn witness_comparison_operands(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, pool: &ClassPool) {
+pub(crate) fn witness_comparison_operands(
+    s: &mut Stmt,
+    msig: Option<&jcdc_jvm::MethodSignature>,
+    pool: &ClassPool,
+) {
     let caller_params: Option<&[jcdc_jvm::TypeParam]> = msig.map(|m| m.params.as_slice());
+    if std::env::var("JCDC_DBG_WIT").is_ok() {
+        eprintln!("WITCMP enter body");
+    }
     fn fix_e(e: &mut Expr, pool: &ClassPool, caller_params: Option<&[jcdc_jvm::TypeParam]>) {
         if let Expr::Bin { op, l, r, .. } = e {
+            if std::env::var("JCDC_DBG_WIT").is_ok() {
+                eprintln!("WITCMP bin lt={:?} rt={:?}", l.type_ref(), r.type_ref());
+            }
             use crate::expr::BinOp;
             if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::RefEq | BinOp::RefNe) {
-                for (a, b) in [(l.as_mut(), r.as_ref()), (r.as_mut(), l.as_ref())] {
-                    let TypeRef::G(want) = b.type_ref() else { continue };
-                    let Expr::Method { cls, name, desc, type_args, .. } = a else { continue };
+                let try_witness = |a: &mut Expr,
+                                   b: &Expr,
+                                   pool: &ClassPool,
+                                   caller_params: Option<&[jcdc_jvm::TypeParam]>| {
+                    let TypeRef::G(want) = b.type_ref() else {
+                        if std::env::var("JCDC_DBG_WIT").is_ok() {
+                            eprintln!("WITTRY skip: b not G");
+                        }
+                        return;
+                    };
+                    let Expr::Method { cls, name, desc, type_args, .. } = &*a else {
+                        if std::env::var("JCDC_DBG_WIT").is_ok() {
+                            eprintln!("WITTRY skip: a not Method: {:?}", std::mem::discriminant(&*a));
+                        }
+                        return;
+                    };
                     if !type_args.is_empty() {
-                        continue;
+                        return;
                     }
-                    if let Some((w, _)) =
-                        compute_witness(cls, name, desc, None, &want, pool, caller_params)
-                    {
+                    let res = compute_witness(cls, name, desc, None, &want, pool, caller_params);
+                    if std::env::var("JCDC_DBG_WIT").is_ok() && name == "defaultFinisher" {
+                        eprintln!("WITTRY {} res={:?}", name, res.is_some());
+                    }
+                    if let Some((w, _)) = res {
                         if let Expr::Method { type_args, .. } = a {
                             *type_args = w;
                         }
                     }
-                }
+                };
+                let rwant = r.type_ref();
+                try_witness(l, r, pool, caller_params);
+                let _ = rwant;
+                try_witness(r, l, pool, caller_params);
             }
         }
         fix_children_e(e, pool, caller_params);
@@ -9905,6 +9996,15 @@ fn unify_types(
                 }
             }
             true
+        }
+        (G::Wildcard(ba), G::Wildcard(bb)) => {
+            use jcdc_jvm::WildcardBound as W;
+            match (ba, bb) {
+                (W::Extends(x), W::Extends(y)) | (W::Super(x), W::Super(y)) => {
+                    unify_types(x, y, map)
+                }
+                _ => false,
+            }
         }
         (a, b) => a == b,
     }

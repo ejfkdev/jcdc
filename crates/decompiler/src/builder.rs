@@ -1962,7 +1962,7 @@ pub fn class_name_to_type(name: &str) -> JavaType {
 /// True if dropping this expression from a `pop` would change semantics.
 pub fn has_side_effects(e: &Expr) -> bool {
     match e {
-        Expr::Const(_) | Expr::Local { .. } | Expr::This | Expr::Raw(_) => false,
+        Expr::Const(_) | Expr::Local { .. } | Expr::This | Expr::Raw(_) | Expr::RawT(..) => false,
         Expr::New { .. } | Expr::Method { .. } | Expr::Invokedynamic { .. } | Expr::Lambda(_)
         | Expr::AnonNew { .. } => true,
         Expr::Assign { .. } | Expr::PreIncDec { .. } | Expr::PostIncDec { .. } => true,
