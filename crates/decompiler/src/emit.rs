@@ -1736,6 +1736,7 @@ impl<'a> Printer<'a> {
                             self.pool,
                             self.pc,
                             &vt,
+                            &[],
                         );
                         crate::method::prune_post_loop_label_breaks(&mut body);
                         crate::method::demote_undefined_label_jumps(&mut body);

@@ -1048,7 +1048,7 @@ fn emit_class(
                 {
                     let banned = class_typevar_names(pc);
                     CAST_BANNED_TVARS.with(|b| *b.borrow_mut() = banned);
-                    cast_wildcard_call_args(&mut body, pool, pc, &mb.vt);
+                    cast_wildcard_call_args(&mut body, pool, pc, &mb.vt, &[]);
                     CAST_BANNED_TVARS.with(|b| b.borrow_mut().clear());
                 }
                 fix_lambda_captures(&mut body, &mut mb.vt, pc, pool, fam);
@@ -2732,7 +2732,9 @@ fn emit_method_with(
                 let banned = class_typevar_names(pc);
                 CAST_BANNED_TVARS.with(|b| *b.borrow_mut() = banned);
             }
-            cast_wildcard_call_args(&mut body, pool, pc, &mb.vt);
+            let caller_params: Vec<jcdc_jvm::TypeParam> =
+                msig.as_ref().map(|m| m.params.clone()).unwrap_or_default();
+            cast_wildcard_call_args(&mut body, pool, pc, &mb.vt, &caller_params);
             if static_ban {
                 CAST_BANNED_TVARS.with(|b| b.borrow_mut().clear());
             }
@@ -8897,13 +8899,18 @@ pub(crate) fn instantiated_method_ret(
     pool: &ClassPool,
     pc: &PoolClass,
 ) -> Option<jcdc_jvm::GenericType> {
-    let (name, desc, owner, is_static) = match m {
-        Expr::Method { name, desc, owner, is_static, .. } => {
-            (name.as_str(), desc, owner.as_deref(), *is_static)
-        }
+    let (cls, name, desc, owner, is_static, args) = match m {
+        Expr::Method { cls, name, desc, owner, is_static, args, .. } => (
+            cls.as_str(),
+            name.as_str(),
+            desc,
+            owner.as_deref(),
+            *is_static,
+            args.as_slice(),
+        ),
         _ => return None,
     };
-    if is_static || name == "<init>" {
+    if name == "<init>" {
         return None;
     }
     let d_str = format!(
@@ -8911,6 +8918,44 @@ pub(crate) fn instantiated_method_ret(
         desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
         desc.ret.to_descriptor()
     );
+    if is_static {
+        // A static generic call whose return is the method's OWN typevar:
+        // infer it from the single bare-typevar formal's actual (jdk
+        // LoggerWrapper: `(System.Logger) Objects.requireNonNull(wrapped)`
+        // upgrades to `(L)` — requireNonNull<T>(T) with wrapped: L;
+        // Logger无法转换为L on the this(..) delegation formal).
+        let dpc = pool.get(cls)?;
+        let mi = (0..dpc.cf.methods.len())
+            .find(|&i| dpc.method_name(i) == Some(name) && desc_raw(&dpc, i) == d_str)?;
+        let msig = method_signature_of(&dpc, mi)?;
+        let jcdc_jvm::GenericType::TypeVar(r) = &msig.ret else {
+            return None;
+        };
+        let hits: Vec<usize> = msig
+            .args
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| matches!(f, jcdc_jvm::GenericType::TypeVar(t) if t == r))
+            .map(|(i, _)| i)
+            .collect();
+        if hits.len() != 1 {
+            return None;
+        }
+        let arg = args.get(hits[0])?;
+        if matches!(arg, Expr::Cast { .. } | Expr::Const(_) | Expr::Lambda(_)) {
+            return None;
+        }
+        let tr = arg.type_ref();
+        return match &tr {
+            TypeRef::G(g @ jcdc_jvm::GenericType::TypeVar(_)) => Some(g.clone()),
+            TypeRef::G(g @ jcdc_jvm::GenericType::Class(cs))
+                if cs.parts.iter().any(|p| !p.args.is_empty()) =>
+            {
+                Some(g.clone())
+            }
+            _ => None,
+        };
+    }
     let (start, start_args): (String, Vec<jcdc_jvm::GenericType>) = match owner {
         Some(o) => {
             let raw_outer = match o {
@@ -9863,9 +9908,10 @@ fn apply_ctor_param_casts(
     params: &[jcdc_jvm::GenericType],
     pool: &ClassPool,
     pc: Option<&PoolClass>,
+    caller_params: &[jcdc_jvm::TypeParam],
 ) {
     let off = args.len().saturating_sub(params.len());
-    apply_param_casts(&mut args[off..], params, pool, pc);
+    apply_param_casts(&mut args[off..], params, pool, pc, caller_params);
 }
 
 /// Apply per-argument source casts for a call/ctor whose instantiated
@@ -9875,6 +9921,7 @@ fn apply_param_casts(
     params: &[jcdc_jvm::GenericType],
     pool: &ClassPool,
     pc: Option<&PoolClass>,
+    caller_params: &[jcdc_jvm::TypeParam],
 ) {
     fn parameterized(t: &jcdc_jvm::GenericType) -> bool {
         match t {
@@ -10030,11 +10077,18 @@ fn apply_param_casts(
                     // Deque<N>.addFirst(Node<T>) fails without it).
                     let have_ty = a.type_ref();
                     let have = have_ty.erased();
-                    let want_er = match (&want, pc) {
-                        (jcdc_jvm::GenericType::TypeVar(n), Some(p)) => {
-                            typevar_bound_erasure(n, p)
-                                .unwrap_or_else(|| TypeRef::G(want.clone()).erased())
-                        }
+                    let want_er = match &want {
+                        jcdc_jvm::GenericType::TypeVar(n) => caller_params
+                            .iter()
+                            .find(|p| &p.name == n)
+                            .and_then(|p| {
+                                p.class_bound
+                                    .clone()
+                                    .or_else(|| p.interface_bounds.first().cloned())
+                            })
+                            .map(|b| TypeRef::G(b).erased())
+                            .or_else(|| pc.and_then(|p| typevar_bound_erasure(n, p)))
+                            .unwrap_or_else(|| TypeRef::G(want.clone()).erased()),
                         _ => TypeRef::G(want.clone()).erased(),
                     };
                     let ok = match (&have, &want_er) {
@@ -10154,9 +10208,10 @@ fn disambiguate_overload_args(e: &mut Expr, pool: &ClassPool) {
 pub(crate) fn upgrade_erased_call_casts(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass) {
     fn fix(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
         type_field_reads(e, pool, pc, true);
-        walk_expr_children(e, pool, pc, fix);
+        let f: fn(&mut Expr, &ClassPool, &PoolClass) = fix;
+        walk_expr_children(e, pool, pc, &mut { f });
     }
-    walk_stmt_exprs(s, pool, pc, fix);
+    walk_stmt_exprs(s, pool, pc, &mut { fix });
 }
 
 /// Type instance field reads with their instantiated Signature type
@@ -10345,7 +10400,13 @@ fn type_field_reads(e: &mut Expr, pool: &ClassPool, pc: &PoolClass, concrete_ok:
     }
 }
 
-pub(crate) fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass, vt: &crate::varalloc::VarTable) {
+pub(crate) fn cast_wildcard_call_args(
+    s: &mut Stmt,
+    pool: &ClassPool,
+    pc: &PoolClass,
+    vt: &crate::varalloc::VarTable,
+    caller_params: &[jcdc_jvm::TypeParam],
+) {
     // Reference comparison between two different parameterizations of
     // the same generic class is "不可比较的类型" (jdk11 Arrays.copyOf:
     // Class<CAP#1 from ? extends T[]> against the class literal
@@ -10895,7 +10956,7 @@ pub(crate) fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolC
             *a = Expr::Cast { ty: raw, e: Box::new(inner) };
         }
     }
-    fn fix_expr(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
+    fn fix_expr(e: &mut Expr, pool: &ClassPool, pc: &PoolClass, caller_params: &[jcdc_jvm::TypeParam]) {
         incomparable_class_cmp(e, pool);
         // Before raw_witness_capture_call_args: type_field_reads drops
         // bytecode self-casts over freshly typed field reads, and a
@@ -10950,15 +11011,15 @@ pub(crate) fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolC
         let params = params.or_else(|| instantiated_ctor_params(e, pool));
         if let Some(params) = params {
             match e {
-                Expr::Method { args, .. } => apply_param_casts(args, &params, pool, Some(pc)),
-                Expr::New { args, .. } => apply_ctor_param_casts(args, &params, pool, Some(pc)),
+                Expr::Method { args, .. } => apply_param_casts(args, &params, pool, Some(pc), caller_params),
+                Expr::New { args, .. } => apply_ctor_param_casts(args, &params, pool, Some(pc), caller_params),
                 _ => {}
             }
         }
-        walk_expr_children(e, pool, pc, fix_expr);
+        walk_expr_children(e, pool, pc, &mut |x, p2, c2| fix_expr(x, p2, c2, caller_params));
     }
     fix_diamond_localdefs(s, vt, pool);
-    walk_stmt_exprs(s, pool, pc, fix_expr);
+    walk_stmt_exprs(s, pool, pc, &mut |x, p2, c2| fix_expr(x, p2, c2, caller_params));
 }
 
 /// Diamond news assigned to a generically-declared local: the New's own
@@ -11111,10 +11172,10 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
     }
     fn apply_to_value(value: &mut Expr, params: &[jcdc_jvm::GenericType], pool: &ClassPool) {
         match value {
-            Expr::New { args, .. } => apply_ctor_param_casts(args, params, pool, None),
+            Expr::New { args, .. } => apply_ctor_param_casts(args, params, pool, None, &[]),
             Expr::Cast { e, .. } => {
                 if let Expr::New { args, .. } = &mut **e {
-                    apply_ctor_param_casts(args, params, pool, None);
+                    apply_ctor_param_casts(args, params, pool, None, &[]);
                 }
             }
             _ => {}
@@ -11195,11 +11256,11 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
         _ => {}
     }
 }
-fn walk_expr_children(
+fn walk_expr_children<F: FnMut(&mut Expr, &ClassPool, &PoolClass)>(
     e: &mut Expr,
     pool: &ClassPool,
     pc: &PoolClass,
-    f: fn(&mut Expr, &ClassPool, &PoolClass),
+    f: &mut F,
 ) {
     match e {
         Expr::Method { owner, args, .. } => {
@@ -11248,11 +11309,11 @@ fn walk_expr_children(
     }
 }
 
-fn walk_stmt_exprs(
+fn walk_stmt_exprs<F: FnMut(&mut Expr, &ClassPool, &PoolClass)>(
     s: &mut Stmt,
     pool: &ClassPool,
     pc: &PoolClass,
-    f: fn(&mut Expr, &ClassPool, &PoolClass),
+    f: &mut F,
 ) {
     match s {
         Stmt::Block(v) => v.iter_mut().for_each(|x| walk_stmt_exprs(x, pool, pc, f)),
@@ -13003,7 +13064,7 @@ fn cast_generic_returns(s: &mut Stmt, want: &TypeRef, pc: &PoolClass, pool: &Cla
                     if let Some(sub) =
                         instantiated_ctor_params_core(ncls, &own, args.len(), pool)
                     {
-                        apply_ctor_param_casts(args, &sub, pool, Some(pc));
+                        apply_ctor_param_casts(args, &sub, pool, Some(pc), &[]);
                     }
                 }
             }
