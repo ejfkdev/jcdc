@@ -1293,7 +1293,45 @@ impl<'a> Printer<'a> {
                     }
                     out.push_str(name);
                     out.push('(');
-                    self.args_typed(args, &desc.args, out);
+                    // Lambda args of a GENERIC call: prime each one's
+                    // body-return cast from the instantiated formal's SAM
+                    // return (jdk17 AbstractPipeline.opEvaluateParallelLazy:
+                    // `i -> (E_OUT[]) new Object[i]` — the erasure-equal
+                    // cast leaves no bytecode trace and without it the
+                    // IntFunction<E_OUT[]> formal starves: Object[]无法
+                    // 转换为E_OUT[]).
+                    let sam_rets: Vec<Option<TypeRef>> = {
+                        let mut v: Vec<Option<TypeRef>> =
+                            std::iter::repeat_with(|| None).take(args.len()).collect();
+                        if crate::classdec::is_generic_call(e, self.pool) {
+                            if let Some((formals, mtvars)) =
+                                crate::classdec::generic_call_formals(e, self.pool, self.pc)
+                            {
+                                if formals.len() == args.len() {
+                                    for (i, (a, f)) in
+                                        args.iter().zip(formals.iter()).enumerate()
+                                    {
+                                        if let Expr::Lambda(l) = a {
+                                            // A formal still carrying the
+                                            // callee's own method typevars
+                                            // is not denotable at this
+                                            // call site.
+                                            if crate::classdec::g_mentions_any(f, &mtvars) {
+                                                continue;
+                                            }
+                                            v[i] = self.sam_ret_cast(f, &l.sam_name);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        v
+                    };
+                    if sam_rets.iter().any(|x| x.is_some()) {
+                        self.args_typed_sam(args, &desc.args, &sam_rets, out);
+                    } else {
+                        self.args_typed(args, &desc.args, out);
+                    }
                     out.push(')');
                 }
             }

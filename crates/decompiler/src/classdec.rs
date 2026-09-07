@@ -2853,6 +2853,14 @@ fn emit_method_with(
                     }
                 }
                 strip_inner_ctor_artifacts(&mut body, &mb.vt, outer_slot_param.clone());
+                // The this$0 store kept the trivial super() from being the
+                // FIRST statement when strip_trivial_super ran earlier; now
+                // that the artifacts are gone, retry (jdk11/17
+                // ConcurrentLinkedQueue.Itr: the printed `super();` after
+                // the hoisted decls is a pre-22 "灵活构造器" error).
+                if is_ctor {
+                    strip_trivial_super(&mut body, pc);
+                }
             }
             // Member inner classes: this$N field reads become Outer.this.
             let outer_this = outer_this_map(pc);
@@ -3670,10 +3678,27 @@ fn strip_trivial_super(body: &mut Stmt, pc: &PoolClass) {
         Stmt::Block(v) => v,
         _ => return,
     };
-    if let Some(first) = stmts.first_mut() {
-        if let Stmt::ExprStmt(Expr::Method { name, cls, args, .. }) = first {
+    // Hoisted/trivial local declarations may precede the call (jdk11
+    // ConcurrentLinkedQueue.Itr: `Node h = null; ... super();` — javac put
+    // super() first in bytecode; the printed pre-super decls make it a
+    // pre-22 "灵活构造器" error). Skip side-effect-free decls when
+    // locating it.
+    fn trivial_decl(s: &Stmt) -> bool {
+        match s {
+            Stmt::LocalDef { init: None, .. } => true,
+            Stmt::LocalDef { init: Some(e), .. } => match e {
+                Expr::Const(_) => true,
+                Expr::Cast { e: i, .. } => matches!(&**i, Expr::Const(_)),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+    let idx = stmts.iter().position(|s| !trivial_decl(s));
+    if let Some(i) = idx {
+        if let Stmt::ExprStmt(Expr::Method { name, cls, args, .. }) = &stmts[i] {
             if name == "<init>" && args.is_empty() && cls != &pc.internal_name {
-                *first = Stmt::Block(vec![]);
+                stmts[i] = Stmt::Block(vec![]);
             }
         }
     }
@@ -9948,7 +9973,112 @@ fn outer_this_instantiation(
     }
 }
 
-fn instantiated_method_params(
+/// Instantiated Signature formals of a call for SAM-return priming:
+/// unlike instantiated_method_params this does NOT bail on generic
+/// methods — the caller gates each formal on mentioning no callee method
+/// typevar (jdk17 AbstractPipeline.opEvaluateParallelLazy: the
+/// IntFunction<E_OUT[]> formal is class-param-only while the sibling
+/// formal carries the callee's P_IN). Direct declarations only (no super
+/// walk); returns (formals, method-typevar names).
+pub(crate) fn generic_call_formals(
+    m: &Expr,
+    pool: &ClassPool,
+    pc: &PoolClass,
+) -> Option<(Vec<jcdc_jvm::GenericType>, Vec<String>)> {
+    use jcdc_jvm::GenericType as G;
+    let (cls, name, desc, owner, is_static) = match m {
+        Expr::Method { cls, name, desc, owner, is_static, .. } => {
+            (cls.as_str(), name.as_str(), desc, owner.as_deref(), *is_static)
+        }
+        _ => return None,
+    };
+    if name == "<init>" {
+        return None;
+    }
+    let (decl, decl_args): (String, Vec<G>) = if is_static {
+        (cls.to_string(), Vec::new())
+    } else {
+        match owner {
+            None | Some(Expr::This) => {
+                let cs = pc.class_attr("Signature").and_then(|b| {
+                    if b.len() >= 2 {
+                        pc.utf8(u16::from_be_bytes([b[0], b[1]])).and_then(|x| parse_class_signature(x))
+                    } else {
+                        None
+                    }
+                });
+                let args = cs
+                    .as_ref()
+                    .map(|c| c.params.iter().map(|p| G::TypeVar(p.name.clone())).collect())
+                    .unwrap_or_default();
+                (pc.internal_name.clone(), args)
+            }
+            Some(o) => match o.type_ref() {
+                TypeRef::G(G::Class(cs)) => {
+                    (crate::method::classsig_internal(&cs), cs.parts.last()?.args.clone())
+                }
+                _ => return None,
+            },
+        }
+    };
+    let d_str = format!(
+        "({}){}",
+        desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+        desc.ret.to_descriptor()
+    );
+    let owned;
+    let dref: &PoolClass = if decl == pc.internal_name {
+        pc
+    } else {
+        owned = pool.get(&decl)?;
+        &owned
+    };
+    let mi = (0..dref.cf.methods.len())
+        .find(|&i| dref.method_name(i) == Some(name) && desc_raw(dref, i) == d_str)?;
+    let msig = method_signature_of(dref, mi)?;
+    let class_params = dref
+        .class_attr("Signature")
+        .and_then(|b| {
+            if b.len() >= 2 {
+                dref.utf8(u16::from_be_bytes([b[0], b[1]])).and_then(|x| parse_class_signature(x))
+            } else {
+                None
+            }
+        })
+        .map(|c| c.params)
+        .unwrap_or_default();
+    if class_params.len() != decl_args.len() {
+        return None;
+    }
+    let formals = msig
+        .args
+        .iter()
+        .map(|a| crate::method::subst_typevars(a, &class_params, &decl_args))
+        .collect();
+    let mtvars = msig.params.iter().map(|p| p.name.clone()).collect();
+    Some((formals, mtvars))
+}
+
+/// True when the type mentions any of the given typevar names.
+pub(crate) fn g_mentions_any(g: &jcdc_jvm::GenericType, names: &[String]) -> bool {
+    g_mentions_any_inner(g, names)
+}
+fn g_mentions_any_inner(g: &jcdc_jvm::GenericType, names: &[String]) -> bool {
+    use jcdc_jvm::GenericType as G;
+    match g {
+        G::TypeVar(n) => names.iter().any(|x| x == n),
+        G::Array(i) => g_mentions_any_inner(i, names),
+        G::Class(cs) => cs
+            .parts
+            .iter()
+            .any(|p| p.args.iter().any(|a| g_mentions_any_inner(a, names))),
+        G::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
+        | G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => g_mentions_any_inner(t, names),
+        _ => false,
+    }
+}
+
+pub(crate) fn instantiated_method_params(
     m: &Expr,
     pool: &ClassPool,
     pc: &PoolClass,
