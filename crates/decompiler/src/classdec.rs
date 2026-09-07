@@ -2738,6 +2738,7 @@ fn emit_method_with(
                 msig.as_ref().map(|m| m.params.clone()).unwrap_or_default();
             cast_wildcard_call_args(&mut body, pool, pc, &mb.vt, &caller_params);
             witness_methodref_localdef_calls(&mut body, &mb.vt, pool, pc, &caller_params);
+            pin_underdetermined_return_diamonds(&mut body, msig.as_ref(), pool);
             if static_ban {
                 CAST_BANNED_TVARS.with(|b| b.borrow_mut().clear());
             }
@@ -2858,6 +2859,16 @@ fn emit_method_with(
             crate::method::prune_post_loop_label_breaks(&mut body);
             crate::method::demote_undefined_label_jumps(&mut body);
             split_return_assigns(&mut body);
+            // Ctor delegations were still capture-arg-padded when
+            // cast_wildcard_call_args ran, and prune_local_ctor_delegation
+            // trims the ARGS without rewriting the node's descriptor (the
+            // desc-based target lookup then misses). Cast the pruned
+            // delegation's erased actuals against the target ctor's
+            // typevar formals directly (jdk26 Gatherers Composite State's
+            // `this(!arg0 ? arg1.get() : null, ..)` needs the source-elided
+            // (A)/(AA) casts — the raw Supplier capture params type the
+            // conditionals at Object: "Object无法转换为A").
+            cast_pruned_delegation_typevar_args(&mut body, pc, mi);
             add_throw_witnesses(&mut body, msig.as_ref(), pool);
             strip_erasure_casts_generic_ret(&mut body, msig.as_ref(), pool);
             witness_generic_returns(&mut body, msig.as_ref(), pool, pc);
@@ -3475,6 +3486,58 @@ fn strip_enum_super(body: &mut Stmt) {
 /// "找不到合适的构造器"). Mirrors the skip sets emit_method_with
 /// applies to the target: val$/this$-named params plus direct
 /// capture-store params.
+/// After prune_local_ctor_delegation: the leading `this(...)` delegation's
+/// args were trimmed but its descriptor still records the synthetic
+/// capture-ctor form, so the desc-keyed cast passes skipped it. Re-align
+/// the pruned args against the same-arity Signature-bearing sibling ctor
+/// and restore the unchecked casts to TYPEVAR formals whose actuals are
+/// plain Object (erased raw-Supplier `get()` conditionals, null-merged
+/// captures). Idempotent: already-cast or generically-typed actuals are
+/// left alone.
+fn cast_pruned_delegation_typevar_args(body: &mut Stmt, pc: &PoolClass, mi_self: usize) {
+    let stmts = match body {
+        Stmt::Block(v) => v,
+        _ => return,
+    };
+    let Some(first) = stmts.first_mut() else { return };
+    let Stmt::ExprStmt(Expr::Method { name, cls, args, .. }) = first else {
+        return;
+    };
+    if name != "<init>" || cls != &pc.internal_name || args.is_empty() {
+        return;
+    }
+    // The target ctor: same class, Signature-bearing, formals matching the
+    // pruned arg count.
+    let mut found: Option<(usize, jcdc_jvm::MethodSignature)> = None;
+    for mi2 in 0..pc.cf.methods.len() {
+        if mi2 == mi_self || pc.method_name(mi2) != Some("<init>") {
+            continue;
+        }
+        let Some(msig) = method_signature_of(pc, mi2) else { continue };
+        if msig.args.len() == args.len() {
+            found = Some((mi2, msig));
+            break;
+        }
+    }
+    let Some((_mi2, msig)) = found else { return };
+    for (a, formal) in args.iter_mut().zip(msig.args.iter()) {
+        let jcdc_jvm::GenericType::TypeVar(tn) = formal else { continue };
+        if matches!(a, Expr::Cast { .. } | Expr::Const(_) | Expr::Lambda(_)) {
+            continue;
+        }
+        if !matches!(a.type_ref(), TypeRef::J(jcdc_jvm::JavaType::Object(n))
+            if n == "java/lang/Object")
+        {
+            continue;
+        }
+        let inner = std::mem::replace(a, Expr::This);
+        *a = Expr::Cast {
+            ty: TypeRef::G(jcdc_jvm::GenericType::TypeVar(tn.clone())),
+            e: Box::new(inner),
+        };
+    }
+}
+
 fn prune_local_ctor_delegation(body: &mut Stmt, pc: &PoolClass, mi_self: usize) {
     let stmts = match body {
         Stmt::Block(v) => v,
@@ -11827,6 +11890,26 @@ pub(crate) fn cast_wildcard_call_args(
                 continue;
             }
             let formal = crate::method::subst_typevars(pt, &class_params, &inst_args);
+            // Typevar formal with an erased (plain-Object) actual: the
+            // source carried the unchecked cast the bytecode elides
+            // (jdk26 Gatherers impl() State's synthetic capture ctor
+            // delegates `this(!arg0 ? arg1.get() : null, ..)` against the
+            // private ctor's (A, AA, boolean, boolean) Signature — the raw
+            // Supplier capture parameter types the conditional at Object:
+            // "Object无法转换为A"). Cast to the typevar; skip values that
+            // already carry a generic type.
+            if let jcdc_jvm::GenericType::TypeVar(tn) = &formal {
+                if matches!(a.type_ref(), TypeRef::J(jcdc_jvm::JavaType::Object(n))
+                    if n == "java/lang/Object")
+                {
+                    let inner = std::mem::replace(a, Expr::This);
+                    *a = Expr::Cast {
+                        ty: TypeRef::G(jcdc_jvm::GenericType::TypeVar(tn.clone())),
+                        e: Box::new(inner),
+                    };
+                }
+                continue;
+            }
             let jcdc_jvm::GenericType::Class(fc) = &formal else {
                 continue;
             };
@@ -14543,6 +14626,364 @@ fn target_inferable_diamonds(
         }
     }
     saw_diamond
+}
+
+fn g_has_typevar_in(g: &jcdc_jvm::GenericType, params: &[jcdc_jvm::TypeParam]) -> bool {
+    use jcdc_jvm::GenericType as G;
+    match g {
+        G::TypeVar(n) => params.iter().any(|p| &p.name == n),
+        G::Array(i) => g_has_typevar_in(i, params),
+        G::Class(cs) => cs
+            .parts
+            .iter()
+            .any(|p| p.args.iter().any(|a| g_has_typevar_in(a, params))),
+        G::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
+        | G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => g_has_typevar_in(t, params),
+        _ => false,
+    }
+}
+
+/// Explicit type arguments for a diamond `new` whose own args the return
+/// target cannot fully resolve: the wildcard slot of the target
+/// (Gatherer<T,?,RR>) leaves the middle parameter open, and javac's
+/// diamond inference then drowns the constructor's functional arguments
+/// in captures (jdk26 Gatherers Composite.impl: `new GathererImpl<>(..)`
+/// — the finisher/combiner method refs face CAP#1 from `? super R#2`,
+/// "方法引用无效"; the source pins `new GathererImpl<T, State, RR>(..)`).
+/// Resolution: unify the newed class's declared supertype instantiation
+/// (own params symbolic) against the target to bind what the target
+/// gives, then bind the rest from the witnessed generic-call arguments
+/// (a Cond counts when both branches agree). All params must end up
+/// bound to denotable non-wildcard types or the diamond stays.
+fn diamond_explicit_args_from_call_args(
+    e: &Expr,
+    want: &jcdc_jvm::GenericType,
+    pool: &ClassPool,
+) -> Option<Vec<jcdc_jvm::GenericType>> {
+    use jcdc_jvm::GenericType as G;
+    let Expr::New { cls, args, .. } = e else { return None };
+    let G::Class(wcs) = want else { return None };
+    let npc = pool.get(cls)?;
+    let Some(csig) = npc.class_attr("Signature").and_then(|b| {
+        if b.len() >= 2 {
+            npc.utf8(u16::from_be_bytes([b[0], b[1]])).and_then(|x| parse_class_signature(x))
+        } else {
+            None
+        }
+    }) else {
+        return None;
+    };
+    if csig.params.is_empty() {
+        return None;
+    }
+    let own_syms: Vec<G> = csig
+        .params
+        .iter()
+        .map(|p| G::TypeVar(p.name.clone()))
+        .collect();
+    // Bind own params from the target through the supertype chain.
+    let want_internal = crate::method::classsig_internal(wcs);
+    let mut subst: HashMap<String, G> = HashMap::new();
+    if want_internal == *cls {
+        let want_args = &wcs.parts.last()?.args;
+        if want_args.len() != csig.params.len() {
+            return None;
+        }
+        for (p, w) in csig.params.iter().zip(want_args.iter()) {
+            let mut one: HashMap<String, G> = HashMap::new();
+            if unify_g_types(&G::TypeVar(p.name.clone()), w, &mut one) {
+                if let Some(g) = one.get(&p.name) {
+                    if !matches!(g, G::Wildcard(_)) {
+                        subst.insert(p.name.clone(), g.clone());
+                    }
+                }
+            }
+        }
+    } else {
+        let mut queue = class_supers_args(&npc, &own_syms);
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some((sup, sup_args)) = queue.pop() {
+            if !seen.insert(sup.clone()) {
+                continue;
+            }
+            if sup == want_internal {
+                let want_args = &wcs.parts.last()?.args;
+                if sup_args.len() != want_args.len() {
+                    return None;
+                }
+                for (sa, wa) in sup_args.iter().zip(want_args.iter()) {
+                    unify_g_types(sa, wa, &mut subst);
+                }
+                subst.retain(|_, v| !matches!(v, G::Wildcard(_)));
+                break;
+            }
+            if let Some(spc) = pool.get(&sup) {
+                queue.extend(class_supers_args(&spc, &sup_args));
+            }
+        }
+    }
+    if csig.params.iter().all(|p| subst.contains_key(&p.name)) {
+        // Fully target-resolved: keep the diamond (target typing works).
+        return None;
+    }
+    // Bind the rest from the ctor's Signature formals against witnessed
+    // generic-call actuals.
+    fn witnessed_ret(a: &Expr, pool: &ClassPool) -> Option<G> {
+        match a {
+            Expr::Cond { t, f, .. } => {
+                let x = witnessed_ret(t, pool)?;
+                let y = witnessed_ret(f, pool)?;
+                if x == y {
+                    return Some(x);
+                }
+                // Branches may sit at different levels of the same hierarchy
+                // (ofGreedy returns Greedy<State,..>, of returns
+                // Integrator<State,..>): widen the subtype side through its
+                // supertypes and retry equality.
+                fn internal(g: &G) -> Option<String> {
+                    match g {
+                        G::Class(cs) => Some(crate::method::classsig_internal(cs)),
+                        _ => None,
+                    }
+                }
+                fn widen(x: &G, target_internal: &str, pool: &ClassPool) -> Option<G> {
+                    let G::Class(cs) = x else { return None };
+                    let xpc = pool.get(&crate::method::classsig_internal(cs))?;
+                    let own = cs.parts.last()?.args.clone();
+                    let mut queue = class_supers_args(&xpc, &own);
+                    let mut seen: HashSet<String> = HashSet::new();
+                    while let Some((sup, sup_args)) = queue.pop() {
+                        if !seen.insert(sup.clone()) {
+                            continue;
+                        }
+                        if sup == target_internal {
+                            let mut out = cs.clone();
+                            out.package = sup.rfind('/').map(|i| sup[..i].to_string()).unwrap_or_default();
+                            out.parts = vec![jcdc_jvm::ClassSigPart {
+                                name: sup.rsplit('/').next().unwrap_or(&sup).to_string(),
+                                args: sup_args,
+                            }];
+                            return Some(G::Class(out));
+                        }
+                        if let Some(spc) = pool.get(&sup) {
+                            queue.extend(class_supers_args(&spc, &sup_args));
+                        }
+                    }
+                    None
+                }
+                let (yi, xi) = (internal(&y), internal(&x));
+                if let (Some(yi), Some(xi)) = (yi, xi) {
+                    if xi != yi {
+                        if let Some(wx) = widen(&x, &yi, pool) {
+                            if wx == y {
+                                return Some(y);
+                            }
+                        }
+                        if let Some(wy) = widen(&y, &xi, pool) {
+                            if wy == x {
+                                return Some(x);
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            Expr::Cast { e: i, .. } => witnessed_ret(i, pool),
+            Expr::Method { cls, name, desc, type_args, args, .. } if !type_args.is_empty() => {
+                let dpc = pool.get(cls.as_str())?;
+                let want_desc = format!(
+                    "({}){}",
+                    desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+                    desc.ret.to_descriptor()
+                );
+                let mi = (0..dpc.cf.methods.len()).find(|&i| {
+                    dpc.method_name(i) == Some(name.as_str())
+                        && dpc.method_desc(i) == Some(want_desc.as_str())
+                })?;
+                let msig = method_signature_of(&dpc, mi)?;
+                if msig.params.len() != type_args.len() {
+                    return None;
+                }
+                // Re-derive the binding types from the arg's unbound
+                // method ref (same machinery that produced the witness).
+                for sa in args.iter() {
+                    let Expr::Lambda(lam) = sa else { continue };
+                    if lam.kind != crate::expr::LambdaKind::MethodRef
+                        || lam.impl_is_static
+                        || !lam.captures.is_empty()
+                    {
+                        continue;
+                    }
+                    if let Some((_, mapping)) =
+                        method_ref_type_args(cls, name, desc, lam, pool)
+                    {
+                        let vals: Vec<G> = msig
+                            .params
+                            .iter()
+                            .map(|p| {
+                                mapping
+                                    .iter()
+                                    .find(|(n, _)| *n == p.name)
+                                    .map(|(_, g)| g.clone())
+                                    .unwrap_or(G::TypeVar(p.name.clone()))
+                            })
+                            .collect();
+                        return Some(crate::method::subst_typevars(
+                            &msig.ret,
+                            &msig.params,
+                            &vals,
+                        ));
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    // Pick the ctor by arity (the New node carries no descriptor; the
+    // args' static erasures are lambda/Object noise). Prefer the
+    // Signature-bearing one on arity ties.
+    let Some(cmi) = (0..npc.cf.methods.len()).find(|&i| {
+        npc.method_name(i) == Some("<init>")
+            && npc
+                .method_desc(i)
+                .and_then(parse_method_descriptor)
+                .map(|md| md.args.len() == args.len())
+                .unwrap_or(false)
+            && method_signature_of(&npc, i).is_some()
+    }) else {
+        return None;
+    };
+    let Some(cmsig) = method_signature_of(&npc, cmi) else {
+        return None;
+    };
+    if cmsig.args.len() != args.len() {
+        return None;
+    }
+    for (a, formal) in args.iter().zip(cmsig.args.iter()) {
+        let Some(g) = witnessed_ret(a, pool) else { continue };
+        // Unify the formal (own params symbolic, already-bound ones fixed)
+        // against the actual's witnessed return.
+        let bound_formal = crate::method::subst_typevars(
+            formal,
+            &csig.params,
+            &csig
+                .params
+                .iter()
+                .map(|p| subst.get(&p.name).cloned().unwrap_or(G::TypeVar(p.name.clone())))
+                .collect::<Vec<_>>(),
+        );
+        unify_g_types(&bound_formal, &g, &mut subst);
+    }
+    // Denotability: a bound value that is a bare TypeVar must either name
+    // an own param (a name collision with the caller's typevar — the
+    // caller's variable is what's in scope at the new site and renders
+    // identically) or NOT be an own param (a caller typevar). Any deeper
+    // own-param mention means the slot stayed symbolic.
+    let out: Option<Vec<G>> = csig
+        .params
+        .iter()
+        .map(|p| {
+            subst.get(&p.name).and_then(|g| {
+                let ok = match g {
+                    G::Wildcard(_) => false,
+                    G::TypeVar(n) => n == &p.name || !g_has_typevar_in(g, &csig.params),
+                    other => !g_has_typevar_in(other, &csig.params),
+                };
+                if ok {
+                    Some(g.clone())
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    out
+}
+
+/// Pin explicit type arguments on a return-position diamond `new` whose
+/// target instantiation is UNDER-DETERMINED (a wildcard slot the target
+/// cannot resolve — jdk26 Gatherers Composite.impl returns
+/// GathererImpl<T,?,RR>). Runs AFTER the method-ref witness passes so the
+/// constructor's functional args already carry their instantiated types
+/// for diamond_explicit_args_from_call_args to read.
+fn pin_underdetermined_return_diamonds(
+    s: &mut Stmt,
+    msig: Option<&jcdc_jvm::MethodSignature>,
+    pool: &ClassPool,
+) {
+    let Some(sig) = msig else { return };
+    let want = jcdc_jvm::GenericType::Class(match &sig.ret {
+        jcdc_jvm::GenericType::Class(cs) => cs.clone(),
+        _ => return,
+    });
+    fn pin(e: &mut Expr, want: &jcdc_jvm::GenericType, pool: &ClassPool) {
+        let (ncls, under) = match &*e {
+            Expr::New { cls, ty, .. } => {
+                // Only diamonds (erased/absent own args) are candidates.
+                let already = matches!(ty, TypeRef::G(jcdc_jvm::GenericType::Class(cs))
+                    if cs.parts.last().map(|p| !p.args.is_empty()).unwrap_or(false));
+                (cls.clone(), !already)
+            }
+            _ => return,
+        };
+        if !under {
+            return;
+        }
+        let Some(resolved) = diamond_explicit_args_from_call_args(e, want, pool) else { return };
+        let ncs = jcdc_jvm::ClassSig {
+            package: ncls.rfind('/').map(|i| ncls[..i].to_string()).unwrap_or_default(),
+            parts: vec![jcdc_jvm::ClassSigPart {
+                name: ncls.rsplit('/').next().unwrap_or(&ncls).to_string(),
+                args: resolved,
+            }],
+        };
+        if let Expr::New { ty, .. } = e {
+            *ty = TypeRef::G(jcdc_jvm::GenericType::Class(ncs));
+        }
+    }
+    fn rec(s: &mut Stmt, want: &jcdc_jvm::GenericType, pool: &ClassPool) {
+        match s {
+            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, want, pool)),
+            Stmt::Return(Some(e)) => pin(e, want, pool),
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                rec(then_stmt, want, pool);
+                if let Some(x) = else_stmt {
+                    rec(x, want, pool);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::Labeled { body, .. }
+            | Stmt::Synchronized { body, .. } => rec(body, want, pool),
+            Stmt::For { init, body, .. } => {
+                init.iter_mut().for_each(|i| rec(i, want, pool));
+                rec(body, want, pool);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    for st in c.body.iter_mut() {
+                        rec(st, want, pool);
+                    }
+                }
+                if let Some(d) = default {
+                    rec(d, want, pool);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                rec(body, want, pool);
+                for c in catches.iter_mut() {
+                    rec(&mut c.body, want, pool);
+                }
+                if let Some(f) = finally {
+                    rec(f, want, pool);
+                }
+            }
+            _ => {}
+        }
+    }
+    rec(s, &want, pool);
 }
 
 fn cast_generic_returns(s: &mut Stmt, want: &TypeRef, pc: &PoolClass, pool: &ClassPool) {

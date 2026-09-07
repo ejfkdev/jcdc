@@ -796,9 +796,33 @@ impl<'a> Printer<'a> {
                 out.push_str(&info.name);
             }
             Expr::This => out.push_str("this"),
-            Expr::New { cls, args, .. } => {
+            Expr::New { cls, args, ty, .. } => {
                 let no_diamond = self.suppress_diamond;
                 self.suppress_diamond = false;
+                // Explicit type arguments pinned by the AST passes
+                // (diamond_explicit_args_from_call_args): print them
+                // instead of the diamond.
+                let explicit = match ty {
+                    TypeRef::G(jcdc_jvm::GenericType::Class(cs))
+                        if cs
+                            .parts
+                            .last()
+                            .map(|p| !p.args.is_empty())
+                            .unwrap_or(false)
+                            && crate::method::classsig_internal(cs) == *cls =>
+                    {
+                        let rendered: Vec<String> = cs
+                            .parts
+                            .last()
+                            .unwrap()
+                            .args
+                            .iter()
+                            .map(|a| self.generic_name(a))
+                            .collect();
+                        Some(format!("<{}>", rendered.join(", ")))
+                    }
+                    _ => None,
+                };
                 // A wildcard-typed ctor argument dooms diamond inference
                 // (the inference variable gets an equality constraint from
                 // the capture and a different bound from the context —
@@ -811,8 +835,12 @@ impl<'a> Printer<'a> {
                     matches!(a.type_ref(), TypeRef::G(ref g)
                         if crate::classdec::g_has_wildcard(g))
                 });
-                let diamond =
-                    if no_diamond || args_wildcard { "" } else { self.diamond_for(cls) };
+                let diamond: std::borrow::Cow<str> = match &explicit {
+                    Some(x) => x.as_str().into(),
+                    None if no_diamond || args_wildcard => "".into(),
+                    None => self.diamond_for(cls).into(),
+                };
+                let diamond = diamond.as_ref();
                 if let Some(local) = cls.strip_prefix('\u{2}') {
                     out.push_str("new ");
                     out.push_str(local);
