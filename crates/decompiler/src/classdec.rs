@@ -11137,6 +11137,14 @@ fn unify_g_types(
 ) -> bool {
     use jcdc_jvm::GenericType as G;
     match (pattern, concrete) {
+        // A wildcard TARGET position does not constrain the diamond's own
+        // arg (Collector<T,?,C> against CollectorImpl<T,A,R>: binding
+        // A := ? poisoned toCollection's ctor-arg casts into Supplier<?>
+        // and made the whole new-expression raw — 方法引用无效 on
+        // Collection::add). Leave the typevar unbound; the resolution
+        // bails and the bare diamond infers A from the arguments, like
+        // the source.
+        (_, G::Wildcard(_)) => true,
         (G::TypeVar(n), _) => match subst.get(n) {
             Some(prev) => prev == concrete,
             None => {
