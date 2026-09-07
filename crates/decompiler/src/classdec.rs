@@ -14137,6 +14137,49 @@ fn disambiguate_lambda_locals(
     }
 }
 
+/// True when a computed witness would break the call's own capture-typed
+/// actuals: a bare-typevar formal whose witness binding is concrete cannot
+/// accept a wildcard-parameterized actual (jdk26 MethodHandles.constant:
+/// the comparison operand void.class witnesses requireNonNull to
+/// <Class<Void>>, but the actual `type` is Class<CAP#1> — "Class<CAP#1>
+/// 无法转换为Class<Void>"; the source keeps the call bare and javac's
+/// reference-equality rules accept the capture comparison).
+fn witness_breaks_capture_args(
+    cls: &str,
+    name: &str,
+    desc: &jcdc_jvm::MethodDescriptor,
+    args: &[Expr],
+    mapping: &[(String, jcdc_jvm::GenericType)],
+    pool: &ClassPool,
+) -> bool {
+    use jcdc_jvm::GenericType as G;
+    let Some(dpc) = pool.get(cls) else { return false };
+    let want_desc = format!(
+        "({}){}",
+        desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+        desc.ret.to_descriptor()
+    );
+    let Some(mi) = (0..dpc.cf.methods.len())
+        .find(|&i| dpc.method_name(i) == Some(name) && dpc.method_desc(i) == Some(want_desc.as_str()))
+    else {
+        return false;
+    };
+    let Some(msig) = method_signature_of(&dpc, mi) else { return false };
+    for (a, formal) in args.iter().zip(msig.args.iter()) {
+        let G::TypeVar(tn) = formal else { continue };
+        let Some((_, bound)) = mapping.iter().find(|(n, _)| n == tn) else { continue };
+        if matches!(bound, G::TypeVar(_)) {
+            continue;
+        }
+        if let TypeRef::G(G::Class(ca)) = a.type_ref() {
+            if ca.parts.iter().any(|p| p.args.iter().any(g_has_wildcard)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub(crate) fn witness_comparison_operands(
     s: &mut Stmt,
     msig: Option<&jcdc_jvm::MethodSignature>,
@@ -14236,15 +14279,18 @@ pub(crate) fn witness_comparison_operands(
                                    pool: &ClassPool,
                                    caller_params: Option<&[jcdc_jvm::TypeParam]>| {
                     let TypeRef::G(want) = b.type_ref() else { return };
-                    let Expr::Method { cls, name, desc, type_args, .. } = &*a else {
+                    let Expr::Method { cls, name, desc, type_args, args, .. } = &*a else {
                         return;
                     };
                     if !type_args.is_empty() {
                         return;
                     }
-                    if let Some((w, _)) =
+                    if let Some((w, mapping)) =
                         compute_witness(cls, name, desc, None, &want, pool, caller_params)
                     {
+                        if witness_breaks_capture_args(cls, name, desc, args, &mapping, pool) {
+                            return;
+                        }
                         if let Expr::Method { type_args, .. } = a {
                             *type_args = w;
                         }
