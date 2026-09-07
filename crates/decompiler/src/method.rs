@@ -398,6 +398,7 @@ pub fn decompile_method(
     reconstruct_synchronized(&mut body);
     strip_monitors_in_sync(&mut body);
     drop_monitor_stores(&mut body, &vt);
+    strip_selftype_checkcasts(&mut body, pool);
     cleanup(&mut body);
     restore_asserts(&mut body);
     cleanup(&mut body);
@@ -640,6 +641,217 @@ fn expr_uses(e: &Expr, used: &mut std::collections::HashSet<u32>) {
 /// Scope-aware deduplication: a variable already declared in an enclosing
 /// open scope gets plain assignments instead of re-declarations. Sibling
 /// scopes may each declare (legal Java).
+/// Erasure checkcasts that source generics make redundant: a call
+/// whose methodref owner redeclares the method with a self-covariant
+/// return (Stream overrides BaseStream.onClose to return Stream) is
+/// followed by javac's `checkcast Owner` because the descriptor return
+/// is the erased supertype. Printing that cast RAW poisons the whole
+/// generic chain downstream (jdk17 Files.find: `((Stream) stream(..)
+/// .onClose(..)).filter(entry -> entry.file())` — entry became Object).
+/// Drop the cast when it targets exactly the methodref owner class.
+fn strip_selftype_checkcasts(body: &mut Stmt, pool: &ClassPool) {
+    fn self_covariant(cls: &str, name: &str, pool: &ClassPool) -> bool {
+        // The source-level return of `recv.name(..)` is the receiver's own
+        // type when the declaring method's generic return is a self-bounded
+        // type variable (BaseStream<T, S extends BaseStream<T,S>>.onClose()
+        // returns S := Stream<Path>) or the owner class redeclares it with
+        // a self return. Walk supers AND interfaces to find the declaration.
+        let want = format!("L{};", cls);
+        let mut queue: Vec<String> = vec![cls.to_string()];
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut depth = 0;
+        while let Some(c) = queue.pop() {
+            if depth > 64 || !seen.insert(c.clone()) {
+                continue;
+            }
+            depth += 1;
+            let Some(cpc) = pool.get(&c) else { continue };
+            for mi in 0..cpc.cf.methods.len() {
+                if cpc.method_name(mi) != Some(name) {
+                    continue;
+                }
+                if cpc
+                    .method_desc(mi)
+                    .map(|d| d.ends_with(&format!("){}", want)))
+                    .unwrap_or(false)
+                {
+                    return true;
+                }
+                let sig_ret_is_typevar = cpc.cf.methods[mi].attributes.iter().any(|a| {
+                    cpc.utf8(a.attribute_name_index) == Some("Signature")
+                        && a.info.len() >= 2
+                        && cpc
+                            .utf8(u16::from_be_bytes([a.info[0], a.info[1]]))
+                            .and_then(|x| jcdc_jvm::parse_method_signature(x))
+                            .map(|sig| matches!(sig.ret, jcdc_jvm::GenericType::TypeVar(_)))
+                            .unwrap_or(false)
+                });
+                if sig_ret_is_typevar && c != cls {
+                    // Declared on a supertype with a generic (self-bounded)
+                    // return: the checkcast to the receiver class is the
+                    // erasure artifact.
+                    return true;
+                }
+            }
+            if let Some(sup) = cpc.super_name() {
+                queue.push(sup.to_string());
+            }
+            for &ii in &cpc.cf.interfaces {
+                if let Some(n) = cpc.class_name(ii) {
+                    queue.push(n.to_string());
+                }
+            }
+        }
+        false
+    }
+    fn fix_expr(e: &mut Expr, pool: &ClassPool) {
+        if let Expr::Cast { ty, e: inner } = e {
+            let dominated = match (&**inner, ty) {
+                (Expr::Method { cls, name, desc, .. }, TypeRef::J(JavaType::Object(x))) => {
+                    x == cls
+                        && desc.ret != JavaType::Object(cls.clone())
+                        && self_covariant(cls, name, pool)
+                }
+                _ => false,
+            };
+            if dominated {
+                let inner = std::mem::replace(inner.as_mut(), Expr::This);
+                *e = inner;
+            }
+        }
+        fix_children(e, pool);
+    }
+    fn fix_children(e: &mut Expr, pool: &ClassPool) {
+        match e {
+            Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+                args.iter_mut().for_each(|a| fix_expr(a, pool));
+            }
+            Expr::Method { owner, args, .. } => {
+                if let Some(o) = owner {
+                    fix_expr(o, pool);
+                }
+                args.iter_mut().for_each(|a| fix_expr(a, pool));
+            }
+            Expr::Field { owner: Some(o), .. } => fix_expr(o, pool),
+            Expr::ArrayIndex { array, index } => {
+                fix_expr(array, pool);
+                fix_expr(index, pool);
+            }
+            Expr::Cast { e: i, .. }
+            | Expr::InstanceOf { e: i, .. }
+            | Expr::Un { e: i, .. }
+            | Expr::PreIncDec { e: i, .. }
+            | Expr::PostIncDec { e: i, .. } => fix_expr(i, pool),
+            Expr::Bin { l, r, .. } => {
+                fix_expr(l, pool);
+                fix_expr(r, pool);
+            }
+            Expr::Cond { c, t, f } => {
+                fix_expr(c, pool);
+                fix_expr(t, pool);
+                fix_expr(f, pool);
+            }
+            Expr::Assign { target, value, .. } => {
+                fix_expr(target, pool);
+                fix_expr(value, pool);
+            }
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter_mut().for_each(|d| fix_expr(d, pool));
+                if let Some(vals) = init {
+                    vals.iter_mut().for_each(|x| fix_expr(x, pool));
+                }
+            }
+            Expr::NewMultiArray { dims, .. } => dims.iter_mut().for_each(|d| fix_expr(d, pool)),
+            Expr::StringConcat(parts) => parts.iter_mut().for_each(|pp| {
+                if let crate::expr::ConcatPart::Str(i) = pp {
+                    fix_expr(i, pool);
+                }
+            }),
+            Expr::Lambda(l) => l.captures.iter_mut().for_each(|c| fix_expr(c, pool)),
+            Expr::Invokedynamic { args, .. } => args.iter_mut().for_each(|a| fix_expr(a, pool)),
+            _ => {}
+        }
+    }
+    fn rec(s: &mut Stmt, pool: &ClassPool) {
+        match s {
+            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, pool)),
+            Stmt::ExprStmt(e) => fix_expr(e, pool),
+            Stmt::LocalDef { init: Some(e), .. } => fix_expr(e, pool),
+            Stmt::Return(Some(e)) | Stmt::Throw(e) => fix_expr(e, pool),
+            Stmt::If { cond, then_stmt, else_stmt } => {
+                fix_expr(cond, pool);
+                rec(then_stmt, pool);
+                if let Some(e) = else_stmt {
+                    rec(e, pool);
+                }
+            }
+            Stmt::While { cond, body } => {
+                fix_expr(cond, pool);
+                rec(body, pool);
+            }
+            Stmt::DoWhile { body, cond } => {
+                rec(body, pool);
+                fix_expr(cond, pool);
+            }
+            Stmt::For { init, cond, update, body } => {
+                init.iter_mut().for_each(|i| rec(i, pool));
+                if let Some(c) = cond {
+                    fix_expr(c, pool);
+                }
+                update.iter_mut().for_each(|u| fix_expr(u, pool));
+                rec(body, pool);
+            }
+            Stmt::ForEach { iterable, body, .. } => {
+                fix_expr(iterable, pool);
+                rec(body, pool);
+            }
+            Stmt::Switch { selector, cases, default, .. } => {
+                fix_expr(selector, pool);
+                for c in cases.iter_mut() {
+                    c.body.iter_mut().for_each(|st| rec(st, pool));
+                }
+                if let Some(d) = default {
+                    rec(d, pool);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                rec(body, pool);
+                for c in catches.iter_mut() {
+                    rec(&mut c.body, pool);
+                }
+                if let Some(f) = finally {
+                    rec(f, pool);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter_mut().for_each(|r| rec(r, pool));
+                rec(body, pool);
+                for c in catches.iter_mut() {
+                    rec(&mut c.body, pool);
+                }
+                if let Some(f) = finally {
+                    rec(f, pool);
+                }
+            }
+            Stmt::Synchronized { lock, body } => {
+                fix_expr(lock, pool);
+                rec(body, pool);
+            }
+            Stmt::Labeled { body, .. } => rec(body, pool),
+            Stmt::Assert { cond, msg } => {
+                fix_expr(cond, pool);
+                if let Some(m) = msg {
+                    fix_expr(m, pool);
+                }
+            }
+            Stmt::TernaryValue { e } => fix_expr(e, pool),
+            Stmt::MonitorEnter(e) | Stmt::MonitorExit(e) => fix_expr(e, pool),
+            _ => {}
+        }
+    }
+    rec(body, pool);
+}
+
 /// `new C` values that reached an `invokespecial C.<init>` through
 /// stack-merge variables (branch-duplicated news): fold the init args
 /// back into the raw new assignments and drop the bare super(..)
