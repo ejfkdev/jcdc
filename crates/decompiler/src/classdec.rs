@@ -672,6 +672,42 @@ thread_local! {
     /// keeps the lookup exact).
     static LOCAL_CLASS_INTERNALS: std::cell::RefCell<HashMap<String, String>> =
         std::cell::RefCell::new(HashMap::new());
+
+    /// Class-level typevar names that are OUT OF SCOPE at the emission
+    /// site (static methods/clinit): unsubstituted field-signature types
+    /// must not be cast to them ("无法从静态上下文中引用非静态 类型
+    /// 变量 K", jdk26 ReferencedKeyMap.internKey putIfAbsent).
+    static CAST_BANNED_TVARS: std::cell::RefCell<Vec<String>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+fn g_mentions_tvar_named(g: &jcdc_jvm::GenericType, names: &[String]) -> bool {
+    use jcdc_jvm::GenericType as G;
+    match g {
+        G::TypeVar(n) => names.iter().any(|b| b == n),
+        G::Array(i) => g_mentions_tvar_named(i, names),
+        G::Class(cs) => cs
+            .parts
+            .iter()
+            .any(|p| p.args.iter().any(|a| g_mentions_tvar_named(a, names))),
+        G::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
+        | G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => g_mentions_tvar_named(t, names),
+        _ => false,
+    }
+}
+
+fn class_typevar_names(pc: &PoolClass) -> Vec<String> {
+    pc.class_attr("Signature")
+        .and_then(|b| {
+            if b.len() >= 2 {
+                pc.utf8(u16::from_be_bytes([b[0], b[1]]))
+                    .and_then(|x| parse_class_signature(x))
+            } else {
+                None
+            }
+        })
+        .map(|sig| sig.params.iter().map(|p| p.name.clone()).collect())
+        .unwrap_or_default()
 }
 
 pub(crate) fn local_class_internal(simple: &str) -> Option<String> {
@@ -1000,7 +1036,12 @@ fn emit_class(
                 // method bodies (jdk11 ObjectInputFilter's clinit
                 // `doPrivileged(() -> {...})` is ambiguous without the raw
                 // PrivilegedAction cast — the vT jdk11 first blocker).
-                cast_wildcard_call_args(&mut body, pool, pc, &mb.vt);
+                {
+                    let banned = class_typevar_names(pc);
+                    CAST_BANNED_TVARS.with(|b| *b.borrow_mut() = banned);
+                    cast_wildcard_call_args(&mut body, pool, pc, &mb.vt);
+                    CAST_BANNED_TVARS.with(|b| b.borrow_mut().clear());
+                }
                 fix_lambda_captures(&mut body, &mut mb.vt, pc, pool, fam);
                 restore_enum_switches(&mut body, pc, pool);
                 hoist_clinit_returns(&mut body);
@@ -2584,7 +2625,15 @@ fn emit_method_with(
             }
             // Wildcard-parameterized call sites: arguments that carry only
             // their erasure need the source-level cast back (`accept((K) x)`).
+            let static_ban = acc.contains(MethodAccessFlags::STATIC);
+            if static_ban {
+                let banned = class_typevar_names(pc);
+                CAST_BANNED_TVARS.with(|b| *b.borrow_mut() = banned);
+            }
             cast_wildcard_call_args(&mut body, pool, pc, &mb.vt);
+            if static_ban {
+                CAST_BANNED_TVARS.with(|b| b.borrow_mut().clear());
+            }
             if pc.cf.major_version < 52 {
                 finalize_captured_locals(&mut body, &pc.internal_name);
             }
@@ -2682,14 +2731,7 @@ fn emit_method_with(
             // ctor-arg witnesses (jdk11 ClassValue.refreshVersion's
             // `new Entry<>(v2, (T) value)` arrives via an inlined
             // access$000 ctor accessor).
-            // Return-position diamonds target the generic signature return.
-            let ret_g = msig.as_ref().and_then(|sig| match &sig.ret {
-                g @ (jcdc_jvm::GenericType::Class(_) | jcdc_jvm::GenericType::Array(_)) => {
-                    Some(TypeRef::G(g.clone()))
-                }
-                _ => None,
-            });
-            fix_diamond_localdefs(&mut body, &mb.vt, pool, ret_g.as_ref());
+            fix_diamond_localdefs(&mut body, &mb.vt, pool);
             // Accessor inlining can expose the real generic callee only
             // now; retry the return witnesses (idempotent).
             add_return_witnesses(&mut body, msig.as_ref(), pool);
@@ -8919,6 +8961,14 @@ fn apply_param_casts(args: &mut [Expr], params: &[jcdc_jvm::GenericType], pool: 
                     if is_generic_call(a, pool) {
                         continue;
                     }
+                    // Class typevars are not in scope in static contexts
+                    // (unsubstituted field-signature parameterization).
+                    if CAST_BANNED_TVARS.with(|b| {
+                        let b = b.borrow();
+                        !b.is_empty() && g_mentions_tvar_named(&want, &b)
+                    }) {
+                        continue;
+                    }
                     // Different parameterized classes (LinkedHashMap<..> →
                     // Map<..>): the original compiled without a cast via
                     // subtyping/inference; inserting one would fail on
@@ -8982,7 +9032,7 @@ fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass, vt: &
         }
         walk_expr_children(e, pool, pc, fix_expr);
     }
-    fix_diamond_localdefs(s, vt, pool, None);
+    fix_diamond_localdefs(s, vt, pool);
     walk_stmt_exprs(s, pool, pc, fix_expr);
 }
 
@@ -8993,12 +9043,7 @@ fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass, vt: &
 /// erased `(T)` cast has no bytecode trace; without it the diamond sees
 /// Object against T and javac gives up: "cannot infer type arguments
 /// for Entry<>").
-fn fix_diamond_localdefs(
-    s: &mut Stmt,
-    vt: &crate::varalloc::VarTable,
-    pool: &ClassPool,
-    ret: Option<&TypeRef>,
-) {
+fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &ClassPool) {
     fn inst_from(ty: &TypeRef, value: &Expr) -> Option<(String, Vec<jcdc_jvm::GenericType>, usize)> {
         let (cls, args) = match value {
             Expr::New { cls, args, .. } => (cls, args),
@@ -9035,21 +9080,6 @@ fn fix_diamond_localdefs(
         }
     }
     match s {
-        // Return position: the method's generic signature return is the
-        // diamond's target (jdk26 ReferencedKeyMap.entryKey: `return new
-        // WeakReferenceKey<>(key, stale)` needs `(K) key` — a cast to a
-        // typevar leaves no bytecode trace).
-        Stmt::Return(Some(e)) => {
-            if let Some(rty) = ret {
-                if let Some((cls, iargs, n)) = inst_from(rty, e) {
-                    if let Some(params) = instantiated_ctor_params_core(&cls, &iargs, n, pool) {
-                        if let Stmt::Return(Some(v)) = s {
-                            apply_to_value(v, &params, pool);
-                        }
-                    }
-                }
-            }
-        }
         Stmt::LocalDef { var, init: Some(value), .. } => {
             if let Some((cls, iargs, n)) = inst_from(&vt.var(*var).ty, value) {
                 if let Some(params) = instantiated_ctor_params_core(&cls, &iargs, n, pool) {
@@ -9077,48 +9107,48 @@ fn fix_diamond_localdefs(
                 }
             }
         }
-        Stmt::Block(v) => v.iter_mut().for_each(|x| fix_diamond_localdefs(x, vt, pool, ret)),
+        Stmt::Block(v) => v.iter_mut().for_each(|x| fix_diamond_localdefs(x, vt, pool)),
         Stmt::If { then_stmt, else_stmt, .. } => {
-            fix_diamond_localdefs(then_stmt, vt, pool, ret);
+            fix_diamond_localdefs(then_stmt, vt, pool);
             if let Some(x) = else_stmt {
-                fix_diamond_localdefs(x, vt, pool, ret);
+                fix_diamond_localdefs(x, vt, pool);
             }
         }
         Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::ForEach { body, .. }
         | Stmt::Labeled { body, .. } | Stmt::Synchronized { body, .. } => {
-            fix_diamond_localdefs(body, vt, pool, ret)
+            fix_diamond_localdefs(body, vt, pool)
         }
         Stmt::For { init, body, .. } => {
-            init.iter_mut().for_each(|i| fix_diamond_localdefs(i, vt, pool, ret));
-            fix_diamond_localdefs(body, vt, pool, ret);
+            init.iter_mut().for_each(|i| fix_diamond_localdefs(i, vt, pool));
+            fix_diamond_localdefs(body, vt, pool);
         }
         Stmt::Switch { cases, default, .. } => {
             for c in cases.iter_mut() {
-                c.body.iter_mut().for_each(|st| fix_diamond_localdefs(st, vt, pool, ret));
+                c.body.iter_mut().for_each(|st| fix_diamond_localdefs(st, vt, pool));
             }
             if let Some(d) = default {
-                fix_diamond_localdefs(d, vt, pool, ret);
+                fix_diamond_localdefs(d, vt, pool);
             }
         }
         Stmt::Try { body, catches, finally } => {
-            fix_diamond_localdefs(body, vt, pool, ret);
+            fix_diamond_localdefs(body, vt, pool);
             for c in catches.iter_mut() {
-                fix_diamond_localdefs(&mut c.body, vt, pool, ret);
+                fix_diamond_localdefs(&mut c.body, vt, pool);
             }
             if let Some(f) = finally {
-                fix_diamond_localdefs(f, vt, pool, ret);
+                fix_diamond_localdefs(f, vt, pool);
             }
         }
         Stmt::TryWithResources { resources, body, catches, finally } => {
             for r in resources.iter_mut() {
-                fix_diamond_localdefs(r, vt, pool, ret);
+                fix_diamond_localdefs(r, vt, pool);
             }
-            fix_diamond_localdefs(body, vt, pool, ret);
+            fix_diamond_localdefs(body, vt, pool);
             for c in catches.iter_mut() {
-                fix_diamond_localdefs(&mut c.body, vt, pool, ret);
+                fix_diamond_localdefs(&mut c.body, vt, pool);
             }
             if let Some(f) = finally {
-                fix_diamond_localdefs(f, vt, pool, ret);
+                fix_diamond_localdefs(f, vt, pool);
             }
         }
         _ => {}
