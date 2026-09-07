@@ -2698,6 +2698,11 @@ fn emit_method_with(
     match decompile_method(pc, pool, mi) {
         Ok(Some(mut mb)) => {
             let mut body = strip_trailing_return(&mb.body);
+            // Before any return-witness machinery: type field reads, drop
+            // redundant raw self-casts and upgrade REAL checkcasts to the
+            // instantiated returns (later raw-cast fallbacks must not be
+            // rewritten — see upgrade_erased_call_casts).
+            upgrade_erased_call_casts(&mut body, pool, pc);
             // Generic methods returning a type variable: javac elides the
             // `(E)` cast when the erasure already matches, but source needs
             // it back.
@@ -10123,6 +10128,209 @@ fn disambiguate_overload_args(e: &mut Expr, pool: &ClassPool) {
     }
 }
 
+/// Early pass (runs before the return-witness machinery): types field
+/// reads, drops redundant raw self-casts, and upgrades RAW bytecode
+/// checkcasts over generic calls to their instantiated returns. Running
+/// before retype_witness_arg_casts matters: that pass deliberately
+/// inserts raw casts for invariant-incompatible formals ((Collection)
+/// perms.values()), and the upgrade must never rewrite them — it only
+/// ever touches casts that exist at this point, i.e. real checkcasts
+/// (jdk17 ModulePatcher: (List) e.getValue() upgrades to (List<String>)
+/// feeding the stream/map chain — Object无法转换为String).
+pub(crate) fn upgrade_erased_call_casts(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass) {
+    fn fix(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
+        type_field_reads(e, pool, pc, true);
+        walk_expr_children(e, pool, pc, fix);
+    }
+    walk_stmt_exprs(s, pool, pc, fix);
+}
+
+/// Type instance field reads with their instantiated Signature type
+/// and drop raw self-casts over already-parameterized expressions:
+/// javac emits a checkcast for erased inherited reads (jdk11
+/// Nodes.CollectorTask.onCompletion: `(Nodes.CollectorTask)
+/// this.leftChild` — leftChild is declared K on
+/// AbstractTask<P_IN,P_OUT,R,K>, instantiated to
+/// CollectorTask<P_IN,P_OUT,T_NODE,T_BUILDER>; the RAW cast erases
+/// the receiver and getLocalResult() collapses to raw Node —
+/// "Node无法转换为T_NODE" x2). With the read typed, the cast is
+/// redundant and the call keeps its generic returns.
+fn type_field_reads(e: &mut Expr, pool: &ClassPool, pc: &PoolClass, concrete_ok: bool) {
+    fn type_one(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
+        if let Expr::Field { owner, cls, name, ty, is_static: false, .. } = e {
+            if !matches!(ty, TypeRef::G(_)) {
+                if let Some(g) =
+                    crate::method::instantiated_field_type(owner.as_deref(), cls, name, pool, pc)
+                {
+                    *ty = g;
+                }
+            }
+        }
+    }
+    // fix_expr is pre-order, but a cast upgrade needs its operand's
+    // owner reads already typed (Cast{Node, Method{owner:
+    // Cast{CollectorTask, Field leftChild}}} — the inner self-cast
+    // must be dropped and the field typed before the outer (Node)
+    // can resolve T_NODE). Recurse first; the walker's later revisit
+    // is idempotent.
+    match e {
+        Expr::Cast { e: inner, .. } => type_field_reads(inner, pool, pc, concrete_ok),
+        Expr::Method { owner, args, .. } => {
+            if let Some(o) = owner {
+                type_field_reads(o, pool, pc, concrete_ok);
+            }
+            args.iter_mut()
+                .for_each(|a| type_field_reads(a, pool, pc, concrete_ok));
+        }
+        _ => {}
+    }
+    type_one(e, pool, pc);
+    if let Expr::Cast { ty, e: inner } = e {
+        // fix_expr is pre-order: type the cast's own operand before
+        // deciding the cast is redundant.
+        type_one(inner, pool, pc);
+        let cast_internal = match ty {
+            TypeRef::J(jcdc_jvm::JavaType::Object(n)) => Some(n.clone()),
+            TypeRef::G(jcdc_jvm::GenericType::Class(cs))
+                if cs.parts.iter().all(|p| p.args.is_empty()) =>
+            {
+                Some(crate::method::classsig_internal(cs))
+            }
+            _ => None,
+        };
+        let ty_erased = ty.erased();
+        // Drop ONLY over a freshly typed FIELD read: a raw cast over a
+        // wildcard-parameterized LOCAL (`(List) list` inserted by
+        // raw_witness_capture_call_args to make an overloaded call
+        // unchecked-applicable) is load-bearing — dropping it returned
+        // 对于binarySearch(List<CAP#1>,T#1) 找不到合适的方法.
+        let redundant_self_cast = match &cast_internal {
+            Some(ci) => match (&**inner, inner.type_ref()) {
+                (
+                    Expr::Field { .. },
+                    TypeRef::G(jcdc_jvm::GenericType::Class(ics)),
+                ) => {
+                    crate::method::classsig_internal(&ics) == *ci
+                        // A WILDCARD-parameterized read keeps its raw
+                        // cast: `(SetN) ImmutableCollections.EMPTY_SET`
+                        // strips SetN<?>'s capture so the value assigns
+                        // unchecked to Set<E> (jdk17 Set.of case 0 —
+                        // SetN<CAP#1>无法转换为Set<E>; the source casts
+                        // (Set<E>) which javac elides). Concrete/typevar
+                        // args (leftChild) stay droppable.
+                        && !ics.parts.iter().any(|p| {
+                            p.args.iter().any(|a| {
+                                matches!(a, jcdc_jvm::GenericType::Wildcard(_))
+                                    || g_has_wildcard(a)
+                            })
+                        })
+                }
+                _ => false,
+            },
+            None => false,
+        };
+        if redundant_self_cast {
+            let taken = std::mem::replace(&mut **inner, Expr::This);
+            *e = taken;
+        } else if cast_internal.is_some() && matches!(&**inner, Expr::Method { .. }) {
+            // Only a RAW class cast (a real bytecode checkcast) may be
+            // upgraded: a precise generic cast like `(T) it.next()`
+            // (cast_generic_locals' synthesis for a T[] element store)
+            // was being rewritten to the owner's typevar `(E)` —
+            // ImmutableCollections SetN/SubList toArray "E无法转换为T"
+            // x2 per tree.
+            //
+            // A raw erasure checkcast over a generic call is javac's
+            // bridge from the erased return to the instantiated one
+            // (Nodes.CollectorTask.onCompletion: getLocalResult()
+            // :Object checkcast Node — the source expression is
+            // already T_NODE via the typed receiver). Render the cast
+            // at the instantiated return so the value keeps flowing
+            // as T_NODE into apply(T_NODE,T_NODE)/setLocalResult
+            // (T_NODE) — raw (Node) args are inconvertible
+            // ("Node无法转换为T_NODE" x2).
+            if std::env::var("JCDC_DBG_UPG").is_ok() {
+                if let Expr::Method { name: mn, .. } = &**inner {
+                    if mn == "getValue" {
+                        eprintln!(
+                            "UPG2 getValue cast_ty={:?} ret={:?}",
+                            ty,
+                            instantiated_method_ret(inner, pool, pc)
+                        );
+                    }
+                }
+            }
+            if let Some(inst) = instantiated_method_ret(inner, pool, pc) {
+                // A wildcard anywhere in the instantiated return is
+                // not a legal cast target and would silently widen a
+                // precise existing cast (`(Spliterator<E>)` →
+                // `(Spliterator<? extends E>)` —
+                // Spliterator<CAP#1>无法转换为Spliterator<E>).
+                if g_has_wildcard(&inst) {
+                    return;
+                }
+                // CONCRETE upgrades belong to the EARLY pass only (real
+                // bytecode checkcasts): inside fix_expr they would rewrite
+                // the deliberate raw casts that retype_witness_arg_casts /
+                // apply_param_casts insert for inconvertible formals
+                // ((Collection) perms.values() → Collection<SP> against a
+                // Collection<Permission> formal — jdk11
+                // SocketPermissionCollection.elements).
+                if !concrete_ok && !crate::method::contains_typevar(&inst) {
+                    return;
+                }
+                let matches_erasure = match &inst {
+                    // The typevar's bound erases to the checkcast
+                    // target (T_NODE extends Node<P_OUT> → Node).
+                    jcdc_jvm::GenericType::TypeVar(n) => {
+                        typevar_bound_erasure(n, pc)
+                            .map(|b| b == ty_erased)
+                            .unwrap_or(false)
+                    }
+                    _ => TypeRef::G(inst.clone()).erased() == ty_erased,
+                };
+                // Every typevar the upgraded form mentions must be
+                // declared by the class being printed: FindOps
+                // doLeaf's raw `(TerminalSink)` checkcast upgraded to
+                // `(TerminalSink<T, O>)` where the enclosing scope
+                // only declares O ("找不到符号 类 T").
+                fn inst_tvars(g: &jcdc_jvm::GenericType, out: &mut Vec<String>) {
+                    use jcdc_jvm::GenericType as GG;
+                    match g {
+                        GG::TypeVar(n) => {
+                            if !out.contains(n) {
+                                out.push(n.clone());
+                            }
+                        }
+                        GG::Class(cs) => cs
+                            .parts
+                            .iter()
+                            .for_each(|p| p.args.iter().for_each(|a| inst_tvars(a, out))),
+                        GG::Array(i) => inst_tvars(i, out),
+                        GG::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
+                        | GG::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => {
+                            inst_tvars(t, out)
+                        }
+                        _ => {}
+                    }
+                }
+                let in_scope = {
+                    let allowed = class_typevar_names(pc);
+                    let mut mentioned: Vec<String> = Vec::new();
+                    inst_tvars(&inst, &mut mentioned);
+                    mentioned.iter().all(|n| allowed.contains(n))
+                };
+                if std::env::var("JCDC_DBG_UPG").is_ok() {
+                    eprintln!("UPG3 me={} inscope={} inst={:?}", matches_erasure, in_scope, inst);
+                }
+                if matches_erasure && in_scope {
+                    *ty = TypeRef::G(inst);
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass, vt: &crate::varalloc::VarTable) {
     // Reference comparison between two different parameterizations of
     // the same generic class is "不可比较的类型" (jdk11 Arrays.copyOf:
@@ -10673,183 +10881,13 @@ pub(crate) fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolC
             *a = Expr::Cast { ty: raw, e: Box::new(inner) };
         }
     }
-    /// Type instance field reads with their instantiated Signature type
-    /// and drop raw self-casts over already-parameterized expressions:
-    /// javac emits a checkcast for erased inherited reads (jdk11
-    /// Nodes.CollectorTask.onCompletion: `(Nodes.CollectorTask)
-    /// this.leftChild` — leftChild is declared K on
-    /// AbstractTask<P_IN,P_OUT,R,K>, instantiated to
-    /// CollectorTask<P_IN,P_OUT,T_NODE,T_BUILDER>; the RAW cast erases
-    /// the receiver and getLocalResult() collapses to raw Node —
-    /// "Node无法转换为T_NODE" x2). With the read typed, the cast is
-    /// redundant and the call keeps its generic returns.
-    fn type_field_reads(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
-        fn type_one(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
-            if let Expr::Field { owner, cls, name, ty, is_static: false, .. } = e {
-                if !matches!(ty, TypeRef::G(_)) {
-                    if let Some(g) =
-                        crate::method::instantiated_field_type(owner.as_deref(), cls, name, pool, pc)
-                    {
-                        *ty = g;
-                    }
-                }
-            }
-        }
-        // fix_expr is pre-order, but a cast upgrade needs its operand's
-        // owner reads already typed (Cast{Node, Method{owner:
-        // Cast{CollectorTask, Field leftChild}}} — the inner self-cast
-        // must be dropped and the field typed before the outer (Node)
-        // can resolve T_NODE). Recurse first; the walker's later revisit
-        // is idempotent.
-        match e {
-            Expr::Cast { e: inner, .. } => type_field_reads(inner, pool, pc),
-            Expr::Method { owner, args, .. } => {
-                if let Some(o) = owner {
-                    type_field_reads(o, pool, pc);
-                }
-                args.iter_mut().for_each(|a| type_field_reads(a, pool, pc));
-            }
-            _ => {}
-        }
-        type_one(e, pool, pc);
-        if let Expr::Cast { ty, e: inner } = e {
-            // fix_expr is pre-order: type the cast's own operand before
-            // deciding the cast is redundant.
-            type_one(inner, pool, pc);
-            let cast_internal = match ty {
-                TypeRef::J(jcdc_jvm::JavaType::Object(n)) => Some(n.clone()),
-                TypeRef::G(jcdc_jvm::GenericType::Class(cs))
-                    if cs.parts.iter().all(|p| p.args.is_empty()) =>
-                {
-                    Some(crate::method::classsig_internal(cs))
-                }
-                _ => None,
-            };
-            let ty_erased = ty.erased();
-            // Drop ONLY over a freshly typed FIELD read: a raw cast over a
-            // wildcard-parameterized LOCAL (`(List) list` inserted by
-            // raw_witness_capture_call_args to make an overloaded call
-            // unchecked-applicable) is load-bearing — dropping it returned
-            // 对于binarySearch(List<CAP#1>,T#1) 找不到合适的方法.
-            let redundant_self_cast = match &cast_internal {
-                Some(ci) => match (&**inner, inner.type_ref()) {
-                    (
-                        Expr::Field { .. },
-                        TypeRef::G(jcdc_jvm::GenericType::Class(ics)),
-                    ) => {
-                        crate::method::classsig_internal(&ics) == *ci
-                            // A WILDCARD-parameterized read keeps its raw
-                            // cast: `(SetN) ImmutableCollections.EMPTY_SET`
-                            // strips SetN<?>'s capture so the value assigns
-                            // unchecked to Set<E> (jdk17 Set.of case 0 —
-                            // SetN<CAP#1>无法转换为Set<E>; the source casts
-                            // (Set<E>) which javac elides). Concrete/typevar
-                            // args (leftChild) stay droppable.
-                            && !ics.parts.iter().any(|p| {
-                                p.args.iter().any(|a| {
-                                    matches!(a, jcdc_jvm::GenericType::Wildcard(_))
-                                        || g_has_wildcard(a)
-                                })
-                            })
-                    }
-                    _ => false,
-                },
-                None => false,
-            };
-            if redundant_self_cast {
-                let taken = std::mem::replace(&mut **inner, Expr::This);
-                *e = taken;
-            } else if cast_internal.is_some() && matches!(&**inner, Expr::Method { .. }) {
-                // Only a RAW class cast (a real bytecode checkcast) may be
-                // upgraded: a precise generic cast like `(T) it.next()`
-                // (cast_generic_locals' synthesis for a T[] element store)
-                // was being rewritten to the owner's typevar `(E)` —
-                // ImmutableCollections SetN/SubList toArray "E无法转换为T"
-                // x2 per tree.
-                //
-                // A raw erasure checkcast over a generic call is javac's
-                // bridge from the erased return to the instantiated one
-                // (Nodes.CollectorTask.onCompletion: getLocalResult()
-                // :Object checkcast Node — the source expression is
-                // already T_NODE via the typed receiver). Render the cast
-                // at the instantiated return so the value keeps flowing
-                // as T_NODE into apply(T_NODE,T_NODE)/setLocalResult
-                // (T_NODE) — raw (Node) args are inconvertible
-                // ("Node无法转换为T_NODE" x2).
-                if let Some(inst) = instantiated_method_ret(inner, pool, pc) {
-                    // A wildcard anywhere in the instantiated return is
-                    // not a legal cast target and would silently widen a
-                    // precise existing cast (`(Spliterator<E>)` →
-                    // `(Spliterator<? extends E>)` —
-                    // Spliterator<CAP#1>无法转换为Spliterator<E>).
-                    if g_has_wildcard(&inst) {
-                        return;
-                    }
-                    // Only TYPEVAR-bearing instantiations upgrade: the
-                    // point is restoring typevar flow ((Node) → (T_NODE)).
-                    // A concrete upgrade would rewrite the deliberate RAW
-                    // fallback for invariant-incompatible reparameterizations
-                    // ((Collection) perms.values() → Collection<SP> against
-                    // a Collection<Permission> formal — jdk11
-                    // SocketPermissionCollection.elements).
-                    if !crate::method::contains_typevar(&inst) {
-                        return;
-                    }
-                    let matches_erasure = match &inst {
-                        // The typevar's bound erases to the checkcast
-                        // target (T_NODE extends Node<P_OUT> → Node).
-                        jcdc_jvm::GenericType::TypeVar(n) => {
-                            typevar_bound_erasure(n, pc)
-                                .map(|b| b == ty_erased)
-                                .unwrap_or(false)
-                        }
-                        _ => TypeRef::G(inst.clone()).erased() == ty_erased,
-                    };
-                    // Every typevar the upgraded form mentions must be
-                    // declared by the class being printed: FindOps
-                    // doLeaf's raw `(TerminalSink)` checkcast upgraded to
-                    // `(TerminalSink<T, O>)` where the enclosing scope
-                    // only declares O ("找不到符号 类 T").
-                    fn inst_tvars(g: &jcdc_jvm::GenericType, out: &mut Vec<String>) {
-                        use jcdc_jvm::GenericType as GG;
-                        match g {
-                            GG::TypeVar(n) => {
-                                if !out.contains(n) {
-                                    out.push(n.clone());
-                                }
-                            }
-                            GG::Class(cs) => cs
-                                .parts
-                                .iter()
-                                .for_each(|p| p.args.iter().for_each(|a| inst_tvars(a, out))),
-                            GG::Array(i) => inst_tvars(i, out),
-                            GG::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
-                            | GG::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => {
-                                inst_tvars(t, out)
-                            }
-                            _ => {}
-                        }
-                    }
-                    let in_scope = {
-                        let allowed = class_typevar_names(pc);
-                        let mut mentioned: Vec<String> = Vec::new();
-                        inst_tvars(&inst, &mut mentioned);
-                        mentioned.iter().all(|n| allowed.contains(n))
-                    };
-                    if matches_erasure && in_scope {
-                        *ty = TypeRef::G(inst);
-                    }
-                }
-            }
-        }
-    }
     fn fix_expr(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
         incomparable_class_cmp(e, pool);
         // Before raw_witness_capture_call_args: type_field_reads drops
         // bytecode self-casts over freshly typed field reads, and a
         // later raw_witness `(Map) this.m` wrap over a field arg must
         // not be re-examined as a droppable self-cast.
-        type_field_reads(e, pool, pc);
+        type_field_reads(e, pool, pc, false);
         raw_witness_capture_call_args(e, pool, pc);
         owner_wildcard_cast(e, pool, pc);
         cast_super_delegation_args(e, pool, pc);
