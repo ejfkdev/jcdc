@@ -8354,7 +8354,20 @@ pub(crate) fn instantiated_field_type(
         let sig_str = dref.utf8(idx)?;
         let ft = jcdc_jvm::parse_field_signature(sig_str)?;
         if !contains_typevar(&ft) {
-            return None;
+            // Concrete parameterizations still upgrade the read
+            // (Hashtable<String,SocketPermission> perms: the source-level
+            // values() type Collection<SocketPermission> drives the
+            // inconvertible-cast raw fallback); only bare/raw forms bail.
+            let is_parameterized = match &ft {
+                jcdc_jvm::GenericType::Class(cs) => {
+                    cs.parts.iter().any(|p| !p.args.is_empty())
+                }
+                jcdc_jvm::GenericType::Array(_) => true,
+                _ => false,
+            };
+            if !is_parameterized {
+                return None;
+            }
         }
         let params = dref
             .class_attr("Signature")

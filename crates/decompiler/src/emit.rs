@@ -923,6 +923,24 @@ impl<'a> Printer<'a> {
                         // Outer anonymous class member: unqualified lexical
                         // resolution (an anon outer has no nameable this).
                         out.push_str(name);
+                    } else if self.private_super_field(cls, name, o.as_ref()) {
+                        // A private field of a SUPERCLASS is not inherited
+                        // into the subclass's member scope: `this.algorithm`
+                        // inside Delegate (extends MessageDigest, algorithm
+                        // private) is "private access" even though the
+                        // source comment says it all — jdk11
+                        // MessageDigest.Delegate.clone casts
+                        // `((MessageDigest)this).algorithm`.
+                        out.push_str("((");
+                        out.push_str(&self.shorten(cls));
+                        out.push_str(") ");
+                        if matches!(o.as_ref(), Expr::This) {
+                            out.push_str("this");
+                        } else {
+                            self.expr(o, 14, out);
+                        }
+                        out.push_str(").");
+                        out.push_str(name);
                     } else {
                         self.expr(o, 15, out);
                         out.push('.');
@@ -933,6 +951,15 @@ impl<'a> Printer<'a> {
                         out.push_str(&self.shorten(cls));
                         out.push('.');
                     }
+                    out.push_str(name);
+                } else if self.private_super_field(
+                    cls,
+                    name,
+                    &Expr::This,
+                ) {
+                    out.push_str("((");
+                    out.push_str(&self.shorten(cls));
+                    out.push_str(") this).");
                     out.push_str(name);
                 } else {
                     out.push_str("this.");
@@ -1998,6 +2025,50 @@ impl<'a> Printer<'a> {
 
     /// Shorten an internal class name for emission: java.lang.* and same
     /// package use simple names; others fully qualified dotted.
+    /// True when `cls.name` is a PRIVATE instance field and the owner
+    /// expression's compile-time type is a strict subclass of cls: the
+    /// field is not in the subclass's member scope, so the source must
+    /// cast the owner to the declaring class
+    /// (`((MessageDigest)this).algorithm` — jdk11 Delegate.clone x3,
+    /// Signature.clone).
+    fn private_super_field(&self, cls: &str, name: &str, o: &Expr) -> bool {
+        if matches!(o, Expr::Raw(_) | Expr::RawT(..)) {
+            return false;
+        }
+        let owner_ct = if matches!(o, Expr::This) {
+            self.pc.internal_name.clone()
+        } else {
+            match o.type_ref().erased() {
+                jcdc_jvm::JavaType::Object(n) => n,
+                _ => return false,
+            }
+        };
+        if owner_ct == cls {
+            return false;
+        }
+        let Some(cpc) = self.pool.get(cls) else { return false };
+        let Some(f) = cpc.cf.fields.iter().find(|f| {
+            !f.access_flags.contains(jcdc_classfile::FieldAccessFlags::STATIC)
+                && cpc.utf8(f.name_index) == Some(name)
+        }) else {
+            return false;
+        };
+        if !f.access_flags.contains(jcdc_classfile::FieldAccessFlags::PRIVATE) {
+            return false;
+        }
+        // cls must be a strict superclass of the owner's compile-time type.
+        let mut cur = owner_ct;
+        for _ in 0..64 {
+            let Some(pc2) = self.pool.get(&cur) else { return false };
+            let Some(sup) = pc2.super_name() else { return false };
+            if sup == cls {
+                return true;
+            }
+            cur = sup.to_string();
+        }
+        false
+    }
+
     fn needs_owner_cast(
         &self,
         cls: &str,

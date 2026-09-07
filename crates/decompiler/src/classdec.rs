@@ -8995,6 +8995,8 @@ pub(crate) fn instantiated_method_ret(
         // CAP#1无法转换为K/V x2 per tree).
         if crate::method::contains_typevar(&inst)
             || matches!(inst, jcdc_jvm::GenericType::Wildcard(_))
+            || matches!(&inst, jcdc_jvm::GenericType::Class(cs)
+                if cs.parts.iter().any(|p| !p.args.is_empty()))
         {
             return Some(inst);
         }
@@ -10007,7 +10009,8 @@ fn apply_param_casts(
                     // actual erased to Node — javac elided the source
                     // `(N)` cast because the erasures coincide, and
                     // Deque<N>.addFirst(Node<T>) fails without it).
-                    let have = a.type_ref().erased();
+                    let have_ty = a.type_ref();
+                    let have = have_ty.erased();
                     let want_er = match (&want, pc) {
                         (jcdc_jvm::GenericType::TypeVar(n), Some(p)) => {
                             typevar_bound_erasure(n, p)
@@ -10023,8 +10026,27 @@ fn apply_param_casts(
                     if !ok {
                         continue;
                     }
+                    // An invariant-incompatible reparameterization of the
+                    // same class (Collection<SocketPermission> against a
+                    // Collection<Permission> formal — jdk11
+                    // SocketPermissionCollection.elements) makes even the
+                    // PRECISE cast inconvertible: javac rejects the cast
+                    // itself. The source used the raw form. Wildcard
+                    // positions keep the precise cast (a legal
+                    // <? super Object> → <? super String> narrowing).
+                    let raw_fallback = match (&have_ty, &want) {
+                        (TypeRef::G(gx), jcdc_jvm::GenericType::Class(cw)) => {
+                            concrete_g_mismatch(gx, &jcdc_jvm::GenericType::Class(cw.clone()))
+                        }
+                        _ => false,
+                    };
+                    let cast_ty = if raw_fallback {
+                        TypeRef::J(TypeRef::G(want.clone()).erased())
+                    } else {
+                        TypeRef::G(want.clone())
+                    };
                     let inner = std::mem::replace(a, Expr::This);
-                    *a = Expr::Cast { ty: TypeRef::G(want), e: Box::new(inner) };
+                    *a = Expr::Cast { ty: cast_ty, e: Box::new(inner) };
     }
 }
 
@@ -10746,6 +10768,16 @@ pub(crate) fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolC
                     // `(Spliterator<? extends E>)` —
                     // Spliterator<CAP#1>无法转换为Spliterator<E>).
                     if g_has_wildcard(&inst) {
+                        return;
+                    }
+                    // Only TYPEVAR-bearing instantiations upgrade: the
+                    // point is restoring typevar flow ((Node) → (T_NODE)).
+                    // A concrete upgrade would rewrite the deliberate RAW
+                    // fallback for invariant-incompatible reparameterizations
+                    // ((Collection) perms.values() → Collection<SP> against
+                    // a Collection<Permission> formal — jdk11
+                    // SocketPermissionCollection.elements).
+                    if !crate::method::contains_typevar(&inst) {
                         return;
                     }
                     let matches_erasure = match &inst {
@@ -12722,11 +12754,96 @@ fn retype_witness_arg_casts(
                     && other.type_ref() != inst_ref
                     && other.type_ref().erased() == inst_er
                 {
+                    // Invariant-incompatible reparameterization of the same
+                    // class: the precise cast is inconvertible (javac
+                    // rejects the cast itself), the source used the raw
+                    // form — Collection<SocketPermission>.values() against
+                    // a Collection<Permission> instantiation (jdk11
+                    // SocketPermissionCollection.elements). The arg's
+                    // SOURCE-level type comes from the owner-instantiated
+                    // call return; the erased expr type cannot show the
+                    // mismatch.
+                    // The owner field may not be typed yet (this pass runs
+                    // before cast_wildcard_call_args): type it so the
+                    // source-level return resolves.
+                    if let Expr::Method { owner: Some(ow), .. } = other {
+                        if let Expr::Field {
+                            owner: fo,
+                            cls: fcls,
+                            name: fname,
+                            ty: fty,
+                            is_static: false,
+                            ..
+                        } = ow.as_mut()
+                        {
+                            if !matches!(fty, TypeRef::G(_)) {
+                                if let Some(g) = crate::method::instantiated_field_type(
+                                    fo.as_deref(),
+                                    fcls,
+                                    fname,
+                                    pool,
+                                    pc,
+                                ) {
+                                    *fty = g;
+                                }
+                            }
+                        }
+                    }
+                    let inconvertible =
+                        instantiated_method_ret(other, pool, pc)
+                            .map(|src| concrete_g_mismatch(&src, &inst))
+                            .unwrap_or(false);
+                    let cast_ty = if inconvertible {
+                        TypeRef::J(inst_ref.erased())
+                    } else {
+                        inst_ref.clone()
+                    };
                     let inner = std::mem::replace(other, Expr::This);
-                    *other = Expr::Cast { ty: inst_ref, e: Box::new(inner) };
+                    *other = Expr::Cast { ty: cast_ty, e: Box::new(inner) };
                 }
             }
         }
+    }
+}
+
+/// Same generic class with an invariant-incompatible argument position
+/// (both sides concrete and different, no wildcard escape hatch): even a
+/// precise cast between the two is a compile error, so call sites must
+/// fall back to the raw form.
+fn concrete_g_mismatch(
+    x: &jcdc_jvm::GenericType,
+    y: &jcdc_jvm::GenericType,
+) -> bool {
+    use jcdc_jvm::GenericType as GG;
+    fn mismatch(x: &GG, y: &GG) -> bool {
+        match (x, y) {
+            (GG::Wildcard(_), _) | (_, GG::Wildcard(_)) => false,
+            (GG::TypeVar(m), GG::TypeVar(n)) => m != n,
+            (GG::TypeVar(_), _) | (_, GG::TypeVar(_)) => false,
+            (GG::Class(cx), GG::Class(cy)) => {
+                crate::method::classsig_internal(cx) != crate::method::classsig_internal(cy)
+                    || cx.parts.len() != cy.parts.len()
+                    || cx.parts.iter().zip(cy.parts.iter()).any(|(px, py)| {
+                        px.args.len() != py.args.len()
+                            || px
+                                .args
+                                .iter()
+                                .zip(py.args.iter())
+                                .any(|(u, v)| mismatch(u, v))
+                    })
+            }
+            (GG::Array(ix), GG::Array(iy)) => mismatch(ix, iy),
+            (GG::Primitive(px), GG::Primitive(py)) => px != py,
+            _ => true,
+        }
+    }
+    match (x, y) {
+        (GG::Class(cx), GG::Class(cy))
+            if crate::method::classsig_internal(cx) == crate::method::classsig_internal(cy) =>
+        {
+            mismatch(x, y)
+        }
+        _ => false,
     }
 }
 
@@ -12839,8 +12956,43 @@ fn cast_generic_returns(s: &mut Stmt, want: &TypeRef, pc: &PoolClass, pool: &Cla
         if !compatible(&have_er, &want_er) {
             return;
         }
+        // Type an owner field read before asking for the call's source
+        // return (this pass runs before cast_wildcard_call_args).
+        if let Expr::Method { owner: Some(ow), .. } = e {
+            if let Expr::Field {
+                owner: fo,
+                cls: fcls,
+                name: fname,
+                ty: fty,
+                is_static: false,
+                ..
+            } = ow.as_mut()
+            {
+                if !matches!(fty, TypeRef::G(_)) {
+                    if let Some(g) =
+                        crate::method::instantiated_field_type(fo.as_deref(), fcls, fname, pool, pc)
+                    {
+                        *fty = g;
+                    }
+                }
+            }
+        }
+        // Invariant-incompatible reparameterization of the same class
+        // (perms.elements(): Enumeration<PropertyPermission> against the
+        // Enumeration<Permission> return): the precise cast is
+        // inconvertible, the source used the raw form.
+        let mut cast_ty = want.clone();
+        if let (TypeRef::G(gw @ jcdc_jvm::GenericType::Class(_)), Expr::Method { .. }) =
+            (want, &*e)
+        {
+            if let Some(src) = instantiated_method_ret(e, pool, pc) {
+                if concrete_g_mismatch(&src, gw) {
+                    cast_ty = TypeRef::J(want_er.clone());
+                }
+            }
+        }
         let inner = std::mem::replace(e, Expr::This);
-        *e = Expr::Cast { ty: want.clone(), e: Box::new(inner) };
+        *e = Expr::Cast { ty: cast_ty, e: Box::new(inner) };
     }
     match s {
         Stmt::Block(v) => v.iter_mut().for_each(|x| cast_generic_returns(x, want, pc, pool)),
