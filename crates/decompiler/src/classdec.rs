@@ -8935,7 +8935,7 @@ fn instantiated_ctor_params_core(
     nargs: usize,
     pool: &ClassPool,
 ) -> Option<Vec<jcdc_jvm::GenericType>> {
-    let dpc = pool.get(cls)?;
+    let dpc = { let x = pool.get(cls); if x.is_none() && std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA s1 dpc {}", cls); } x? };
     let class_sig = dpc.class_attr("Signature").and_then(|b| {
         if b.len() >= 2 {
             dpc.utf8(u16::from_be_bytes([b[0], b[1]])).and_then(|x| parse_class_signature(x))
@@ -9590,195 +9590,567 @@ fn add_return_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, 
 /// bare call infers <Object,Object>. The comparison operand supplies
 /// the wanted type; compute_witness unifies it with the callee's
 /// generic return (jdk26 Gatherers 12-14 errors).
+///
+/// ALSO: Type arguments for a generic call whose functional argument is an
+/// UNBOUND method reference: the SAM parameter shape unifies against the
+/// target method's signature (`Integrator.<State,T,RR>of(State::integrate)`
+/// — jdk26 Gatherers; the source witnesses leave no bytecode trace and
+/// javac's untyped inference dies on the Downstream capture: "方法引用
+/// 无效"). Conservative v1: the receiver fills the first SAM param when
+/// it is a callee typevar; remaining SAM params unify against the target's
+/// Signature; every callee typevar must end up bound and denotable.
+fn method_ref_type_args(
+    cls: &str,
+    name: &str,
+    desc: &jcdc_jvm::MethodDescriptor,
+    lam: &crate::expr::LambdaExpr,
+    pool: &ClassPool,
+) -> Option<Vec<String>> {
+    use jcdc_jvm::GenericType as G;
+    if lam.kind != crate::expr::LambdaKind::MethodRef || lam.impl_is_static {
+        if std::env::var("JCDC_DBG_WIT").is_ok() {
+            eprintln!(
+                "MRTA bail1 {} {} kind={:?} static={} impl={}.{} ref_recv={:?}",
+                cls, name, lam.kind, lam.impl_is_static, lam.impl_owner, lam.impl_name, lam.ref_receiver
+            );
+        }
+        return None;
+    }
+    let dpc = pool.get(cls)?;
+    let want_desc = format!(
+        "({}){}",
+        desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+        desc.ret.to_descriptor()
+    );
+    let mi = (0..dpc.cf.methods.len())
+        .find(|&i| dpc.method_name(i) == Some(name) && dpc.method_desc(i) == Some(want_desc.as_str()))?;
+    let msig = { let x = method_signature_of(&dpc, mi); if x.is_none() && std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA s2 msig {} {}", cls, name); } x? };
+    if msig.params.is_empty() {
+        { if std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA bail{} {} at {}", cls, name, 2); } return None; }
+    }
+    let tvar_names: Vec<String> = msig.params.iter().map(|p| p.name.clone()).collect();
+    let mut sam_cs: Option<jcdc_jvm::ClassSig> = None;
+    for pt in &msig.args {
+        if let G::Class(cs) = pt {
+            if g_mentions_tvar_named(pt, &tvar_names) {
+                sam_cs = Some(cs.clone());
+                break;
+            }
+        }
+    }
+    let sam_cs = { if sam_cs.is_none() && std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA s3 sam_cs {}", name); } sam_cs? };
+    let sam_internal = crate::method::classsig_internal(&sam_cs);
+    let sam_pc = { let x = pool.get(&sam_internal); if x.is_none() && std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA s4 sam_pc {}", sam_internal); } x? };
+    // The SAM method may be inherited (ofGreedy's param is
+    // Integrator$Greedy which does NOT redeclare integrate): walk the
+    // interface's supers. Class params of the declaring type pair with
+    // the instantiation args positionally (same-name passthrough is the
+    // norm; anything else fails unification safely).
+    fn find_sam(
+        pcx: &PoolClass,
+        sam_name: &str,
+        pool: &ClassPool,
+        depth: usize,
+    ) -> Option<(jcdc_jvm::MethodSignature, Vec<jcdc_jvm::TypeParam>)> {
+        let own = (0..pcx.cf.methods.len()).find(|&i| pcx.method_name(i) == Some(sam_name));
+        if let Some(mi) = own {
+            if let Some(msig) = method_signature_of(pcx, mi) {
+                let params = pcx
+                    .class_attr("Signature")
+                    .and_then(|b| {
+                        if b.len() >= 2 {
+                            pcx.utf8(u16::from_be_bytes([b[0], b[1]]))
+                                .and_then(|x| parse_class_signature(x))
+                        } else {
+                            None
+                        }
+                    })
+                    .map(|cs| cs.params)
+                    .unwrap_or_default();
+                return Some((msig, params));
+            }
+        }
+        if depth >= 4 {
+            return None;
+        }
+        for &ii in &pcx.cf.interfaces {
+            if let Some(iname) = pcx.class_name(ii) {
+                if let Some(ipc) = pool.get(iname) {
+                    if let Some(x) = find_sam(&ipc, sam_name, pool, depth + 1) {
+                        return Some(x);
+                    }
+                }
+            }
+        }
+        if let Some(sup) = pcx.super_name() {
+            if !sup.is_empty() {
+                if let Some(spc) = pool.get(sup) {
+                    return find_sam(&spc, sam_name, pool, depth + 1);
+                }
+            }
+        }
+        None
+    }
+    let (sam_msig, sam_cls_params) = {
+        let x = find_sam(&sam_pc, &lam.sam_name, pool, 0);
+        if x.is_none() && std::env::var("JCDC_DBG_WIT").is_ok() {
+            eprintln!("MRTA s5 sam_mi {}", lam.sam_name);
+        }
+        x?
+    };
+    let inst_args = {
+        let pl = sam_cs.parts.last();
+        if pl.is_none() && std::env::var("JCDC_DBG_WIT").is_ok() {
+            eprintln!("MRTA s7 parts");
+        }
+        pl?.args.clone()
+    };
+    let sam_params: Vec<G> = sam_msig
+        .args
+        .iter()
+        .map(|a| crate::method::subst_typevars(a, &sam_cls_params, &inst_args))
+        .collect();
+    let rpc = { let x = pool.get(&lam.impl_owner); if x.is_none() && std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA s8 rpc {}", lam.impl_owner); } x? };
+    let rmi = (0..rpc.cf.methods.len()).find(|&i| {
+        rpc.method_name(i) == Some(lam.impl_name.as_str())
+            && rpc
+                .method_desc(i)
+                .map(|d| {
+                    d == format!(
+                        "({}){}",
+                        lam.impl_desc
+                            .args
+                            .iter()
+                            .map(|t| t.to_descriptor())
+                            .collect::<String>(),
+                        lam.impl_desc.ret.to_descriptor()
+                    )
+                })
+                .unwrap_or(false)
+    })?;
+    let ref_msig = { let x = method_signature_of(&rpc, rmi); if x.is_none() && std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA s10 ref_msig {}.{}", lam.impl_owner, lam.impl_name); } x? };
+    if sam_params.len() != ref_msig.args.len() + 1 {
+        { if std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA bail{} {} at {}", cls, name, 3); } return None; }
+    }
+    let mut mapping: Vec<(String, G)> = Vec::new();
+    match &sam_params[0] {
+        G::TypeVar(tn) => {
+            let tail = lam.impl_owner.rsplit('$').next().unwrap_or(&lam.impl_owner);
+            let simple = tail.trim_start_matches(|c: char| c.is_ascii_digit()).to_string();
+            if simple.is_empty() {
+                { if std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA bail{} {} at {}", cls, name, 4); } return None; }
+            }
+            mapping.push((
+                tn.clone(),
+                G::Class(jcdc_jvm::ClassSig {
+                    package: String::new(),
+                    parts: vec![jcdc_jvm::ClassSigPart { name: simple, args: Vec::new() }],
+                }),
+            ));
+        }
+        _ => { if std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA s12 recv {:?}", sam_params.first()); } return None; }
+    }
+    // Direction matters: `have` is the SAM (callee-typevar) side so the
+    // mapping binds CALLEE typevars to the target method's types
+    // (A:=State, T:=T, R:=RR), not the reverse.
+    for (i, rp) in ref_msig.args.iter().enumerate() {
+        if !unify_types(&sam_params[i + 1], rp, &mut mapping) {
+            { if std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA bail{} {} at {}", cls, name, 5); } return None; }
+        }
+    }
+    let mut out = Vec::with_capacity(msig.params.len());
+    for p in &msig.params {
+        match mapping.iter().find(|(n, _)| n == &p.name) {
+            Some((_, G::Wildcard(_))) => return None,
+            Some((_, t)) => out.push(t.to_java()),
+            None => return None,
+        }
+    }
+    Some(out)
+}
+
+fn method_signature_of(pc: &PoolClass, mi: usize) -> Option<jcdc_jvm::MethodSignature> {
+    let sig_bytes = pc.cf.methods[mi].attributes.iter().find_map(|a| {
+        if pc.utf8(a.attribute_name_index) == Some("Signature") {
+            Some(a.info.as_slice())
+        } else {
+            None
+        }
+    })?;
+    if sig_bytes.len() < 2 {
+        return None;
+    }
+    pc.utf8(u16::from_be_bytes([sig_bytes[0], sig_bytes[1]]))
+        .and_then(|x| parse_method_signature(x))
+}
+
 pub(crate) fn witness_comparison_operands(
     s: &mut Stmt,
     msig: Option<&jcdc_jvm::MethodSignature>,
     pool: &ClassPool,
 ) {
+    use jcdc_jvm::GenericType as G;
     let caller_params: Option<&[jcdc_jvm::TypeParam]> = msig.map(|m| m.params.as_slice());
-    if std::env::var("JCDC_DBG_WIT").is_ok() {
-        eprintln!("WITCMP enter body");
-    }
-    fn fix_e(e: &mut Expr, pool: &ClassPool, caller_params: Option<&[jcdc_jvm::TypeParam]>) {
-        if let Expr::Bin { op, l, r, .. } = e {
-            if std::env::var("JCDC_DBG_WIT").is_ok() {
-                eprintln!("WITCMP bin lt={:?} rt={:?}", l.type_ref(), r.type_ref());
+    let ret_want: Option<G> = msig.and_then(|m| match &m.ret {
+        g @ (G::Class(_) | G::Array(_)) => Some(g.clone()),
+        _ => None,
+    });
+
+    // Instantiate a callee's generic params for a call expression: the
+    // receiver's parameterization (instance calls) or the declared owner
+    // typevars mapped to the caller's SAME-NAMED typevars (static calls
+    // inside a generic class — Gatherers.impl's `Integrator.of(..)` where
+    // the SAM carries the caller's A/T/R).
+    fn inst_params(
+        cls: &str,
+        mname: &str,
+        mdesc: &jcdc_jvm::MethodDescriptor,
+        owner: Option<&Expr>,
+        pool: &ClassPool,
+        caller_params: Option<&[jcdc_jvm::TypeParam]>,
+    ) -> Option<Vec<G>> {
+        let cpc = pool.get(cls)?;
+        let want_desc = format!(
+            "({}){}",
+            mdesc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+            mdesc.ret.to_descriptor()
+        );
+        let mi = (0..cpc.cf.methods.len())
+            .find(|&i| cpc.method_name(i) == Some(mname) && cpc.method_desc(i) == Some(want_desc.as_str()))?;
+        let msig_c = method_signature_of(&cpc, mi)?;
+        let cls_params = cpc
+            .class_attr("Signature")
+            .and_then(|b| {
+                if b.len() >= 2 {
+                    cpc.utf8(u16::from_be_bytes([b[0], b[1]]))
+                        .and_then(|x| parse_class_signature(x))
+                } else {
+                    None
+                }
+            })
+            .map(|cs| cs.params)
+            .unwrap_or_default();
+        if cls_params.is_empty() {
+            return Some(msig_c.args.clone());
+        }
+        // Receiver actuals for instance calls.
+        let recv_args: Option<Vec<G>> = match owner {
+            Some(Expr::This) | None => None,
+            Some(o) => match o.type_ref() {
+                TypeRef::G(G::Class(cs)) => cs.parts.last().map(|p| p.args.clone()),
+                _ => None,
+            },
+        };
+        let inst: Vec<G> = match recv_args {
+            Some(a) if a.len() == cls_params.len() => a,
+            _ => {
+                // Static call inside a generic owner: map the class typevars
+                // to same-named caller typevars when they exist there.
+                let cps = caller_params?;
+                cls_params
+                    .iter()
+                    .map(|p| {
+                        if cps.iter().any(|cp| cp.name == p.name) {
+                            G::TypeVar(p.name.clone())
+                        } else {
+                            G::TypeVar(p.name.clone())
+                        }
+                    })
+                    .collect()
             }
+        };
+        Some(
+            msig_c
+                .args
+                .iter()
+                .map(|a| crate::method::subst_typevars(a, &cls_params, &inst))
+                .collect(),
+        )
+    }
+
+    fn fix_e(
+        e: &mut Expr,
+        pool: &ClassPool,
+        caller_params: Option<&[jcdc_jvm::TypeParam]>,
+        want: Option<&G>,
+    ) {
+        // Comparisons: operand parameterization drives witnesses.
+        if let Expr::Bin { op, l, r, .. } = e {
             use crate::expr::BinOp;
             if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::RefEq | BinOp::RefNe) {
                 let try_witness = |a: &mut Expr,
                                    b: &Expr,
                                    pool: &ClassPool,
                                    caller_params: Option<&[jcdc_jvm::TypeParam]>| {
-                    let TypeRef::G(want) = b.type_ref() else {
-                        if std::env::var("JCDC_DBG_WIT").is_ok() {
-                            eprintln!("WITTRY skip: b not G");
-                        }
-                        return;
-                    };
+                    let TypeRef::G(want) = b.type_ref() else { return };
                     let Expr::Method { cls, name, desc, type_args, .. } = &*a else {
-                        if std::env::var("JCDC_DBG_WIT").is_ok() {
-                            eprintln!("WITTRY skip: a not Method: {:?}", std::mem::discriminant(&*a));
-                        }
                         return;
                     };
                     if !type_args.is_empty() {
                         return;
                     }
-                    let res = compute_witness(cls, name, desc, None, &want, pool, caller_params);
-                    if std::env::var("JCDC_DBG_WIT").is_ok() && name == "defaultFinisher" {
-                        eprintln!("WITTRY {} res={:?}", name, res.is_some());
-                    }
-                    if let Some((w, _)) = res {
+                    if let Some((w, _)) =
+                        compute_witness(cls, name, desc, None, &want, pool, caller_params)
+                    {
                         if let Expr::Method { type_args, .. } = a {
                             *type_args = w;
                         }
                     }
                 };
-                let rwant = r.type_ref();
                 try_witness(l, r, pool, caller_params);
-                let _ = rwant;
                 try_witness(r, l, pool, caller_params);
+                // Comparison side fed by an unbound method ref.
+                let mut apply: Option<(bool, Vec<String>)> = None;
+                for (idx, (a, b)) in
+                    [(l.as_ref(), r.as_ref()), (r.as_ref(), l.as_ref())]
+                        .into_iter()
+                        .enumerate()
+                {
+                    if !matches!(b.type_ref(), TypeRef::G(_)) {
+                        continue;
+                    }
+                    let Expr::Method { cls, name, desc, type_args, args, .. } = a else {
+                        continue;
+                    };
+                    if !type_args.is_empty() {
+                        continue;
+                    }
+                    let Some(Expr::Lambda(lam)) = args.first() else { continue };
+                    if let Some(w) = method_ref_type_args(cls, name, desc, lam, pool) {
+                        apply = Some((idx == 0, w));
+                        break;
+                    }
+                }
+                if let Some((is_l, w)) = apply {
+                    let target = if is_l { l } else { r };
+                    if let Expr::Method { type_args, .. } = target.as_mut() {
+                        *type_args = w;
+                    }
+                }
             }
         }
-        fix_children_e(e, pool, caller_params);
+        // Method calls: witness from the contextual target when the call
+        // carries an unbound method ref whose SAM contains wildcards (bare
+        // inference dies on capture conversion: "方法引用无效
+        // Downstream<CAP#1>无法转换为Downstream<? super RR>"). Only fire
+        // when a target exists — pinned witnesses WITHOUT a driving target
+        // starve outer inference (ofSequential finisher regression).
+        if let Some(want_g) = want {
+            if let Expr::Method { cls, name, desc, type_args, args, owner, .. } = &*e {
+                if type_args.is_empty() {
+                    if let Some(Expr::Lambda(lam)) = args.first() {
+                        if lam.kind == crate::expr::LambdaKind::MethodRef {
+                            if let Some(params) =
+                                inst_params(cls, name, desc, owner.as_deref(), pool, caller_params)
+                            {
+                                if params.len() == args.len() {
+                                    if let Some(p0) = params.first() {
+                                        if g_has_wildcard(p0) {
+                                            if let Some((w, _)) = compute_witness(
+                                                cls,
+                                                name,
+                                                desc,
+                                                None,
+                                                want_g,
+                                                pool,
+                                                caller_params,
+                                            ) {
+                                                if let Expr::Method { type_args, .. } = e {
+                                                    *type_args = w;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fix_children_e(e, pool, caller_params, want);
     }
-    fn fix_children_e(e: &mut Expr, pool: &ClassPool, caller_params: Option<&[jcdc_jvm::TypeParam]>) {
+    fn fix_children_e(
+        e: &mut Expr,
+        pool: &ClassPool,
+        caller_params: Option<&[jcdc_jvm::TypeParam]>,
+        want: Option<&G>,
+    ) {
+        // Param wants for call/ctor args, computed before the mutable walk.
+        let call_params: Option<Vec<G>> = match &*e {
+            Expr::New { .. } => instantiated_ctor_params(e, pool),
+            Expr::Method { cls, name, desc, owner, .. } => {
+                inst_params(cls, name, desc, owner.as_deref(), pool, caller_params)
+            }
+            _ => None,
+        };
         match e {
-            Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
-                args.iter_mut().for_each(|a| fix_e(a, pool, caller_params));
+            Expr::New { args, .. } => {
+                for (i, a) in args.iter_mut().enumerate() {
+                    let pw = call_params.as_ref().and_then(|ps| ps.get(i).cloned());
+                    fix_e(a, pool, caller_params, pw.as_ref());
+                }
+            }
+            Expr::AnonNew { args, .. } => {
+                args.iter_mut().for_each(|a| fix_e(a, pool, caller_params, want));
             }
             Expr::Method { owner, args, .. } => {
                 if let Some(o) = owner {
-                    fix_e(o, pool, caller_params);
+                    fix_e(o, pool, caller_params, None);
                 }
-                args.iter_mut().for_each(|a| fix_e(a, pool, caller_params));
+                for (i, a) in args.iter_mut().enumerate() {
+                    let pw = call_params.as_ref().and_then(|ps| ps.get(i).cloned());
+                    fix_e(a, pool, caller_params, pw.as_ref());
+                }
             }
-            Expr::Field { owner: Some(o), .. } => fix_e(o, pool, caller_params),
+            Expr::Field { owner: Some(o), .. } => fix_e(o, pool, caller_params, None),
             Expr::ArrayIndex { array, index } => {
-                fix_e(array, pool, caller_params);
-                fix_e(index, pool, caller_params);
+                fix_e(array, pool, caller_params, want);
+                fix_e(index, pool, caller_params, None);
             }
-            Expr::Cast { e: i, .. } | Expr::InstanceOf { e: i, .. } | Expr::Un { e: i, .. }
-            | Expr::PreIncDec { e: i, .. } | Expr::PostIncDec { e: i, .. } => {
-                fix_e(i, pool, caller_params);
+            Expr::Cast { ty, e: i } => {
+                let w = match ty {
+                    TypeRef::G(g) => Some(g.clone()),
+                    _ => None,
+                };
+                fix_e(i, pool, caller_params, w.as_ref().or(want));
             }
+            Expr::InstanceOf { e: i, .. }
+            | Expr::Un { e: i, .. }
+            | Expr::PreIncDec { e: i, .. }
+            | Expr::PostIncDec { e: i, .. } => fix_e(i, pool, caller_params, want),
             Expr::Bin { l, r, .. } => {
-                fix_e(l, pool, caller_params);
-                fix_e(r, pool, caller_params);
+                fix_e(l, pool, caller_params, want);
+                fix_e(r, pool, caller_params, want);
             }
             Expr::Cond { c, t, f } => {
-                fix_e(c, pool, caller_params);
-                fix_e(t, pool, caller_params);
-                fix_e(f, pool, caller_params);
+                fix_e(c, pool, caller_params, None);
+                fix_e(t, pool, caller_params, want);
+                fix_e(f, pool, caller_params, want);
             }
             Expr::Assign { target, value, .. } => {
-                fix_e(target, pool, caller_params);
-                fix_e(value, pool, caller_params);
+                let tw = match target.type_ref() {
+                    TypeRef::G(g) => Some(g.clone()),
+                    _ => None,
+                };
+                fix_e(target, pool, caller_params, None);
+                fix_e(value, pool, caller_params, tw.as_ref().or(want));
             }
-            Expr::NewArray { dims, init, .. } => {
-                dims.iter_mut().for_each(|d| fix_e(d, pool, caller_params));
+            Expr::NewArray { elem, dims, init, .. } => {
+                dims.iter_mut().for_each(|d| fix_e(d, pool, caller_params, None));
                 if let Some(vals) = init {
-                    vals.iter_mut().for_each(|x| fix_e(x, pool, caller_params));
+                    let _ = elem;
+                    vals.iter_mut().for_each(|x| fix_e(x, pool, caller_params, want));
                 }
             }
             Expr::NewMultiArray { dims, .. } => {
-                dims.iter_mut().for_each(|d| fix_e(d, pool, caller_params));
+                dims.iter_mut().for_each(|d| fix_e(d, pool, caller_params, None));
             }
             Expr::StringConcat(parts) => parts.iter_mut().for_each(|pp| {
                 if let crate::expr::ConcatPart::Str(i) = pp {
-                    fix_e(i, pool, caller_params);
+                    fix_e(i, pool, caller_params, want);
                 }
             }),
             Expr::Lambda(l) => l
                 .captures
                 .iter_mut()
-                .for_each(|c| fix_e(c, pool, caller_params)),
+                .for_each(|c| fix_e(c, pool, caller_params, want)),
             Expr::Invokedynamic { args, .. } => {
-                args.iter_mut().for_each(|a| fix_e(a, pool, caller_params));
+                args.iter_mut().for_each(|a| fix_e(a, pool, caller_params, want));
             }
             _ => {}
         }
     }
-    fn rec(s: &mut Stmt, pool: &ClassPool, caller_params: Option<&[jcdc_jvm::TypeParam]>) {
+    fn rec(
+        s: &mut Stmt,
+        pool: &ClassPool,
+        caller_params: Option<&[jcdc_jvm::TypeParam]>,
+        ret_want: Option<&G>,
+    ) {
         match s {
-            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, pool, caller_params)),
-            Stmt::ExprStmt(e) => fix_e(e, pool, caller_params),
-            Stmt::LocalDef { init: Some(e), .. } => fix_e(e, pool, caller_params),
-            Stmt::Return(Some(e)) | Stmt::Throw(e) => fix_e(e, pool, caller_params),
+            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, pool, caller_params, ret_want)),
+            Stmt::ExprStmt(e) => fix_e(e, pool, caller_params, None),
+            Stmt::LocalDef { var: _, init: Some(e), .. } => {
+                fix_e(e, pool, caller_params, None);
+            }
+            Stmt::Return(Some(e)) => {
+                fix_e(e, pool, caller_params, ret_want);
+            }
+            Stmt::Throw(e) => fix_e(e, pool, caller_params, None),
             Stmt::If { cond, then_stmt, else_stmt } => {
-                fix_e(cond, pool, caller_params);
-                rec(then_stmt, pool, caller_params);
+                fix_e(cond, pool, caller_params, None);
+                rec(then_stmt, pool, caller_params, ret_want);
                 if let Some(e) = else_stmt {
-                    rec(e, pool, caller_params);
+                    rec(e, pool, caller_params, ret_want);
                 }
             }
             Stmt::While { cond, body } => {
-                fix_e(cond, pool, caller_params);
-                rec(body, pool, caller_params);
+                fix_e(cond, pool, caller_params, None);
+                rec(body, pool, caller_params, ret_want);
             }
             Stmt::DoWhile { body, cond } => {
-                rec(body, pool, caller_params);
-                fix_e(cond, pool, caller_params);
+                rec(body, pool, caller_params, ret_want);
+                fix_e(cond, pool, caller_params, None);
             }
             Stmt::For { init, cond, update, body } => {
-                init.iter_mut().for_each(|i| rec(i, pool, caller_params));
+                init.iter_mut().for_each(|i| rec(i, pool, caller_params, ret_want));
                 if let Some(c) = cond {
-                    fix_e(c, pool, caller_params);
+                    fix_e(c, pool, caller_params, None);
                 }
-                update.iter_mut().for_each(|u| fix_e(u, pool, caller_params));
-                rec(body, pool, caller_params);
+                update.iter_mut().for_each(|u| fix_e(u, pool, caller_params, None));
+                rec(body, pool, caller_params, ret_want);
             }
             Stmt::ForEach { iterable, body, .. } => {
-                fix_e(iterable, pool, caller_params);
-                rec(body, pool, caller_params);
+                fix_e(iterable, pool, caller_params, None);
+                rec(body, pool, caller_params, ret_want);
             }
             Stmt::Switch { selector, cases, default, .. } => {
-                fix_e(selector, pool, caller_params);
+                fix_e(selector, pool, caller_params, None);
                 for c in cases.iter_mut() {
-                    c.body.iter_mut().for_each(|st| rec(st, pool, caller_params));
+                    c.body.iter_mut().for_each(|st| rec(st, pool, caller_params, ret_want));
                 }
                 if let Some(d) = default {
-                    rec(d, pool, caller_params);
+                    rec(d, pool, caller_params, ret_want);
                 }
             }
             Stmt::Try { body, catches, finally } => {
-                rec(body, pool, caller_params);
+                rec(body, pool, caller_params, ret_want);
                 for c in catches.iter_mut() {
-                    rec(&mut c.body, pool, caller_params);
+                    rec(&mut c.body, pool, caller_params, ret_want);
                 }
                 if let Some(f) = finally {
-                    rec(f, pool, caller_params);
+                    rec(f, pool, caller_params, ret_want);
                 }
             }
             Stmt::TryWithResources { resources, body, catches, finally } => {
-                resources.iter_mut().for_each(|r| rec(r, pool, caller_params));
-                rec(body, pool, caller_params);
+                resources.iter_mut().for_each(|r| rec(r, pool, caller_params, ret_want));
+                rec(body, pool, caller_params, ret_want);
                 for c in catches.iter_mut() {
-                    rec(&mut c.body, pool, caller_params);
+                    rec(&mut c.body, pool, caller_params, ret_want);
                 }
                 if let Some(f) = finally {
-                    rec(f, pool, caller_params);
+                    rec(f, pool, caller_params, ret_want);
                 }
             }
             Stmt::Synchronized { lock, body } => {
-                fix_e(lock, pool, caller_params);
-                rec(body, pool, caller_params);
+                fix_e(lock, pool, caller_params, None);
+                rec(body, pool, caller_params, ret_want);
             }
-            Stmt::Labeled { body, .. } => rec(body, pool, caller_params),
+            Stmt::Labeled { body, .. } => rec(body, pool, caller_params, ret_want),
             Stmt::Assert { cond, msg } => {
-                fix_e(cond, pool, caller_params);
+                fix_e(cond, pool, caller_params, None);
                 if let Some(m) = msg {
-                    fix_e(m, pool, caller_params);
+                    fix_e(m, pool, caller_params, None);
                 }
             }
-            Stmt::TernaryValue { e } => fix_e(e, pool, caller_params),
-            Stmt::MonitorEnter(e) | Stmt::MonitorExit(e) => fix_e(e, pool, caller_params),
+            Stmt::TernaryValue { e } => fix_e(e, pool, caller_params, ret_want),
+            Stmt::MonitorEnter(e) | Stmt::MonitorExit(e) => fix_e(e, pool, caller_params, None),
             _ => {}
         }
     }
-    rec(s, pool, caller_params);
+    rec(s, pool, caller_params, ret_want.as_ref());
 }
+
 
 fn compute_witness(
     cls: &str,
