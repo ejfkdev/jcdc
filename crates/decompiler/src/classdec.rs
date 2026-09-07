@@ -1501,7 +1501,7 @@ fn outer_param_slot(pc: &PoolClass) -> Option<(u16, String)> {
     Some((1, fname))
 }
 
-fn class_has_this0(pc: &PoolClass) -> bool {
+pub(crate) fn class_has_this0(pc: &PoolClass) -> bool {
     pc.cf.fields.iter().any(|f| {
         pc.utf8(f.name_index)
             .map(|n| n.starts_with("this$"))

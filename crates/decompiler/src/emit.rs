@@ -1140,7 +1140,39 @@ impl<'a> Printer<'a> {
                 if name == "<init>" && *is_special {
                     // super(...) / this(...)
                     let is_super_form = *is_super || cls != &self.pc.internal_name;
-                    if is_super_form {
+                    // Qualified super for a STATIC class extending an
+                    // INNER superclass: javac synthesizes the enclosing
+                    // instance as the ctor's first param, and the source
+                    // form is `outer.super(rest)` (jdk11/17/26
+                    // BoundMethodHandle.SpeciesData extends
+                    // ClassSpecializer<..>.SpeciesData — plain
+                    // super(outer, key) is "需要包含..的封闭实例" x3 trees).
+                    let qualified_outer = if is_super_form
+                        && !args.is_empty()
+                        && cls.contains('$')
+                        && !crate::classdec::class_has_this0(self.pc)
+                    {
+                        let enclosing = cls.rsplit_once('$').map(|(o, _)| o.to_string());
+                        match (enclosing, self.pool.get(cls)) {
+                            (Some(enc), Some(spc))
+                                if crate::classdec::class_has_this0(&spc)
+                                    && crate::classdec::is_subtype_of(
+                                        self.pool,
+                                        &args[0].type_ref().erased(),
+                                        &enc,
+                                    ) =>
+                            {
+                                Some(enc)
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if qualified_outer.is_some() {
+                        self.expr(&args[0], 15, out);
+                        out.push_str(".super(");
+                    } else if is_super_form {
                         out.push_str("super(");
                     } else {
                         out.push_str("this(");
@@ -1162,7 +1194,13 @@ impl<'a> Printer<'a> {
                     // generic formals — casting there broke FindOps
                     // `super(parent, spliterator)` (K := FindTask<..>
                     // accepts the arg fine; the raw erasure cast does not).
-                    if desc.args.len() == args.len() {
+                    if qualified_outer.is_some() {
+                        if desc.args.len() == args.len() && desc.args.len() >= 1 {
+                            self.args_typed(&args[1..], &desc.args[1..], out);
+                        } else {
+                            self.args(&args[1..], out);
+                        }
+                    } else if desc.args.len() == args.len() {
                         if is_super_form {
                             self.args_typed(args, &desc.args, out);
                         } else {
