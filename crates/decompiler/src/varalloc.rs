@@ -35,6 +35,15 @@ pub struct VarTable {
     /// generic/plain-Object value); they must stay Object so every branch
     /// assignment type-checks. Evidence inference may not narrow them.
     pub wide_stack_vars: HashSet<u32>,
+    /// Exception-table handler start pcs: an LVT range beginning at one
+    /// (or at its astore + 1/2) is a catch parameter binding. Such
+    /// ranges never receive forward store attribution — a store just
+    /// BEFORE a handler initializes the try-body variable, not the
+    /// catch param (jdk11 HostnameChecker.matchDNS: `sni = new
+    /// SNIHostName(..)` at pc 8 landed on `iae` whose handler range
+    /// starts at 14, within the 8-byte lead-in — SNIHostName无法转换为
+    /// IllegalArgumentException).
+    pub handler_starts: Vec<u16>,
 }
 
 /// Pull the typed Code attribute out of a method, if any.
@@ -116,6 +125,7 @@ impl VarTable {
             let handler_starts: Vec<u16> = code_attribute(pc, m_idx)
                 .map(|code| code.exception_table.iter().map(|t| t.handler_pc).collect())
                 .unwrap_or_default();
+            vt.handler_starts = handler_starts.clone();
             // (slot, pc, is_store) for every typed local access, in pc
             // order — used to keep a long-gap merge honest about accesses
             // inside the gap.
@@ -405,8 +415,16 @@ impl VarTable {
                                 // before the next catch param's LVT range,
                                 // jdk17 ForkJoinTask.exec `return rex` —
                                 // forward attribution turned `return true`
-                                // into returning the exception).
-                                || (is_store && pc0 < *rs && *rs - pc0 <= 8)
+                                // into returning the exception). A range
+                                // starting AT a handler is a catch param:
+                                // the store before it belongs to the
+                                // try-body variable (HostnameChecker sni).
+                                || (is_store
+                                    && pc0 < *rs
+                                    && *rs - pc0 <= 8
+                                    && !vt.handler_starts.iter().any(|h| {
+                                        *rs == *h || *rs == h + 1 || *rs == h + 2
+                                    }))
                         })
                     })
                     .unwrap_or(false);
@@ -530,9 +548,18 @@ impl VarTable {
         // javac often starts an LVT range just AFTER the storing
         // instruction; attribute a nearby access to the next range before
         // falling back to the previous one (keeps slot-reuse splits like
-        // `byte[] dst` / `int b` on one slot apart).
+        // `byte[] dst` / `int b` on one slot apart). Never forward-
+        // attribute into a catch-param range (starts at a handler pc or
+        // its astore+1/+2): the store before a handler initializes the
+        // try-body variable (jdk11 HostnameChecker.matchDNS `sni = new
+        // SNIHostName(..)` was typed IllegalArgumentException).
         for (rs, _, id) in segs {
-            if *rs > pc && *rs - pc <= 8 {
+            if *rs > pc
+                && *rs - pc <= 8
+                && !self.handler_starts.iter().any(|h| {
+                    *rs == *h || *rs == h + 1 || *rs == h + 2
+                })
+            {
                 return Some(*id);
             }
         }
