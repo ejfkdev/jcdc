@@ -451,6 +451,7 @@ pub fn decompile_method(
     cleanup(&mut body);
     prune_dead_breaks(&mut body);
     prune_post_loop_label_breaks(&mut body);
+    demote_undefined_label_jumps(&mut body);
     cleanup(&mut body);
     disambiguate_nested_locals(&mut vt, &body);
     prune_unreachable(&mut body);
@@ -7311,6 +7312,199 @@ fn is_inflight_throw(s: &Stmt) -> bool {
 /// Java forbids a local declaration from shadowing another local of the
 /// SAME method in an enclosing scope. When two distinct variables (slots)
 /// share an LVT name and end up nested, rename the inner one.
+/// Breaks/continues whose labels are DEFINED nowhere in the method are
+/// structurizer residue: a `break L31` targeting a following switch case
+/// is the bytecode's fall-through edge (jdk11 Pattern slice case 0 →
+/// default; "未定义的标签"), and a continue targeting a lost loop header
+/// still means "the enclosing loop". Demote: drop the break where it
+/// sits as the case's tail (fall-through), collapse `if (c) { X } else
+/// { break L; }` to `if (!c) { X }` at case tail, and strip labels from
+/// continues (nearest enclosing loop is the only candidate left).
+pub(crate) fn demote_undefined_label_jumps(s: &mut Stmt) {
+    fn defined_labels(s: &Stmt, out: &mut HashSet<String>, ids: &mut HashSet<u32>) {
+        match s {
+            Stmt::Label(id) => {
+                ids.insert(*id);
+            }
+            Stmt::Goto(_) | Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::Labeled { label, body } => {
+                out.insert(label.clone());
+                defined_labels(body, out, ids);
+            }
+            Stmt::Block(v) => v.iter().for_each(|x| defined_labels(x, out, ids)),
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                defined_labels(then_stmt, out, ids);
+                if let Some(e) = else_stmt {
+                    defined_labels(e, out, ids);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::Labeled { body, .. }
+            | Stmt::Synchronized { body, .. } => defined_labels(body, out, ids),
+            Stmt::For { init, body, .. } => {
+                init.iter().for_each(|x| defined_labels(x, out, ids));
+                defined_labels(body, out, ids);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases {
+                    c.body.iter().for_each(|x| defined_labels(x, out, ids));
+                }
+                if let Some(d) = default {
+                    defined_labels(d, out, ids);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                defined_labels(body, out, ids);
+                for c in catches {
+                    defined_labels(&c.body, out, ids);
+                }
+                if let Some(f) = finally {
+                    defined_labels(f, out, ids);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter().for_each(|x| defined_labels(x, out, ids));
+                defined_labels(body, out, ids);
+                for c in catches {
+                    defined_labels(&c.body, out, ids);
+                }
+                if let Some(f) = finally {
+                    defined_labels(f, out, ids);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut defined: HashSet<String> = HashSet::new();
+    let mut defined_ids: HashSet<u32> = HashSet::new();
+    defined_labels(s, &mut defined, &mut defined_ids);
+    fn undefined_jump(s: &Stmt, defined: &HashSet<String>, ids: &HashSet<u32>) -> bool {
+        match s {
+            Stmt::Break(Some(l)) | Stmt::Continue(Some(l)) => !defined.contains(l),
+            Stmt::Goto(id) => !ids.contains(id),
+            _ => false,
+        }
+    }
+    /// The single statement wrapped in (possibly nested) single-element blocks.
+    fn unwrap_single(v: &Stmt) -> &Stmt {
+        let mut cur = v;
+        loop {
+            match cur {
+                Stmt::Block(inner) if inner.len() == 1 => cur = &inner[0],
+                other => return other,
+            }
+        }
+    }
+    fn try_fold_tail_if(st: &mut Stmt, defined: &HashSet<String>, ids: &HashSet<u32>) -> bool {
+        if let Stmt::Block(v) = st {
+            if v.len() == 1 {
+                return try_fold_tail_if(&mut v[0], defined, ids);
+            }
+            return false;
+        }
+        let Stmt::If { cond, then_stmt, else_stmt: Some(e) } = st else {
+            return false;
+        };
+        let then_undef = undefined_jump(unwrap_single(then_stmt), defined, ids);
+        let else_undef = undefined_jump(unwrap_single(e), defined, ids);
+        if then_undef == else_undef {
+            // neither, or both (ambiguous — leave for the switch restorer)
+            return false;
+        }
+        let c = cond.clone();
+        *st = if then_undef {
+            Stmt::If {
+                cond: crate::convert::negate(c),
+                then_stmt: e.clone(),
+                else_stmt: None,
+            }
+        } else {
+            Stmt::If {
+                cond: c,
+                then_stmt: then_stmt.clone(),
+                else_stmt: None,
+            }
+        };
+        true
+    }
+    fn fix_vec(v: &mut Vec<Stmt>, defined: &HashSet<String>, ids: &HashSet<u32>) {
+        let mut i = 0;
+        while i < v.len() {
+            // Trailing undefined jump in this block: drop (fall-through).
+            if i + 1 == v.len() && undefined_jump(&v[i], defined, ids) {
+                v.remove(i);
+                continue;
+            }
+            // Tail if/else where ONE branch is an undefined-label break
+            // (the switch fall-through edge): keep the other branch under
+            // the (possibly negated) condition and fall through.
+            if i + 1 == v.len() && try_fold_tail_if(&mut v[i], defined, ids) {
+                if v[i].is_empty_block() {
+                    v.remove(i);
+                    continue;
+                }
+            }
+            fix_stmt(&mut v[i], defined, ids);
+            i += 1;
+        }
+    }
+    fn fix_stmt(s: &mut Stmt, defined: &HashSet<String>, ids: &HashSet<u32>) {
+        match s {
+            Stmt::Break(Some(l)) if !defined.contains(l) => *s = Stmt::Break(None),
+            Stmt::Continue(Some(l)) if !defined.contains(l) => *s = Stmt::Continue(None),
+            Stmt::Goto(id) if !ids.contains(id) => *s = Stmt::Break(None),
+            Stmt::Block(v) => fix_vec(v, defined, ids),
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                fix_stmt(then_stmt, defined, ids);
+                if let Some(e) = else_stmt {
+                    fix_stmt(e, defined, ids);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::ForEach { body, .. } => {
+                fix_stmt(body, defined, ids);
+            }
+            Stmt::For { init, body, .. } => {
+                init.iter_mut().for_each(|x| fix_stmt(x, defined, ids));
+                fix_stmt(body, defined, ids);
+            }
+            Stmt::Labeled { body, .. } | Stmt::Synchronized { body, .. } => {
+                fix_stmt(body, defined, ids);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    fix_vec(&mut c.body, defined, ids);
+                }
+                if let Some(d) = default {
+                    fix_stmt(d, defined, ids);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                fix_stmt(body, defined, ids);
+                for c in catches.iter_mut() {
+                    fix_stmt(&mut c.body, defined, ids);
+                }
+                if let Some(f) = finally {
+                    fix_stmt(f, defined, ids);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter_mut().for_each(|x| fix_stmt(x, defined, ids));
+                fix_stmt(body, defined, ids);
+                for c in catches.iter_mut() {
+                    fix_stmt(&mut c.body, defined, ids);
+                }
+                if let Some(f) = finally {
+                    fix_stmt(f, defined, ids);
+                }
+            }
+            _ => {}
+        }
+    }
+    fix_stmt(s, &defined, &defined_ids);
+}
+
 /// `L: do {..} while (c); break L;` — loop-exit edges materialized as a
 /// labeled break right AFTER the loop they name are do-while rotation
 /// residue: illegal Java ("在 switch 或 loop 外部中断") and redundant

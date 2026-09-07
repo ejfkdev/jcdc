@@ -2753,8 +2753,11 @@ fn emit_method_with(
             restore_enum_switches(&mut body, pc, pool);
             // Switch restoration reassembles case blocks AFTER the method
             // pipeline: rerun the post-loop label-break prune there (jdk17
-            // GregorianCalendar case 2 `L2: do..while; break L2;`).
+            // GregorianCalendar case 2 `L2: do..while; break L2;`) and the
+            // undefined-label demotion (jdk11 Pattern slice case-0
+            // fall-through compiled to `break L31`).
             crate::method::prune_post_loop_label_breaks(&mut body);
+            crate::method::demote_undefined_label_jumps(&mut body);
             add_throw_witnesses(&mut body, msig.as_ref(), pool);
             strip_erasure_casts_generic_ret(&mut body, msig.as_ref(), pool);
             witness_generic_returns(&mut body, msig.as_ref(), pool);
@@ -2789,6 +2792,9 @@ fn emit_method_with(
                 }
                 _ => None,
             });
+            // Last moment before printing: labels can be dropped by any
+            // earlier reshaping pass, leaving undefined-label breaks.
+            crate::method::demote_undefined_label_jumps(&mut body);
             let text = Printer::new(pc, pool, &mb.vt)
                 .with_indent(indent + 1)
                 .with_ret_bool(ret_bool)
@@ -9946,8 +9952,27 @@ fn disambiguate_lambda_locals(
             if l.impl_owner == pc.internal_name {
                 if let Some(mi) = pc.find_own_method(&l.impl_name, &l.impl_desc.to_string()) {
                     if let Ok(Some(mb)) = decompile_method(pc, pool, mi) {
+                        // Params split into [captures..., SAM params...]:
+                        // capture params are LEXICAL references to outer
+                        // locals (renaming the outer var on their account
+                        // breaks the very reference — System.LoggerFinder
+                        // `rb` regression), only the trailing SAM slice
+                        // introduces new lambda-scope names.
+                        let pvars: Vec<&crate::varalloc::VarInfo> = mb
+                            .vt
+                            .vars
+                            .iter()
+                            .filter(|v| v.is_param && v.name != "this")
+                            .collect();
+                        let nsam = l.param_names.len();
+                        let skip = pvars.len().saturating_sub(nsam);
+                        for (i, v) in pvars.iter().enumerate() {
+                            if i >= skip {
+                                names.insert(v.name.clone());
+                            }
+                        }
                         for v in &mb.vt.vars {
-                            if v.name != "this" {
+                            if !v.is_param && v.name != "this" {
                                 names.insert(v.name.clone());
                             }
                         }

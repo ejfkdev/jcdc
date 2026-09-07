@@ -1460,6 +1460,7 @@ impl<'a> Printer<'a> {
                         }
                         crate::classdec::restore_enum_switches(&mut body, self.pc, self.pool);
                         crate::method::prune_post_loop_label_breaks(&mut body);
+                        crate::method::demote_undefined_label_jumps(&mut body);
                         // Single-return body → expression lambda.
                         let mut single_expr = match &body {
                             Stmt::Return(Some(e)) => Some(e.clone()),
