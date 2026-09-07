@@ -2772,6 +2772,7 @@ fn emit_method_with(
             let captys_save =
                 CAPTURE_GENERIC_TYPES.with(|m| std::mem::take(&mut *m.borrow_mut()));
             fix_lambda_captures(&mut body, &mut mb.vt, pc, pool, fam);
+            disambiguate_lambda_locals(pc, pool, &mut mb.vt, &body);
             line.push_str(" {\n");
             out.push_str(&line);
             let ret_bool = mdesc.as_ref().map(|d| d.ret == jcdc_jvm::JavaType::Boolean).unwrap_or(false)
@@ -9914,6 +9915,202 @@ fn method_signature_of(pc: &PoolClass, mi: usize) -> Option<jcdc_jvm::MethodSign
     }
     pc.utf8(u16::from_be_bytes([sig_bytes[0], sig_bytes[1]]))
         .and_then(|x| parse_method_signature(x))
+}
+
+/// A hoisted method-top local can collide with lambda parameter and
+/// lambda-body local names that the source declared BEFORE the local's
+/// original (block-scoped) declaration — legal in source, but the hoist
+/// moves the declaration above the lambdas and javac rejects the
+/// shadowing ("已在方法 makeGraph 中定义了变量 m2", jdk11 module
+/// Resolver). Rename the OUTER local (all references follow the
+/// VarTable name) until no lambda-scope name collides.
+fn disambiguate_lambda_locals(
+    pc: &PoolClass,
+    pool: &ClassPool,
+    vt: &mut crate::varalloc::VarTable,
+    body: &Stmt,
+) {
+    fn collect_lambda_names(
+        e: &Expr,
+        pc: &PoolClass,
+        pool: &ClassPool,
+        names: &mut HashSet<String>,
+    ) {
+        if let Expr::Lambda(l) = e {
+            for n in &l.param_names {
+                names.insert(n.clone());
+            }
+            // The printer prefers the impl method's own LVT names for the
+            // parameter list, and the impl body's locals share the lambda's
+            // scope rules — collect both.
+            if l.impl_owner == pc.internal_name {
+                if let Some(mi) = pc.find_own_method(&l.impl_name, &l.impl_desc.to_string()) {
+                    if let Ok(Some(mb)) = decompile_method(pc, pool, mi) {
+                        for v in &mb.vt.vars {
+                            if v.name != "this" {
+                                names.insert(v.name.clone());
+                            }
+                        }
+                        // Nested lambdas inside this impl body share the
+                        // same shadow rules (Resolver: the m2 lambda lives
+                        // inside the flatMap lambda's body).
+                        collect_stmt(&mb.body, pc, pool, names);
+                    }
+                }
+            }
+        }
+        match e {
+            Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+                args.iter().for_each(|a| collect_lambda_names(a, pc, pool, names));
+            }
+            Expr::Method { owner, args, .. } => {
+                if let Some(o) = owner {
+                    collect_lambda_names(o, pc, pool, names);
+                }
+                args.iter().for_each(|a| collect_lambda_names(a, pc, pool, names));
+            }
+            Expr::Field { owner: Some(o), .. } => collect_lambda_names(o, pc, pool, names),
+            Expr::ArrayIndex { array, index } => {
+                collect_lambda_names(array, pc, pool, names);
+                collect_lambda_names(index, pc, pool, names);
+            }
+            Expr::Cast { e: i, .. }
+            | Expr::InstanceOf { e: i, .. }
+            | Expr::Un { e: i, .. }
+            | Expr::PreIncDec { e: i, .. }
+            | Expr::PostIncDec { e: i, .. } => collect_lambda_names(i, pc, pool, names),
+            Expr::Bin { l, r, .. } => {
+                collect_lambda_names(l, pc, pool, names);
+                collect_lambda_names(r, pc, pool, names);
+            }
+            Expr::Cond { c, t, f } => {
+                collect_lambda_names(c, pc, pool, names);
+                collect_lambda_names(t, pc, pool, names);
+                collect_lambda_names(f, pc, pool, names);
+            }
+            Expr::Assign { target, value, .. } => {
+                collect_lambda_names(target, pc, pool, names);
+                collect_lambda_names(value, pc, pool, names);
+            }
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter().for_each(|d| collect_lambda_names(d, pc, pool, names));
+                if let Some(vals) = init {
+                    vals.iter().for_each(|x| collect_lambda_names(x, pc, pool, names));
+                }
+            }
+            Expr::NewMultiArray { dims, .. } => {
+                dims.iter().for_each(|d| collect_lambda_names(d, pc, pool, names));
+            }
+            Expr::StringConcat(parts) => parts.iter().for_each(|pp| {
+                if let crate::expr::ConcatPart::Str(i) = pp {
+                    collect_lambda_names(i, pc, pool, names);
+                }
+            }),
+            Expr::Lambda(l) => l.captures.iter().for_each(|c| collect_lambda_names(c, pc, pool, names)),
+            Expr::Invokedynamic { args, .. } => {
+                args.iter().for_each(|a| collect_lambda_names(a, pc, pool, names));
+            }
+            _ => {}
+        }
+    }
+    fn collect_stmt(s: &Stmt, pc: &PoolClass, pool: &ClassPool, names: &mut HashSet<String>) {
+        match s {
+            Stmt::Block(v) => v.iter().for_each(|x| collect_stmt(x, pc, pool, names)),
+            Stmt::ExprStmt(e) => collect_lambda_names(e, pc, pool, names),
+            Stmt::LocalDef { init: Some(e), .. } => collect_lambda_names(e, pc, pool, names),
+            Stmt::Return(Some(e)) | Stmt::Throw(e) => collect_lambda_names(e, pc, pool, names),
+            Stmt::If { cond, then_stmt, else_stmt } => {
+                collect_lambda_names(cond, pc, pool, names);
+                collect_stmt(then_stmt, pc, pool, names);
+                if let Some(e) = else_stmt {
+                    collect_stmt(e, pc, pool, names);
+                }
+            }
+            Stmt::While { cond, body } => {
+                collect_lambda_names(cond, pc, pool, names);
+                collect_stmt(body, pc, pool, names);
+            }
+            Stmt::DoWhile { body, cond } => {
+                collect_stmt(body, pc, pool, names);
+                collect_lambda_names(cond, pc, pool, names);
+            }
+            Stmt::For { init, cond, update, body } => {
+                init.iter().for_each(|i| collect_stmt(i, pc, pool, names));
+                if let Some(c) = cond {
+                    collect_lambda_names(c, pc, pool, names);
+                }
+                update.iter().for_each(|u| collect_lambda_names(u, pc, pool, names));
+                collect_stmt(body, pc, pool, names);
+            }
+            Stmt::ForEach { iterable, body, .. } => {
+                collect_lambda_names(iterable, pc, pool, names);
+                collect_stmt(body, pc, pool, names);
+            }
+            Stmt::Switch { selector, cases, default, .. } => {
+                collect_lambda_names(selector, pc, pool, names);
+                for c in cases {
+                    c.body.iter().for_each(|st| collect_stmt(st, pc, pool, names));
+                }
+                if let Some(d) = default {
+                    collect_stmt(d, pc, pool, names);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                collect_stmt(body, pc, pool, names);
+                for c in catches {
+                    collect_stmt(&c.body, pc, pool, names);
+                }
+                if let Some(f) = finally {
+                    collect_stmt(f, pc, pool, names);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter().for_each(|r| collect_stmt(r, pc, pool, names));
+                collect_stmt(body, pc, pool, names);
+                for c in catches {
+                    collect_stmt(&c.body, pc, pool, names);
+                }
+                if let Some(f) = finally {
+                    collect_stmt(f, pc, pool, names);
+                }
+            }
+            Stmt::Synchronized { lock, body } => {
+                collect_lambda_names(lock, pc, pool, names);
+                collect_stmt(body, pc, pool, names);
+            }
+            Stmt::Labeled { body, .. } => collect_stmt(body, pc, pool, names),
+            Stmt::Assert { cond, msg } => {
+                collect_lambda_names(cond, pc, pool, names);
+                if let Some(m) = msg {
+                    collect_lambda_names(m, pc, pool, names);
+                }
+            }
+            Stmt::TernaryValue { e } => collect_lambda_names(e, pc, pool, names),
+            Stmt::MonitorEnter(e) | Stmt::MonitorExit(e) => collect_lambda_names(e, pc, pool, names),
+            _ => {}
+        }
+    }
+    let mut lambda_names: HashSet<String> = HashSet::new();
+    collect_stmt(body, pc, pool, &mut lambda_names);
+    if lambda_names.is_empty() {
+        return;
+    }
+    let existing: HashSet<String> = vt.vars.iter().map(|v| v.name.clone()).collect();
+    for v in vt.vars.iter_mut() {
+        if v.is_param || !lambda_names.contains(&v.name) {
+            continue;
+        }
+        let base = v.name.clone();
+        let mut k = 1;
+        loop {
+            let cand = format!("{}${}", base, k);
+            if !lambda_names.contains(&cand) && !existing.contains(&cand) {
+                v.name = cand;
+                break;
+            }
+            k += 1;
+        }
+    }
 }
 
 pub(crate) fn witness_comparison_operands(
