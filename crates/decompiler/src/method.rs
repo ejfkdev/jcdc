@@ -8502,9 +8502,22 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
         // variable needs no cast at all: the assignment position already
         // types it (`topSpecies = findSpecies(tsk)`; any erasure cast is
         // illegal there — "SpeciesData无法转换为S", jdk26 ClassSpecializer).
-        if let TypeRef::G(jcdc_jvm::GenericType::TypeVar(tv)) = want {
+        // The match must be through the OWNER's instantiation, not the
+        // declared typevar NAME: `Map.Entry<?,?>.getKey()` declares K but
+        // returns CAP#1 — the name-only check conflated it with TreeMap's
+        // K and dropped the source's `(K)entry.getKey()` cast
+        // (CAP#1无法转换为K/V x2 per tree, TreeMap.buildFromSorted).
+        if let TypeRef::G(tv_g @ jcdc_jvm::GenericType::TypeVar(tv)) = want {
             if generic_call_ret_typevar(value, pool).as_deref() == Some(tv.as_str()) {
-                return;
+                let skip = match crate::classdec::instantiated_method_ret(value, pool, pc) {
+                    Some(inst) => &inst == tv_g,
+                    // Unresolvable owner: keep the historical name-based
+                    // skip (a wrong cast here broke ClassSpecializer).
+                    None => true,
+                };
+                if skip {
+                    return;
+                }
             }
         }
         // A call whose SOURCE-level return — instantiated through the

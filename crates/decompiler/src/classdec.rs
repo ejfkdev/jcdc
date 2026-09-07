@@ -8964,16 +8964,19 @@ pub(crate) fn instantiated_method_ret(
             return None;
         }
         let inst = crate::method::subst_typevars(&msig.ret, &params, &cur_args);
-        // A wildcard anywhere in the instantiated return (previous() on a
-        // ListIterator<? extends T> owner → `? extends T`; spliterator()
-        // on a Collection<? extends E> field → Spliterator<? extends E>)
-        // is not a legal cast target or silently widens an existing
-        // precise cast (`(Spliterator<E>)` → `(Spliterator<? extends E>)`
-        // — Spliterator<CAP#1>无法转换为Spliterator<E>): stand down.
-        if g_has_wildcard(&inst) {
-            return None;
-        }
-        if crate::method::contains_typevar(&inst) {
+        // Wildcard instantiations are RETURNED (callers decide): a cast
+        // upgrade must stand down on them (previous() on a
+        // ListIterator<? extends T> owner → `? extends T` is not a legal
+        // cast target; spliterator() on a Collection<? extends E> field
+        // would widen a precise `(Spliterator<E>)`), but cast_generic_
+        // locals NEEDS the distinction: getKey() on a Map.Entry<?,?>
+        // local instantiates to an unbounded wildcard ≠ the target K —
+        // conflating it with "unresolvable" kept the name-based skip and
+        // dropped the source's `(K)` cast (TreeMap.buildFromSorted
+        // CAP#1无法转换为K/V x2 per tree).
+        if crate::method::contains_typevar(&inst)
+            || matches!(inst, jcdc_jvm::GenericType::Wildcard(_))
+        {
             return Some(inst);
         }
         return None;
@@ -10471,6 +10474,14 @@ pub(crate) fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolC
                 // (T_NODE) — raw (Node) args are inconvertible
                 // ("Node无法转换为T_NODE" x2).
                 if let Some(inst) = instantiated_method_ret(inner, pool, pc) {
+                    // A wildcard anywhere in the instantiated return is
+                    // not a legal cast target and would silently widen a
+                    // precise existing cast (`(Spliterator<E>)` →
+                    // `(Spliterator<? extends E>)` —
+                    // Spliterator<CAP#1>无法转换为Spliterator<E>).
+                    if g_has_wildcard(&inst) {
+                        return;
+                    }
                     let matches_erasure = match &inst {
                         // The typevar's bound erases to the checkcast
                         // target (T_NODE extends Node<P_OUT> → Node).
