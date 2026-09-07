@@ -3541,7 +3541,24 @@ pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: 
                 h.drain(hoist_mark..).collect()
             })
         };
-        if !drained.is_empty() && matches!(body, Stmt::Block(_)) && !in_anon_body {
+        if std::env::var("JCDC_DBG_ANON").is_ok() && !drained.is_empty() {
+            let names: Vec<&String> = drained.iter().map(|(n, _)| n).collect();
+            eprintln!(
+                "DRAIN {:?} is_block={} in_anon_body={}",
+                names,
+                matches!(body, Stmt::Block(_)),
+                in_anon_body
+            );
+        }
+        if !drained.is_empty() && !in_anon_body {
+            // Single-statement bodies (bare `return ..;`) still need the
+            // decl: wrap so the insertion has a block (jdk26 Utils
+            // makeSegmentVarHandle — VarHandleCache decl drained but
+            // dropped because the body was not a Block).
+            if !matches!(body, Stmt::Block(_)) {
+                let orig = std::mem::replace(body, Stmt::Block(vec![]));
+                *body = Stmt::Block(vec![orig]);
+            }
             let Stmt::Block(v) = body else { unreachable!() };
             for (name, decl) in drained {
                 if v.iter().any(|x| matches!(x, Stmt::ClassDecl { name: n2, .. } if *n2 == name))
@@ -4618,6 +4635,9 @@ fn emit_local_class_decl(
     // if-branch, mentioned again by the tail return after the chain —
     // 6 "找不到符号 类 State" at the tail).
     if EXTERN_DECL.with(|x| x.borrow().contains(&simple)) {
+        if std::env::var("JCDC_DBG_ANON").is_ok() {
+            eprintln!("EXTERNHIT {}", simple);
+        }
         EXTERN_REDECL.with(|r| r.borrow_mut().insert(simple.clone()));
         return;
     }
@@ -4732,6 +4752,15 @@ fn emit_local_class_decl(
     let hoist_mark = ANON_HOIST.with(|h| h.borrow().len());
     let emitted = emit_anon_body(lpc, pool, fam, captures, &mut buf, 0, true);
     if emitted.is_err() {
+        if std::env::var("JCDC_DBG_ANON").is_ok() {
+            eprintln!(
+                "LOCALDECL fail {} err={:?} emitting={:?} depth={}",
+                cls,
+                emitted.err(),
+                EMITTING.with(|e| e.borrow().clone()),
+                ANON_BODY_DEPTH.with(|d| d.get())
+            );
+        }
         ANON_HOIST.with(|h| h.borrow_mut().truncate(hoist_mark));
         return;
     }
@@ -4802,6 +4831,11 @@ fn walk_expr_anon(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, fam: &Family, 
             }
             _ => None,
         };
+        if std::env::var("JCDC_DBG_ANON").is_ok() {
+            if let Some(c) = member_cls {
+                eprintln!("MEMBERCLS {} in_locals={}", c, fam.locals.contains(c));
+            }
+        }
         if let Some(cls) = member_cls {
             if fam.locals.contains(cls) {
                 if let Some(lpc) = pool.get(cls) {
@@ -6592,6 +6626,11 @@ pub(crate) fn fix_lambda_captures(
                                 .filter(|(n, _)| !already.contains(n) && !retained.contains(n))
                                 .collect();
                             if !fresh.is_empty() {
+                                if std::env::var("JCDC_DBG_ANON").is_ok() {
+                                    let names: Vec<&String> =
+                                        fresh.iter().map(|(n, _)| n).collect();
+                                    eprintln!("EXTERNREG {:?}", names);
+                                }
                                 EXTERN_DECL.with(|x| {
                                     let mut x = x.borrow_mut();
                                     for (n, _) in &fresh {
