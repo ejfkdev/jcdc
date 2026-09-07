@@ -9015,8 +9015,82 @@ fn apply_param_casts(args: &mut [Expr], params: &[jcdc_jvm::GenericType], pool: 
     }
 }
 
+/// Overload-disambiguation casts: the methodref descriptor records which
+/// overload the source picked, but when the argument's static type fits
+/// SEVERAL same-name same-arity overloads (Node.Builder.OfDouble is both
+/// DoubleConsumer and Consumer<Double>), the untyped print is "对
+/// tryAdvance的引用不明确". Cast the arg to the descriptor's param type —
+/// exactly the source's `(DoubleConsumer) nodeBuilder` (an upcast with no
+/// bytecode trace).
+fn disambiguate_overload_args(e: &mut Expr, pool: &ClassPool) {
+    let (cls, name, desc) = match &*e {
+        Expr::Method { cls, name, desc, .. } => (cls.clone(), name.clone(), desc.clone()),
+        _ => return,
+    };
+    if name == "<init>" {
+        return;
+    }
+    let own_desc = format!(
+        "({}){}",
+        desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+        desc.ret.to_descriptor()
+    );
+    let Some(cpc) = pool.get(&cls) else { return };
+    let mut variants: Vec<String> = Vec::new();
+    for mi in 0..cpc.cf.methods.len() {
+        if cpc.method_name(mi) != Some(name.as_str()) {
+            continue;
+        }
+        if let Some(d) = cpc.method_desc(mi) {
+            if d != own_desc {
+                if let Some(md) = parse_method_descriptor(d) {
+                    if md.args.len() == desc.args.len() {
+                        variants.push(d.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if variants.is_empty() {
+        return;
+    }
+    let Expr::Method { args, .. } = e else { return };
+    for (i, a) in args.iter_mut().enumerate() {
+        if matches!(a, Expr::Cast { .. } | Expr::Const(_)) {
+            continue;
+        }
+        let Some(jcdc_jvm::JavaType::Object(di)) = desc.args.get(i) else {
+            continue;
+        };
+        let have = a.type_ref().erased();
+        let jcdc_jvm::JavaType::Object(hn) = &have else {
+            continue;
+        };
+        if hn == di || !is_subtype_of(pool, &have, di) {
+            continue;
+        }
+        let ambiguous = variants.iter().any(|vd| {
+            parse_method_descriptor(vd)
+                .and_then(|md| md.args.get(i).cloned())
+                .map(|t| {
+                    matches!(&t, jcdc_jvm::JavaType::Object(on)
+                        if on != di && is_subtype_of(pool, &have, on))
+                })
+                .unwrap_or(false)
+        });
+        if ambiguous {
+            let inner = std::mem::replace(a, Expr::This);
+            *a = Expr::Cast {
+                ty: TypeRef::J(jcdc_jvm::JavaType::Object(di.clone())),
+                e: Box::new(inner),
+            };
+        }
+    }
+}
+
 fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass, vt: &crate::varalloc::VarTable) {
     fn fix_expr(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
+        disambiguate_overload_args(e, pool);
         let params = instantiated_method_params(e, pool, pc);
         if params.is_none() && !matches!(e, Expr::New { .. }) {
             raw_witness_generic_method_args(e, pool, pc);
