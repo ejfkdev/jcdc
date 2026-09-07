@@ -266,7 +266,8 @@ def verify_features(releases, keep=False):
                 p = run([str(java), "-cp", str(rdir / "re"), f"feat.{name}"], timeout=30)
                 got = p.stdout.decode("utf-8", "replace") + p.stderr.decode("utf-8", "replace")
                 exp_rc, exp = orig_out[name]
-                matches[name] = ("OK" if (p.returncode == exp_rc and got == exp) else "DIFF", got)
+                ok = p.returncode == exp_rc and got == exp
+                matches[name] = ("OK" if ok else f"DIFF(rc={p.returncode},exp_rc={exp_rc},out_eq={got == exp})", got)
         results[r] = {
             "compile_orig": True,
             "decomp_stderr": decomp_err,

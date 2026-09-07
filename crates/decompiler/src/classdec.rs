@@ -8909,43 +8909,60 @@ fn instantiated_method_params(
                     owned0 = p;
                     &owned0
                 }
-                None => return None,
+                None => { return None; }
             }
         };
-        let mi0 = (0..cref0.cf.methods.len()).find(|&i| {
+        let mi0 = match (0..cref0.cf.methods.len()).find(|&i| {
             cref0.method_name(i) == Some(name) && desc_raw(cref0, i) == d_str
-        })?;
-        let sb0 = cref0.cf.methods[mi0].attributes.iter().find_map(|a| {
+        }) {
+            Some(m) => m,
+            None => { return None; }
+        };
+        let sb0 = match cref0.cf.methods[mi0].attributes.iter().find_map(|a| {
             if cref0.utf8(a.attribute_name_index) == Some("Signature") {
                 Some(a.info.as_slice())
             } else {
                 None
             }
-        })?;
+        }) {
+            Some(b) => b,
+            None => { return None; }
+        };
         if sb0.len() < 2 {
             return None;
         }
-        let msig0 = cref0
+        let msig0 = match cref0
             .utf8(u16::from_be_bytes([sb0[0], sb0[1]]))
-            .and_then(|x| jcdc_jvm::parse_method_signature(x))?;
+            .and_then(|x| jcdc_jvm::parse_method_signature(x))
+        {
+            Some(m) => m,
+            None => { return None; }
+        };
         if !msig0.params.is_empty() {
             return None;
         }
-        let cp0 = cref0.class_attr("Signature").and_then(|b| {
-            if b.len() < 2 {
-                return None;
-            }
-            cref0
-                .utf8(u16::from_be_bytes([b[0], b[1]]))
-                .and_then(|x| parse_class_signature(x))
-        })?;
-        if cp0.params.len() != args.len() {
+        // No class Signature = non-generic declaring class: empty
+        // substitution domain (parseEnumValue's parameterized formals
+        // need no substitution at all).
+        let cp0_params: Vec<jcdc_jvm::TypeParam> = cref0
+            .class_attr("Signature")
+            .and_then(|b| {
+                if b.len() < 2 {
+                    return None;
+                }
+                cref0
+                    .utf8(u16::from_be_bytes([b[0], b[1]]))
+                    .and_then(|x| parse_class_signature(x))
+            })
+            .map(|cs| cs.params)
+            .unwrap_or_default();
+        if cp0_params.len() != args.len() {
             return None;
         }
         let inst0: Vec<jcdc_jvm::GenericType> = msig0
             .args
             .iter()
-            .map(|t| crate::method::subst_typevars(t, &cp0.params, &args))
+            .map(|t| crate::method::subst_typevars(t, &cp0_params, &args))
             .collect();
         if inst0.iter().any(crate::method::has_nested_wildcard) {
             return None;
@@ -9040,13 +9057,29 @@ fn instantiated_method_params(
         // do not model here (handled by the return-witness pass instead).
         return None;
     }
-    let class_params = dref.class_attr("Signature").and_then(|b| {
-        if b.len() < 2 {
-            return None;
-        }
-        let i2 = u16::from_be_bytes([b[0], b[1]]);
-        dref.utf8(i2).and_then(|s| jcdc_jvm::parse_class_signature(s))
-    })?;
+    // A declaring class WITHOUT a class Signature is simply non-generic:
+    // treat its (empty) parameter list as the substitution domain rather
+    // than bailing — the method's own Signature still carries the
+    // parameterized formals (AnnotationParser.parseEnumValue's
+    // `(Class<? extends Enum>) memberType` source cast was lost because
+    // the whole path returned None here).
+    let class_params = dref
+        .class_attr("Signature")
+        .and_then(|b| {
+            if b.len() < 2 {
+                return None;
+            }
+            let i2 = u16::from_be_bytes([b[0], b[1]]);
+            dref.utf8(i2).and_then(|s| jcdc_jvm::parse_class_signature(s))
+        })
+        .unwrap_or_else(|| jcdc_jvm::ClassSignature {
+            params: Vec::new(),
+            superclass: jcdc_jvm::GenericType::Class(jcdc_jvm::ClassSig {
+                package: String::new(),
+                parts: vec![jcdc_jvm::ClassSigPart { name: "Object".into(), args: Vec::new() }],
+            }),
+            interfaces: Vec::new(),
+        });
     if class_params.params.len() != dargs.len() {
         return None;
     }
@@ -9395,12 +9428,19 @@ fn raw_witness_generic_method_args(e: &mut Expr, pool: &ClassPool, pc: &PoolClas
 /// against T: "cannot infer type arguments for Entry<>").
 fn instantiated_ctor_params(e: &Expr, pool: &ClassPool) -> Option<Vec<jcdc_jvm::GenericType>> {
     let Expr::New { cls, ty, args, .. } = e else { return None };
-    let TypeRef::G(jcdc_jvm::GenericType::Class(cs)) = ty else { return None };
-    let part = cs.parts.last()?;
-    if part.args.is_empty() {
-        return None;
+    if let TypeRef::G(jcdc_jvm::GenericType::Class(cs)) = ty {
+        if let Some(part) = cs.parts.last() {
+            if !part.args.is_empty() {
+                return instantiated_ctor_params_core(cls, &part.args, args.len(), pool);
+            }
+        }
     }
-    instantiated_ctor_params_core(cls, &part.args, args.len(), pool)
+    // Raw or non-generic new: the ctor's own Signature formals may still
+    // be parameterized (jdk11 EnumConstantNotPresentExceptionProxy
+    // `(Class<? extends Enum<?>>, String)` — the source cast on the arg
+    // leaves only an erased checkcast in bytecode). Generic classes with
+    // an empty domain safely bail on the arity check inside.
+    instantiated_ctor_params_core(cls, &[], args.len(), pool)
 }
 
 fn instantiated_ctor_params_core(
@@ -9410,14 +9450,21 @@ fn instantiated_ctor_params_core(
     pool: &ClassPool,
 ) -> Option<Vec<jcdc_jvm::GenericType>> {
     let dpc = { let x = pool.get(cls); if x.is_none() && std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA s1 dpc {}", cls); } x? };
-    let class_sig = dpc.class_attr("Signature").and_then(|b| {
-        if b.len() >= 2 {
-            dpc.utf8(u16::from_be_bytes([b[0], b[1]])).and_then(|x| parse_class_signature(x))
-        } else {
-            None
-        }
-    })?;
-    if class_sig.params.len() != inst_args.len() {
+    // A class WITHOUT a class Signature is non-generic: empty substitution
+    // domain instead of a bail (EnumConstantNotPresentExceptionProxy's
+    // `(Class<? extends Enum<?>>)` ctor formal needs the param casts).
+    let class_params: Vec<jcdc_jvm::TypeParam> = dpc
+        .class_attr("Signature")
+        .and_then(|b| {
+            if b.len() >= 2 {
+                dpc.utf8(u16::from_be_bytes([b[0], b[1]])).and_then(|x| parse_class_signature(x))
+            } else {
+                None
+            }
+        })
+        .map(|cs| cs.params)
+        .unwrap_or_default();
+    if class_params.len() != inst_args.len() {
         return None;
     }
     let mi = (0..dpc.cf.methods.len()).find(|&i| {
@@ -9444,7 +9491,7 @@ fn instantiated_ctor_params_core(
     let inst: Vec<jcdc_jvm::GenericType> = msig
         .args
         .iter()
-        .map(|t| crate::method::subst_typevars(t, &class_sig.params, inst_args))
+        .map(|t| crate::method::subst_typevars(t, &class_params, inst_args))
         .collect();
     if inst.iter().any(crate::method::has_nested_wildcard) {
         return None;
@@ -11361,7 +11408,47 @@ fn compute_witness(
                 }
                 out.push(t.to_java());
             }
-            Some((_, t)) => out.push(t.to_java()),
+            Some((_, t)) => {
+                // An explicit CLASS type argument must satisfy the
+                // callee's declared bound too: `Enum.<Object>valueOf(..)`
+                // violates `T extends Enum<T>` (jdk11 AnnotationParser
+                // parseEnumValue — the bare call infers the capture and
+                // compiles unchecked).
+                if !trivial_bound(p) {
+                    let ok_bound = |b: &jcdc_jvm::GenericType| -> bool {
+                        match b {
+                            jcdc_jvm::GenericType::Class(bc) => {
+                                let bi = crate::method::classsig_internal(bc);
+                                match t {
+                                    jcdc_jvm::GenericType::Class(tc) => {
+                                        let ti = crate::method::classsig_internal(tc);
+                                        ti == bi
+                                            || is_subtype_of(
+                                                pool,
+                                                &jcdc_jvm::JavaType::Object(ti),
+                                                &bi,
+                                            )
+                                    }
+                                    jcdc_jvm::GenericType::Array(_) => bi == "java/lang/Object",
+                                    _ => false,
+                                }
+                            }
+                            // Typevar/wildcard bounds (incl. F-bounds on
+                            // caller typevars) are not cheaply checkable.
+                            _ => true,
+                        }
+                    };
+                    if let Some(cb) = &p.class_bound {
+                        if !ok_bound(cb) {
+                            return None;
+                        }
+                    }
+                    if p.interface_bounds.iter().any(|ib| !ok_bound(ib)) {
+                        return None;
+                    }
+                }
+                out.push(t.to_java());
+            }
             None => return None,
         }
     }
