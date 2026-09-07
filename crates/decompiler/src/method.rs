@@ -8698,8 +8698,47 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
         // (the local's type): "inference variable T has incompatible
         // bounds" (jdk11 VarHandleByteArrayAs*, 31 errors per sibling).
         if let Expr::Cast { ty, e: ce } = value {
-            let real_checkcast =
-                matches!(&**ce, Expr::Method { desc, .. } if desc.ret != ty.erased());
+            // Only a GENERICS-ONLY G-typed cast can be synthetic (javac
+            // emits no checkcast when the erasure is unchanged); a
+            // J-typed cast is a REAL bytecode checkcast and must survive
+            // here so cast_generic_returns can retype it to the generic
+            // target: `a = (T[]) Arrays.copyOfRange(items, ..,
+            // a.getClass())` (jdk11 ArrayBlockingQueue.toArray) has a
+            // real checkcast Object[] that this branch used to drop —
+            // 推论变量 T#1 具有不兼容的上限 x2 trees. For G casts over
+            // generic calls, a typevar/array-of-typevar cast erases to
+            // its BOUND, not the bare descriptor return: compare against
+            // that too before calling it synthetic.
+            let bound_er = match ty {
+                TypeRef::G(jcdc_jvm::GenericType::TypeVar(n)) => {
+                    crate::classdec::typevar_bound_erasure_in(n, &[], pc)
+                }
+                TypeRef::G(jcdc_jvm::GenericType::Array(inner)) => {
+                    match inner.as_ref() {
+                        jcdc_jvm::GenericType::TypeVar(n) => {
+                            crate::classdec::typevar_bound_erasure_in(n, &[], pc)
+                                .map(|b| jcdc_jvm::JavaType::Array(Box::new(b)))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let real_checkcast = matches!(ty, TypeRef::J(_))
+                || matches!(&**ce, Expr::Method { desc, .. } if {
+                    desc.ret != ty.erased()
+                        || match (&desc.ret, &bound_er) {
+                            (
+                                jcdc_jvm::JavaType::Object(x),
+                                Some(jcdc_jvm::JavaType::Object(y)),
+                            ) => x != y,
+                            (
+                                jcdc_jvm::JavaType::Array(x),
+                                Some(jcdc_jvm::JavaType::Array(y)),
+                            ) => x != y,
+                            _ => false,
+                        }
+                });
             if !real_checkcast && crate::classdec::is_generic_call(ce, pool) {
                 let inner = std::mem::replace(value, Expr::This);
                 if let Expr::Cast { e: ce2, .. } = inner {
@@ -8791,7 +8830,21 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
         if compatible_erasure(&have, &want_er) {
             // Generic calls infer their type from the assignment target;
             // a frozen cast would sabotage that (and javac emitted none).
-            if !crate::classdec::is_generic_call(value, pool) {
+            // EXCEPTION — the reflective-array idiom: a getClass() actual
+            // pins the callee's array typevar at the ERASURE while the
+            // target wants T[] (`a = (T[]) Arrays.copyOfRange(items, ..,
+            // a.getClass())` — without the source cast T#1 collects
+            // bounds {T, Object}, 推论变量 T#1 具有不兼容的上限, jdk11
+            // ArrayBlockingQueue.toArray x2 trees); the cast is the only
+            // denotable resolution.
+            let reflective_array = matches!(
+                want,
+                TypeRef::G(jcdc_jvm::GenericType::Array(b))
+                    if matches!(b.as_ref(), jcdc_jvm::GenericType::TypeVar(_))
+            ) && matches!(value, Expr::Method { args, .. } if args.iter().any(|x| {
+                matches!(x, Expr::Method { name, args: ga, .. } if name == "getClass" && ga.is_empty())
+            }));
+            if !crate::classdec::is_generic_call(value, pool) || reflective_array {
                 let inner = std::mem::replace(value, Expr::This);
                 *value = Expr::Cast { ty: want.clone(), e: Box::new(inner) };
             }

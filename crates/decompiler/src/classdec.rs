@@ -9918,7 +9918,7 @@ fn instantiated_ctor_params_core(
 
 /// Bound erasure lookup that also covers METHOD typevars (the caller's
 /// `<V extends Number,A> read(...)` — V is not a class param).
-fn typevar_bound_erasure_in(
+pub(crate) fn typevar_bound_erasure_in(
     n: &str,
     caller_params: &[jcdc_jvm::TypeParam],
     pc: &PoolClass,
