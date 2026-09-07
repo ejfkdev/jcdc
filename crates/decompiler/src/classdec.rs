@@ -2705,6 +2705,7 @@ fn emit_method_with(
             // instantiated returns (later raw-cast fallbacks must not be
             // rewritten — see upgrade_erased_call_casts).
             upgrade_erased_call_casts(&mut body, pool, pc);
+            relay_inconvertible_local_casts(&mut body, &mb.vt, pool);
             upgrade_typevar_array_casts(&mut body, pool, pc);
             // Generic methods returning a type variable: javac elides the
             // `(E)` cast when the erasure already matches, but source needs
@@ -16333,6 +16334,94 @@ fn typevar_array_call_elem(
         return Some((**el_g).clone());
     }
     None
+}
+
+/// Post-upgrade sibling of the cast_generic_locals relay: the raw
+/// checkcast over a generic call is upgraded to the precise instantiated
+/// return HERE (upgrade_erased_call_casts), after cast_generic_locals
+/// ran — an upgraded cast that is invariant-inconvertible to the local's
+/// declared type needs the source's RAW intermediate hop (jdk26
+/// Properties.store0: `(Set<Map.Entry<String,String>>) (Set) entrySet()`
+/// decompiled to the single precise (Set<Map.Entry<Object,Object>>) cast —
+/// 无法转换). Demote the cast to its erasure and wrap with the target.
+fn relay_inconvertible_local_casts(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &ClassPool) {
+    use jcdc_jvm::GenericType as G;
+    fn relay(value: &mut Expr, want: &TypeRef, pool: &ClassPool) {
+        let TypeRef::G(wg @ G::Class(wc)) = want else { return };
+        let Expr::Cast { ty, .. } = &*value else { return };
+        let TypeRef::G(G::Class(cc)) = ty else { return };
+        let args_differ = match (cc.parts.last(), wc.parts.last()) {
+            (Some(a), Some(b)) => a.args != b.args,
+            _ => false,
+        };
+        if !args_differ {
+            return;
+        }
+        let cc_internal = crate::method::classsig_internal(cc);
+        let wc_internal = crate::method::classsig_internal(wc);
+        let convertible_classes = cc_internal == wc_internal
+            || is_subtype_of(pool, &jcdc_jvm::JavaType::Object(cc_internal.clone()), &wc_internal);
+        if !convertible_classes || g_has_wildcard(&G::Class(cc.clone())) || g_has_wildcard(wg) {
+            return;
+        }
+        let raw = ty.erased();
+        if let Expr::Cast { ty: inner_ty, .. } = value {
+            *inner_ty = TypeRef::J(raw);
+        }
+        let v = std::mem::replace(value, Expr::This);
+        *value = Expr::Cast { ty: TypeRef::G(wg.clone()), e: Box::new(v) };
+    }
+    fn rec(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &ClassPool) {
+        match s {
+            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, vt, pool)),
+            Stmt::LocalDef { var, init: Some(e), .. } => {
+                let want = vt.var(*var).ty.clone();
+                relay(e, &want, pool);
+            }
+            Stmt::ExprStmt(Expr::Assign { target, value, .. }) => {
+                if let Expr::Local { var, .. } = &**target {
+                    let want = vt.var(*var).ty.clone();
+                    relay(value, &want, pool);
+                }
+            }
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                rec(then_stmt, vt, pool);
+                if let Some(e) = else_stmt {
+                    rec(e, vt, pool);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::Labeled { body, .. }
+            | Stmt::Synchronized { body, .. } => rec(body, vt, pool),
+            Stmt::For { init, body, .. } => {
+                init.iter_mut().for_each(|i| rec(i, vt, pool));
+                rec(body, vt, pool);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    for st in c.body.iter_mut() {
+                        rec(st, vt, pool);
+                    }
+                }
+                if let Some(d) = default {
+                    rec(d, vt, pool);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                rec(body, vt, pool);
+                for c in catches.iter_mut() {
+                    rec(&mut c.body, vt, pool);
+                }
+                if let Some(f) = finally {
+                    rec(f, vt, pool);
+                }
+            }
+            _ => {}
+        }
+    }
+    rec(s, vt, pool);
 }
 
 fn cast_generic_returns(s: &mut Stmt, want: &TypeRef, pc: &PoolClass, pool: &ClassPool) {

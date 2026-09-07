@@ -8747,6 +8747,48 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
                 return;
             }
         }
+        // An upgraded precise G cast can be INVARIANT-INCONVERTIBLE to the
+        // assignment target (jdk26 Properties.store0:
+        // (Set<Map.Entry<Object,Object>>) entrySet() against a
+        // Collection<Map.Entry<String,String>> local — the source bridges
+        // with a RAW intermediate: (Set<Map.Entry<String,String>>) (Set)
+        // entrySet()). Demote the existing cast to its erasure and wrap
+        // with the target: the raw hop makes both steps legal unchecked
+        // conversions.
+        if let (Expr::Cast { ty, .. }, TypeRef::G(wg @ jcdc_jvm::GenericType::Class(wc))) =
+            (&*value, want)
+        {
+            if let TypeRef::G(jcdc_jvm::GenericType::Class(cc)) = ty {
+                let args_differ = match (cc.parts.last(), wc.parts.last()) {
+                    (Some(a), Some(b)) => a.args != b.args,
+                    _ => false,
+                };
+                let cc_internal = crate::method::classsig_internal(cc);
+                let wc_internal = crate::method::classsig_internal(wc);
+                let convertible_classes = cc_internal == wc_internal
+                    || crate::classdec::is_subtype_of(
+                        pool,
+                        &jcdc_jvm::JavaType::Object(cc_internal.clone()),
+                        &wc_internal,
+                    );
+                if args_differ
+                    && convertible_classes
+                    && !crate::classdec::g_has_wildcard(&jcdc_jvm::GenericType::Class(cc.clone()))
+                    && !crate::classdec::g_has_wildcard(wg)
+                {
+                    let raw = ty.erased();
+                    let wc2 = wc.clone();
+                    let wg2 = wg.clone();
+                    let _ = wc2;
+                    if let Expr::Cast { ty: inner_ty, .. } = value {
+                        *inner_ty = TypeRef::J(raw);
+                    }
+                    let v = std::mem::replace(value, Expr::This);
+                    *value = Expr::Cast { ty: TypeRef::G(wg2), e: Box::new(v) };
+                    return;
+                }
+            }
+        }
         let TypeRef::G(_) = want else {
             // A boolean value flowing into an int slot was `b ? 1 : 0` in
             // source (the JVM stores both as ints); into a byte/short

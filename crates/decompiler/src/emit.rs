@@ -1359,6 +1359,17 @@ impl<'a> Printer<'a> {
             Expr::ArrayIndex { array, index } => {
                 self.expr(array, 15, out);
                 out.push('[');
+                // Array indexes are int by definition: a long-typed index
+                // local (slot-sharing/merge typed the foreach lowering's
+                // counter long — jdk26 Files.copy `options[i]`,
+                // 从long转换到int可能会有损失) needs the narrowing cast.
+                let idx_ty = match &**index {
+                    Expr::Local { var, .. } => self.vt.var(*var).ty.erased(),
+                    other => other.type_ref().erased(),
+                };
+                if matches!(idx_ty, jcdc_jvm::JavaType::Long) {
+                    out.push_str("(int) ");
+                }
                 self.expr(index, 1, out);
                 out.push(']');
             }
@@ -2323,7 +2334,14 @@ impl<'a> Printer<'a> {
                 }
             }
         }
-        if cands.is_empty() && has_this0 && skip == 0 {
+        // jdk21+ javac forwards the enclosing instance straight to super
+        // WITHOUT an own this$0 field (jdk26 CallArranger
+        // BoxBindingCalculator: super(this$0param, forArguments, false)
+        // with the outer arg later stripped — the untyped fallback
+        // printed the boolean formal's `0`). Treat a leading
+        // enclosing-class formal as the synthetic outer param too.
+        let enclosing = cls.rsplit_once('$').map(|(o, _)| o.to_string());
+        if cands.is_empty() && skip == 0 {
             for mi in 0..pcx.cf.methods.len() {
                 if pcx.method_name(mi) != Some("<init>") {
                     continue;
@@ -2331,7 +2349,13 @@ impl<'a> Printer<'a> {
                 let d = pcx.method_desc(mi)?;
                 if let Some(md) = jcdc_jvm::parse_method_descriptor(d) {
                     if md.args.len() == extra + n + 1 {
-                        cands.push(md.args[extra + 1..].to_vec());
+                        let outer_first = match (&enclosing, md.args.first()) {
+                            (Some(enc), Some(jcdc_jvm::JavaType::Object(nm))) => nm == enc,
+                            _ => false,
+                        };
+                        if has_this0 || outer_first {
+                            cands.push(md.args[extra + 1..].to_vec());
+                        }
                     }
                 }
             }
