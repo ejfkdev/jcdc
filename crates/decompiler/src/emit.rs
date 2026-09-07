@@ -1206,7 +1206,22 @@ impl<'a> Printer<'a> {
                         }
                         out.push_str("super.");
                     } else if let Some(o) = owner {
-                        if matches!(o.as_ref(), Expr::Raw(t) if t == "\u{3}") {
+                        if let Expr::Lambda(l) = o.as_ref() {
+                            // A lambda RECEIVER needs the source's SAM cast
+                            // (`((BooleanSupplier) () -> ..).getAsBoolean()`
+                            // — a bare lambda cannot own a call: 此处不应为
+                            // lambda 表达式, jdk26 Proxy assert).
+                            if !l.sam_cls.is_empty() {
+                                out.push_str("((");
+                                out.push_str(&self.shorten(&l.sam_cls));
+                                out.push_str(") ");
+                                self.expr(o, 14, out);
+                                out.push_str(").");
+                            } else {
+                                self.expr(o, 15, out);
+                                out.push('.');
+                            }
+                        } else if matches!(o.as_ref(), Expr::Raw(t) if t == "\u{3}") {
                             // Outer anonymous member call: unqualified
                             // lexical resolution.
                         } else if self.needs_owner_cast(cls, name, desc, o) {

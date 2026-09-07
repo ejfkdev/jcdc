@@ -238,6 +238,11 @@ pub struct LambdaExpr {
     pub captures: Vec<Expr>,
     /// SAM parameter names (synthesized if absent).
     pub param_names: Vec<String>,
+    /// The SAM interface's internal name (the indy descriptor's return):
+    /// a lambda used as a call RECEIVER must print with the source's SAM
+    /// cast (`((BooleanSupplier) () -> ..).getAsBoolean()` — a bare lambda
+    /// cannot be an owner: 此处不应为 lambda 表达式, jdk26 Proxy).
+    pub sam_cls: String,
     /// Method-ref receiver class name, for `X::y` form.
     pub ref_receiver: Option<String>,
     /// Snapshot renames for captured outer locals that are NOT

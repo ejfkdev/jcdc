@@ -1623,7 +1623,17 @@ impl<'a> Builder<'a> {
                     }
                 });
                 if let Some(le) =
-                    self.build_lambda(&name, &sam, args.clone(), impl_handle_idx, inst_md)?
+                    self.build_lambda(
+                        &name,
+                        &sam,
+                        args.clone(),
+                        impl_handle_idx,
+                        inst_md,
+                        match &mdesc.ret {
+                            JavaType::Object(n) => n.clone(),
+                            _ => String::new(),
+                        },
+                    )?
                 {
                     let e = Expr::Lambda(Box::new(le));
                     if mdesc.ret == JavaType::Void {
@@ -1728,6 +1738,7 @@ impl<'a> Builder<'a> {
         dynamic_args: Vec<Expr>,
         impl_handle_idx: u16,
         inst_sam_desc: Option<MethodDescriptor>,
+        sam_cls: String,
     ) -> BResult<Option<LambdaExpr>> {
         let (kind, ref_index) = match jcdc_classfile::get_entry(&self.pc.cf.constant_pool, impl_handle_idx) {
             Some(ConstantPoolEntry::MethodHandle(h)) => (h.reference_kind, h.reference_index),
@@ -1766,6 +1777,7 @@ impl<'a> Builder<'a> {
                 param_names,
                 ref_receiver: None,
                 capture_snaps: Vec::new(),
+                sam_cls: sam_cls.clone(),
             }));
         }
         if is_synthetic_lambda
@@ -1792,6 +1804,7 @@ impl<'a> Builder<'a> {
                 param_names,
                 ref_receiver: None,
                 capture_snaps: Vec::new(),
+                sam_cls: sam_cls.clone(),
             }));
         }
 
@@ -1819,6 +1832,7 @@ impl<'a> Builder<'a> {
             param_names,
             ref_receiver: receiver,
             capture_snaps: Vec::new(),
+            sam_cls,
         }))
     }
 

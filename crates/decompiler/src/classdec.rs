@@ -2880,6 +2880,7 @@ fn emit_method_with(
             crate::method::prune_post_loop_label_breaks(&mut body);
             crate::method::demote_undefined_label_jumps(&mut body);
             split_return_assigns(&mut body);
+            disambiguate_catch_collisions(&mut body, &mb.vt);
             // Ctor delegations were still capture-arg-padded when
             // cast_wildcard_call_args ran, and prune_local_ctor_delegation
             // trims the ARGS without rewriting the node's descriptor (the
@@ -3255,6 +3256,161 @@ pub(crate) fn split_return_assigns(s: &mut Stmt) {
         }
         _ => {}
     }
+}
+
+/// A catch parameter must not shadow a local declared in an ENCLOSING
+/// block (javac: "已在方法 start 中定义了变量 e1" — jdk26 ProcessBuilder:
+/// the hoisted method-top `Throwable e1 = null;` collides with the
+/// catch's own LVT name). Rename the catch variable (narrower scope; its
+/// references follow var_name) with the house `$N` suffix. Sibling
+/// catches in DIFFERENT try statements may legally share a name, so only
+/// decls/catches textually BEFORE this try (at any depth) plus the try's
+/// own catch list count.
+fn disambiguate_catch_collisions(s: &mut Stmt, vt: &crate::varalloc::VarTable) {
+    fn eff_name(c: &crate::stmt::Catch, vt: &crate::varalloc::VarTable) -> String {
+        c.var_name
+            .clone()
+            .unwrap_or_else(|| vt.var(c.var).name.clone())
+    }
+    fn used_before(stmts: &[Stmt], vt: &crate::varalloc::VarTable, used: &mut HashSet<String>) {
+        for st in stmts {
+            match st {
+                Stmt::LocalDef { var, .. } => {
+                    used.insert(vt.var(*var).name.clone());
+                }
+                Stmt::Block(v) => used_before(v, vt, used),
+                Stmt::If { then_stmt, else_stmt, .. } => {
+                    used_before(std::slice::from_ref(then_stmt.as_ref()), vt, used);
+                    if let Some(e) = else_stmt {
+                        used_before(std::slice::from_ref(e.as_ref()), vt, used);
+                    }
+                }
+                Stmt::While { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::ForEach { body, .. }
+                | Stmt::Labeled { body, .. }
+                | Stmt::Synchronized { body, .. } => {
+                    used_before(std::slice::from_ref(body.as_ref()), vt, used)
+                }
+                Stmt::For { init, body, .. } => {
+                    used_before(init, vt, used);
+                    used_before(std::slice::from_ref(body.as_ref()), vt, used);
+                }
+                Stmt::Switch { cases, default, .. } => {
+                    for c in cases {
+                        used_before(&c.body, vt, used);
+                    }
+                    if let Some(d) = default {
+                        used_before(std::slice::from_ref(d.as_ref()), vt, used);
+                    }
+                }
+                Stmt::Try { body, catches, finally } => {
+                    used_before(std::slice::from_ref(body.as_ref()), vt, used);
+                    for c in catches {
+                        used.insert(eff_name(c, vt));
+                        used_before(std::slice::from_ref(c.body.as_ref()), vt, used);
+                    }
+                    if let Some(f) = finally {
+                        used_before(std::slice::from_ref(f.as_ref()), vt, used);
+                    }
+                }
+                Stmt::TryWithResources { resources, body, catches, finally } => {
+                    used_before(resources, vt, used);
+                    used_before(std::slice::from_ref(body.as_ref()), vt, used);
+                    for c in catches {
+                        used.insert(eff_name(c, vt));
+                        used_before(std::slice::from_ref(c.body.as_ref()), vt, used);
+                    }
+                    if let Some(f) = finally {
+                        used_before(std::slice::from_ref(f.as_ref()), vt, used);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    fn rec(s: &mut Stmt, vt: &crate::varalloc::VarTable, used: &mut HashSet<String>) {
+        match s {
+            Stmt::Block(v) => {
+                for st in v.iter_mut() {
+                    rec(st, vt, used);
+                }
+            }
+            Stmt::LocalDef { var, .. } => {
+                used.insert(vt.var(*var).name.clone());
+            }
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                rec(then_stmt, vt, used);
+                if let Some(e) = else_stmt {
+                    rec(e, vt, used);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::Labeled { body, .. }
+            | Stmt::Synchronized { body, .. } => rec(body, vt, used),
+            Stmt::For { init, body, .. } => {
+                for i in init.iter_mut() {
+                    rec(i, vt, used);
+                }
+                rec(body, vt, used);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    for st in c.body.iter_mut() {
+                        rec(st, vt, used);
+                    }
+                }
+                if let Some(d) = default {
+                    rec(d, vt, used);
+                }
+            }
+            Stmt::Try { body, catches, finally }
+            | Stmt::TryWithResources { body, catches, finally, .. } => {
+                // Names in scope BEFORE this try.
+                let mut before = used.clone();
+                let _ = &mut before;
+                {
+                    // (used already carries the preceding decls; the catch
+                    // list below adds this try's own names as it goes.)
+                }
+                rec(body, vt, used);
+                let mut own: HashSet<String> = HashSet::new();
+                for c in catches.iter_mut() {
+                    let name = eff_name(c, vt);
+                    if used.contains(&name) || own.contains(&name) {
+                        let mut k = 1usize;
+                        loop {
+                            let cand = format!("{}${}", name, k);
+                            if !used.contains(&cand) && !own.contains(&cand) {
+                                c.var_name = Some(cand.clone());
+                                own.insert(cand);
+                                break;
+                            }
+                            k += 1;
+                        }
+                    } else {
+                        own.insert(name.clone());
+                    }
+                    let cname = eff_name(c, vt);
+                    let mut inner = used.clone();
+                    inner.insert(cname);
+                    rec(c.body.as_mut(), vt, &mut inner);
+                }
+                if let Some(f) = finally {
+                    rec(f, vt, used);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Seed with method-level decls that PRECEDE any try: a single forward
+    // walk with a running `used` set handles ordering; hoisted method-top
+    // decls are the first statements and land in `used` before the tries.
+    let mut used: HashSet<String> = HashSet::new();
+    let _ = used_before;
+    rec(s, vt, &mut used);
 }
 
 fn prune_tail_bare_returns(s: &mut Stmt) {
