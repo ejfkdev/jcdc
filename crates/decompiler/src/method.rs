@@ -7341,7 +7341,6 @@ pub(crate) fn demote_undefined_label_jumps(s: &mut Stmt) {
             Stmt::While { body, .. }
             | Stmt::DoWhile { body, .. }
             | Stmt::ForEach { body, .. }
-            | Stmt::Labeled { body, .. }
             | Stmt::Synchronized { body, .. } => defined_labels(body, out, ids),
             Stmt::For { init, body, .. } => {
                 init.iter().for_each(|x| defined_labels(x, out, ids));
@@ -7429,11 +7428,19 @@ pub(crate) fn demote_undefined_label_jumps(s: &mut Stmt) {
         };
         true
     }
-    fn fix_vec(v: &mut Vec<Stmt>, defined: &HashSet<String>, ids: &HashSet<u32>) {
+    fn fix_vec(v: &mut Vec<Stmt>, defined: &HashSet<String>, ids: &HashSet<u32>, in_loop: bool) {
         let mut i = 0;
         while i < v.len() {
-            // Trailing undefined jump in this block: drop (fall-through).
-            if i + 1 == v.len() && undefined_jump(&v[i], defined, ids) {
+            // Trailing undefined jump — or, outside any loop/switch, a
+            // trailing bare break/continue (an orphan goto the structurizer
+            // parked at the method end; bare breaks are illegal there and
+            // dropping them is exactly the exit fall-through, jdk11
+            // Resolver: `} while (changed); break;`).
+            if i + 1 == v.len()
+                && (undefined_jump(&v[i], defined, ids)
+                    || (!in_loop
+                        && matches!(&v[i], Stmt::Break(None) | Stmt::Continue(None))))
+            {
                 v.remove(i);
                 continue;
             }
@@ -7446,63 +7453,77 @@ pub(crate) fn demote_undefined_label_jumps(s: &mut Stmt) {
                     continue;
                 }
             }
-            fix_stmt(&mut v[i], defined, ids);
+            fix_stmt(&mut v[i], defined, ids, in_loop);
             i += 1;
         }
     }
-    fn fix_stmt(s: &mut Stmt, defined: &HashSet<String>, ids: &HashSet<u32>) {
+    fn fix_stmt(s: &mut Stmt, defined: &HashSet<String>, ids: &HashSet<u32>, in_loop: bool) {
         match s {
-            Stmt::Break(Some(l)) if !defined.contains(l) => *s = Stmt::Break(None),
-            Stmt::Continue(Some(l)) if !defined.contains(l) => *s = Stmt::Continue(None),
-            Stmt::Goto(id) if !ids.contains(id) => *s = Stmt::Break(None),
-            Stmt::Block(v) => fix_vec(v, defined, ids),
+            Stmt::Break(Some(l)) if !defined.contains(l) => {
+                *s = if in_loop { Stmt::Break(None) } else { Stmt::Block(vec![]) };
+            }
+            Stmt::Continue(Some(l)) if !defined.contains(l) => {
+                *s = if in_loop { Stmt::Continue(None) } else { Stmt::Block(vec![]) };
+            }
+            Stmt::Goto(id) if !ids.contains(id) => {
+                *s = if in_loop { Stmt::Break(None) } else { Stmt::Block(vec![]) };
+            }
+            Stmt::Block(v) => fix_vec(v, defined, ids, in_loop),
             Stmt::If { then_stmt, else_stmt, .. } => {
-                fix_stmt(then_stmt, defined, ids);
+                fix_stmt(then_stmt, defined, ids, in_loop);
                 if let Some(e) = else_stmt {
-                    fix_stmt(e, defined, ids);
+                    fix_stmt(e, defined, ids, in_loop);
                 }
             }
             Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::ForEach { body, .. } => {
-                fix_stmt(body, defined, ids);
+                fix_stmt(body, defined, ids, true);
             }
             Stmt::For { init, body, .. } => {
-                init.iter_mut().for_each(|x| fix_stmt(x, defined, ids));
-                fix_stmt(body, defined, ids);
+                init.iter_mut().for_each(|x| fix_stmt(x, defined, ids, in_loop));
+                fix_stmt(body, defined, ids, true);
             }
             Stmt::Labeled { body, .. } | Stmt::Synchronized { body, .. } => {
-                fix_stmt(body, defined, ids);
+                fix_stmt(body, defined, ids, in_loop);
             }
             Stmt::Switch { cases, default, .. } => {
                 for c in cases.iter_mut() {
-                    fix_vec(&mut c.body, defined, ids);
+                    fix_vec(&mut c.body, defined, ids, true);
                 }
                 if let Some(d) = default {
-                    fix_stmt(d, defined, ids);
+                    fix_stmt(d, defined, ids, true);
                 }
             }
             Stmt::Try { body, catches, finally } => {
-                fix_stmt(body, defined, ids);
+                fix_stmt(body, defined, ids, in_loop);
                 for c in catches.iter_mut() {
-                    fix_stmt(&mut c.body, defined, ids);
+                    fix_stmt(&mut c.body, defined, ids, in_loop);
                 }
                 if let Some(f) = finally {
-                    fix_stmt(f, defined, ids);
+                    fix_stmt(f, defined, ids, in_loop);
                 }
             }
             Stmt::TryWithResources { resources, body, catches, finally } => {
-                resources.iter_mut().for_each(|x| fix_stmt(x, defined, ids));
-                fix_stmt(body, defined, ids);
+                resources.iter_mut().for_each(|x| fix_stmt(x, defined, ids, in_loop));
+                fix_stmt(body, defined, ids, in_loop);
                 for c in catches.iter_mut() {
-                    fix_stmt(&mut c.body, defined, ids);
+                    fix_stmt(&mut c.body, defined, ids, in_loop);
                 }
                 if let Some(f) = finally {
-                    fix_stmt(f, defined, ids);
+                    fix_stmt(f, defined, ids, in_loop);
                 }
             }
             _ => {}
         }
     }
-    fix_stmt(s, &defined, &defined_ids);
+    fix_stmt(s, &defined, &defined_ids, false);
+    // Removed orphan jumps can leave empty blocks behind.
+    fn strip_empty(v: &mut Stmt) {
+        if let Stmt::Block(items) = v {
+            items.iter_mut().for_each(strip_empty);
+            items.retain(|x| !x.is_empty_block());
+        }
+    }
+    strip_empty(s);
 }
 
 /// `L: do {..} while (c); break L;` — loop-exit edges materialized as a
