@@ -2715,7 +2715,7 @@ fn emit_method_with(
                         cast_generic_returns(&mut body, &want, pc);
                         // A cast cannot drive inference for a generic
                         // callee; prefer an explicit type witness.
-                        add_return_witnesses(&mut body, Some(sig), pool);
+                        add_return_witnesses(&mut body, Some(sig), pool, pc);
                     }
                     _ => {}
                 }
@@ -2837,7 +2837,7 @@ fn emit_method_with(
             fix_diamond_localdefs(&mut body, &mb.vt, pool);
             // Accessor inlining can expose the real generic callee only
             // now; retry the return witnesses (idempotent).
-            add_return_witnesses(&mut body, msig.as_ref(), pool);
+            add_return_witnesses(&mut body, msig.as_ref(), pool, pc);
             restore_enum_switches(&mut body, pc, pool);
             // Switch restoration reassembles case blocks AFTER the method
             // pipeline: rerun the post-loop label-break prune there (jdk17
@@ -2848,7 +2848,7 @@ fn emit_method_with(
             crate::method::demote_undefined_label_jumps(&mut body);
             add_throw_witnesses(&mut body, msig.as_ref(), pool);
             strip_erasure_casts_generic_ret(&mut body, msig.as_ref(), pool);
-            witness_generic_returns(&mut body, msig.as_ref(), pool);
+            witness_generic_returns(&mut body, msig.as_ref(), pool, pc);
             witness_comparison_operands(&mut body, msig.as_ref(), pool);
             // Scope the extern-decl registry to THIS method's emission:
             // names extracted here must suppress re-declaration inside
@@ -5356,7 +5356,7 @@ fn cast_typevar_param_args(
     }
 }
 
-fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, pool: &ClassPool) {
+fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, pool: &ClassPool, pc: &PoolClass) {
     use crate::expr::Expr;
     let Some(sig) = msig else { return };
     // Parameterized return, typevar or not: wildcard/capture values need
@@ -5453,6 +5453,7 @@ fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature
         ret_er: &jcdc_jvm::JavaType,
         pool: &ClassPool,
         sig: &jcdc_jvm::MethodSignature,
+        pc: &PoolClass,
     ) {
         // A conditional with a poly (lambda/method-ref) arm must NOT be
         // wrapped as a whole: the cast makes the conditional standalone
@@ -5462,8 +5463,8 @@ fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature
         // arm takes the method's return type directly.
         if let Expr::Cond { t, f, .. } = e {
             if matches!(**t, Expr::Lambda(_)) || matches!(**f, Expr::Lambda(_)) {
-                fix(t, ret_g, ret_er, pool, sig);
-                fix(f, ret_g, ret_er, pool, sig);
+                fix(t, ret_g, ret_er, pool, sig, pc);
+                fix(f, ret_g, ret_er, pool, sig, pc);
                 return;
             }
         }
@@ -5498,7 +5499,7 @@ fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature
                         );
                         if let Some((wit, mapping)) = w {
                             *type_args = wit;
-                            retype_witness_arg_casts(cls, name, desc, args, &mapping, pool);
+                            retype_witness_arg_casts(cls, name, desc, args, &mapping, pool, pc, &sig.params);
                             return;
                         }
                     }
@@ -5528,48 +5529,48 @@ fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature
         let v = std::mem::replace(e, Expr::This);
         *e = Expr::Cast { ty: ret_g.clone(), e: Box::new(v) };
     }
-    fn rec(s: &mut Stmt, ret_g: &TypeRef, ret_er: &jcdc_jvm::JavaType, pool: &ClassPool, sig: &jcdc_jvm::MethodSignature) {
+    fn rec(s: &mut Stmt, ret_g: &TypeRef, ret_er: &jcdc_jvm::JavaType, pool: &ClassPool, sig: &jcdc_jvm::MethodSignature, pc: &PoolClass) {
         match s {
-            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, ret_g, ret_er, pool, sig)),
-            Stmt::Return(Some(e)) => fix(e, ret_g, ret_er, pool, sig),
+            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, ret_g, ret_er, pool, sig, pc)),
+            Stmt::Return(Some(e)) => fix(e, ret_g, ret_er, pool, sig, pc),
             Stmt::If { then_stmt, else_stmt, .. } => {
-                rec(then_stmt, ret_g, ret_er, pool, sig);
+                rec(then_stmt, ret_g, ret_er, pool, sig, pc);
                 if let Some(x) = else_stmt {
-                    rec(x, ret_g, ret_er, pool, sig);
+                    rec(x, ret_g, ret_er, pool, sig, pc);
                 }
             }
             Stmt::While { body, .. }
             | Stmt::DoWhile { body, .. }
             | Stmt::ForEach { body, .. }
             | Stmt::Labeled { body, .. }
-            | Stmt::Synchronized { body, .. } => rec(body, ret_g, ret_er, pool, sig),
+            | Stmt::Synchronized { body, .. } => rec(body, ret_g, ret_er, pool, sig, pc),
             Stmt::For { init, body, .. } => {
-                init.iter_mut().for_each(|i| rec(i, ret_g, ret_er, pool, sig));
-                rec(body, ret_g, ret_er, pool, sig);
+                init.iter_mut().for_each(|i| rec(i, ret_g, ret_er, pool, sig, pc));
+                rec(body, ret_g, ret_er, pool, sig, pc);
             }
             Stmt::Switch { cases, default, .. } => {
                 for c in cases.iter_mut() {
                     for st in c.body.iter_mut() {
-                        rec(st, ret_g, ret_er, pool, sig);
+                        rec(st, ret_g, ret_er, pool, sig, pc);
                     }
                 }
                 if let Some(d) = default {
-                    rec(d, ret_g, ret_er, pool, sig);
+                    rec(d, ret_g, ret_er, pool, sig, pc);
                 }
             }
             Stmt::Try { body, catches, finally } => {
-                rec(body, ret_g, ret_er, pool, sig);
+                rec(body, ret_g, ret_er, pool, sig, pc);
                 for c in catches.iter_mut() {
-                    rec(&mut c.body, ret_g, ret_er, pool, sig);
+                    rec(&mut c.body, ret_g, ret_er, pool, sig, pc);
                 }
                 if let Some(f) = finally {
-                    rec(f, ret_g, ret_er, pool, sig);
+                    rec(f, ret_g, ret_er, pool, sig, pc);
                 }
             }
             _ => {}
         }
     }
-    rec(s, &ret_g, &ret_er, pool, sig);
+    rec(s, &ret_g, &ret_er, pool, sig, pc);
 }
 
 /// True when `(cls, name)` is one of the signature-polymorphic methods
@@ -9692,6 +9693,23 @@ fn instantiated_ctor_params_core(
     Some(inst)
 }
 
+/// Bound erasure lookup that also covers METHOD typevars (the caller's
+/// `<V extends Number,A> read(...)` — V is not a class param).
+fn typevar_bound_erasure_in(
+    n: &str,
+    caller_params: &[jcdc_jvm::TypeParam],
+    pc: &PoolClass,
+) -> Option<jcdc_jvm::JavaType> {
+    if let Some(p) = caller_params.iter().find(|p| p.name == n) {
+        let b = p
+            .class_bound
+            .clone()
+            .or_else(|| p.interface_bounds.first().cloned())?;
+        return Some(TypeRef::G(b).erased());
+    }
+    typevar_bound_erasure(n, pc)
+}
+
 /// The erasure of a class typevar's leftmost bound (T_NODE extends
 /// Node<P_OUT> → Node): generic_to_erased flattens a bare TypeVar to
 /// Object, losing the bound the checkcast/erasure-alignment checks need.
@@ -11007,58 +11025,58 @@ fn is_generic_class(cls: &str, pool: &ClassPool) -> bool {
         .unwrap_or(false)
 }
 
-fn add_return_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, pool: &ClassPool) {
+fn add_return_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, pool: &ClassPool, pc: &PoolClass) {
     let Some(sig) = msig else { return };
-    fn walk(s: &mut Stmt, sig: &jcdc_jvm::MethodSignature, pool: &ClassPool) {
+    fn walk(s: &mut Stmt, sig: &jcdc_jvm::MethodSignature, pool: &ClassPool, pc: &PoolClass) {
         match s {
-            Stmt::Block(v) => v.iter_mut().for_each(|x| walk(x, sig, pool)),
-            Stmt::Return(Some(e)) => fix_ret(e, sig, pool),
+            Stmt::Block(v) => v.iter_mut().for_each(|x| walk(x, sig, pool, pc)),
+            Stmt::Return(Some(e)) => fix_ret(e, sig, pool, pc),
             Stmt::If { then_stmt, else_stmt, .. } => {
-                walk(then_stmt, sig, pool);
+                walk(then_stmt, sig, pool, pc);
                 if let Some(e) = else_stmt {
-                    walk(e, sig, pool);
+                    walk(e, sig, pool, pc);
                 }
             }
-            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => walk(body, sig, pool),
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => walk(body, sig, pool, pc),
             Stmt::For { init, body, .. } => {
-                init.iter_mut().for_each(|i| walk(i, sig, pool));
-                walk(body, sig, pool);
+                init.iter_mut().for_each(|i| walk(i, sig, pool, pc));
+                walk(body, sig, pool, pc);
             }
-            Stmt::ForEach { body, .. } => walk(body, sig, pool),
+            Stmt::ForEach { body, .. } => walk(body, sig, pool, pc),
             Stmt::Switch { cases, default, .. } => {
                 for c in cases.iter_mut() {
-                    c.body.iter_mut().for_each(|x| walk(x, sig, pool));
+                    c.body.iter_mut().for_each(|x| walk(x, sig, pool, pc));
                 }
                 if let Some(d) = default {
-                    walk(d, sig, pool);
+                    walk(d, sig, pool, pc);
                 }
             }
             Stmt::Try { body, catches, finally } => {
-                walk(body, sig, pool);
+                walk(body, sig, pool, pc);
                 for c in catches.iter_mut() {
-                    walk(&mut c.body, sig, pool);
+                    walk(&mut c.body, sig, pool, pc);
                 }
                 if let Some(f) = finally {
-                    walk(f, sig, pool);
+                    walk(f, sig, pool, pc);
                 }
             }
             Stmt::TryWithResources { resources, body, catches, finally } => {
                 for r in resources.iter_mut() {
-                    walk(r, sig, pool);
+                    walk(r, sig, pool, pc);
                 }
-                walk(body, sig, pool);
+                walk(body, sig, pool, pc);
                 for c in catches.iter_mut() {
-                    walk(&mut c.body, sig, pool);
+                    walk(&mut c.body, sig, pool, pc);
                 }
                 if let Some(f) = finally {
-                    walk(f, sig, pool);
+                    walk(f, sig, pool, pc);
                 }
             }
-            Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => walk(body, sig, pool),
+            Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => walk(body, sig, pool, pc),
             _ => {}
         }
     }
-    fn fix_ret(e: &mut Expr, sig: &jcdc_jvm::MethodSignature, pool: &ClassPool) {
+    fn fix_ret(e: &mut Expr, sig: &jcdc_jvm::MethodSignature, pool: &ClassPool, pc: &PoolClass) {
         // (Target) callExpr  →  callExpr with witnesses
         let mut had_cast = false;
         let witness = {
@@ -11091,12 +11109,12 @@ fn add_return_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, 
                 Expr::Cast { e: inner, .. } => {
                     if let Expr::Method { type_args, cls, name, desc, args, .. } = &mut **inner {
                         *type_args = w;
-                        retype_witness_arg_casts(cls, name, desc, args, &mapping, pool);
+                        retype_witness_arg_casts(cls, name, desc, args, &mapping, pool, pc, &sig.params);
                     }
                 }
                 Expr::Method { type_args, cls, name, desc, args, .. } => {
                     *type_args = w;
-                    retype_witness_arg_casts(cls, name, desc, args, &mapping, pool);
+                    retype_witness_arg_casts(cls, name, desc, args, &mapping, pool, pc, &sig.params);
                 }
                 _ => {}
             }
@@ -11109,7 +11127,7 @@ fn add_return_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, 
             }
         }
     }
-    walk(s, sig, pool);
+    walk(s, sig, pool, pc);
 }
 
 /// Equality operands: a generic call compared against a parameterized
@@ -12170,7 +12188,53 @@ fn compute_witness(
     // Match the callee's generic return against the wanted type.
     let mut mapping: Vec<(String, jcdc_jvm::GenericType)> = Vec::new();
     if !unify_types(&msig.ret, want, &mut mapping) {
-        return None;
+        // A covariant declared return that is a SUBTYPE of the wanted
+        // class (CompletedFuture<V#1>.withResult returned where
+        // CompletableFuture<V> is wanted — jdk11
+        // AsynchronousSocketChannelImpl.read `return CompletedFuture
+        // .withResult((V) result)`: "推论变量 V#1 具有不兼容的上限" x12
+        // across trees): walk the declared return's supertype chain with
+        // its own args as the carried instantiation and unify the
+        // matching supertype against want.
+        mapping.clear();
+        let (have_cs, want_cs) = match (&msig.ret, want) {
+            (jcdc_jvm::GenericType::Class(a), jcdc_jvm::GenericType::Class(b)) => (a, b),
+            _ => return None,
+        };
+        let have_internal = crate::method::classsig_internal(have_cs);
+        let want_internal = crate::method::classsig_internal(want_cs);
+        if have_internal == want_internal {
+            return None;
+        }
+        let hpc = pool.get(&have_internal)?;
+        let own: Vec<jcdc_jvm::GenericType> = have_cs
+            .parts
+            .last()
+            .map(|p| p.args.clone())
+            .unwrap_or_default();
+        let mut found: Option<Vec<jcdc_jvm::GenericType>> = None;
+        let mut queue = class_supers_args(&hpc, &own);
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some((sup, sup_args)) = queue.pop() {
+            if !seen.insert(sup.clone()) {
+                continue;
+            }
+            if sup == want_internal {
+                found = Some(sup_args);
+                break;
+            }
+            if let Some(spc) = pool.get(&sup) {
+                queue.extend(class_supers_args(&spc, &sup_args));
+            }
+        }
+        let Some(sup_args) = found else { return None };
+        let mut sup_cs = want_cs.clone();
+        if let Some(last) = sup_cs.parts.last_mut() {
+            last.args = sup_args;
+        }
+        if !unify_types(&jcdc_jvm::GenericType::Class(sup_cs), want, &mut mapping) {
+            return None;
+        }
     }
     // Every method type parameter must be bound by the unification, and
     // only to a denotable type — a wildcard bound means inference should
@@ -12267,6 +12331,8 @@ fn retype_witness_arg_casts(
     args: &mut [Expr],
     mapping: &[(String, jcdc_jvm::GenericType)],
     pool: &ClassPool,
+    pc: &PoolClass,
+    caller_params: &[jcdc_jvm::TypeParam],
 ) {
     let Some(dpc) = pool.get(cls) else { return };
     let want_desc = {
@@ -12323,6 +12389,18 @@ fn retype_witness_arg_casts(
             continue;
         }
         let inst_ref = TypeRef::G(inst.clone());
+        // A TypeVar instantiation erases to its BOUND, not Object: the
+        // source `(V) result` cast (result: Number, V extends Number) is
+        // a provable no-op javac elides, and only the bound-aware
+        // erasure match restores it (jdk11 AsynchronousSocketChannelImpl
+        // read/write x4 per tree).
+        let inst_er = match &inst {
+            jcdc_jvm::GenericType::TypeVar(n) => {
+                typevar_bound_erasure_in(n, caller_params, pc)
+                    .unwrap_or_else(|| inst_ref.erased())
+            }
+            _ => inst_ref.erased(),
+        };
         match a {
             Expr::Cast { ty, e: ce } => {
                 if is_generic_call(ce, pool) {
@@ -12330,13 +12408,13 @@ fn retype_witness_arg_casts(
                     // whole outer call an unchecked erasure-invocation; the
                     // source relies on target-type inference instead — drop
                     // the cast and let inference run.
-                    if ty.erased() == inst_ref.erased() {
+                    if ty.erased() == inst_er {
                         let inner = std::mem::replace(a, Expr::This);
                         if let Expr::Cast { e: ce2, .. } = inner {
                             *a = *ce2;
                         }
                     }
-                } else if inst_ref.erased() == ty.erased() && *ty != inst_ref {
+                } else if inst_er == ty.erased() && *ty != inst_ref {
                     *ty = inst_ref.clone();
                 }
             }
@@ -12348,7 +12426,7 @@ fn retype_witness_arg_casts(
                 // type inference handles the position.
                 if !is_generic_call(other, pool)
                     && other.type_ref() != inst_ref
-                    && other.type_ref().erased() == inst_ref.erased()
+                    && other.type_ref().erased() == inst_er
                 {
                     let inner = std::mem::replace(other, Expr::This);
                     *other = Expr::Cast { ty: inst_ref, e: Box::new(inner) };
