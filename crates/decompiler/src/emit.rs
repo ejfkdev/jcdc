@@ -622,6 +622,7 @@ impl<'a> Printer<'a> {
         }
         match e {
             Expr::Const(c) => self.const_val(c, out),
+            Expr::Raw(t) if t == "\u{3}" => out.push_str("this"),
             Expr::Raw(t) => out.push_str(t),
             Expr::Local { var, .. } => {
                 let info = self.vt.var(*var);
@@ -790,9 +791,15 @@ impl<'a> Printer<'a> {
                     }
                     out.push_str(".length");
                 } else if let Some(o) = owner {
-                    self.expr(o, 15, out);
-                    out.push('.');
-                    out.push_str(name);
+                    if matches!(o.as_ref(), Expr::Raw(t) if t == "\u{3}") {
+                        // Outer anonymous class member: unqualified lexical
+                        // resolution (an anon outer has no nameable this).
+                        out.push_str(name);
+                    } else {
+                        self.expr(o, 15, out);
+                        out.push('.');
+                        out.push_str(name);
+                    }
                 } else if *is_static {
                     if cls != &self.pc.internal_name {
                         out.push_str(&self.shorten(cls));
@@ -866,8 +873,13 @@ impl<'a> Printer<'a> {
                         }
                         out.push_str("super.");
                     } else if let Some(o) = owner {
-                        self.expr(o, 15, out);
-                        out.push('.');
+                        if matches!(o.as_ref(), Expr::Raw(t) if t == "\u{3}") {
+                            // Outer anonymous member call: unqualified
+                            // lexical resolution.
+                        } else {
+                            self.expr(o, 15, out);
+                            out.push('.');
+                        }
                     } else if *is_static && (cls != &self.pc.internal_name || !type_args.is_empty())
                     {
                         out.push_str(&self.shorten(cls));

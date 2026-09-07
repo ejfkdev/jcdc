@@ -5486,15 +5486,21 @@ fn render_captures(
         .into_iter()
         .map(|(k, v)| {
             if k.starts_with("this$") {
-                // Anonymous outer classes have no source name; their body is
-                // inlined, so plain `this` denotes the same instance.
+                // Anonymous outer classes have no source name. The body
+                // being emitted sits INSIDE the outer anon's inlined body,
+                // so its members resolve LEXICALLY: substitute an unqualified
+                // marker (the printer drops the owner entirely). A `this`
+                // rendering would denote the NESTED class itself (jdk11/17
+                // KeyStore Builder: nested anon reading getCalled/
+                // oldException printed this.getCalled — 11 symbol errors);
+                // an argument-position marker keeps the enclosing `this`.
                 let starts_digit = outer_simple
                     .chars()
                     .next()
                     .map(|c| c.is_ascii_digit())
                     .unwrap_or(false);
                 return if starts_digit {
-                    (k, Expr::Raw("this".to_string()))
+                    (k, Expr::Raw("\u{3}".to_string()))
                 } else {
                     (k, Expr::Raw(format!("{}.this", outer_qthis)))
                 };
