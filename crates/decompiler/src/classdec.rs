@@ -13037,10 +13037,21 @@ fn cast_generic_returns(s: &mut Stmt, want: &TypeRef, pc: &PoolClass, pool: &Cla
         };
         // An existing checkcast carries the erasure (`(Object[])`); retype
         // it to the generic target (`(T[])`) when the erasures line up.
-        if let Expr::Cast { ty, .. } = e {
+        if let Expr::Cast { ty, e: ce } = e {
+            // A wildcard-bearing precise target over a GENERIC call poisons
+            // its inference: (Map<String,Provider<? extends RG>>) around
+            // collect(toMap(..)) flows the wildcard into toMap's U and
+            // javac rejects the whole conversion (jdk17
+            // RandomGeneratorFactory.createFactoryMap — ground truth: the
+            // RAW (Map) form compiles via unchecked conversion). Keep raw.
+            let wildcard_target = match want {
+                TypeRef::G(g) => g_has_wildcard(g),
+                _ => false,
+            };
             if matches!(want, TypeRef::G(_))
                 && *ty != *want
                 && compatible(&ty.erased(), &want.erased())
+                && !(wildcard_target && is_generic_call(ce, pool))
             {
                 *ty = want.clone();
             }
