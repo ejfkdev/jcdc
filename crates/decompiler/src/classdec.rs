@@ -14239,6 +14239,211 @@ fn unify_types(
     }
 }
 
+/// True when a bare generic call's diamond arguments stay consistent with
+/// the TARGET-inferred instantiation of the call's own typevars: binding the
+/// method typevars from `want` (the return), substituting into the formals,
+/// and unifying each diamond's declared supertype instantiation against the
+/// formal must bind every diamond class param — with no conflicting binding.
+/// Then the bare return-position call infers from the target (the source
+/// shape) and a synthesized precise cast would only freeze the arg-driven
+/// inference into an invariance failure (jdk11/17/26 ImmutableCollections
+/// Map1.entrySet: `(Set<Map.Entry<K,V>>) Set.of(new KeyValueHolder<>(k0,v0))`
+/// — Set<KeyValueHolder<K,V>> is not Set<Entry<K,V>>; bare `Set.of(new
+/// KeyValueHolder<>(k0, v0))` target-types E := Entry<K,V> and the diamond
+/// follows). jdk17 Stream.toList fails this check (ArrayList<Object> is
+/// never <: List<? extends T>) and keeps its required cast.
+fn target_inferable_diamonds(
+    cls: &str,
+    name: &str,
+    desc: &jcdc_jvm::MethodDescriptor,
+    args: &[Expr],
+    want: &TypeRef,
+    pool: &ClassPool,
+) -> bool {
+    use jcdc_jvm::GenericType as G;
+    let TypeRef::G(wg) = want else { return false };
+    let Some(dpc) = pool.get(cls) else { return false };
+    let want_desc = format!(
+        "({}){}",
+        desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+        desc.ret.to_descriptor()
+    );
+    let Some(mi) = (0..dpc.cf.methods.len())
+        .find(|&i| dpc.method_name(i) == Some(name) && dpc.method_desc(i) == Some(want_desc.as_str()))
+    else {
+        return false;
+    };
+    let Some(msig) = method_signature_of(&dpc, mi) else { return false };
+    if msig.params.is_empty() {
+        return false;
+    }
+    let mut map: Vec<(String, G)> = Vec::new();
+    if !unify_types(&msig.ret, wg, &mut map) {
+        return false;
+    }
+    if msig
+        .params
+        .iter()
+        .any(|p| !map.iter().any(|(n, _)| *n == p.name))
+    {
+        return false;
+    }
+    let vals: Vec<G> = msig
+        .params
+        .iter()
+        .map(|p| {
+            map.iter()
+                .find(|(n, _)| *n == p.name)
+                .map(|(_, g)| g.clone())
+                .unwrap_or(G::TypeVar(p.name.clone()))
+        })
+        .collect();
+    let mut saw_diamond = false;
+    for (a, formal) in args.iter().zip(msig.args.iter()) {
+        let Expr::New { cls: ncls, args: nargs, .. } = a else { continue };
+        // Diamond new: the erased form prints `new X<>(..)`; require the
+        // class to be generic (a diamond on a non-generic class is a plain
+        // new and imposes nothing).
+        if !is_generic_class(ncls, pool) {
+            continue;
+        }
+        saw_diamond = true;
+        let inst_formal = crate::method::subst_typevars(formal, &msig.params, &vals);
+        let own = if let G::Class(fcs) = &inst_formal {
+            if crate::method::classsig_internal(fcs) == *ncls {
+                fcs.parts.last().map(|p| p.args.clone()).unwrap_or_default()
+            } else {
+                match diamond_args_from_target(ncls, fcs, pool) {
+                    Some(o) => o,
+                    None => return false,
+                }
+            }
+        } else {
+            return false;
+        };
+        if own.is_empty() {
+            return false;
+        }
+        // The formal's target-side shape may still carry wildcards after
+        // substitution (toList's List<? extends T>): the diamond resolves
+        // its own params from the ctor args in that slot; only a fully
+        // concrete target proves the consistency.
+        if own.iter().any(crate::classdec::g_has_wildcard) {
+            return false;
+        }
+        // Standalone (ctor-arg-driven) inference of the diamond's own params.
+        let Some(npc) = pool.get(ncls) else { return false };
+        let Some(csig) = npc.class_attr("Signature").and_then(|b| {
+            if b.len() >= 2 {
+                npc.utf8(u16::from_be_bytes([b[0], b[1]])).and_then(|x| parse_class_signature(x))
+            } else {
+                None
+            }
+        }) else {
+            return false;
+        };
+        let Some(cmi) = (0..npc.cf.methods.len()).find(|&i| {
+            npc.method_name(i) == Some("<init>")
+                && npc
+                    .method_desc(i)
+                    .map(|d| {
+                        d == format!(
+                            "({})V",
+                            nargs
+                                .iter()
+                                .map(|x| x.type_ref().erased().to_descriptor())
+                                .collect::<String>()
+                        )
+                    })
+                    .unwrap_or(false)
+        }) else {
+            return false;
+        };
+        let Some(cmsig) = method_signature_of(&npc, cmi) else { return false };
+        fn tyref_to_g(t: &TypeRef) -> jcdc_jvm::GenericType {
+            match t {
+                TypeRef::G(g) => g.clone(),
+                TypeRef::J(jt) => match jt {
+                    jcdc_jvm::JavaType::Object(n) => {
+                        let (pkg, simple) = match n.rfind('/') {
+                            Some(i) => (n[..i].to_string(), n[i + 1..].to_string()),
+                            None => (String::new(), n.clone()),
+                        };
+                        jcdc_jvm::GenericType::Class(jcdc_jvm::ClassSig {
+                            package: pkg,
+                            parts: vec![jcdc_jvm::ClassSigPart { name: simple, args: Vec::new() }],
+                        })
+                    }
+                    jcdc_jvm::JavaType::Array(i) => {
+                        jcdc_jvm::GenericType::Array(Box::new(tyref_to_g(&TypeRef::J((**i).clone()))))
+                    }
+                    jcdc_jvm::JavaType::Boolean => jcdc_jvm::GenericType::Primitive('Z'),
+                    jcdc_jvm::JavaType::Byte => jcdc_jvm::GenericType::Primitive('B'),
+                    jcdc_jvm::JavaType::Char => jcdc_jvm::GenericType::Primitive('C'),
+                    jcdc_jvm::JavaType::Short => jcdc_jvm::GenericType::Primitive('S'),
+                    jcdc_jvm::JavaType::Int => jcdc_jvm::GenericType::Primitive('I'),
+                    jcdc_jvm::JavaType::Long => jcdc_jvm::GenericType::Primitive('J'),
+                    jcdc_jvm::JavaType::Float => jcdc_jvm::GenericType::Primitive('F'),
+                    jcdc_jvm::JavaType::Double => jcdc_jvm::GenericType::Primitive('D'),
+                    jcdc_jvm::JavaType::Void => jcdc_jvm::GenericType::Primitive('V'),
+                },
+            }
+        }
+        let mut subst: HashMap<String, jcdc_jvm::GenericType> = HashMap::new();
+        for (ca, cf) in nargs.iter().zip(cmsig.args.iter()) {
+            if !unify_g_types(cf, &tyref_to_g(&ca.type_ref()), &mut subst) {
+                return false;
+            }
+        }
+        if csig
+            .params
+            .iter()
+            .any(|p| !subst.contains_key(&p.name))
+        {
+            return false;
+        }
+        // The standalone instantiation must convert to the target
+        // instantiation: walk the diamond class's supertypes to the formal's
+        // class and compare args structurally.
+        let standalone: Vec<G> = csig
+            .params
+            .iter()
+            .map(|p| subst.get(&p.name).cloned().unwrap_or(G::TypeVar(p.name.clone())))
+            .collect();
+        let f_internal = if let G::Class(fcs) = &inst_formal {
+            crate::method::classsig_internal(fcs)
+        } else {
+            return false;
+        };
+        if f_internal == *ncls {
+            if standalone != own {
+                return false;
+            }
+            continue;
+        }
+        let mut queue = class_supers_args(&npc, &standalone);
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut found: Option<Vec<G>> = None;
+        while let Some((sup, sup_args)) = queue.pop() {
+            if !seen.insert(sup.clone()) {
+                continue;
+            }
+            if sup == f_internal {
+                found = Some(sup_args);
+                break;
+            }
+            if let Some(spc) = pool.get(&sup) {
+                queue.extend(class_supers_args(&spc, &sup_args));
+            }
+        }
+        let Some(sup_args) = found else { return false };
+        if sup_args != own {
+            return false;
+        }
+    }
+    saw_diamond
+}
+
 fn cast_generic_returns(s: &mut Stmt, want: &TypeRef, pc: &PoolClass, pool: &ClassPool) {
     fn fix(e: &mut Expr, want: &TypeRef, pc: &PoolClass, pool: &ClassPool) {
         if matches!(e, Expr::Const(_)) {
@@ -14336,6 +14541,22 @@ fn cast_generic_returns(s: &mut Stmt, want: &TypeRef, pc: &PoolClass, pool: &Cla
                         *fty = g;
                     }
                 }
+            }
+        }
+        // Bare generic call with diamond args that stay consistent under
+        // target inference: skip the cast entirely (the bare return
+        // position is the source shape; a precise cast freezes the
+        // arg-driven inference into an invariance failure — jdk11/17/26
+        // ImmutableCollections Map1.entrySet).
+        if let Expr::Method { cls: mcls, name: mname, desc: mdesc, type_args: mta, args: margs, .. } =
+            &*e
+        {
+            if mta.is_empty()
+                && matches!(want, TypeRef::G(_))
+                && is_generic_call(e, pool)
+                && target_inferable_diamonds(mcls, mname, mdesc, margs, want, pool)
+            {
+                return;
             }
         }
         // Invariant-incompatible reparameterization of the same class
