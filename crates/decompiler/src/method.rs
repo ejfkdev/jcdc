@@ -3529,6 +3529,15 @@ fn cast_object_returns(s: &mut Stmt, ret_ty: &JavaType) {
         if !matches!(e, Expr::Local { .. } | Expr::Method { .. } | Expr::Field { .. } | Expr::ArrayIndex { .. }) {
             return;
         }
+        // A generically-typed value (typevar/parameterized) is NOT a plain
+        // Object even though a typevar's erasure renders as one: casting
+        // `return castResult` (M extends Map<K,D>) to the descriptor
+        // erasure produced `return (Map) castResult` inside the groupingBy
+        // finisher lambda — Map无法转换为M (jdk17 Collectors x2, x2 per
+        // tree with groupingByConcurrent).
+        if matches!(e.type_ref(), TypeRef::G(_)) {
+            return;
+        }
         if e.type_ref().erased() == JavaType::Object("java/lang/Object".into()) {
             let inner = std::mem::replace(e, Expr::This);
             *e = Expr::Cast { ty: TypeRef::J(want.clone()), e: Box::new(inner) };
