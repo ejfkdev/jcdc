@@ -8828,6 +8828,32 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
         let have = value.type_ref().erased();
         let want_er = want.erased();
         if compatible_erasure(&have, &want_er) {
+            // A generic call at a parameterized local whose typevar formal
+            // is fed by a WILDCARD-carrying actual cannot unify (S := CAP#1
+            // from the arg vs S := ResourceBundleProvider from the target —
+            // jdk17 Bundles: the source casts
+            // (ServiceLoader<ResourceBundleProvider>) loadInstalled(type);
+            // the generics-only cast leaves no checkcast): synthesize the
+            // target cast.
+            let generic_here = crate::classdec::is_generic_call(value, pool);
+            let wild_call_cast = match (&*value, want) {
+                (Expr::Method { args, .. }, TypeRef::G(jcdc_jvm::GenericType::Class(wcs)))
+                    if generic_here
+                        && wcs.parts.iter().any(|p| !p.args.is_empty())
+                        && args.iter().any(|a| {
+                            matches!(a.type_ref(), TypeRef::G(g)
+                                if crate::classdec::g_has_wildcard(&g))
+                        }) =>
+                {
+                    Some(want.clone())
+                }
+                _ => None,
+            };
+            if let Some(ty) = wild_call_cast {
+                let inner = std::mem::replace(value, Expr::This);
+                *value = Expr::Cast { ty, e: Box::new(inner) };
+                return;
+            }
             // Generic calls infer their type from the assignment target;
             // a frozen cast would sabotage that (and javac emitted none).
             // EXCEPTION — the reflective-array idiom: a getClass() actual
