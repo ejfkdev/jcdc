@@ -12825,6 +12825,7 @@ pub(crate) fn cast_wildcard_call_args(
                 _ => {}
             }
         }
+        cast_object_locals_at_typed_formals(e);
         walk_expr_children(e, pool, pc, &mut |x, p2, c2| fix_expr(x, p2, c2, caller_params));
         // Arg-driven witness, POST-children: a bare generic call whose
         // sibling call args now carry method-ref witnesses gets its own
@@ -16422,6 +16423,37 @@ fn relay_inconvertible_local_casts(s: &mut Stmt, vt: &crate::varalloc::VarTable,
         }
     }
     rec(s, vt, pool);
+}
+
+/// Cast plain-Object LOCAL actuals at typed reference formals using the
+/// call's DESCRIPTOR (no Signature needed): a switch-expression merge var
+/// whose per-arm stores LUB'ed to Object loses the source's static type
+/// (jdk26 ConstantPoolBuilder.methodHandleEntry(stack77, stack78) —
+/// stack78: Object against MemberRefEntry; ConstantValueAttribute
+/// of(stack79) stays ambiguous between its two overloads without it).
+/// The source compiled, so the runtime value satisfies the formal; the
+/// explicit cast restores exactly that guarantee.
+fn cast_object_locals_at_typed_formals(e: &mut Expr) {
+    let Expr::Method { desc, args, name, .. } = e else { return };
+    if name == "<init>" || desc.args.len() != args.len() {
+        return;
+    }
+    for (a, ft) in args.iter_mut().zip(desc.args.iter()) {
+        let jcdc_jvm::JavaType::Object(fn_name) = ft else { continue };
+        if fn_name == "java/lang/Object" {
+            continue;
+        }
+        if !matches!(a, Expr::Local { .. }) {
+            continue;
+        }
+        if !matches!(a.type_ref(), TypeRef::J(jcdc_jvm::JavaType::Object(n))
+            if n == "java/lang/Object")
+        {
+            continue;
+        }
+        let inner = std::mem::replace(a, Expr::This);
+        *a = Expr::Cast { ty: TypeRef::J(ft.clone()), e: Box::new(inner) };
+    }
 }
 
 fn cast_generic_returns(s: &mut Stmt, want: &TypeRef, pc: &PoolClass, pool: &ClassPool) {
