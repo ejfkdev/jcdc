@@ -14591,6 +14591,416 @@ fn unify_types(
     }
 }
 
+/// Substitute typevar NAMES positionally (the SAM class's params are not
+/// the newed class's TypeParam list, so subst_typevars' &TypeParam keying
+/// does not fit).
+fn subst_g_named(
+    g: &jcdc_jvm::GenericType,
+    names: &[String],
+    args: &[jcdc_jvm::GenericType],
+) -> jcdc_jvm::GenericType {
+    use jcdc_jvm::GenericType as G;
+    match g {
+        G::TypeVar(n) => names
+            .iter()
+            .position(|p| p == n)
+            .and_then(|i| args.get(i))
+            .cloned()
+            .unwrap_or_else(|| g.clone()),
+        G::Class(cs) => G::Class(jcdc_jvm::ClassSig {
+            package: cs.package.clone(),
+            parts: cs
+                .parts
+                .iter()
+                .map(|p| jcdc_jvm::ClassSigPart {
+                    name: p.name.clone(),
+                    args: p.args.iter().map(|a| subst_g_named(a, names, args)).collect(),
+                })
+                .collect(),
+        }),
+        G::Array(i) => G::Array(Box::new(subst_g_named(i, names, args))),
+        G::Wildcard(jcdc_jvm::WildcardBound::Extends(t)) => {
+            G::Wildcard(jcdc_jvm::WildcardBound::Extends(Box::new(subst_g_named(t, names, args))))
+        }
+        G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => {
+            G::Wildcard(jcdc_jvm::WildcardBound::Super(Box::new(subst_g_named(t, names, args))))
+        }
+        other => other.clone(),
+    }
+}
+
+/// A resolved type-argument value is DENOTABLE at the new site when every
+/// typevar it mentions is in scope there: the caller's own method typevars
+/// (collected from the return target), an own-param NAME COLLISION (the
+/// caller's same-named typevar is what renders), and never an unbound
+/// receiver-class typevar (List's E1) or a foreign name.
+fn denotable_type_args(
+    g: &jcdc_jvm::GenericType,
+    own: &[jcdc_jvm::TypeParam],
+    want_tvars: &HashSet<String>,
+    recv_tvars: &HashSet<String>,
+) -> bool {
+    use jcdc_jvm::GenericType as G;
+    fn tvs(g: &G, out: &mut Vec<String>) {
+        match g {
+            G::TypeVar(n) => out.push(n.clone()),
+            G::Array(i) => tvs(i, out),
+            G::Class(cs) => cs.parts.iter().for_each(|p| p.args.iter().for_each(|a| tvs(a, out))),
+            G::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
+            | G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => tvs(t, out),
+            _ => {}
+        }
+    }
+    if matches!(g, G::Wildcard(_)) {
+        return false;
+    }
+    let mut names: Vec<String> = Vec::new();
+    tvs(g, &mut names);
+    names.iter().all(|n| {
+        !recv_tvars.contains(n)
+            && (want_tvars.contains(n) || own.iter().any(|p| &p.name == n))
+    })
+}
+
+fn want_typevars(g: &jcdc_jvm::GenericType) -> HashSet<String> {
+    let mut out = Vec::new();
+    fn tvs(g: &jcdc_jvm::GenericType, out: &mut Vec<String>) {
+        use jcdc_jvm::GenericType as G;
+        match g {
+            G::TypeVar(n) => out.push(n.clone()),
+            G::Array(i) => tvs(i, out),
+            G::Class(cs) => cs.parts.iter().for_each(|p| p.args.iter().for_each(|a| tvs(a, out))),
+            G::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
+            | G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => tvs(t, out),
+            _ => {}
+        }
+    }
+    tvs(g, &mut out);
+    out.into_iter().collect()
+}
+
+/// Resolve a diamond's own type args with method-ref help: the target
+/// resolves what it can (jdk11 Collectors.toUnmodifiableList's
+/// Collector<T,?,List<T>> binds T2:=T, R:=List<T> but leaves A open —
+/// wildcard slots never bind); each UNBOUND method-ref actual then fills
+/// the gaps through its SAM formal (List::add at BiConsumer<A,T2>: the
+/// receiver slot gives A := List<E1>, the ref method's param unifies
+/// E1 with the already-bound T2 := T, so A := List<T> — the source's
+/// (Supplier<List<T>>) pin). Every own param must end up bound to a
+/// denotable non-wildcard type or the diamond stays bare.
+fn diamond_args_from_refs(
+    ncls: &str,
+    args: &[Expr],
+    wcs: &jcdc_jvm::ClassSig,
+    pool: &ClassPool,
+) -> Option<Vec<jcdc_jvm::GenericType>> {
+    use jcdc_jvm::GenericType as G;
+    let want_internal = crate::method::classsig_internal(wcs);
+    let want_args = wcs.parts.last()?.args.clone();
+    let npc = pool.get(ncls)?;
+    let csig = npc.class_attr("Signature").and_then(|b| {
+        if b.len() >= 2 {
+            npc.utf8(u16::from_be_bytes([b[0], b[1]])).and_then(|x| parse_class_signature(x))
+        } else {
+            None
+        }
+    })?;
+    if csig.params.is_empty() {
+        return None;
+    }
+    let own_syms: Vec<G> = csig
+        .params
+        .iter()
+        .map(|p| G::TypeVar(p.name.clone()))
+        .collect();
+    // Seed: bind own params from the target through the supertype chain.
+    let mut subst: HashMap<String, G> = HashMap::new();
+    if want_internal == *ncls {
+        if want_args.len() != csig.params.len() {
+            return None;
+        }
+        for (p, w) in csig.params.iter().zip(want_args.iter()) {
+            let mut one: HashMap<String, G> = HashMap::new();
+            if unify_g_types(&G::TypeVar(p.name.clone()), w, &mut one) {
+                if let Some(g) = one.get(&p.name) {
+                    if !matches!(g, G::Wildcard(_)) {
+                        subst.insert(p.name.clone(), g.clone());
+                    }
+                }
+            }
+        }
+    } else {
+        let mut queue = class_supers_args(&npc, &own_syms);
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some((sup, sup_args)) = queue.pop() {
+            if !seen.insert(sup.clone()) {
+                continue;
+            }
+            if sup == want_internal {
+                if sup_args.len() != want_args.len() {
+                    return None;
+                }
+                for (sa, wa) in sup_args.iter().zip(want_args.iter()) {
+                    unify_g_types(sa, wa, &mut subst);
+                }
+                subst.retain(|_, v| !matches!(v, G::Wildcard(_)));
+                break;
+            }
+            if let Some(spc) = pool.get(&sup) {
+                queue.extend(class_supers_args(&spc, &sup_args));
+            }
+        }
+    }
+    if csig.params.iter().all(|p| subst.contains_key(&p.name)) {
+        return None; // fully target-resolved: the plain path handles it
+    }
+    // Method-ref actuals fill the gaps through the ctor formals.
+    let mut recv_tvars: HashSet<String> = HashSet::new();
+    let Some(cmi) = (0..npc.cf.methods.len()).find(|&i| {
+        npc.method_name(i) == Some("<init>")
+            && npc
+                .method_desc(i)
+                .and_then(parse_method_descriptor)
+                .map(|md| md.args.len() == args.len())
+                .unwrap_or(false)
+            && method_signature_of(&npc, i).is_some()
+    }) else {
+        return None;
+    };
+    let Some(cmsig) = method_signature_of(&npc, cmi) else {
+        return None;
+    };
+    for (a, formal) in args.iter().zip(cmsig.args.iter()) {
+        let Expr::Lambda(lam) = a else { continue };
+        if lam.kind != crate::expr::LambdaKind::MethodRef
+            || lam.impl_is_static
+            || !lam.captures.is_empty()
+        {
+            continue;
+        }
+        // The formal must be a parameterized SAM class.
+        let inst_formal = {
+            let vals: Vec<G> = csig
+                .params
+                .iter()
+                .map(|p| {
+                    subst
+                        .get(&p.name)
+                        .cloned()
+                        .unwrap_or(G::TypeVar(p.name.clone()))
+                })
+                .collect();
+            crate::method::subst_typevars(formal, &csig.params, &vals)
+        };
+        let G::Class(sam_cs) = &inst_formal else { continue };
+        if sam_cs.parts.last().map(|p| p.args.is_empty()).unwrap_or(true) {
+            continue;
+        }
+        let sam_internal = crate::method::classsig_internal(sam_cs);
+        let Some(sam_pc) = pool.get(&sam_internal) else { continue };
+        // The SAM method by name (walking supers like method_ref_common).
+        fn find_sam_sig(
+            pcx: &PoolClass,
+            sam_name: &str,
+            pool: &ClassPool,
+            depth: usize,
+        ) -> Option<jcdc_jvm::MethodSignature> {
+            let own = (0..pcx.cf.methods.len()).find(|&i| pcx.method_name(i) == Some(sam_name));
+            if let Some(mi) = own {
+                if let Some(msig) = method_signature_of(pcx, mi) {
+                    return Some(msig);
+                }
+            }
+            if depth >= 4 {
+                return None;
+            }
+            for &ii in &pcx.cf.interfaces {
+                if let Some(iname) = pcx.class_name(ii) {
+                    if let Some(ipc) = pool.get(iname) {
+                        if let Some(x) = find_sam_sig(&ipc, sam_name, pool, depth + 1) {
+                            return Some(x);
+                        }
+                    }
+                }
+            }
+            None
+        }
+        let Some(sam_msig) = find_sam_sig(&sam_pc, &lam.sam_name, pool, 0) else { continue };
+        // Unbound ref: the SAM's first formal param is the receiver slot;
+        // the rest align with the target method's params.
+        let rpc = {
+            let x = pool.get(&lam.impl_owner);
+            match x {
+                Some(p) => p,
+                None => continue,
+            }
+        };
+        let rcsig = rpc.class_attr("Signature").and_then(|b| {
+            if b.len() >= 2 {
+                rpc.utf8(u16::from_be_bytes([b[0], b[1]])).and_then(|x| parse_class_signature(x))
+            } else {
+                None
+            }
+        });
+        let own_ref: Vec<G> = rcsig
+            .as_ref()
+            .map(|cs| {
+                cs.params
+                    .iter()
+                    .map(|p| G::TypeVar(p.name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(cs) = &rcsig {
+            for p in &cs.params {
+                recv_tvars.insert(p.name.clone());
+            }
+        }
+        // Receiver class for the slot: the impl owner with its own params
+        // symbolic (List<E1>).
+        let recv = G::Class(jcdc_jvm::ClassSig {
+            package: lam
+                .impl_owner
+                .rfind('/')
+                .map(|i| lam.impl_owner[..i].to_string())
+                .unwrap_or_default(),
+            parts: vec![jcdc_jvm::ClassSigPart {
+                name: lam.impl_owner.rsplit('/').next().unwrap_or(&lam.impl_owner).to_string(),
+                args: own_ref.clone(),
+            }],
+        });
+        // Map the SAM's class params positionally to the formal's actual
+        // args, then bind the receiver slot.
+        let sam_params_names: Vec<String> = sam_pc
+            .class_attr("Signature")
+            .and_then(|b| {
+                if b.len() >= 2 {
+                    sam_pc.utf8(u16::from_be_bytes([b[0], b[1]])).and_then(|x| parse_class_signature(x))
+                } else {
+                    None
+                }
+            })
+            .map(|cs| cs.params.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default();
+        let formal_args = &sam_cs.parts.last()?.args;
+        if sam_params_names.len() != formal_args.len() {
+            continue;
+        }
+        // Translate the sam method's formal params through the class
+        // param -> actual mapping.
+        let sam_formals: Vec<G> = sam_msig
+            .args
+            .iter()
+            .map(|sa| subst_g_named(sa, &sam_params_names, formal_args))
+            .collect();
+        // Receiver slot: unify sam_formals[0] (an own-param-carrying
+        // formal like A) against the receiver shape List<E1>.
+        let mut mapping: Vec<(String, G)> = subst
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if sam_formals.is_empty() {
+            continue;
+        }
+        if !unify_types(&sam_formals[0], &recv, &mut mapping) {
+            continue;
+        }
+        // Remaining SAM params against the ref method's Signature params.
+        let rmi = (0..rpc.cf.methods.len()).find(|&i| {
+            rpc.method_name(i) == Some(lam.impl_name.as_str())
+                && rpc
+                    .method_desc(i)
+                    .map(|d| {
+                        d == format!(
+                            "({}){}",
+                            lam.impl_desc
+                                .args
+                                .iter()
+                                .map(|t| t.to_descriptor())
+                                .collect::<String>(),
+                            lam.impl_desc.ret.to_descriptor()
+                        )
+                    })
+                    .unwrap_or(false)
+        });
+        let Some(rmi) = rmi else { continue };
+        let Some(ref_msig) = method_signature_of(&rpc, rmi) else { continue };
+        if ref_msig.args.len() + 1 != sam_formals.len() {
+            continue;
+        }
+        let mut ok = true;
+        for (i, rp) in ref_msig.args.iter().enumerate() {
+            // The ref method's params carry the receiver class's own
+            // typevars (List.add's E1). Direction matters: `rp` is the
+            // pattern side so the RECEIVER's typevar binds (E1 := T from
+            // the already-bound sam slot); the opposite order would bind
+            // the caller's typevar (T := E1) and drop the resolution.
+            let f_i = &sam_formals[i + 1];
+            if let G::TypeVar(rn) = rp {
+                match mapping.iter().find(|(n, _)| n == rn) {
+                    Some((_, prev)) => {
+                        if prev != f_i {
+                            // Consistent only if the prior value unifies
+                            // with this slot.
+                            let mut probe = mapping.clone();
+                            if !unify_types(prev, f_i, &mut probe) {
+                                ok = false;
+                                break;
+                            }
+                            mapping = probe;
+                        }
+                    }
+                    None => {
+                        mapping.push((rn.clone(), f_i.clone()));
+                    }
+                }
+            } else if !unify_types(f_i, rp, &mut mapping) {
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            continue;
+        }
+        // Fixpoint: receiver typevars bound later (E1 := T) must be
+        // substituted through earlier values (A := List<E1> -> List<T>).
+        for _ in 0..4 {
+            let keys: Vec<String> = mapping.iter().map(|(k, _)| k.clone()).collect();
+            let vals: Vec<G> = mapping.iter().map(|(_, v)| v.clone()).collect();
+            let mut changed = false;
+            for (_, v) in mapping.iter_mut() {
+                let nv = subst_g_named(v, &keys, &vals);
+                if &nv != v {
+                    *v = nv;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        subst = mapping
+            .into_iter()
+            .filter(|(k, _)| csig.params.iter().any(|p| &p.name == k))
+            .collect();
+    }
+    let want_tvs = want_typevars(&G::Class(wcs.clone()));
+    let out: Option<Vec<G>> = csig
+        .params
+        .iter()
+        .map(|p| {
+            subst.get(&p.name).and_then(|g| {
+                if denotable_type_args(g, &csig.params, &want_tvs, &recv_tvars) {
+                    Some(g.clone())
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    out
+}
+
 /// True when a bare generic call's diamond arguments stay consistent with
 /// the TARGET-inferred instantiation of the call's own typevars: binding the
 /// method typevars from `want` (the return), substituting into the formals,
@@ -15068,22 +15478,16 @@ fn diamond_explicit_args_from_call_args(
         );
         unify_g_types(&bound_formal, &g, &mut subst);
     }
-    // Denotability: a bound value that is a bare TypeVar must either name
-    // an own param (a name collision with the caller's typevar — the
-    // caller's variable is what's in scope at the new site and renders
-    // identically) or NOT be an own param (a caller typevar). Any deeper
-    // own-param mention means the slot stayed symbolic.
+    // Denotability at the sibling-witnessed new site (see
+    // denotable_type_args).
+    let want_tvs = want_typevars(want);
+    let no_recv: HashSet<String> = HashSet::new();
     let out: Option<Vec<G>> = csig
         .params
         .iter()
         .map(|p| {
             subst.get(&p.name).and_then(|g| {
-                let ok = match g {
-                    G::Wildcard(_) => false,
-                    G::TypeVar(n) => n == &p.name || !g_has_typevar_in(g, &csig.params),
-                    other => !g_has_typevar_in(other, &csig.params),
-                };
-                if ok {
+                if denotable_type_args(g, &csig.params, &want_tvs, &no_recv) {
                     Some(g.clone())
                 } else {
                     None
@@ -15333,13 +15737,61 @@ fn cast_generic_returns(s: &mut Stmt, want: &TypeRef, pc: &PoolClass, pool: &Cla
         // UnmodifiableEntrySetSpliterator<>((Spliterator<Entry<K,V>>)
         // c.spliterator())` — the capture-typed bare arg starved the
         // diamond, 无法推断UnmodifiableEntrySetSpliterator<>).
-        if let Expr::New { cls: ncls, args, .. } = e {
+        if let Expr::New { cls: ncls, args, ty: nty, .. } = e {
             if let TypeRef::G(jcdc_jvm::GenericType::Class(wcs)) = want {
-                let own = if crate::method::classsig_internal(wcs) == *ncls {
+                let same_cls = crate::method::classsig_internal(wcs) == *ncls;
+                let own = if same_cls {
                     wcs.parts.last().map(|p| p.args.clone()).unwrap_or_default()
                 } else {
                     diamond_args_from_target(ncls, wcs, pool).unwrap_or_default()
                 };
+                // Target left own args unresolved (wildcard slot): let the
+                // method-ref actuals fill the gaps and pin the New's type
+                // (jdk11/17/26 Collectors.toUnmodifiable* — A := List<T>
+                // from List::add at BiConsumer<A,T>; the bare diamond
+                // collapsed A to the raw-ref inference and javac gave up:
+                // 无法推断CollectorImpl<>的类型参数).
+                // Pin the New's type ONLY for the refs-resolved case (the
+                // target-resolved path keeps the diamond; a same-class
+                // wildcard target like ChronoZonedDateTimeImpl<?> would
+                // otherwise print the illegal `new X<?>(..)`).
+                let mut pinned: Option<Vec<jcdc_jvm::GenericType>> = None;
+                let own = if own.is_empty()
+                    && !same_cls
+                    && args.iter().any(|a| {
+                        matches!(a, Expr::Lambda(l)
+                            if l.kind == crate::expr::LambdaKind::MethodRef
+                                && !l.impl_is_static
+                                && l.captures.is_empty())
+                    })
+                {
+                    match diamond_args_from_refs(ncls, args, wcs, pool) {
+                        Some(r) => {
+                            pinned = Some(r.clone());
+                            r
+                        }
+                        None => Vec::new(),
+                    }
+                } else {
+                    own
+                };
+                if let Some(resolved) = &pinned {
+                    let already = matches!(nty, TypeRef::G(jcdc_jvm::GenericType::Class(cs2))
+                        if cs2.parts.last().map(|p| !p.args.is_empty()).unwrap_or(false));
+                    if !already {
+                        let ncs = jcdc_jvm::ClassSig {
+                            package: ncls
+                                .rfind('/')
+                                .map(|i| ncls[..i].to_string())
+                                .unwrap_or_default(),
+                            parts: vec![jcdc_jvm::ClassSigPart {
+                                name: ncls.rsplit('/').next().unwrap_or(ncls).to_string(),
+                                args: resolved.clone(),
+                            }],
+                        };
+                        *nty = TypeRef::G(jcdc_jvm::GenericType::Class(ncs));
+                    }
+                }
                 if !own.is_empty() {
                     let arg_tys: Vec<jcdc_jvm::JavaType> =
                         args.iter().map(|x| x.type_ref().erased()).collect();

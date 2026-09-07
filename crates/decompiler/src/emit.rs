@@ -932,8 +932,64 @@ impl<'a> Printer<'a> {
                             None => self.args(&args[1..], out),
                         }
                     } else {
+                        // Pinned generic instantiation: prime lambda args
+                        // from the ctor's instantiated Signature formals.
+                        let sam_rets: Vec<Option<TypeRef>> = match ty {
+                            TypeRef::G(jcdc_jvm::GenericType::Class(cs))
+                                if explicit.is_some()
+                                    && crate::method::classsig_internal(cs) == *cls =>
+                            {
+                                let pinned = cs.parts.last().map(|p| p.args.clone());
+                                let formals = crate::classdec::ctor_formals_by_arity(
+                                    cls,
+                                    args.len(),
+                                    self.pool,
+                                );
+                                // The raw ctor formals carry the class's
+                                // own typevars — substitute the pinned
+                                // instantiation before reading the SAM
+                                // return (an unsubstituted R printed `(R)`
+                                // — 找不到符号).
+                                let class_params = self
+                                    .pool
+                                    .get(cls)
+                                    .and_then(|cpc| {
+                                        cpc.class_attr("Signature").and_then(|b| {
+                                            if b.len() >= 2 {
+                                                cpc.utf8(u16::from_be_bytes([b[0], b[1]]))
+                                                    .and_then(|x| jcdc_jvm::parse_class_signature(x))
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                    })
+                                    .map(|sig| sig.params)
+                                    .unwrap_or_default();
+                                args.iter()
+                                    .enumerate()
+                                    .map(|(i, a)| {
+                                        if !matches!(a, Expr::Lambda(_)) {
+                                            return None;
+                                        }
+                                        let f = formals.as_ref()?.get(i)?;
+                                        let pinned = pinned.as_ref()?;
+                                        if pinned.len() != class_params.len() {
+                                            return None;
+                                        }
+                                        let inst = crate::method::subst_typevars(
+                                            f,
+                                            &class_params,
+                                            pinned,
+                                        );
+                                        let Expr::Lambda(l) = a else { return None };
+                                        self.sam_ret_cast(&inst, &l.sam_name)
+                                    })
+                                    .collect()
+                            }
+                            _ => Vec::new(),
+                        };
                         match self.ctor_param_types(cls, 0, args.len(), args) {
-                            Some(pt) => self.args_typed(args, &pt, out),
+                            Some(pt) => self.args_typed_sam(args, &pt, &sam_rets, out),
                             None => self.args(args, out),
                         }
                     }
@@ -1567,6 +1623,23 @@ impl<'a> Printer<'a> {
     }
 
     fn args_typed(&mut self, args: &[Expr], param_types: &[jcdc_jvm::JavaType], out: &mut String) {
+        self.args_typed_sam(args, param_types, &[], out)
+    }
+
+    /// args_typed with per-argument SAM-return priming: a lambda actual at
+    /// a parameterized-SAM formal of a pinned generic ctor gets its body
+    /// return cast from the formal's instantiated SAM return (jdk11/17/26
+    /// Collectors.toUnmodifiable*'s finisher `list -> (List<T>)
+    /// List.of(list.toArray())` — the erased instantiatedMethodType says
+    /// only List, so the generic cast is recoverable solely from the
+    /// diamond's resolved formal).
+    fn args_typed_sam(
+        &mut self,
+        args: &[Expr],
+        param_types: &[jcdc_jvm::JavaType],
+        sam_rets: &[Option<TypeRef>],
+        out: &mut String,
+    ) {
         for (i, a) in args.iter().enumerate() {
             if i > 0 {
                 out.push_str(", ");
@@ -1589,7 +1662,16 @@ impl<'a> Printer<'a> {
                 Some(jcdc_jvm::JavaType::Byte) | Some(jcdc_jvm::JavaType::Short) => {
                     self.expr_narrow_arg(a, &param_types[i].clone(), out);
                 }
-                _ => self.expr(a, 1, out),
+                _ => {
+                    match sam_rets.get(i).and_then(|x| x.as_ref()) {
+                        Some(t) if matches!(a, Expr::Lambda(_)) => {
+                            let prev = self.lambda_sam_ret.replace(t.clone());
+                            self.expr(a, 1, out);
+                            self.lambda_sam_ret = prev;
+                        }
+                        _ => self.expr(a, 1, out),
+                    }
+                }
             }
         }
     }
