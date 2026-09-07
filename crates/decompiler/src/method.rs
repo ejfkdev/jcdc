@@ -5549,7 +5549,25 @@ fn booleanize_deep(e: &mut crate::expr::Expr) {
             booleanize_deep(index);
             NUMERIC_CTX.with(|n| n.set(n.get() - 1));
         }
-        Expr::Cast { e: x, .. } | Expr::InstanceOf { e: x, .. } => booleanize_deep(x),
+        Expr::Cast { ty, e: x } => {
+            // A cast to a numeric primitive is an int context: the inner
+            // 0/1 ternary must survive as int (`(long) (c ? 1 : 0)` —
+            // jdk11 Year/MinguoDate getEraYear; folding to boolean gave
+            // "boolean无法转换为long").
+            let numeric = matches!(
+                ty.erased(),
+                JavaType::Long | JavaType::Int | JavaType::Short | JavaType::Byte
+                    | JavaType::Char | JavaType::Float | JavaType::Double
+            );
+            if numeric {
+                NUMERIC_CTX.with(|n| n.set(n.get() + 1));
+            }
+            booleanize_deep(x);
+            if numeric {
+                NUMERIC_CTX.with(|n| n.set(n.get() - 1));
+            }
+        }
+        Expr::InstanceOf { e: x, .. } => booleanize_deep(x),
         Expr::Field { owner: Some(o), .. } => booleanize_deep(o),
         _ => {}
     }
