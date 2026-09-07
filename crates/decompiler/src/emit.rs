@@ -1063,7 +1063,15 @@ impl<'a> Printer<'a> {
                         return;
                     }
                 }
-                if let (TypeRef::G(_), Expr::New { cls, .. }) = (ty, &**e) {
+                // CLASS-argument generic casts only: a TYPEVAR cast is
+                // load-bearing (`(T) new SimpleEntry<>(..)` — jdk11
+                // IdentityHashMap.toArray: the diamond infers from the
+                // ctor args and the unchecked (T) makes the T[] store
+                // legal; dropping it left the diamond to infer from the
+                // array target T — 无法推断SimpleEntry<>的类型参数).
+                if let (TypeRef::G(jcdc_jvm::GenericType::Class(_)), Expr::New { cls, .. }) =
+                    (ty, &**e)
+                {
                     if !self.diamond_for(cls).is_empty() {
                         // Synthetic generics-only cast around a diamond new:
                         // DROP the cast and keep the diamond. A generic-typed

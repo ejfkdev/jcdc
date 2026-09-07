@@ -8893,15 +8893,34 @@ pub(crate) fn instantiated_method_ret(
         desc.ret.to_descriptor()
     );
     let (start, start_args): (String, Vec<jcdc_jvm::GenericType>) = match owner {
-        Some(o) => match o.type_ref() {
-            TypeRef::G(jcdc_jvm::GenericType::Class(cs)) => {
-                (crate::method::classsig_internal(&cs), cs.parts.last()?.args.clone())
+        Some(o) => {
+            let raw_outer = match o {
+                Expr::Raw(s) => s
+                    .strip_suffix(".this")
+                    .and_then(|simple| outer_this_instantiation(pc, simple, pool)),
+                _ => None,
+            };
+            match raw_outer {
+                Some(pair) => pair,
+                None => match o.type_ref() {
+                    TypeRef::G(jcdc_jvm::GenericType::Class(cs)) => {
+                        (crate::method::classsig_internal(&cs), cs.parts.last()?.args.clone())
+                    }
+                    t => match t.erased() {
+                        jcdc_jvm::JavaType::Object(n) => {
+                            if pc.internal_name.starts_with(&n)
+                                && pc.internal_name.as_bytes().get(n.len()) == Some(&b'$')
+                            {
+                                (n.clone(), own_typevars(&n, pool))
+                            } else {
+                                (n, Vec::new())
+                            }
+                        }
+                        _ => return None,
+                    },
+                },
             }
-            t => match t.erased() {
-                jcdc_jvm::JavaType::Object(n) => (n, Vec::new()),
-                _ => return None,
-            },
-        },
+        }
         None => {
             let args = pc
                 .class_attr("Signature")
@@ -8984,6 +9003,52 @@ pub(crate) fn instantiated_method_ret(
     None
 }
 
+/// The enclosing class of `pc` whose simple name matches `simple` (the
+/// qualifier of a rendered `X.this` outer reference), paired with its own
+/// typevars as arguments: they are in scope inside the inner class, so
+/// `IdentityHashMap.this.put(traversalTable[i], v)` resolves its formals
+/// to K/V (jdk11 IdentityHashMap.EntryIterator.Entry.setValue lost the
+/// source's `(K)` cast — Object无法转换为K).
+/// A class's own typevars as generic arguments (empty when non-generic).
+fn own_typevars(cls: &str, pool: &ClassPool) -> Vec<jcdc_jvm::GenericType> {
+    pool.get(cls)
+        .and_then(|c| {
+            c.class_attr("Signature").and_then(|b| {
+                if b.len() < 2 {
+                    return None;
+                }
+                let i2 = u16::from_be_bytes([b[0], b[1]]);
+                c.utf8(i2).and_then(|s| parse_class_signature(s))
+            })
+        })
+        .map(|sig| {
+            sig.params
+                .iter()
+                .map(|p| jcdc_jvm::GenericType::TypeVar(p.name.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn outer_this_instantiation(
+    pc: &PoolClass,
+    simple: &str,
+    pool: &ClassPool,
+) -> Option<(String, Vec<jcdc_jvm::GenericType>)> {
+    let name = pc.internal_name.as_str();
+    let mut idx = name.rfind('$')?;
+    loop {
+        let cand = &name[..idx];
+        if simple_name(cand) == simple {
+            return Some((cand.to_string(), own_typevars(cand, pool)));
+        }
+        match cand.rfind('$') {
+            Some(i) => idx = i,
+            None => return None,
+        }
+    }
+}
+
 fn instantiated_method_params(
     m: &Expr,
     pool: &ClassPool,
@@ -9040,15 +9105,41 @@ fn instantiated_method_params(
                     }
                 }
             }
-            Some(o) => match o.type_ref() {
-                TypeRef::G(jcdc_jvm::GenericType::Class(cs)) => {
-                    (crate::method::classsig_internal(&cs), cs.parts.last()?.args.clone())
+            Some(o) => {
+                // A qualified outer this renders as Expr::Raw("X.this"):
+                // resolve the enclosing class and its own typevars.
+                let raw_outer = match o {
+                    Expr::Raw(s) => s
+                        .strip_suffix(".this")
+                        .and_then(|simple| outer_this_instantiation(pc, simple, pool)),
+                    _ => None,
+                };
+                match raw_outer {
+                    Some(pair) => pair,
+                    None => match o.type_ref() {
+                        TypeRef::G(jcdc_jvm::GenericType::Class(cs)) => {
+                            (crate::method::classsig_internal(&cs), cs.parts.last()?.args.clone())
+                        }
+                        t => match t.erased() {
+                            jcdc_jvm::JavaType::Object(n) => {
+                                // An erased read of an ENCLOSING class
+                                // instance (a this$0 field): the outer
+                                // class's own typevars are in scope inside
+                                // the inner one, so parameterize with them
+                                // (IdentityHashMap.this.put needs K/V).
+                                if pc.internal_name.starts_with(&n)
+                                    && pc.internal_name.as_bytes().get(n.len()) == Some(&b'$')
+                                {
+                                    (n.clone(), own_typevars(&n, pool))
+                                } else {
+                                    (n, Vec::new())
+                                }
+                            }
+                            _ => return None,
+                        },
+                    },
                 }
-                t => match t.erased() {
-                    jcdc_jvm::JavaType::Object(n) => (n, Vec::new()),
-                    _ => return None,
-                },
-            },
+            }
         }
     };
     let d_str = format!(

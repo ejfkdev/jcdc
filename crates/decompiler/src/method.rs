@@ -8553,10 +8553,18 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
         // raw `(Collection)`-style cast, which leaves no bytecode trace.
         // Re-insert it as a cast to the raw erasure (unchecked but legal).
         if let (JavaType::Object(hn), JavaType::Object(_)) = (&have, &want_er) {
+            // A diamond new is only safe to cast when the target is a
+            // TYPEVAR (unchecked (T) — the source form of jdk11
+            // IdentityHashMap.toArray `a[ti++] = (T) new SimpleEntry<>
+            // (unmaskNull(key), tab[si+1])`, elided because T erases to
+            // Object): under a CLASS cast a diamond loses its target and
+            // infers Object bounds (see Printer.suppress_diamond).
             let valueish = matches!(
                 value,
                 Expr::Method { .. } | Expr::Local { .. } | Expr::Field { .. } | Expr::ArrayIndex { .. }
-            );
+            ) || (matches!(value, Expr::New { .. } | Expr::AnonNew { .. })
+                && matches!(want, TypeRef::G(jcdc_jvm::GenericType::TypeVar(_))
+                    | TypeRef::G(jcdc_jvm::GenericType::Array(_))));
             if valueish && hn != "java/lang/Object" && hn != "java/lang/String" {
                 let inner = std::mem::replace(value, Expr::This);
                 // A type-var target needs the cast to the VARIABLE: the
