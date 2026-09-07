@@ -10435,7 +10435,14 @@ pub(crate) fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolC
             if redundant_self_cast {
                 let taken = std::mem::replace(&mut **inner, Expr::This);
                 *e = taken;
-            } else if matches!(&**inner, Expr::Method { .. }) {
+            } else if cast_internal.is_some() && matches!(&**inner, Expr::Method { .. }) {
+                // Only a RAW class cast (a real bytecode checkcast) may be
+                // upgraded: a precise generic cast like `(T) it.next()`
+                // (cast_generic_locals' synthesis for a T[] element store)
+                // was being rewritten to the owner's typevar `(E)` —
+                // ImmutableCollections SetN/SubList toArray "E无法转换为T"
+                // x2 per tree.
+                //
                 // A raw erasure checkcast over a generic call is javac's
                 // bridge from the erased return to the instantiated one
                 // (Nodes.CollectorTask.onCompletion: getLocalResult()
