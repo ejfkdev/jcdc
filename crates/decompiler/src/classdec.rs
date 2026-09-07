@@ -2861,9 +2861,16 @@ fn strip_outer_super_arg(body: &mut Stmt, vt: &VarTable) {
     let Some(idx) = stmts.iter().position(|st| !is_pre_junk(st)) else { return };
     if let Some(Stmt::ExprStmt(Expr::Method { name, args, .. })) = stmts.get_mut(idx) {
         if name == "<init>" && !args.is_empty() {
+            // The outer instance is ALWAYS the first param (slot 1):
+            // a bare is_param check ate a real super arg when the super
+            // is static-nested and takes none (jdk17 ExplodedImage
+            // PathNode(String name, ..) → `super(attrs)` lost name —
+            // "需要: String,BasicFileAttributes 找到: BasicFileAttributes").
             let is_outer_local = match &args[0] {
-                Expr::Local { var, .. } => vt.var(*var).name.starts_with("this$")
-                    || vt.var(*var).is_param,
+                Expr::Local { var, .. } => {
+                    vt.var(*var).name.starts_with("this$")
+                        || (vt.var(*var).is_param && vt.var(*var).slot == 1)
+                }
                 Expr::This => true,
                 _ => false,
             };
