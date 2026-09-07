@@ -9499,6 +9499,17 @@ fn instantiated_ctor_params_core(
     Some(inst)
 }
 
+/// Ctor Signature formals EXCLUDE the synthetic outer-instance/marker
+/// parameters that Expr::New's args may still carry (member-inner news
+/// prepend the outer `this`): align the instantiated formals with the
+/// TRAIL of the args, never the head (jdk26 ReverseOrderSortedMapView:
+/// Submap's `(K head, K tail)` zipped against `(this, fromKey, toKey)`
+/// cast the outer this to `(K)` — "找不到符号 类 Submap").
+fn apply_ctor_param_casts(args: &mut [Expr], params: &[jcdc_jvm::GenericType], pool: &ClassPool) {
+    let off = args.len().saturating_sub(params.len());
+    apply_param_casts(&mut args[off..], params, pool);
+}
+
 /// Apply per-argument source casts for a call/ctor whose instantiated
 /// parameter types are known (see cast_wildcard_call_args).
 fn apply_param_casts(args: &mut [Expr], params: &[jcdc_jvm::GenericType], pool: &ClassPool) {
@@ -9853,7 +9864,7 @@ pub(crate) fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolC
         if let Some(params) = params {
             match e {
                 Expr::Method { args, .. } => apply_param_casts(args, &params, pool),
-                Expr::New { args, .. } => apply_param_casts(args, &params, pool),
+                Expr::New { args, .. } => apply_ctor_param_casts(args, &params, pool),
                 _ => {}
             }
         }
@@ -9897,10 +9908,10 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
     }
     fn apply_to_value(value: &mut Expr, params: &[jcdc_jvm::GenericType], pool: &ClassPool) {
         match value {
-            Expr::New { args, .. } => apply_param_casts(args, params, pool),
+            Expr::New { args, .. } => apply_ctor_param_casts(args, params, pool),
             Expr::Cast { e, .. } => {
                 if let Expr::New { args, .. } = &mut **e {
-                    apply_param_casts(args, params, pool);
+                    apply_ctor_param_casts(args, params, pool);
                 }
             }
             _ => {}

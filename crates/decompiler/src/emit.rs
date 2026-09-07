@@ -735,7 +735,40 @@ impl<'a> Printer<'a> {
                     // typed rendering turns an int constant into the
                     // char/boolean literal the ctor expects (jdk17
                     // MessageFormat `new Qchar(39, quoted)`).
-                    let internal = crate::classdec::local_class_internal(local);
+                    // Nested local-class method printing runs under a
+                    // TAKEN LOCAL_CLASS_INTERNALS registry — resolve a
+                    // self-construction (`new BitSetSpliterator(..)` inside
+                    // BitSetSpliterator.trySplit) through the printer's
+                    // own class when the registry misses. Local-class
+                    // ctors capture the enclosing instance as a leading
+                    // param that the printed new-site omits; the this$0
+                    // fallback in ctor_param_types lines the formals up
+                    // (jdk11 BitSet$1BitSetSpliterator(BitSet,int,int,int,
+                    // boolean) — the boolean formal rendered its arg `0`).
+                    let internal = crate::classdec::local_class_internal(local).or_else(|| {
+                        let tail =
+                            self.pc.internal_name.rsplit('$').next().unwrap_or("");
+                        let simple =
+                            tail.trim_start_matches(|c: char| c.is_ascii_digit());
+                        if !simple.is_empty() && simple == local {
+                            return Some(self.pc.internal_name.clone());
+                        }
+                        // Probe the nested-name space of the printing
+                        // context (javac numbers method-local classes
+                        // `$1Name`): the new-site needs the real class to
+                        // resolve its ctor formals.
+                        let base = format!("{}${}", self.pc.internal_name, local);
+                        if self.pool.get(&base).is_some() {
+                            return Some(base);
+                        }
+                        for d in 0..10 {
+                            let cand = format!("{}${}{}", self.pc.internal_name, d, local);
+                            if self.pool.get(&cand).is_some() {
+                                return Some(cand);
+                            }
+                        }
+                        None
+                    });
                     match internal
                         .as_deref()
                         .and_then(|i| self.ctor_param_types(i, 0, args.len(), args))
@@ -1670,6 +1703,16 @@ impl<'a> Printer<'a> {
         let pcx = self.pool.get(cls)?;
         // Enum ctors carry the implicit (String name, int ordinal) prefix.
         let extra: usize = if pcx.is_enum() { 2 } else { 0 };
+        // Inner/local classes capture the enclosing instance as a leading
+        // ctor param (this$0 field proves it) that the printed new-site
+        // omits: fall back to skipping it so the formals line up (jdk11
+        // BitSet$1BitSetSpliterator(BitSet,int,int,int,boolean) — the
+        // boolean formal rendered its arg as `0`).
+        let has_this0 = pcx.cf.fields.iter().any(|f| {
+            pcx.utf8(f.name_index)
+                .map(|nm| nm.starts_with("this$"))
+                .unwrap_or(false)
+        });
         let mut cands: Vec<Vec<jcdc_jvm::JavaType>> = Vec::new();
         for mi in 0..pcx.cf.methods.len() {
             if pcx.method_name(mi) != Some("<init>") {
@@ -1679,6 +1722,19 @@ impl<'a> Printer<'a> {
             if let Some(md) = jcdc_jvm::parse_method_descriptor(d) {
                 if md.args.len() == skip + extra + n {
                     cands.push(md.args[skip + extra..].to_vec());
+                }
+            }
+        }
+        if cands.is_empty() && has_this0 && skip == 0 {
+            for mi in 0..pcx.cf.methods.len() {
+                if pcx.method_name(mi) != Some("<init>") {
+                    continue;
+                }
+                let d = pcx.method_desc(mi)?;
+                if let Some(md) = jcdc_jvm::parse_method_descriptor(d) {
+                    if md.args.len() == extra + n + 1 {
+                        cands.push(md.args[extra + 1..].to_vec());
+                    }
                 }
             }
         }
