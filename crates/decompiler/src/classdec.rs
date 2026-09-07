@@ -10013,6 +10013,17 @@ fn apply_param_casts(
                                 _ => None,
                             }
                         }
+                        // An ARRAY-of-typevar formal (`(E[]) input` — jdk17
+                        // ImmutableCollections.listFromTrustedArrayNullsAllowed:
+                        // the source cast erases away because E[] and Object[]
+                        // coincide; without it the ListN<> diamond got E :=
+                        // Object from the raw varargs actual against the
+                        // target's E equality, 无法推断ListN<>).
+                        t @ jcdc_jvm::GenericType::Array(_)
+                            if crate::method::contains_typevar(t) =>
+                        {
+                            Some(t.clone())
+                        }
                         // A parameterized parameter type (`BiFunction<? super
                         // String, ...>`): an argument whose erasure matches
                         // but whose parameters differ needs the source cast.

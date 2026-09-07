@@ -1487,7 +1487,14 @@ impl<'a> Printer<'a> {
             match param_types.get(off + i) {
                 Some(pt @ jcdc_jvm::JavaType::Object(_)) => {
                     let have = a.type_ref().erased();
+                    // Generically-typed args (typevars/parameterized) are
+                    // already source-typed: casting them to the descriptor
+                    // erasure breaks convertibility to typevar formals
+                    // (jdk17 StreamSpliterators SliceSpliterator.OfPrimitive
+                    // this((Spliterator.OfPrimitive) s, ..) against a
+                    // T_SPLITR formal — OfPrimitive无法转换为T_SPLITR).
                     if &have != pt
+                        && !matches!(a.type_ref(), TypeRef::G(_))
                         && !matches!(
                             a,
                             Expr::Cast { .. }
