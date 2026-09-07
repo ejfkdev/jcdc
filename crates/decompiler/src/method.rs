@@ -436,6 +436,10 @@ pub fn decompile_method(
     cast_generic_locals(&vt, pool, pc, &mut body);
     cast_object_returns(&mut body, &ret_ty);
     cast_narrowing_assigns(&vt, &mut body);
+    if pc.method_name(m_idx) != Some("<init>") {
+        fold_merged_new_inits(&mut body, pc);
+        cleanup(&mut body);
+    }
     dedupe_declarations(&mut body);
     ensure_declared(&vt, &mut body);
     cleanup(&mut body);
@@ -636,6 +640,220 @@ fn expr_uses(e: &Expr, used: &mut std::collections::HashSet<u32>) {
 /// Scope-aware deduplication: a variable already declared in an enclosing
 /// open scope gets plain assignments instead of re-declarations. Sibling
 /// scopes may each declare (legal Java).
+/// `new C` values that reached an `invokespecial C.<init>` through
+/// stack-merge variables (branch-duplicated news): fold the init args
+/// back into the raw new assignments and drop the bare super(..)
+/// statement. Outside a constructor a Method{<init>} on a non-this
+/// owner can never be a real super call — it is always a merged new's
+/// initializer (jdk17 InflaterInputStream read(): `stack231 = new
+/// ZipException(); super(stack233); throw stack231;` — "显式构造器调用
+/// 只能出现在构造器主体中" + the message never reached the exception).
+fn fold_merged_new_inits(body: &mut Stmt, pc: &PoolClass) {
+    let mut inits: Vec<(u32, String, Vec<Expr>)> = Vec::new();
+    fn find_inits(s: &Stmt, pc: &PoolClass, out: &mut Vec<(u32, String, Vec<Expr>)>) {
+        match s {
+            Stmt::ExprStmt(Expr::Method { name, cls, owner, args, .. })
+                if name == "<init>" && cls != &pc.internal_name =>
+            {
+                if let Some(o) = owner {
+                    if let Expr::Local { var, .. } = &**o {
+                        out.push((*var, cls.clone(), args.clone()));
+                    }
+                }
+            }
+            Stmt::Block(v) => v.iter().for_each(|x| find_inits(x, pc, out)),
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                find_inits(then_stmt, pc, out);
+                if let Some(e) = else_stmt {
+                    find_inits(e, pc, out);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => find_inits(body, pc, out),
+            Stmt::For { init, body, .. } => {
+                init.iter().for_each(|x| find_inits(x, pc, out));
+                find_inits(body, pc, out);
+            }
+            Stmt::ForEach { body, .. } => find_inits(body, pc, out),
+            Stmt::Labeled { body, .. } | Stmt::Synchronized { body, .. } => {
+                find_inits(body, pc, out);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases {
+                    c.body.iter().for_each(|x| find_inits(x, pc, out));
+                }
+                if let Some(d) = default {
+                    find_inits(d, pc, out);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                find_inits(body, pc, out);
+                for c in catches {
+                    find_inits(&c.body, pc, out);
+                }
+                if let Some(f) = finally {
+                    find_inits(f, pc, out);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter().for_each(|x| find_inits(x, pc, out));
+                find_inits(body, pc, out);
+                for c in catches {
+                    find_inits(&c.body, pc, out);
+                }
+                if let Some(f) = finally {
+                    find_inits(f, pc, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    find_inits(body, pc, &mut inits);
+    if inits.is_empty() {
+        return;
+    }
+    fn rewrite(s: &mut Stmt, inits: &[(u32, String, Vec<Expr>)], pc: &PoolClass) {
+        match s {
+            Stmt::Block(v) => {
+                // Raw `v = new C()` assignments in this block whose class
+                // has a merged init later: the initialized value is
+                // assigned at the INIT site instead; the raw twin store
+                // is dead (its object is never observed).
+                let dead: std::collections::HashSet<u32> = v
+                    .iter()
+                    .filter_map(|st| match st {
+                        Stmt::ExprStmt(Expr::Assign { target, value, .. }) => {
+                            match (&**target, &**value) {
+                                (Expr::Local { var, .. }, Expr::New { cls, raw: true, .. })
+                                    if inits.iter().any(|(_, c, _)| c == cls) =>
+                                {
+                                    Some(*var)
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !dead.is_empty() {
+                    v.retain(|st| {
+                        !matches!(st, Stmt::ExprStmt(Expr::Assign { target, .. })
+                            if matches!(&**target, Expr::Local { var, .. } if dead.contains(var)))
+                    });
+                }
+                let mut i = 0;
+                while i < v.len() {
+                    let folded = match &v[i] {
+                        Stmt::ExprStmt(Expr::Method { name, cls, owner, args, .. })
+                            if name == "<init>" && cls != &pc.internal_name =>
+                        {
+                            match owner.as_deref() {
+                                Some(Expr::Local { var, ty }) => {
+                                    let var = *var;
+                                    let ty = ty.clone();
+                                    inits.iter().find(|(v2, c2, _)| *v2 == var && c2 == cls).map(
+                                        |(_, _, iargs)| {
+                                            let mut stmts = vec![Stmt::ExprStmt(Expr::Assign {
+                                                target: Box::new(Expr::Local { var, ty: ty.clone() }),
+                                                op: crate::expr::AssignOp::Plain,
+                                                value: Box::new(Expr::New {
+                                                    cls: cls.clone(),
+                                                    ty: crate::expr::TypeRef::J(
+                                                        jcdc_jvm::JavaType::Object(cls.clone()),
+                                                    ),
+                                                    args: iargs.clone(),
+                                                    raw: false,
+                                                }),
+                                            })];
+                                            // DUP twins: point every other
+                                            // raw-new var of the same class
+                                            // (the dead raw assigns removed
+                                            // above) at the initialized
+                                            // object — the throw/return flow
+                                            // reads a twin.
+                                            for &tv in dead.iter() {
+                                                if tv != var {
+                                                    stmts.push(Stmt::ExprStmt(Expr::Assign {
+                                                        target: Box::new(Expr::Local {
+                                                            var: tv,
+                                                            ty: ty.clone(),
+                                                        }),
+                                                        op: crate::expr::AssignOp::Plain,
+                                                        value: Box::new(Expr::Local {
+                                                            var,
+                                                            ty: ty.clone(),
+                                                        }),
+                                                    }));
+                                                }
+                                            }
+                                            Stmt::Block(stmts)
+                                        },
+                                    )
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(f) = folded {
+                        v[i] = f;
+                    } else {
+                        rewrite(&mut v[i], inits, pc);
+                    }
+                    i += 1;
+                }
+                v.retain(|x| !x.is_empty_block());
+            }
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                rewrite(then_stmt, inits, pc);
+                if let Some(e) = else_stmt {
+                    rewrite(e, inits, pc);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => rewrite(body, inits, pc),
+            Stmt::For { init, body, .. } => {
+                init.iter_mut().for_each(|x| rewrite(x, inits, pc));
+                rewrite(body, inits, pc);
+            }
+            Stmt::ForEach { body, .. } => rewrite(body, inits, pc),
+            Stmt::Labeled { body, .. } | Stmt::Synchronized { body, .. } => {
+                rewrite(body, inits, pc);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    for x in c.body.iter_mut() {
+                        rewrite(x, inits, pc);
+                    }
+                }
+                if let Some(d) = default {
+                    rewrite(d, inits, pc);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                rewrite(body, inits, pc);
+                for c in catches.iter_mut() {
+                    rewrite(&mut c.body, inits, pc);
+                }
+                if let Some(f) = finally {
+                    rewrite(f, inits, pc);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                for r in resources.iter_mut() {
+                    rewrite(r, inits, pc);
+                }
+                rewrite(body, inits, pc);
+                for c in catches.iter_mut() {
+                    rewrite(&mut c.body, inits, pc);
+                }
+                if let Some(f) = finally {
+                    rewrite(f, inits, pc);
+                }
+            }
+            _ => {}
+        }
+    }
+    rewrite(body, &inits, pc);
+}
 fn dedupe_declarations(body: &mut Stmt) {
     let mut scopes: Vec<std::collections::HashSet<u32>> = Vec::new();
     scopes.push(std::collections::HashSet::new());
