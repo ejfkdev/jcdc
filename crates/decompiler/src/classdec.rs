@@ -2682,7 +2682,14 @@ fn emit_method_with(
             // ctor-arg witnesses (jdk11 ClassValue.refreshVersion's
             // `new Entry<>(v2, (T) value)` arrives via an inlined
             // access$000 ctor accessor).
-            fix_diamond_localdefs(&mut body, &mb.vt, pool);
+            // Return-position diamonds target the generic signature return.
+            let ret_g = msig.as_ref().and_then(|sig| match &sig.ret {
+                g @ (jcdc_jvm::GenericType::Class(_) | jcdc_jvm::GenericType::Array(_)) => {
+                    Some(TypeRef::G(g.clone()))
+                }
+                _ => None,
+            });
+            fix_diamond_localdefs(&mut body, &mb.vt, pool, ret_g.as_ref());
             // Accessor inlining can expose the real generic callee only
             // now; retry the return witnesses (idempotent).
             add_return_witnesses(&mut body, msig.as_ref(), pool);
@@ -8975,7 +8982,7 @@ fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass, vt: &
         }
         walk_expr_children(e, pool, pc, fix_expr);
     }
-    fix_diamond_localdefs(s, vt, pool);
+    fix_diamond_localdefs(s, vt, pool, None);
     walk_stmt_exprs(s, pool, pc, fix_expr);
 }
 
@@ -8986,7 +8993,12 @@ fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass, vt: &
 /// erased `(T)` cast has no bytecode trace; without it the diamond sees
 /// Object against T and javac gives up: "cannot infer type arguments
 /// for Entry<>").
-fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &ClassPool) {
+fn fix_diamond_localdefs(
+    s: &mut Stmt,
+    vt: &crate::varalloc::VarTable,
+    pool: &ClassPool,
+    ret: Option<&TypeRef>,
+) {
     fn inst_from(ty: &TypeRef, value: &Expr) -> Option<(String, Vec<jcdc_jvm::GenericType>, usize)> {
         let (cls, args) = match value {
             Expr::New { cls, args, .. } => (cls, args),
@@ -9023,6 +9035,21 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
         }
     }
     match s {
+        // Return position: the method's generic signature return is the
+        // diamond's target (jdk26 ReferencedKeyMap.entryKey: `return new
+        // WeakReferenceKey<>(key, stale)` needs `(K) key` — a cast to a
+        // typevar leaves no bytecode trace).
+        Stmt::Return(Some(e)) => {
+            if let Some(rty) = ret {
+                if let Some((cls, iargs, n)) = inst_from(rty, e) {
+                    if let Some(params) = instantiated_ctor_params_core(&cls, &iargs, n, pool) {
+                        if let Stmt::Return(Some(v)) = s {
+                            apply_to_value(v, &params, pool);
+                        }
+                    }
+                }
+            }
+        }
         Stmt::LocalDef { var, init: Some(value), .. } => {
             if let Some((cls, iargs, n)) = inst_from(&vt.var(*var).ty, value) {
                 if let Some(params) = instantiated_ctor_params_core(&cls, &iargs, n, pool) {
@@ -9050,48 +9077,48 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
                 }
             }
         }
-        Stmt::Block(v) => v.iter_mut().for_each(|x| fix_diamond_localdefs(x, vt, pool)),
+        Stmt::Block(v) => v.iter_mut().for_each(|x| fix_diamond_localdefs(x, vt, pool, ret)),
         Stmt::If { then_stmt, else_stmt, .. } => {
-            fix_diamond_localdefs(then_stmt, vt, pool);
+            fix_diamond_localdefs(then_stmt, vt, pool, ret);
             if let Some(x) = else_stmt {
-                fix_diamond_localdefs(x, vt, pool);
+                fix_diamond_localdefs(x, vt, pool, ret);
             }
         }
         Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::ForEach { body, .. }
         | Stmt::Labeled { body, .. } | Stmt::Synchronized { body, .. } => {
-            fix_diamond_localdefs(body, vt, pool)
+            fix_diamond_localdefs(body, vt, pool, ret)
         }
         Stmt::For { init, body, .. } => {
-            init.iter_mut().for_each(|i| fix_diamond_localdefs(i, vt, pool));
-            fix_diamond_localdefs(body, vt, pool);
+            init.iter_mut().for_each(|i| fix_diamond_localdefs(i, vt, pool, ret));
+            fix_diamond_localdefs(body, vt, pool, ret);
         }
         Stmt::Switch { cases, default, .. } => {
             for c in cases.iter_mut() {
-                c.body.iter_mut().for_each(|st| fix_diamond_localdefs(st, vt, pool));
+                c.body.iter_mut().for_each(|st| fix_diamond_localdefs(st, vt, pool, ret));
             }
             if let Some(d) = default {
-                fix_diamond_localdefs(d, vt, pool);
+                fix_diamond_localdefs(d, vt, pool, ret);
             }
         }
         Stmt::Try { body, catches, finally } => {
-            fix_diamond_localdefs(body, vt, pool);
+            fix_diamond_localdefs(body, vt, pool, ret);
             for c in catches.iter_mut() {
-                fix_diamond_localdefs(&mut c.body, vt, pool);
+                fix_diamond_localdefs(&mut c.body, vt, pool, ret);
             }
             if let Some(f) = finally {
-                fix_diamond_localdefs(f, vt, pool);
+                fix_diamond_localdefs(f, vt, pool, ret);
             }
         }
         Stmt::TryWithResources { resources, body, catches, finally } => {
             for r in resources.iter_mut() {
-                fix_diamond_localdefs(r, vt, pool);
+                fix_diamond_localdefs(r, vt, pool, ret);
             }
-            fix_diamond_localdefs(body, vt, pool);
+            fix_diamond_localdefs(body, vt, pool, ret);
             for c in catches.iter_mut() {
-                fix_diamond_localdefs(&mut c.body, vt, pool);
+                fix_diamond_localdefs(&mut c.body, vt, pool, ret);
             }
             if let Some(f) = finally {
-                fix_diamond_localdefs(f, vt, pool);
+                fix_diamond_localdefs(f, vt, pool, ret);
             }
         }
         _ => {}
