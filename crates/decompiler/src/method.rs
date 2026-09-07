@@ -585,6 +585,12 @@ fn collect_decl_use(s: &Stmt, declared: &mut std::collections::HashSet<u32>, use
             expr_uses(lock, used);
             collect_decl_use(body, declared, used);
         }
+        // SESE wraps labelled loops in Labeled nodes: without this arm the
+        // whole loop body is invisible to ensure_declared (jdk11
+        // SynchronousQueue.TransferStack.transfer: m's 11 uses inside
+        // `L1: while` went uncounted, its lost decl never re-added —
+        // 找不到符号 变量 m x11).
+        Stmt::Labeled { body, .. } => collect_decl_use(body, declared, used),
         Stmt::MonitorEnter(e) | Stmt::MonitorExit(e) => expr_uses(e, used),
         _ => {}
     }
