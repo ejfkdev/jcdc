@@ -2735,6 +2735,7 @@ fn emit_method_with(
             let caller_params: Vec<jcdc_jvm::TypeParam> =
                 msig.as_ref().map(|m| m.params.clone()).unwrap_or_default();
             cast_wildcard_call_args(&mut body, pool, pc, &mb.vt, &caller_params);
+            witness_methodref_localdef_calls(&mut body, &mb.vt, pool, pc, &caller_params);
             if static_ban {
                 CAST_BANNED_TVARS.with(|b| b.borrow_mut().clear());
             }
@@ -11010,6 +11011,126 @@ fn type_field_reads(e: &mut Expr, pool: &ClassPool, pc: &PoolClass, concrete_ok:
     }
 }
 
+/// Generic call initializing a generically-declared local, with functional
+/// (lambda/method-ref) arguments: the declared type is the inference target
+/// the source used. `TerminalOp<T, LinkedHashSet<T>> reduceOp =
+/// ReduceOps.<T, LinkedHashSet<T>>makeRef(LinkedHashSet::new, ...)` —
+/// without the witness the raw-SAM-cast or bare forms die ("方法引用无效"
+/// / 无法推断). When compute_witness recovers every callee typevar as a
+/// denotable type, set the explicit type arguments and strip the raw
+/// erasure casts wrapping the lambda args (the witness types the formals;
+/// the raw casts would re-erase them and break method-ref arity).
+fn witness_methodref_localdef_calls(
+    s: &mut Stmt,
+    vt: &crate::varalloc::VarTable,
+    pool: &ClassPool,
+    pc: &PoolClass,
+    caller_params: &[jcdc_jvm::TypeParam],
+) {
+    fn fix(
+        e: &mut Expr,
+        want: &jcdc_jvm::GenericType,
+        pool: &ClassPool,
+        caller_params: &[jcdc_jvm::TypeParam],
+    ) {
+        let (cls, name, desc) = match &*e {
+            Expr::Method { cls, name, desc, type_args, args, .. } if type_args.is_empty() => {
+                // Every argument must be functional (possibly raw-cast):
+                // a non-functional arg means the call is not the
+                // lambda-overload shape the witness reconstructs.
+                if !args.iter().all(|a| match a {
+                    Expr::Lambda(_) => true,
+                    Expr::Cast { e: i, .. } => matches!(&**i, Expr::Lambda(_)),
+                    _ => false,
+                }) {
+                    return;
+                }
+                (cls.clone(), name.clone(), desc.clone())
+            }
+            _ => return,
+        };
+        let Some((w, _)) =
+            compute_witness(cls.as_str(), name.as_str(), &desc, None, want, pool, Some(caller_params))
+        else {
+            return;
+        };
+        if let Expr::Method { type_args, args, .. } = e {
+            *type_args = w;
+            for a in args.iter_mut() {
+                // Strip raw erasure casts wrapping the functional args:
+                // with the call witnessed, the formals are concrete and
+                // the raw cast would re-erase the SAM (breaking
+                // method-ref arity).
+                let raw_over_lambda = matches!(a, Expr::Cast { ty, e: i }
+                    if matches!(ty, TypeRef::J(jcdc_jvm::JavaType::Object(_)))
+                        && matches!(&**i, Expr::Lambda(_)));
+                if raw_over_lambda {
+                    let v = std::mem::replace(a, Expr::This);
+                    if let Expr::Cast { e: i, .. } = v {
+                        *a = *i;
+                    }
+                }
+            }
+        }
+    }
+    fn rec(
+        s: &mut Stmt,
+        vt: &crate::varalloc::VarTable,
+        pool: &ClassPool,
+        pc: &PoolClass,
+        caller_params: &[jcdc_jvm::TypeParam],
+    ) {
+        let _ = pc;
+        match s {
+            Stmt::Block(v) => v
+                .iter_mut()
+                .for_each(|x| rec(x, vt, pool, pc, caller_params)),
+            Stmt::LocalDef { var, init: Some(e), .. } => {
+                if let TypeRef::G(want) = &vt.var(*var).ty {
+                    fix(e, want, pool, caller_params);
+                }
+            }
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                rec(then_stmt, vt, pool, pc, caller_params);
+                if let Some(x) = else_stmt {
+                    rec(x, vt, pool, pc, caller_params);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::Labeled { body, .. }
+            | Stmt::Synchronized { body, .. } => rec(body, vt, pool, pc, caller_params),
+            Stmt::For { init, body, .. } => {
+                init.iter_mut()
+                    .for_each(|i| rec(i, vt, pool, pc, caller_params));
+                rec(body, vt, pool, pc, caller_params);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    for st in c.body.iter_mut() {
+                        rec(st, vt, pool, pc, caller_params);
+                    }
+                }
+                if let Some(d) = default {
+                    rec(d, vt, pool, pc, caller_params);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                rec(body, vt, pool, pc, caller_params);
+                for c in catches.iter_mut() {
+                    rec(&mut c.body, vt, pool, pc, caller_params);
+                }
+                if let Some(f) = finally {
+                    rec(f, vt, pool, pc, caller_params);
+                }
+            }
+            _ => {}
+        }
+    }
+    rec(s, vt, pool, pc, caller_params);
+}
+
 pub(crate) fn cast_wildcard_call_args(
     s: &mut Stmt,
     pool: &ClassPool,
@@ -11607,6 +11728,31 @@ pub(crate) fn cast_wildcard_call_args(
                         if let Some(w) = method_ref_inst_type_args(cls, name, desc, lam, pool) {
                             if std::env::var("JCDC_DBG_WIT").is_ok() {
                                 eprintln!("INSTTA {}.{} -> {:?}", cls, name, w);
+                            }
+                            *type_args = w;
+                        }
+                    }
+                    // UNBOUND instance method ref: the SAM parameter shape
+                    // unifies against the target method's own Signature
+                    // (Integrator.<FixedWindow,TR,List<TR>>ofGreedy(
+                    // FixedWindow::integrate) — jdk26 Gatherers; the source
+                    // witnesses leave no bytecode trace and javac's
+                    // untyped inference dies on the Downstream capture).
+                    // method_ref_type_args binds every callee typevar to a
+                    // denotable non-wildcard type or bails, so the witness
+                    // is exactly the one javac recorded.
+                    // ref_receiver carries the CLASS name for the unbound
+                    // `X::y` form (the printer renders it); the bound form
+                    // carries captures[0] instead — captures.is_empty() is
+                    // the unbound check.
+                    if type_args.is_empty()
+                        && lam.kind == crate::expr::LambdaKind::MethodRef
+                        && !lam.impl_is_static
+                        && lam.captures.is_empty()
+                    {
+                        if let Some(w) = method_ref_type_args(cls, name, desc, lam, pool) {
+                            if std::env::var("JCDC_DBG_WIT").is_ok() {
+                                eprintln!("REFTA {}.{} -> {:?}", cls, name, w);
                             }
                             *type_args = w;
                         }
