@@ -2764,6 +2764,26 @@ fn emit_method_with(
                 }
             }
             substitute_captures(&mut body, captures, pool);
+            // Capture substitution replaces val$/param reads with RawT
+            // expressions carrying the OUTER scope's generic types — the
+            // earlier generic passes saw only the erased capture shapes
+            // (jdk26 LazyCollections LazyMapIterator's anon Consumer:
+            // `action.accept(new LazyEntry(..))` with action raw-typed at
+            // fix time, so the Consumer<? super Entry<K,V>> formal never
+            // instantiated). Retry them on the substituted body (they are
+            // idempotent: cast/witness/ty checks skip settled nodes).
+            if !captures.is_empty() {
+                if static_ban {
+                    let banned = class_typevar_names(pc);
+                    CAST_BANNED_TVARS.with(|b| *b.borrow_mut() = banned);
+                }
+                cast_wildcard_call_args(&mut body, pool, pc, &mb.vt, &caller_params);
+                witness_methodref_localdef_calls(&mut body, &mb.vt, pool, pc, &caller_params);
+                pin_underdetermined_return_diamonds(&mut body, msig.as_ref(), pool);
+                if static_ban {
+                    CAST_BANNED_TVARS.with(|b| b.borrow_mut().clear());
+                }
+            }
             // Ctor artifact stripping runs BEFORE the outer-this
             // substitution: it normalizes param-slot reads of the outer
             // instance (Local this$N) into field reads (this.this$N),
@@ -10657,7 +10677,7 @@ fn apply_param_casts(
                     // source's (K)k/(V)v arg casts erase away (Object→
                     // Object) and the bare diamond over Object args fails
                     // inference (无法推断SimpleImmutableEntry<>的类型参数).
-                    if let Expr::New { cls: acls, args: aargs, .. } = a {
+                    if let Expr::New { cls: acls, args: aargs, ty: aty, .. } = a {
                         if let jcdc_jvm::GenericType::Class(wcs) = &want {
                             // Same class: the formal's args are the diamond's
                             // own. Supertype formal (Entry<K,V> against a
@@ -10670,6 +10690,34 @@ fn apply_param_casts(
                             };
                             {
                                 if !wargs.is_empty() {
+                                    // Pin the resolved instantiation on the
+                                    // New itself: a wildcard-bearing ctor
+                                    // arg strips the diamond at print time
+                                    // (the raw new then fails the capture
+                                    // formal — jdk26 LazyCollections
+                                    // LazyEntry), while explicit args keep
+                                    // the value convertible.
+                                    {
+                                        let already = matches!(aty, TypeRef::G(jcdc_jvm::GenericType::Class(cs2))
+                                            if cs2.parts.last().map(|p| !p.args.is_empty()).unwrap_or(false));
+                                        if !already {
+                                            let ncs = jcdc_jvm::ClassSig {
+                                                package: acls
+                                                    .rfind('/')
+                                                    .map(|i| acls[..i].to_string())
+                                                    .unwrap_or_default(),
+                                                parts: vec![jcdc_jvm::ClassSigPart {
+                                                    name: acls
+                                                        .rsplit('/')
+                                                        .next()
+                                                        .unwrap_or(acls)
+                                                        .to_string(),
+                                                    args: wargs.clone(),
+                                                }],
+                                            };
+                                            *aty = TypeRef::G(jcdc_jvm::GenericType::Class(ncs));
+                                        }
+                                    }
                                     let arg_tys: Vec<jcdc_jvm::JavaType> = aargs
                                         .iter()
                                         .map(|x| x.type_ref().erased())
@@ -10751,7 +10799,16 @@ fn apply_param_casts(
                         if matches!(o.type_ref(), TypeRef::G(jcdc_jvm::GenericType::Class(cs))
                             if cs.parts.iter().any(|p| p.args.iter().any(
                                 |x| matches!(x, jcdc_jvm::GenericType::Wildcard(_))))));
-                    if !capture_read && a.type_ref() == TypeRef::G(want.clone()) {
+                    // A CONDITIONAL's type_ref reports the first branch's
+                    // type, but javac glues divergent branches to their LUB
+                    // (`!REVERSE ? e0 : e1` with e0:E, e1:Object types at
+                    // Object — jdk26 ImmutableCollections Set12.forEach,
+                    // "Object无法转换为CAP#1"): the equality shortcut only
+                    // holds when BOTH branches already carry the want type.
+                    let cond_mixed = matches!(a, Expr::Cond { t, f, .. }
+                        if t.type_ref() != TypeRef::G(want.clone())
+                            || f.type_ref() != TypeRef::G(want.clone()));
+                    if !capture_read && !cond_mixed && a.type_ref() == TypeRef::G(want.clone()) {
                         continue;
                     }
                     if matches!(a, Expr::Cast { .. } | Expr::Const(_)) {
@@ -10844,6 +10901,51 @@ fn apply_param_casts(
                             let inner = std::mem::replace(a, Expr::This);
                             *a = Expr::Cast { ty: cast_ty, e: Box::new(inner) };
                             continue;
+                        }
+                    }
+                    // A SUPER-wildcard formal's capture rejects raw and
+                    // subtype values outright (no unchecked conversion to a
+                    // capture variable): the precise cast to the stripped
+                    // bound is the source shape (jdk26 LazyCollections
+                    // LazyMapIterator.forEachRemaining — `action.accept(new
+                    // LazyEntry<>(..))` printed raw by the diamond gate:
+                    // "LazyEntry无法转换为CAP#1 from ? super Entry<K,V>").
+                    if let jcdc_jvm::GenericType::Wildcard(jcdc_jvm::WildcardBound::Super(x)) = pt {
+                        // A DIAMOND/raw New carries a G type with empty args
+                        // in the AST but prints without parameterization —
+                        // it needs the cast like any erased actual.
+                        let diamond_new = {
+                            let ar: &Expr = a;
+                            match ar {
+                                Expr::New { ty: TypeRef::G(jcdc_jvm::GenericType::Class(cs)), .. } => {
+                                    cs.parts.last().map(|p| p.args.is_empty()).unwrap_or(true)
+                                }
+                                Expr::New { .. } => true,
+                                _ => false,
+                            }
+                        };
+                        if !matches!(a.type_ref(), TypeRef::G(_)) || diamond_new {
+                            let have_er = a.type_ref().erased();
+                            let x_er = TypeRef::G((**x).clone()).erased();
+                            let aligned = match (&have_er, &x_er) {
+                                (jcdc_jvm::JavaType::Object(hn), jcdc_jvm::JavaType::Object(xn)) => {
+                                    hn == xn
+                                        || is_subtype_of(
+                                            pool,
+                                            &jcdc_jvm::JavaType::Object(hn.clone()),
+                                            xn,
+                                        )
+                                }
+                                _ => false,
+                            };
+                            if aligned && !g_has_wildcard(x) {
+                                let inner = std::mem::replace(a, Expr::This);
+                                *a = Expr::Cast {
+                                    ty: TypeRef::G((**x).clone()),
+                                    e: Box::new(inner),
+                                };
+                                continue;
+                            }
                         }
                     }
                     // Erasures must line up. A TypeVar formal erases to
@@ -12012,18 +12114,17 @@ pub(crate) fn cast_wildcard_call_args(
             return;
         };
         let Some(last) = cs.parts.last() else { return };
-        // Only `? extends X` in input position breaks capture; an unbounded
-        // `?` has no source-typed actual to conflict with and no sensible
-        // strip target.
-        if !last
-            .args
-            .iter()
-            .any(|a| matches!(a, G::Wildcard(jcdc_jvm::WildcardBound::Extends(_))))
-            || last
-                .args
-                .iter()
-                .any(|a| matches!(a, G::Wildcard(jcdc_jvm::WildcardBound::Any)))
-        {
+        // `? extends X` in input position breaks capture against an
+        // exactly-X actual; an unbounded `?` breaks against a plain-Object
+        // actual (LazyCollections FunctionHolder) and strips to Object —
+        // the `broken` scan below decides which case actually applies.
+        if !last.args.iter().any(|a| {
+            matches!(
+                a,
+                G::Wildcard(jcdc_jvm::WildcardBound::Extends(_))
+                    | G::Wildcard(jcdc_jvm::WildcardBound::Any)
+            )
+        }) {
             return;
         }
         let dpc;
@@ -12073,6 +12174,15 @@ pub(crate) fn cast_wildcard_call_args(
                     G::Wildcard(jcdc_jvm::WildcardBound::Extends(x)),
                     TypeRef::G(ag),
                 ) => **x == ag,
+                // An unbounded-wildcard formal against a plain-Object
+                // actual: apply(CAP#1 from ?) cannot take Object (jdk26
+                // LazyCollections FunctionHolder `fun.apply(input)` with
+                // fun: Function<?,?> — "Object无法转换为CAP#1"; the source
+                // de-wildcards the owner: ((Function<Object,T>) fun)).
+                (
+                    G::Wildcard(jcdc_jvm::WildcardBound::Any),
+                    TypeRef::J(jcdc_jvm::JavaType::Object(n)),
+                ) => n == "java/lang/Object",
                 _ => false,
             }
         });
@@ -12088,6 +12198,18 @@ pub(crate) fn cast_wildcard_call_args(
                 match std::mem::replace(a, G::Primitive('V')) {
                     G::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
                     | G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => *a = *t,
+                    // Unbounded: Object is the only always-legal slot type
+                    // (input position accepts any actual; the erased return
+                    // flows through the source's own result cast).
+                    G::Wildcard(jcdc_jvm::WildcardBound::Any) => {
+                        *a = G::Class(jcdc_jvm::ClassSig {
+                            package: "java/lang".to_string(),
+                            parts: vec![jcdc_jvm::ClassSigPart {
+                                name: "Object".to_string(),
+                                args: Vec::new(),
+                            }],
+                        })
+                    }
                     other => *a = other,
                 }
             }
@@ -14655,6 +14777,31 @@ fn g_has_typevar_in(g: &jcdc_jvm::GenericType, params: &[jcdc_jvm::TypeParam]) -
 /// gives, then bind the rest from the witnessed generic-call arguments
 /// (a Cond counts when both branches agree). All params must end up
 /// bound to denotable non-wildcard types or the diamond stays.
+/// The Signature formals of the class's arity-matching constructor (the
+/// printer's diamond gates need the formal shapes; synthetic capture
+/// ctors carry no Signature and are skipped).
+pub(crate) fn ctor_formals_by_arity(
+    cls: &str,
+    nargs: usize,
+    pool: &ClassPool,
+) -> Option<Vec<jcdc_jvm::GenericType>> {
+    let cpc = pool.get(cls)?;
+    let cmi = (0..cpc.cf.methods.len()).find(|&i| {
+        cpc.method_name(i) == Some("<init>")
+            && cpc
+                .method_desc(i)
+                .and_then(parse_method_descriptor)
+                .map(|md| md.args.len() == nargs)
+                .unwrap_or(false)
+            && method_signature_of(&cpc, i).is_some()
+    })?;
+    let cmsig = method_signature_of(&cpc, cmi)?;
+    if cmsig.args.len() != nargs {
+        return None;
+    }
+    Some(cmsig.args)
+}
+
 fn diamond_explicit_args_from_call_args(
     e: &Expr,
     want: &jcdc_jvm::GenericType,
@@ -14913,10 +15060,114 @@ fn pin_underdetermined_return_diamonds(
     pool: &ClassPool,
 ) {
     let Some(sig) = msig else { return };
-    let want = jcdc_jvm::GenericType::Class(match &sig.ret {
-        jcdc_jvm::GenericType::Class(cs) => cs.clone(),
-        _ => return,
-    });
+    // The owner-diamond pin is target-less (the chained call's formals
+    // drive it), so it runs for ANY generic return; the New pin needs a
+    // Class return target and is skipped for typevar/wildcard returns.
+    let want = match &sig.ret {
+        jcdc_jvm::GenericType::Class(cs) => Some(jcdc_jvm::GenericType::Class(cs.clone())),
+        _ => None,
+    };
+    // A diamond RECEIVER of a chained generic call infers Object bounds
+    // (the owner position has no target typing): pin its own params from
+    // the chained call's formals against the G-typed actuals (jdk26
+    // ForkJoinPool.invokeAny `(T) new InvokeAnyRoot<>().invokeAny(tasks,
+    // ..)` — tasks: Collection<? extends Callable<T>> binds the root's T;
+    // the source writes new InvokeAnyRoot<T>()).
+    fn pin_owner_diamond(e: &mut Expr, pool: &ClassPool) {
+        let call = match &mut *e {
+            Expr::Cast { e: i, .. } => i.as_mut(),
+            other => other,
+        };
+        let Expr::Method { cls: mcls, name, desc, owner: Some(owner), args, .. } = call else { return };
+        let Expr::New { cls: ncls, ty, args: nargs, .. } = owner.as_mut() else { return };
+        if ncls != mcls && !mcls.starts_with(ncls.as_str()) {
+            // the call may be inherited; allow only same-class chains here
+        }
+        let already = matches!(ty, TypeRef::G(jcdc_jvm::GenericType::Class(cs))
+            if cs.parts.last().map(|p| !p.args.is_empty()).unwrap_or(false));
+        if already {
+            return;
+        }
+        let Some(npc) = pool.get(ncls.as_str()) else { return };
+        let Some(csig) = npc.class_attr("Signature").and_then(|b| {
+            if b.len() >= 2 {
+                npc.utf8(u16::from_be_bytes([b[0], b[1]])).and_then(|x| parse_class_signature(x))
+            } else {
+                None
+            }
+        }) else {
+            return;
+        };
+        if csig.params.is_empty() {
+            return;
+        }
+        // The chained method's Signature on the newed class.
+        let want_desc = format!(
+            "({}){}",
+            desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+            desc.ret.to_descriptor()
+        );
+        let Some(mi) = (0..npc.cf.methods.len()).find(|&i| {
+            npc.method_name(i) == Some(name.as_str())
+                && npc.method_desc(i) == Some(want_desc.as_str())
+        }) else {
+            return;
+        };
+        let Some(msig) = method_signature_of(&npc, mi) else {
+            return;
+        };
+        if msig.args.len() != args.len() {
+            return;
+        }
+        let own_syms: Vec<jcdc_jvm::GenericType> = csig
+            .params
+            .iter()
+            .map(|p| jcdc_jvm::GenericType::TypeVar(p.name.clone()))
+            .collect();
+        let mut subst: Vec<(String, jcdc_jvm::GenericType)> = Vec::new();
+        for (a, formal) in args.iter().zip(msig.args.iter()) {
+            let TypeRef::G(ag) = a.type_ref() else {
+                continue;
+            };
+            let inst_formal =
+                crate::method::subst_typevars(formal, &csig.params, &own_syms);
+            unify_types(&inst_formal, &ag, &mut subst);
+        }
+        let resolved: Option<Vec<jcdc_jvm::GenericType>> = csig
+            .params
+            .iter()
+            .map(|p| {
+                subst.iter().find(|(n, _)| *n == p.name).and_then(|(_, g)| {
+                    // A bare TypeVar value naming the own param is the
+                    // caller's same-named typevar (in scope at the new
+                    // site, renders identically); deeper own-param mentions
+                    // mean the slot stayed symbolic.
+                    let ok = match g {
+                        jcdc_jvm::GenericType::Wildcard(_) => false,
+                        jcdc_jvm::GenericType::TypeVar(n) => {
+                            n == &p.name || !g_has_typevar_in(g, &csig.params)
+                        }
+                        other => !g_has_typevar_in(other, &csig.params),
+                    };
+                    if ok {
+                        Some(g.clone())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        let Some(resolved) = resolved else { return };
+        let ncs = jcdc_jvm::ClassSig {
+            package: ncls.rfind('/').map(|i| ncls[..i].to_string()).unwrap_or_default(),
+            parts: vec![jcdc_jvm::ClassSigPart {
+                name: ncls.rsplit('/').next().unwrap_or(ncls).to_string(),
+                args: resolved,
+            }],
+        };
+        *ty = TypeRef::G(jcdc_jvm::GenericType::Class(ncs));
+        let _ = nargs;
+    }
     fn pin(e: &mut Expr, want: &jcdc_jvm::GenericType, pool: &ClassPool) {
         let (ncls, under) = match &*e {
             Expr::New { cls, ty, .. } => {
@@ -14942,10 +15193,15 @@ fn pin_underdetermined_return_diamonds(
             *ty = TypeRef::G(jcdc_jvm::GenericType::Class(ncs));
         }
     }
-    fn rec(s: &mut Stmt, want: &jcdc_jvm::GenericType, pool: &ClassPool) {
+    fn rec(s: &mut Stmt, want: Option<&jcdc_jvm::GenericType>, pool: &ClassPool) {
         match s {
             Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, want, pool)),
-            Stmt::Return(Some(e)) => pin(e, want, pool),
+            Stmt::Return(Some(e)) => {
+                pin_owner_diamond(e, pool);
+                if let Some(w) = want {
+                    pin(e, w, pool);
+                }
+            }
             Stmt::If { then_stmt, else_stmt, .. } => {
                 rec(then_stmt, want, pool);
                 if let Some(x) = else_stmt {
@@ -14983,7 +15239,7 @@ fn pin_underdetermined_return_diamonds(
             _ => {}
         }
     }
-    rec(s, &want, pool);
+    rec(s, want.as_ref(), pool);
 }
 
 fn cast_generic_returns(s: &mut Stmt, want: &TypeRef, pc: &PoolClass, pool: &ClassPool) {
