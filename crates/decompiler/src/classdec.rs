@@ -1053,6 +1053,7 @@ fn emit_class(
                 }
                 fix_lambda_captures(&mut body, &mut mb.vt, pc, pool, fam);
                 restore_enum_switches(&mut body, pc, pool);
+                fold_restart_guards(&mut body);
                 hoist_clinit_returns(&mut body);
                 prune_tail_bare_returns(&mut body);
                 let stmts = stmt_vec(&body);
@@ -1201,6 +1202,7 @@ fn emit_class(
                         inline_anonymous(&mut body, pc, pool, fam, &mb.vt);
                         inline_accessors(&mut body, pc, pool);
                         restore_enum_switches(&mut body, pc, pool);
+                        fold_restart_guards(&mut body);
                         hoist_clinit_returns(&mut body);
                         (body, mb.vt)
                     })
@@ -2847,6 +2849,7 @@ fn emit_method_with(
             // now; retry the return witnesses (idempotent).
             add_return_witnesses(&mut body, msig.as_ref(), pool, pc);
             restore_enum_switches(&mut body, pc, pool);
+            fold_restart_guards(&mut body);
             // Switch restoration reassembles case blocks AFTER the method
             // pipeline: rerun the post-loop label-break prune there (jdk17
             // GregorianCalendar case 2 `L2: do..while; break L2;`) and the
@@ -11131,6 +11134,363 @@ fn witness_methodref_localdef_calls(
     rec(s, vt, pool, pc, caller_params);
 }
 
+/// Fold the desugared GUARDED-PATTERN restart shape back into a `when`
+/// guard (jdk26 DecimalFormat/CompactNumberFormat 此 case 标签由前一个 case
+/// 标签支配 x4). javac compiles `case BigInteger bi when bi.bitLength() < 64
+/// -> body` into a restart-loop case that tests the guard and, on failure,
+/// bumps the typeSwitch state and continues; the restored pattern switch
+/// then carries the SAME type label twice (guarded + unguarded), which
+/// javac rejects. Recognize the shape per case group:
+/// `[T v = (T) sel;]? if (guard) { body } else { [state = N;] continue; }`
+/// and rewrite to `case T v when <guard-with-v>: { body }` — the guard's
+/// references to the binding local become casts of the selector (the
+/// pattern variable is not in scope under its ignoredN label).
+pub(crate) fn fold_restart_guards(s: &mut Stmt) {
+    fn replace_local(e: &mut Expr, var: u32, with: &Expr) {
+        match e {
+            Expr::Local { var: v, .. } if *v == var => {
+                *e = with.clone();
+            }
+            Expr::Cast { e: i, .. } => replace_local(i, var, with),
+            Expr::Cond { c, t, f } => {
+                replace_local(c, var, with);
+                replace_local(t, var, with);
+                replace_local(f, var, with);
+            }
+            Expr::Bin { l, r, .. } => {
+                replace_local(l, var, with);
+                replace_local(r, var, with);
+            }
+            Expr::Un { e: i, .. } => replace_local(i, var, with),
+            Expr::Method { owner, args, .. } => {
+                if let Some(o) = owner {
+                    replace_local(o, var, with);
+                }
+                args.iter_mut().for_each(|a| replace_local(a, var, with));
+            }
+            Expr::Field { owner, .. } => {
+                if let Some(o) = owner {
+                    replace_local(o, var, with);
+                }
+            }
+            Expr::ArrayIndex { array, index } => {
+                replace_local(array, var, with);
+                replace_local(index, var, with);
+            }
+            Expr::InstanceOf { e: i, .. } => replace_local(i, var, with),
+            _ => {}
+        }
+    }
+    // The else arm must be the restart: [int-state assigns...] continue;
+    fn is_restart(st: &Stmt) -> bool {
+        match st {
+            Stmt::Continue(None) => true,
+            Stmt::Block(v) => {
+                !v.is_empty()
+                    && matches!(v.last(), Some(Stmt::Continue(None)))
+                    && v[..v.len() - 1].iter().all(|x| {
+                        matches!(x, Stmt::ExprStmt(Expr::Assign { target, value, .. })
+                            if matches!(&**target, Expr::Local { .. })
+                                && matches!(&**value, Expr::Const(crate::expr::ConstVal::Int(_))))
+                    })
+            }
+            _ => false,
+        }
+    }
+    fn try_fold(c: &mut crate::stmt::CaseGroup) {
+        if c.raw_labels.len() != 1 || c.guard.is_some() {
+            return;
+        }
+        // Split: optional leading binding LocalDef, then the guard If as the
+        // LAST statement of the group.
+        let (bind_idx, if_idx) = match c.body.len() {
+            n if n >= 1 && matches!(c.body[n - 1], Stmt::If { .. }) => {
+                let b = if n >= 2 && matches!(c.body[n - 2], Stmt::LocalDef { .. }) {
+                    Some(n - 2)
+                } else {
+                    None
+                };
+                (b, n - 1)
+            }
+            _ => return,
+        };
+        let (cond, then_box) = {
+            let Stmt::If { cond, then_stmt, else_stmt: Some(els) } = &c.body[if_idx] else { return };
+            if !is_restart(els) {
+                return;
+            }
+            (cond.clone(), then_stmt.clone())
+        };
+        // The binding LocalDef (if any) must be immediately before the If
+        // and initialize from a cast of the switch selector; its local is
+        // what the guard references.
+        let mut guard = cond;
+        if let Some(bi) = bind_idx {
+            if bi + 1 != if_idx {
+                return;
+            }
+            let Stmt::LocalDef { var, init: Some(init), .. } = &c.body[bi] else { return };
+            if !matches!(init, Expr::Cast { .. }) {
+                return;
+            }
+            replace_local(&mut guard, *var, init);
+        }
+        c.guard = Some(guard);
+        // Body becomes the guard-pass branch (minus the binding def and the
+        // If wrapper).
+        let then_stmts = match *then_box {
+            Stmt::Block(v) => v,
+            other => vec![other],
+        };
+        // Keep the binding LocalDef (the body references the local; the
+        // when-guard uses the selector cast since the pattern variable is
+        // bound under the label's ignoredN name).
+        let mut nb: Vec<Stmt> = Vec::new();
+        for (i, st) in c.body.iter().enumerate() {
+            if i == if_idx {
+                continue;
+            }
+            nb.push(st.clone());
+        }
+        nb.extend(then_stmts);
+        c.body = nb;
+    }
+    match s {
+        Stmt::Switch { cases, default, .. } => {
+            for c in cases.iter_mut() {
+                try_fold(c);
+                for st in c.body.iter_mut() {
+                    fold_restart_guards(st);
+                }
+            }
+            if let Some(d) = default {
+                fold_restart_guards(d);
+            }
+        }
+        Stmt::Block(v) => v.iter_mut().for_each(fold_restart_guards),
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            fold_restart_guards(then_stmt);
+            if let Some(e) = else_stmt {
+                fold_restart_guards(e);
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::ForEach { body, .. }
+        | Stmt::Labeled { body, .. }
+        | Stmt::Synchronized { body, .. } => fold_restart_guards(body),
+        Stmt::For { init, body, .. } => {
+            init.iter_mut().for_each(fold_restart_guards);
+            fold_restart_guards(body);
+        }
+        Stmt::Try { body, catches, finally } => {
+            fold_restart_guards(body);
+            for c in catches.iter_mut() {
+                fold_restart_guards(&mut c.body);
+            }
+            if let Some(f) = finally {
+                fold_restart_guards(f);
+            }
+        }
+        Stmt::TryWithResources { resources, body, catches, finally } => {
+            resources.iter_mut().for_each(fold_restart_guards);
+            fold_restart_guards(body);
+            for c in catches.iter_mut() {
+                fold_restart_guards(&mut c.body);
+            }
+            if let Some(f) = finally {
+                fold_restart_guards(f);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Witness a bare generic call from an ALREADY-WITNESSED sibling argument:
+/// the sibling's method-ref unification bound the sibling callee's typevars;
+/// substituting them into the sibling's generic return yields the arg's
+/// instantiated type, which unifies against THIS callee's formal to bind the
+/// leftover typevars the return target left open (jdk26 Gatherers
+/// ofSequential: Integrator.<FixedWindow,TR,List<TR>>ofGreedy types the arg
+/// Greedy<FixedWindow,TR,List<TR>>; the formal Integrator<A,T,R> then binds
+/// A:=FixedWindow, T:=TR, R:=List<TR> — the source's
+/// Gatherer.<TR,FixedWindow,List<TR>>ofSequential). Every callee typevar must
+/// end up bound to a denotable non-wildcard type, and at least one binding
+/// must come from the sibling (otherwise ordinary inference had the
+/// information and pinning could only starve it).
+fn arg_driven_call_witness(
+    cls: &str,
+    name: &str,
+    desc: &jcdc_jvm::MethodDescriptor,
+    args: &[Expr],
+    sib_maps: &[(usize, Vec<(String, jcdc_jvm::GenericType)>)],
+    pool: &ClassPool,
+    caller_params: &[jcdc_jvm::TypeParam],
+) -> Option<Vec<String>> {
+    use jcdc_jvm::GenericType as G;
+    if sib_maps.is_empty() {
+        return None;
+    }
+    let dpc = pool.get(cls)?;
+    let want_desc = format!(
+        "({}){}",
+        desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+        desc.ret.to_descriptor()
+    );
+    let mi = (0..dpc.cf.methods.len())
+        .find(|&i| dpc.method_name(i) == Some(name) && dpc.method_desc(i) == Some(want_desc.as_str()))?;
+    let msig = method_signature_of(&dpc, mi)?;
+    if msig.params.is_empty() {
+        return None;
+    }
+    let mut mapping: Vec<(String, G)> = Vec::new();
+    let mut sibling_bound = false;
+    for (ai, sib_map) in sib_maps {
+        let Expr::Method { cls: scls, name: sname, desc: sdesc, type_args, .. } =
+            args.get(*ai)?
+        else {
+            continue;
+        };
+        if type_args.is_empty() {
+            continue;
+        }
+        // The sibling's generic return, instantiated with its witness.
+        let sdpc = pool.get(scls.as_str())?;
+        let swant = format!(
+            "({}){}",
+            sdesc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+            sdesc.ret.to_descriptor()
+        );
+        let smi = (0..sdpc.cf.methods.len()).find(|&i| {
+            sdpc.method_name(i) == Some(sname.as_str())
+                && sdpc.method_desc(i) == Some(swant.as_str())
+        })?;
+        let smsig = method_signature_of(&sdpc, smi)?;
+        if smsig.params.len() != type_args.len() {
+            continue;
+        }
+        // Bind the sibling callee's typevars from the witness mapping we
+        // computed for it (names align by construction).
+        let inst_ret = crate::method::subst_typevars(&smsig.ret, &smsig.params, &{
+            let vals: Vec<G> = smsig
+                .params
+                .iter()
+                .map(|p| {
+                    sib_map
+                        .iter()
+                        .find(|(n, _)| *n == p.name)
+                        .map(|(_, g)| g.clone())
+                        .unwrap_or(G::TypeVar(p.name.clone()))
+                })
+                .collect();
+            vals
+        });
+        let Some(formal) = msig.args.get(*ai) else { continue };
+        // have = formal (callee-typevar side binds), want = the sibling's
+        // instantiated type. The sibling's return may be a SUBTYPE of the
+        // formal's class (Greedy<A,T,R> extends Integrator<A,T,R>): walk
+        // its supertypes with the carried instantiation first.
+        let mut bound = unify_types(formal, &inst_ret, &mut mapping);
+        if !bound {
+            if let (G::Class(have_cs), G::Class(want_cs)) = (&inst_ret, formal) {
+                let have_internal = crate::method::classsig_internal(have_cs);
+                let want_internal = crate::method::classsig_internal(want_cs);
+                if have_internal != want_internal {
+                    if let Some(hpc) = pool.get(&have_internal) {
+                        let own = have_cs
+                            .parts
+                            .last()
+                            .map(|p| p.args.clone())
+                            .unwrap_or_default();
+                        let mut queue = class_supers_args(&hpc, &own);
+                        let mut seen: HashSet<String> = HashSet::new();
+                        while let Some((sup, sup_args)) = queue.pop() {
+                            if !seen.insert(sup.clone()) {
+                                continue;
+                            }
+                            if sup == want_internal {
+                                let mut sup_cs = want_cs.clone();
+                                if let Some(last) = sup_cs.parts.last_mut() {
+                                    last.args = sup_args;
+                                }
+                                mapping.clear();
+                                bound = unify_types(
+                                    formal,
+                                    &G::Class(sup_cs),
+                                    &mut mapping,
+                                );
+                                break;
+                            }
+                            if let Some(spc) = pool.get(&sup) {
+                                queue.extend(class_supers_args(&spc, &sup_args));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if bound {
+            sibling_bound = true;
+        }
+    }
+    if !sibling_bound {
+        return None;
+    }
+    fn trivial_bound(p: &jcdc_jvm::TypeParam) -> bool {
+        if !p.interface_bounds.is_empty() {
+            return false;
+        }
+        match &p.class_bound {
+            None => true,
+            Some(G::Class(cs)) => {
+                cs.parts.len() == 1 && cs.parts[0].name == "Object" && cs.parts[0].args.is_empty()
+            }
+            Some(G::TypeVar(_)) => false,
+            _ => false,
+        }
+    }
+    let mut out = Vec::with_capacity(msig.params.len());
+    for p in &msig.params {
+        match mapping.iter().find(|(n, _)| n == &p.name) {
+            Some((_, G::Wildcard(_))) => return None,
+            Some((_, G::TypeVar(tn))) => {
+                if !trivial_bound(p) {
+                    let caller_bounded = caller_params
+                        .iter()
+                        .find(|cp| &cp.name == tn)
+                        .map(|cp| !trivial_bound(cp))
+                        .unwrap_or(true);
+                    if !caller_bounded {
+                        return None;
+                    }
+                }
+                out.push(G::TypeVar(tn.clone()).to_java());
+            }
+            Some((_, t)) => {
+                if !trivial_bound(p) {
+                    // Class-typed explicit args must satisfy the declared
+                    // bound; only check the cheap same-class case.
+                    if let (G::Class(tc), Some(G::Class(bc))) = (t, p.class_bound.as_ref().or_else(|| p.interface_bounds.first())) {
+                        let ti = crate::method::classsig_internal(tc);
+                        let bi = crate::method::classsig_internal(bc);
+                        if ti != bi
+                            && !is_subtype_of(pool, &jcdc_jvm::JavaType::Object(ti), &bi)
+                        {
+                            return None;
+                        }
+                    }
+                }
+                out.push(t.to_java());
+            }
+            None => return None,
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
 pub(crate) fn cast_wildcard_call_args(
     s: &mut Stmt,
     pool: &ClassPool,
@@ -11721,6 +12081,7 @@ pub(crate) fn cast_wildcard_call_args(
         // Utf8Entry::stringValue) — the raw methodref leaves the chain
         // Optional<String> and the sibling orElse(BSM_NULL_CONSTANT)
         // fails to convert).
+        let mut pending_ta: Option<Vec<String>> = None;
         if let Expr::Method { cls, name, desc, type_args, args, .. } = e {
             if type_args.is_empty() {
                 if let Some(Expr::Lambda(lam)) = args.first() {
@@ -11729,35 +12090,47 @@ pub(crate) fn cast_wildcard_call_args(
                             if std::env::var("JCDC_DBG_WIT").is_ok() {
                                 eprintln!("INSTTA {}.{} -> {:?}", cls, name, w);
                             }
-                            *type_args = w;
-                        }
-                    }
-                    // UNBOUND instance method ref: the SAM parameter shape
-                    // unifies against the target method's own Signature
-                    // (Integrator.<FixedWindow,TR,List<TR>>ofGreedy(
-                    // FixedWindow::integrate) — jdk26 Gatherers; the source
-                    // witnesses leave no bytecode trace and javac's
-                    // untyped inference dies on the Downstream capture).
-                    // method_ref_type_args binds every callee typevar to a
-                    // denotable non-wildcard type or bails, so the witness
-                    // is exactly the one javac recorded.
-                    // ref_receiver carries the CLASS name for the unbound
-                    // `X::y` form (the printer renders it); the bound form
-                    // carries captures[0] instead — captures.is_empty() is
-                    // the unbound check.
-                    if type_args.is_empty()
-                        && lam.kind == crate::expr::LambdaKind::MethodRef
-                        && !lam.impl_is_static
-                        && lam.captures.is_empty()
-                    {
-                        if let Some(w) = method_ref_type_args(cls, name, desc, lam, pool) {
-                            if std::env::var("JCDC_DBG_WIT").is_ok() {
-                                eprintln!("REFTA {}.{} -> {:?}", cls, name, w);
-                            }
-                            *type_args = w;
+                            pending_ta = Some(w);
                         }
                     }
                 }
+                // UNBOUND instance method ref in ANY argument position: the
+                // SAM parameter shape unifies against the target method's
+                // own Signature (Integrator.<FixedWindow,TR,List<TR>>
+                // ofGreedy(FixedWindow::integrate) — jdk26 Gatherers; the
+                // source witnesses leave no bytecode trace and javac's
+                // untyped inference dies on the Downstream capture).
+                // method_ref_type_args binds every callee typevar to a
+                // denotable non-wildcard type or bails, so the witness is
+                // exactly the one javac recorded. ref_receiver carries the
+                // CLASS name for the unbound `X::y` form (the printer
+                // renders it); the bound form carries captures[0] instead —
+                // captures.is_empty() is the unbound check.
+                if pending_ta.is_none() {
+                    for a in args.iter() {
+                        let Expr::Lambda(lam) = a else { continue };
+                        if lam.kind != crate::expr::LambdaKind::MethodRef
+                            || lam.impl_is_static
+                            || !lam.captures.is_empty()
+                        {
+                            continue;
+                        }
+                        if let Some((w, _mapping)) =
+                            method_ref_type_args(cls, name, desc, lam, pool)
+                        {
+                            if std::env::var("JCDC_DBG_WIT").is_ok() {
+                                eprintln!("REFTA {}.{} -> {:?}", cls, name, w);
+                            }
+                            pending_ta = Some(w);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(w) = pending_ta {
+            if let Expr::Method { type_args, .. } = e {
+                *type_args = w;
             }
         }
         if params.is_none() && !matches!(e, Expr::New { .. }) {
@@ -11773,6 +12146,68 @@ pub(crate) fn cast_wildcard_call_args(
             }
         }
         walk_expr_children(e, pool, pc, &mut |x, p2, c2| fix_expr(x, p2, c2, caller_params));
+        // Arg-driven witness, POST-children: a bare generic call whose
+        // sibling call args now carry method-ref witnesses gets its own
+        // leftover typevars pinned from the sibling's instantiated return
+        // (jdk26 Gatherers ofSequential — the source carries
+        // Gatherer.<TR,FixedWindow,List<TR>>ofSequential around the
+        // witnessed Integrator.<FixedWindow,TR,List<TR>>ofGreedy; without
+        // it the finisher ref faces an unresolved inference variable:
+        // "Downstream<CAP#1>无法转换为Downstream<? super List<TR>>").
+        if let Expr::Method { cls, name, desc, type_args, args, .. } = &*e {
+            if type_args.is_empty() {
+                let mut sib_maps: Vec<(usize, Vec<(String, jcdc_jvm::GenericType)>)> =
+                    Vec::new();
+                for (ai, a) in args.iter().enumerate() {
+                    let Expr::Method {
+                        cls: scls,
+                        name: sname,
+                        desc: sdesc,
+                        type_args: sta,
+                        args: sargs,
+                        ..
+                    } = a
+                    else {
+                        continue;
+                    };
+                    if sta.is_empty() {
+                        continue;
+                    }
+                    // Re-derive the sibling's witness mapping from its own
+                    // unbound method-ref arg (deterministic; the sibling's
+                    // type_args were set by the pass above).
+                    for sa in sargs.iter() {
+                        let Expr::Lambda(lam) = sa else { continue };
+                        if lam.kind != crate::expr::LambdaKind::MethodRef
+                            || lam.impl_is_static
+                            || !lam.captures.is_empty()
+                        {
+                            continue;
+                        }
+                        if let Some((_, mapping)) =
+                            method_ref_type_args(scls, sname, sdesc, lam, pool)
+                        {
+                            if !mapping.is_empty() {
+                                sib_maps.push((ai, mapping));
+                            }
+                        }
+                        break;
+                    }
+                }
+                if !sib_maps.is_empty() {
+                    if let Some(w) = arg_driven_call_witness(
+                        cls, name, desc, args, &sib_maps, pool, caller_params,
+                    ) {
+                        if std::env::var("JCDC_DBG_WIT").is_ok() {
+                            eprintln!("ARGWIT {}.{} -> {:?}", cls, name, w);
+                        }
+                        if let Expr::Method { type_args, .. } = e {
+                            *type_args = w;
+                        }
+                    }
+                }
+            }
+        }
     }
     fix_diamond_localdefs(s, vt, pool, pc);
     walk_stmt_exprs(s, pool, pc, &mut |x, p2, c2| fix_expr(x, p2, c2, caller_params));
@@ -12656,10 +13091,10 @@ fn method_ref_type_args(
     desc: &jcdc_jvm::MethodDescriptor,
     lam: &crate::expr::LambdaExpr,
     pool: &ClassPool,
-) -> Option<Vec<String>> {
+) -> Option<(Vec<String>, Vec<(String, jcdc_jvm::GenericType)>)> {
     use jcdc_jvm::GenericType as G;
     if let Some(w) = method_ref_inst_type_args(cls, name, desc, lam, pool) {
-        return Some(w);
+        return Some((w, Vec::new()));
     }
     let (msig, tvar_names, sam_cs, sam_msig, sam_cls_params, inst_args) =
         method_ref_common(cls, name, desc, lam, pool)?;
@@ -12725,7 +13160,7 @@ fn method_ref_type_args(
             None => return None,
         }
     }
-    Some(out)
+    Some((out, mapping))
 }
 
 fn method_signature_of(pc: &PoolClass, mi: usize) -> Option<jcdc_jvm::MethodSignature> {
@@ -13153,7 +13588,7 @@ pub(crate) fn witness_comparison_operands(
                         continue;
                     }
                     let Some(Expr::Lambda(lam)) = args.first() else { continue };
-                    if let Some(w) = method_ref_type_args(cls, name, desc, lam, pool) {
+                    if let Some((w, _)) = method_ref_type_args(cls, name, desc, lam, pool) {
                         apply = Some((idx == 0, w));
                         break;
                     }

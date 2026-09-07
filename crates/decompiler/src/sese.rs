@@ -410,6 +410,38 @@ impl<'a> Structurer<'a> {
         best
     }
 
+    /// True when `cur` (a stop member) flows through single-successor
+    /// blocks to an already-consumed terminator: the chain is safe to
+    /// copy here because its endpoint was structured elsewhere and the
+    /// copy is this path's sole continuation.
+    fn sese_stop_chain_to_claimed_terminator(
+        &self,
+        cur: usize,
+        stop: &HashSet<usize>,
+        ctx: &SeseCtx,
+    ) -> bool {
+        let mut x = cur;
+        for _ in 0..8 {
+            if matches!(self.results[x].term, Term::Return(_) | Term::Throw(_)) {
+                return ctx.consumed.contains(&x);
+            }
+            if !matches!(self.results[x].term, Term::Fallthrough | Term::Goto) {
+                return false;
+            }
+            let succs = &self.cfg.blocks[x].succ;
+            if succs.len() != 1 {
+                return false;
+            }
+            let n = succs[0];
+            if n == x || ctx.loop_stack.contains(&n) {
+                return false;
+            }
+            let _ = stop;
+            x = n;
+        }
+        false
+    }
+
     fn reaches_within(&self, ctx: &SeseCtx, from: usize, target: usize, stop: &HashSet<usize>) -> bool {
         if from == target {
             return true;
@@ -582,8 +614,37 @@ impl<'a> Structurer<'a> {
                             }
                         }
                     }
-                } else if !parts.is_empty() {
-                    parts.push(Region::Goto { target: cur });
+                } else if !stop.contains(&cur)
+                    || !self.sese_stop_chain_to_claimed_terminator(cur, stop, ctx)
+                {
+                    if !parts.is_empty() {
+                        parts.push(Region::Goto { target: cur });
+                    }
+                } else {
+                    // A stop member whose forward flow is a single-succ chain
+                    // into an ALREADY-CONSUMED terminator: copy the chain
+                    // inline. The restart-loop switch (jdk26 DecimalFormat
+                    // guarded typeSwitch): the guard-pass body is a loop exit
+                    // that flows ONLY to the shared areturn every case region
+                    // absorbed — `break L1` would land after the loop where
+                    // nothing remains and the body is lost. Normal loop exits
+                    // chain to UNCLAIMED continuations and keep the Goto
+                    // (inlining those rewrote breaks into returns and
+                    // degraded while-cond loops, ThreadPoolExecutor).
+                    let mut cstop: HashSet<usize> = stop.iter().copied().collect();
+                    for &u in ctx.universe.iter() {
+                        if !reach.contains(&u) {
+                            cstop.insert(u);
+                        }
+                    }
+                    match self.copy_walk(cur, &cstop, &ctx.top_groups, usize::MAX) {
+                        Some(r) => parts.push(r),
+                        None => {
+                            if !parts.is_empty() {
+                                parts.push(Region::Goto { target: cur });
+                            }
+                        }
+                    }
                 }
                 break;
             }
@@ -826,6 +887,26 @@ impl<'a> Structurer<'a> {
                 parts.push(Region::Loop { header, body: Box::new(body), members, exits: exits.clone() });
                 // Continue after the loop at the header's natural exit (if it
                 // is within this region's reach and not an enclosing stop).
+                // A consumed candidate whose preds are ALL the header can
+                // only have been emitted INSIDE the body (the header's
+                // switch/if dispatched it — the restart loop's natural exits
+                // ARE the case targets); hoisting it re-emits the first
+                // case's body after the loop (jdk26 DecimalFormat
+                // `Long l = ...` tail). A consumed candidate with other
+                // preds is the genuine shared follow (Class.methodToString
+                // `if (c) return X; else { loop }`) and keeps the loop-top
+                // consumed policy below.
+                let header_id = cur;
+                let natural_follow = natural_follow
+                    .into_iter()
+                    .filter(|f| {
+                        !ctx.consumed.contains(f)
+                            || !self.cfg.blocks[*f]
+                                .pred
+                                .iter()
+                                .all(|&p| p == header_id)
+                    })
+                    .collect::<Vec<_>>();
                 match natural_follow.first().copied() {
                     // No `!consumed` gate: a follow already consumed by a
                     // sibling branch (the shared single-return block after
@@ -935,7 +1016,11 @@ impl<'a> Structurer<'a> {
                         ternary,
                     });
                     match follow {
-                        Some(f) if reach.contains(&f) => {
+                        // A follow already consumed by the case regions (the
+                        // shared terminator tail each case absorbed/duplicated)
+                        // must not continue here — that would re-emit it after
+                        // the switch.
+                        Some(f) if reach.contains(&f) && !ctx.consumed.contains(&f) => {
                             cur = f;
                             last_via_goto = false;
                             continue;

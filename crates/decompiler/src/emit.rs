@@ -485,8 +485,24 @@ impl<'a> Printer<'a> {
                     for l in &c.enum_labels {
                         self.line(&format!("case {}:", l));
                     }
-                    for l in &c.raw_labels {
-                        self.line(&format!("case {}:", l));
+                    if let Some(g) = &c.guard {
+                        // Folded pattern guard: the desugared restart shape
+                        // (`if (guard) body else { state=N; continue; }`)
+                        // restored to `case T v when guard:` (jdk26
+                        // DecimalFormat — duplicate type-pattern labels are
+                        // "此 case 标签由前一个 case 标签支配" without it).
+                        for l in &c.raw_labels {
+                            let mut line = format!("case {} when ", l);
+                            let mut gtxt = String::new();
+                            self.expr(g, 1, &mut gtxt);
+                            line.push_str(&gtxt);
+                            line.push(':');
+                            self.line(&line);
+                        }
+                    } else {
+                        for l in &c.raw_labels {
+                            self.line(&format!("case {}:", l));
+                        }
                     }
                     for l in &c.labels {
                         self.line(&format!("case {}:", l));
@@ -1748,6 +1764,7 @@ impl<'a> Printer<'a> {
                             }
                         }
                         crate::classdec::restore_enum_switches(&mut body, self.pc, self.pool);
+                        crate::classdec::fold_restart_guards(&mut body);
                         // Nested calls inside lambda bodies need the same
                         // overload-disambiguation/instantiation witnesses
                         // as top-level method bodies (BootstrapLogger

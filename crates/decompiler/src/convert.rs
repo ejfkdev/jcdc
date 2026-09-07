@@ -257,6 +257,7 @@ impl<'a> Converter<'a> {
                         string_labels: vec![],
                         enum_labels: vec![],
                         raw_labels: vec![],
+                        guard: None,
                         body: stmt_to_vec(s),
                     });
                 }

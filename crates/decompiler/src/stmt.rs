@@ -113,6 +113,10 @@ pub struct CaseGroup {
     /// Verbatim case labels (`null`, type patterns) from typeSwitch
     /// restoration.
     pub raw_labels: Vec<String>,
+    /// Pattern guard (`case T v when GUARD:`) folded from the desugared
+    /// restart shape (guarded typeSwitch: `if (guard) body else
+    /// {state=N; continue;}`). Printed after the raw label.
+    pub guard: Option<crate::expr::Expr>,
     pub body: Vec<Stmt>,
 }
 

@@ -1095,8 +1095,25 @@ impl<'a> Structurer<'a> {
                         // The "follow" is an enclosing barrier (loop exit):
                         // the branch is a jump out, not a fallthrough.
                         // Terminator exits stay Empty — the return/throw is
-                        // emitted after the loop.
-                        Region::Goto { target: taken }
+                        // emitted after the loop. UNLESS the exit chains into
+                        // an already-claimed terminator (restart-loop guarded
+                        // case: breaking lands after the loop where nothing
+                        // remains; jdk26 DecimalFormat case 6).
+                        if !self.loops_stack.contains(&taken)
+                            && self.stop_chain_to_claimed_terminator(taken, claimed)
+                        {
+                            // `taken` is the if-follow and sits in bstop;
+                            // copy_walk's reachable_within would exclude the
+                            // entry itself — lift it for the copy.
+                            let mut cstop = bstop.clone();
+                            cstop.remove(&taken);
+                            match self.copy_walk(taken, &cstop, active, cur) {
+                                Some(r) => r,
+                                None => Region::Goto { target: taken },
+                            }
+                        } else {
+                            Region::Goto { target: taken }
+                        }
                     } else if let Some(absorbed) = self.absorb_pure(taken, universe, &bstop, claimed) {
                         absorbed
                     } else if universe.contains(&taken)
@@ -1132,8 +1149,23 @@ impl<'a> Structurer<'a> {
                         } else if stop.contains(&taken) && !self.is_terminator_block(taken) {
                             // Jump to an enclosing loop's exit (or other
                             // barrier): keep it as a Goto so conversion
-                            // resolves it to `break`.
-                            Region::Goto { target: taken }
+                            // resolves it to `break` — UNLESS the exit chains
+                            // into an already-claimed terminator (the
+                            // restart-loop guarded case: breaking would land
+                            // after the loop where nothing remains and the
+                            // body is lost; jdk26 DecimalFormat case 6).
+                            if !self.loops_stack.contains(&taken)
+                                && self.stop_chain_to_claimed_terminator(taken, claimed)
+                            {
+                                let mut cstop = bstop.clone();
+                                cstop.remove(&taken);
+                                match self.copy_walk(taken, &cstop, active, cur) {
+                                    Some(r) => r,
+                                    None => Region::Goto { target: taken },
+                                }
+                            } else {
+                                Region::Goto { target: taken }
+                            }
                         } else {
                             Region::Empty
                         }
@@ -1150,8 +1182,20 @@ impl<'a> Structurer<'a> {
                         // The "follow" is an enclosing barrier (loop exit):
                         // the branch is a jump out, not a fallthrough.
                         // Terminator exits stay Empty — the return/throw is
-                        // emitted after the loop.
-                        Region::Goto { target: fall }
+                        // emitted after the loop. See the taken side for the
+                        // claimed-terminator-chain exception.
+                        if !self.loops_stack.contains(&fall)
+                            && self.stop_chain_to_claimed_terminator(fall, claimed)
+                        {
+                            let mut cstop = bstop.clone();
+                            cstop.remove(&fall);
+                            match self.copy_walk(fall, &cstop, active, cur) {
+                                Some(r) => r,
+                                None => Region::Goto { target: fall },
+                            }
+                        } else {
+                            Region::Goto { target: fall }
+                        }
                     } else if let Some(absorbed) = self.absorb_pure(fall, universe, &bstop, claimed) {
                         absorbed
                     } else if universe.contains(&fall)
@@ -1191,8 +1235,21 @@ impl<'a> Structurer<'a> {
                     } else if stop.contains(&fall) && !self.is_terminator_block(fall) {
                         // Jump to an enclosing loop's exit (or other
                         // barrier): keep it as a Goto so conversion
-                        // resolves it to `break`.
-                        Region::Goto { target: fall }
+                        // resolves it to `break` — unless the exit chains
+                        // into an already-claimed terminator (see the
+                        // taken side; jdk26 DecimalFormat guarded case).
+                        if !self.loops_stack.contains(&fall)
+                            && self.stop_chain_to_claimed_terminator(fall, claimed)
+                        {
+                            let mut cstop = bstop.clone();
+                            cstop.remove(&fall);
+                            match self.copy_walk(fall, &cstop, active, cur) {
+                                Some(r) => r,
+                                None => Region::Goto { target: fall },
+                            }
+                        } else {
+                            Region::Goto { target: fall }
+                        }
                     } else {
                         if std::env::var("JCDC_DBG_IF").is_ok() {
                             eprintln!(
@@ -1510,6 +1567,36 @@ impl<'a> Structurer<'a> {
             }
         }
         if saw_live { common } else { None }
+    }
+
+    /// True when `cur` flows through single-successor blocks to an
+    /// already-claimed terminator: the chain is safe to copy inline because
+    /// its endpoint was structured elsewhere (the restart-loop switch: the
+    /// guard-pass body flows ONLY to the shared areturn every case region
+    /// absorbed) and the copy is this path's sole continuation. Normal loop
+    /// exits chain to UNCLAIMED continuations (the post-loop follow) and
+    /// must stay jumps — inlining those rewrites breaks into returns and
+    /// degrades while-cond loops (jdk26 ThreadPoolExecutor regression).
+    fn stop_chain_to_claimed_terminator(&self, cur: usize, claimed: &HashSet<usize>) -> bool {
+        let mut x = cur;
+        for _ in 0..8 {
+            if matches!(self.results[x].term, Term::Return(_) | Term::Throw(_)) {
+                return claimed.contains(&x);
+            }
+            if !matches!(self.results[x].term, Term::Fallthrough | Term::Goto) {
+                return false;
+            }
+            let succs = &self.cfg.blocks[x].succ;
+            if succs.len() != 1 {
+                return false;
+            }
+            let n = succs[0];
+            if n == x || self.loops_stack.contains(&n) {
+                return false;
+            }
+            x = n;
+        }
+        false
     }
 
     fn switch_follow(&self, cur: usize, universe: &HashSet<usize>) -> Option<usize> {
