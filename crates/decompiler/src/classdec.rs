@@ -8697,6 +8697,87 @@ fn add_throw_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, p
 /// generic and `e` carries only the erased type.
 /// Resolve the generic parameter types of a method call as instantiated by
 /// the owner expression's parameterization. Returns None when unresolvable.
+/// Direct supers of `pcls` as (internal name, type arguments), with the
+/// class's own typevars substituted by `self_args`. Signature-driven when
+/// present (parameterized supers); erased fallback otherwise.
+fn class_supers_args(
+    pcls: &PoolClass,
+    self_args: &[jcdc_jvm::GenericType],
+) -> Vec<(String, Vec<jcdc_jvm::GenericType>)> {
+    let sig = pcls.class_attr("Signature").and_then(|b| {
+        if b.len() >= 2 {
+            pcls.utf8(u16::from_be_bytes([b[0], b[1]]))
+                .and_then(|x| parse_class_signature(x))
+        } else {
+            None
+        }
+    });
+    let mut out: Vec<(String, Vec<jcdc_jvm::GenericType>)> = Vec::new();
+    if let Some(sig) = sig {
+        let self_params = sig.params.clone();
+        let mut candidates: Vec<jcdc_jvm::GenericType> = vec![sig.superclass.clone()];
+        candidates.extend(sig.interfaces.iter().cloned());
+        for cand in candidates {
+            if let jcdc_jvm::GenericType::Class(cs) = &cand {
+                let internal = crate::method::classsig_internal(cs);
+                let args: Vec<jcdc_jvm::GenericType> = cs
+                    .parts
+                    .last()
+                    .map(|p| {
+                        p.args
+                            .iter()
+                            .map(|a| {
+                                crate::method::subst_typevars(a, &self_params, self_args)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                out.push((internal, args));
+            }
+        }
+    }
+    if out.is_empty() {
+        if let Some(sn) = pcls.super_name() {
+            out.push((sn.to_string(), Vec::new()));
+        }
+        for i in pcls.interface_names() {
+            out.push((i.to_string(), Vec::new()));
+        }
+    }
+    out
+}
+
+/// The type arguments a superclass/superinterface `target` receives in
+/// `pc`'s declaration (pc's own typevars passed through as TypeVars).
+fn supertype_instantiation(
+    pc: &PoolClass,
+    target: &str,
+    pool: &ClassPool,
+) -> Option<Vec<jcdc_jvm::GenericType>> {
+    let self_args: Vec<jcdc_jvm::GenericType> = pc
+        .class_attr("Signature")
+        .and_then(|b| {
+            if b.len() >= 2 {
+                pc.utf8(u16::from_be_bytes([b[0], b[1]]))
+                    .and_then(|x| parse_class_signature(x))
+            } else {
+                None
+            }
+        })
+        .map(|sig| {
+            sig.params
+                .iter()
+                .map(|p| jcdc_jvm::GenericType::TypeVar(p.name.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let _ = pool;
+    class_supers_args(pc, &self_args)
+        .into_iter()
+        .find(|(n, _)| n == target)
+        .map(|(_, a)| a)
+}
+
 fn instantiated_method_params(
     m: &Expr,
     pool: &ClassPool,
@@ -8723,24 +8804,39 @@ fn instantiated_method_params(
                         (crate::method::classsig_internal(&cs), cs.parts.last()?.args.clone())
                     }
                     _ => {
-                        // implicit `this` or erased owner: the enclosing class
-                        let cs = pc.class_attr("Signature").and_then(|b| {
-                            if b.len() < 2 {
-                                return None;
+                        // Inherited generic method on an implicit `this`:
+                        // the methodref names the DECLARING supertype
+                        // (FindSink.accept(T) from OfDouble) — instantiate
+                        // its params through pc's supertype signature so
+                        // apply_param_casts can restore the source-level
+                        // `accept((Double) value)` cast that disambiguates
+                        // it from the primitive overloads.
+                        if cls != pc.internal_name {
+                            if let Some(inst) = supertype_instantiation(pc, cls, pool) {
+                                (cls.to_string(), inst)
+                            } else {
+                                (cls.to_string(), Vec::new())
                             }
-                            let idx = u16::from_be_bytes([b[0], b[1]]);
-                            pc.utf8(idx).and_then(|s| jcdc_jvm::parse_class_signature(s))
-                        });
-                        let args = cs
-                            .as_ref()
-                            .map(|c| {
-                                c.params
-                                    .iter()
-                                    .map(|p| jcdc_jvm::GenericType::TypeVar(p.name.clone()))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        (pc.internal_name.clone(), args)
+                        } else {
+                            // implicit `this` or erased owner: the enclosing class
+                            let cs = pc.class_attr("Signature").and_then(|b| {
+                                if b.len() < 2 {
+                                    return None;
+                                }
+                                let idx = u16::from_be_bytes([b[0], b[1]]);
+                                pc.utf8(idx).and_then(|s| jcdc_jvm::parse_class_signature(s))
+                            });
+                            let args = cs
+                                .as_ref()
+                                .map(|c| {
+                                    c.params
+                                        .iter()
+                                        .map(|p| jcdc_jvm::GenericType::TypeVar(p.name.clone()))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            (pc.internal_name.clone(), args)
+                        }
                     }
                 }
             }
@@ -8755,28 +8851,66 @@ fn instantiated_method_params(
             },
         }
     };
-    let dpc;
-    let dref: &PoolClass = if decl == pc.internal_name {
-        pc
-    } else {
-        dpc = pool.get(&decl)?;
-        &dpc
-    };
     let d_str = format!(
         "({}){}",
         desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
         desc.ret.to_descriptor()
     );
-    let _ = &d_str;
-    let mi = (0..dref.cf.methods.len()).find(|&i| {
-        dref.method_name(i) == Some(name) && dref.method_desc(i) == Some(desc_raw(dref, i).as_str())
-            && desc_raw(dref, i) == {
-                let mut a = String::new();
-                for t in &desc.args {
-                    a.push_str(&t.to_descriptor());
+    // Resolve the declaring class. The methodref owner names the RECEIVER
+    // class even for inherited methods (OfDouble.accept:(Object)V is
+    // declared as Sink<T>.accept(T)) — BFS down the super chain, carrying
+    // each hop's type arguments, until a class actually declares
+    // name+d_str with a usable Signature.
+    let mut queue: std::collections::VecDeque<(String, Vec<jcdc_jvm::GenericType>)> =
+        std::collections::VecDeque::new();
+    queue.push_back((decl.clone(), args.clone()));
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(decl.clone());
+    let mut resolved: Option<(String, Vec<jcdc_jvm::GenericType>)> = None;
+    let mut hops = 0usize;
+    while let Some((cur, cur_args)) = queue.pop_front() {
+        hops += 1;
+        if hops > 24 {
+            break;
+        }
+        let owned;
+        let cref: &PoolClass = if cur == pc.internal_name {
+            pc
+        } else {
+            match pool.get(&cur) {
+                Some(p) => {
+                    owned = p;
+                    &owned
                 }
-                format!("({}){}", a, desc.ret.to_descriptor())
+                None => continue,
             }
+        };
+        let declares = (0..cref.cf.methods.len()).any(|i| {
+            cref.method_name(i) == Some(name) && desc_raw(cref, i) == d_str
+                && cref.cf.methods[i].attributes.iter().any(|a| {
+                    cref.utf8(a.attribute_name_index) == Some("Signature")
+                })
+        });
+        if declares {
+            resolved = Some((cur, cur_args));
+            break;
+        }
+        for (sn, sargs) in class_supers_args(cref, &cur_args) {
+            if seen.insert(sn.clone()) {
+                queue.push_back((sn, sargs));
+            }
+        }
+    }
+    let (dclass, dargs) = resolved?;
+    let dpc;
+    let dref: &PoolClass = if dclass == pc.internal_name {
+        pc
+    } else {
+        dpc = pool.get(&dclass)?;
+        &dpc
+    };
+    let mi = (0..dref.cf.methods.len()).find(|&i| {
+        dref.method_name(i) == Some(name) && desc_raw(dref, i) == d_str
     })?;
     let sig_bytes = dref.cf.methods[mi].attributes.iter().find_map(|a| {
         if dref.utf8(a.attribute_name_index) == Some("Signature") {
@@ -8802,13 +8936,13 @@ fn instantiated_method_params(
         let i2 = u16::from_be_bytes([b[0], b[1]]);
         dref.utf8(i2).and_then(|s| jcdc_jvm::parse_class_signature(s))
     })?;
-    if class_params.params.len() != args.len() {
+    if class_params.params.len() != dargs.len() {
         return None;
     }
     let inst: Vec<jcdc_jvm::GenericType> = msig
         .args
         .iter()
-        .map(|t| crate::method::subst_typevars(t, &class_params.params, &args))
+        .map(|t| crate::method::subst_typevars(t, &class_params.params, &dargs))
         .collect();
     // Captured owner arguments can nest wildcards, which is not valid Java.
     if inst.iter().any(crate::method::has_nested_wildcard) {
@@ -9292,8 +9426,25 @@ fn disambiguate_overload_args(e: &mut Expr, pool: &ClassPool) {
 
 fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass, vt: &crate::varalloc::VarTable) {
     fn fix_expr(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
-        disambiguate_overload_args(e, pool);
         let params = instantiated_method_params(e, pool, pc);
+        // An Object descriptor param that instantiates to something else is
+        // the ERASURE of a generic parameter (accept(T) → (Object)V), not
+        // a source-level overload — disambiguate_overload_args would cast
+        // the arg to `(Object)`, a method that does not exist at source
+        // level (FindOps.FindSink.OfDouble.accept).
+        let erased_generic_param = match (&params, &*e) {
+            (Some(ps), Expr::Method { desc, .. }) => {
+                ps.iter().zip(desc.args.iter()).any(|(p, d)| {
+                    matches!(d, jcdc_jvm::JavaType::Object(n) if n == "java/lang/Object")
+                        && !matches!(p, jcdc_jvm::GenericType::Class(cs)
+                            if crate::method::classsig_internal(cs) == "java/lang/Object")
+                })
+            }
+            _ => false,
+        };
+        if !erased_generic_param {
+            disambiguate_overload_args(e, pool);
+        }
         if params.is_none() && !matches!(e, Expr::New { .. }) {
             raw_witness_generic_method_args(e, pool, pc);
         }
