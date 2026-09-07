@@ -10574,7 +10574,51 @@ pub(crate) fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolC
 /// Object against T and javac gives up: "cannot infer type arguments
 /// for Entry<>").
 fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &ClassPool) {
-    fn inst_from(ty: &TypeRef, value: &Expr) -> Option<(String, Vec<jcdc_jvm::GenericType>, usize)> {
+    /// Structural unification of a supertype-arg PATTERN (over the newed
+    /// class's own typevars) against the local's CONCRETE type arg.
+    fn unify_g(
+        pattern: &jcdc_jvm::GenericType,
+        concrete: &jcdc_jvm::GenericType,
+        subst: &mut HashMap<String, jcdc_jvm::GenericType>,
+    ) -> bool {
+        use jcdc_jvm::GenericType as G;
+        match (pattern, concrete) {
+            (G::TypeVar(n), _) => match subst.get(n) {
+                Some(prev) => prev == concrete,
+                None => {
+                    subst.insert(n.clone(), concrete.clone());
+                    true
+                }
+            },
+            (G::Class(p), G::Class(c)) => {
+                crate::method::classsig_internal(p) == crate::method::classsig_internal(c)
+                    && p.parts.len() == c.parts.len()
+                    && p.parts.iter().zip(c.parts.iter()).all(|(pp, cp)| {
+                        pp.args.len() == cp.args.len()
+                            && pp.args
+                                .iter()
+                                .zip(cp.args.iter())
+                                .all(|(a, b)| unify_g(a, b, subst))
+                    })
+            }
+            (G::Array(pi), G::Array(ci)) => unify_g(pi, ci, subst),
+            (
+                G::Wildcard(jcdc_jvm::WildcardBound::Extends(pt)),
+                G::Wildcard(jcdc_jvm::WildcardBound::Extends(ct)),
+            )
+            | (
+                G::Wildcard(jcdc_jvm::WildcardBound::Super(pt)),
+                G::Wildcard(jcdc_jvm::WildcardBound::Super(ct)),
+            ) => unify_g(pt, ct, subst),
+            (G::Primitive(a), G::Primitive(b)) => a == b,
+            _ => false,
+        }
+    }
+    fn inst_from(
+        ty: &TypeRef,
+        value: &Expr,
+        pool: &ClassPool,
+    ) -> Option<(String, Vec<jcdc_jvm::GenericType>, usize)> {
         let (cls, args) = match value {
             Expr::New { cls, args, .. } => (cls, args),
             Expr::Cast { e, .. } => match &**e {
@@ -10589,14 +10633,70 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
             Expr::Cast { ty: t @ TypeRef::G(_), .. } => t.clone(),
             _ => ty.clone(),
         };
-        match &inst_ty {
-            TypeRef::G(jcdc_jvm::GenericType::Class(cs)) => cs
-                .parts
-                .last()
-                .filter(|p| !p.args.is_empty())
-                .map(|p| (cls.clone(), p.args.clone(), args.len())),
-            _ => None,
+        let cs = match &inst_ty {
+            TypeRef::G(jcdc_jvm::GenericType::Class(cs)) => cs,
+            _ => return None,
+        };
+        let last = cs.parts.last().filter(|p| !p.args.is_empty())?;
+        let ty_internal = crate::method::classsig_internal(cs);
+        if ty_internal == *cls {
+            return Some((cls.clone(), last.args.clone(), args.len()));
         }
+        // Diamond against a SUPERTYPE-typed local (`Spliterator<Provider
+        // <S>> s = new ProviderSpliterator<>(it)`): the local's args are
+        // the INTERFACE's, not the newed class's own — feeding them
+        // straight into ProviderSpliterator<T>'s ctor formals substituted
+        // T := Provider<S> and cast the arg to Iterator<Provider<Provider
+        // <S>>> (Iterator<Provider<S>>无法转换为..., jdk11 ServiceLoader
+        // x2 per tree). Resolve the class's own args by unifying its
+        // declared supertype instantiation (with own typevars symbolic)
+        // against the local's concrete type.
+        let cpc = pool.get(cls)?;
+        let own_params: Vec<String> = cpc
+            .class_attr("Signature")
+            .and_then(|b| {
+                if b.len() < 2 {
+                    return None;
+                }
+                cpc.utf8(u16::from_be_bytes([b[0], b[1]]))
+                    .and_then(|x| parse_class_signature(x))
+            })
+            .map(|sig| sig.params.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default();
+        if own_params.is_empty() {
+            return None;
+        }
+        let self_args: Vec<jcdc_jvm::GenericType> = own_params
+            .iter()
+            .map(|n| jcdc_jvm::GenericType::TypeVar(n.clone()))
+            .collect();
+        let mut queue = class_supers_args(&cpc, &self_args);
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some((sup, sup_args)) = queue.pop() {
+            if !seen.insert(sup.clone()) {
+                continue;
+            }
+            if sup == ty_internal {
+                if sup_args.len() != last.args.len() {
+                    return None;
+                }
+                let mut subst: HashMap<String, jcdc_jvm::GenericType> = HashMap::new();
+                let ok = sup_args
+                    .iter()
+                    .zip(last.args.iter())
+                    .all(|(p, c)| unify_g(p, c, &mut subst));
+                if !ok {
+                    return None;
+                }
+                let resolved: Option<Vec<jcdc_jvm::GenericType>> =
+                    own_params.iter().map(|n| subst.get(n).cloned()).collect();
+                return resolved.map(|r| (cls.clone(), r, args.len()));
+            }
+            if let Some(spc) = pool.get(&sup) {
+                queue.extend(class_supers_args(&spc, &sup_args));
+            }
+        }
+        None
     }
     fn apply_to_value(value: &mut Expr, params: &[jcdc_jvm::GenericType], pool: &ClassPool) {
         match value {
@@ -10611,7 +10711,7 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
     }
     match s {
         Stmt::LocalDef { var, init: Some(value), .. } => {
-            if let Some((cls, iargs, n)) = inst_from(&vt.var(*var).ty, value) {
+            if let Some((cls, iargs, n)) = inst_from(&vt.var(*var).ty, value, pool) {
                 if let Some(params) = instantiated_ctor_params_core(&cls, &iargs, n, pool) {
                     if let Stmt::LocalDef { init: Some(v), .. } = s {
                         apply_to_value(v, &params, pool);
@@ -10624,7 +10724,7 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
         Stmt::ExprStmt(inner) => {
             let target = match &*inner {
                 Expr::Assign { target, value, .. } => match &**target {
-                    Expr::Local { var, .. } => inst_from(&vt.var(*var).ty, value),
+                    Expr::Local { var, .. } => inst_from(&vt.var(*var).ty, value, pool),
                     _ => None,
                 },
                 _ => None,
