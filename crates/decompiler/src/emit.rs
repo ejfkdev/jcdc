@@ -876,6 +876,18 @@ impl<'a> Printer<'a> {
                         if matches!(o.as_ref(), Expr::Raw(t) if t == "\u{3}") {
                             // Outer anonymous member call: unqualified
                             // lexical resolution.
+                        } else if self.needs_owner_cast(cls, name, desc, o) {
+                            // Private / cross-package members are NOT
+                            // inherited by the receiver's static type:
+                            // the source cast to the declaring class
+                            // (`((ZipFile) jar).getManifestNum()`) leaves
+                            // no bytecode trace when the receiver is
+                            // already a subtype.
+                            out.push_str("((");
+                            out.push_str(&self.shorten(cls));
+                            out.push_str(") ");
+                            self.expr(o, 14, out);
+                            out.push_str(").");
                         } else {
                             self.expr(o, 15, out);
                             out.push('.');
@@ -1668,6 +1680,44 @@ impl<'a> Printer<'a> {
 
     /// Shorten an internal class name for emission: java.lang.* and same
     /// package use simple names; others fully qualified dotted.
+    fn needs_owner_cast(
+        &self,
+        cls: &str,
+        name: &str,
+        desc: &jcdc_jvm::MethodDescriptor,
+        o: &Expr,
+    ) -> bool {
+        let jcdc_jvm::JavaType::Object(on) = o.type_ref().erased() else {
+            return false;
+        };
+        if on == cls {
+            return false;
+        }
+        let Some(cpc) = self.pool.get(cls) else { return false };
+        let want = format!(
+            "({}){}",
+            desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+            desc.ret.to_descriptor()
+        );
+        let Some(mi) = (0..cpc.cf.methods.len()).find(|&i| {
+            cpc.method_name(i) == Some(name) && cpc.method_desc(i) == Some(want.as_str())
+        }) else {
+            return false;
+        };
+        let acc = cpc.cf.methods[mi].access_flags;
+        use jcdc_classfile::MethodAccessFlags as M;
+        if acc.contains(M::PRIVATE) {
+            return true;
+        }
+        if !acc.contains(M::PUBLIC) && !acc.contains(M::PROTECTED) {
+            fn pkg(n: &str) -> &str {
+                n.rsplit_once('/').map(|(p, _)| p).unwrap_or("")
+            }
+            return pkg(&on) != pkg(cls);
+        }
+        false
+    }
+
     fn needs_object_relay(&self, ty: &TypeRef, e: &Expr) -> bool {
         if matches!(e, Expr::Cast { .. } | Expr::Const(_)) {
             return false;
