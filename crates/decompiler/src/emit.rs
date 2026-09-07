@@ -1068,16 +1068,20 @@ impl<'a> Printer<'a> {
                         } else {
                             self.args_delegation(args, &desc.args, out);
                         }
+                    } else if !is_super_form {
+                        // desc is the EXACT invoked ctor signature and the
+                        // args are outer-stripped: args_delegation aligns
+                        // by tail (jdk11 ZipFileInflaterInputStream —
+                        // ctor_param_types' arity match would pick the
+                        // wrong same-arity overload and cast against
+                        // shifted formals, (ZipFile) zfin x3).
+                        self.args_delegation(args, &desc.args, out);
                     } else {
                         match self.ctor_param_types(cls, 0, args.len(), args) {
-                            Some(pt) => {
-                                if is_super_form {
-                                    self.args_typed(args, &pt, out);
-                                } else {
-                                    self.args_delegation(args, &pt, out);
-                                }
+                            Some(pt) if pt.len() == args.len() => {
+                                self.args_typed(args, &pt, out)
                             }
-                            None => self.args(args, out),
+                            _ => self.args(args, out),
                         }
                     }
                     out.push(')');
@@ -1469,11 +1473,18 @@ impl<'a> Printer<'a> {
         param_types: &[jcdc_jvm::JavaType],
         out: &mut String,
     ) {
+        // Inner-class ctor descriptors carry the synthetic outer param
+        // while the expression args are outer-stripped: align the formals
+        // with the TRAIL of the args, like apply_ctor_param_casts (jdk11
+        // ZipFileInflaterInputStream this(zfin, res, res.getInflater(),
+        // size) was cast against the shifted descriptor formals —
+        // (ZipFile) zfin, (ZipFileInputStream) res... x3 inconvertible).
+        let off = param_types.len().saturating_sub(args.len());
         for (i, a) in args.iter().enumerate() {
             if i > 0 {
                 out.push_str(", ");
             }
-            match param_types.get(i) {
+            match param_types.get(off + i) {
                 Some(pt @ jcdc_jvm::JavaType::Object(_)) => {
                     let have = a.type_ref().erased();
                     if &have != pt
