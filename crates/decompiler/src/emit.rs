@@ -1687,6 +1687,14 @@ impl<'a> Printer<'a> {
         desc: &jcdc_jvm::MethodDescriptor,
         o: &Expr,
     ) -> bool {
+        // Raw-rendered owners (qualified `HashMap.this`, substituted
+        // capture text) carry no trustworthy static type — and casting
+        // them to a RAW class erases the whole generic member chain
+        // (`((HashMap) HashMap.this).<T>keysToArray(..)` made the call
+        // raw: "Object[]无法转换为T[]").
+        if matches!(o, Expr::Raw(_) | Expr::This) {
+            return false;
+        }
         let jcdc_jvm::JavaType::Object(on) = o.type_ref().erased() else {
             return false;
         };

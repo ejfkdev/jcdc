@@ -2739,6 +2739,7 @@ fn emit_method_with(
             add_throw_witnesses(&mut body, msig.as_ref(), pool);
             strip_erasure_casts_generic_ret(&mut body, msig.as_ref(), pool);
             witness_generic_returns(&mut body, msig.as_ref(), pool);
+            witness_comparison_operands(&mut body, msig.as_ref(), pool);
             // Scope the extern-decl registry to THIS method's emission:
             // names extracted here must suppress re-declaration inside
             // lambda bodies printed below, but must not leak into other
@@ -9519,6 +9520,173 @@ fn add_return_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, 
         }
     }
     walk(s, sig, pool);
+}
+
+/// Equality operands: a generic call compared against a parameterized
+/// value needs its type arguments restored — `leftFinisher !=
+/// Gatherer.defaultFinisher()` fails as "不可比较的类型" because the
+/// bare call infers <Object,Object>. The comparison operand supplies
+/// the wanted type; compute_witness unifies it with the callee's
+/// generic return (jdk26 Gatherers 12-14 errors).
+fn witness_comparison_operands(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, pool: &ClassPool) {
+    let caller_params: Option<&[jcdc_jvm::TypeParam]> = msig.map(|m| m.params.as_slice());
+    fn fix_e(e: &mut Expr, pool: &ClassPool, caller_params: Option<&[jcdc_jvm::TypeParam]>) {
+        if let Expr::Bin { op, l, r, .. } = e {
+            use crate::expr::BinOp;
+            if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::RefEq | BinOp::RefNe) {
+                for (a, b) in [(l.as_mut(), r.as_ref()), (r.as_mut(), l.as_ref())] {
+                    let TypeRef::G(want) = b.type_ref() else { continue };
+                    let Expr::Method { cls, name, desc, type_args, .. } = a else { continue };
+                    if !type_args.is_empty() {
+                        continue;
+                    }
+                    if let Some((w, _)) =
+                        compute_witness(cls, name, desc, None, &want, pool, caller_params)
+                    {
+                        if let Expr::Method { type_args, .. } = a {
+                            *type_args = w;
+                        }
+                    }
+                }
+            }
+        }
+        fix_children_e(e, pool, caller_params);
+    }
+    fn fix_children_e(e: &mut Expr, pool: &ClassPool, caller_params: Option<&[jcdc_jvm::TypeParam]>) {
+        match e {
+            Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+                args.iter_mut().for_each(|a| fix_e(a, pool, caller_params));
+            }
+            Expr::Method { owner, args, .. } => {
+                if let Some(o) = owner {
+                    fix_e(o, pool, caller_params);
+                }
+                args.iter_mut().for_each(|a| fix_e(a, pool, caller_params));
+            }
+            Expr::Field { owner: Some(o), .. } => fix_e(o, pool, caller_params),
+            Expr::ArrayIndex { array, index } => {
+                fix_e(array, pool, caller_params);
+                fix_e(index, pool, caller_params);
+            }
+            Expr::Cast { e: i, .. } | Expr::InstanceOf { e: i, .. } | Expr::Un { e: i, .. }
+            | Expr::PreIncDec { e: i, .. } | Expr::PostIncDec { e: i, .. } => {
+                fix_e(i, pool, caller_params);
+            }
+            Expr::Bin { l, r, .. } => {
+                fix_e(l, pool, caller_params);
+                fix_e(r, pool, caller_params);
+            }
+            Expr::Cond { c, t, f } => {
+                fix_e(c, pool, caller_params);
+                fix_e(t, pool, caller_params);
+                fix_e(f, pool, caller_params);
+            }
+            Expr::Assign { target, value, .. } => {
+                fix_e(target, pool, caller_params);
+                fix_e(value, pool, caller_params);
+            }
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter_mut().for_each(|d| fix_e(d, pool, caller_params));
+                if let Some(vals) = init {
+                    vals.iter_mut().for_each(|x| fix_e(x, pool, caller_params));
+                }
+            }
+            Expr::NewMultiArray { dims, .. } => {
+                dims.iter_mut().for_each(|d| fix_e(d, pool, caller_params));
+            }
+            Expr::StringConcat(parts) => parts.iter_mut().for_each(|pp| {
+                if let crate::expr::ConcatPart::Str(i) = pp {
+                    fix_e(i, pool, caller_params);
+                }
+            }),
+            Expr::Lambda(l) => l
+                .captures
+                .iter_mut()
+                .for_each(|c| fix_e(c, pool, caller_params)),
+            Expr::Invokedynamic { args, .. } => {
+                args.iter_mut().for_each(|a| fix_e(a, pool, caller_params));
+            }
+            _ => {}
+        }
+    }
+    fn rec(s: &mut Stmt, pool: &ClassPool, caller_params: Option<&[jcdc_jvm::TypeParam]>) {
+        match s {
+            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, pool, caller_params)),
+            Stmt::ExprStmt(e) => fix_e(e, pool, caller_params),
+            Stmt::LocalDef { init: Some(e), .. } => fix_e(e, pool, caller_params),
+            Stmt::Return(Some(e)) | Stmt::Throw(e) => fix_e(e, pool, caller_params),
+            Stmt::If { cond, then_stmt, else_stmt } => {
+                fix_e(cond, pool, caller_params);
+                rec(then_stmt, pool, caller_params);
+                if let Some(e) = else_stmt {
+                    rec(e, pool, caller_params);
+                }
+            }
+            Stmt::While { cond, body } => {
+                fix_e(cond, pool, caller_params);
+                rec(body, pool, caller_params);
+            }
+            Stmt::DoWhile { body, cond } => {
+                rec(body, pool, caller_params);
+                fix_e(cond, pool, caller_params);
+            }
+            Stmt::For { init, cond, update, body } => {
+                init.iter_mut().for_each(|i| rec(i, pool, caller_params));
+                if let Some(c) = cond {
+                    fix_e(c, pool, caller_params);
+                }
+                update.iter_mut().for_each(|u| fix_e(u, pool, caller_params));
+                rec(body, pool, caller_params);
+            }
+            Stmt::ForEach { iterable, body, .. } => {
+                fix_e(iterable, pool, caller_params);
+                rec(body, pool, caller_params);
+            }
+            Stmt::Switch { selector, cases, default, .. } => {
+                fix_e(selector, pool, caller_params);
+                for c in cases.iter_mut() {
+                    c.body.iter_mut().for_each(|st| rec(st, pool, caller_params));
+                }
+                if let Some(d) = default {
+                    rec(d, pool, caller_params);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                rec(body, pool, caller_params);
+                for c in catches.iter_mut() {
+                    rec(&mut c.body, pool, caller_params);
+                }
+                if let Some(f) = finally {
+                    rec(f, pool, caller_params);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter_mut().for_each(|r| rec(r, pool, caller_params));
+                rec(body, pool, caller_params);
+                for c in catches.iter_mut() {
+                    rec(&mut c.body, pool, caller_params);
+                }
+                if let Some(f) = finally {
+                    rec(f, pool, caller_params);
+                }
+            }
+            Stmt::Synchronized { lock, body } => {
+                fix_e(lock, pool, caller_params);
+                rec(body, pool, caller_params);
+            }
+            Stmt::Labeled { body, .. } => rec(body, pool, caller_params),
+            Stmt::Assert { cond, msg } => {
+                fix_e(cond, pool, caller_params);
+                if let Some(m) = msg {
+                    fix_e(m, pool, caller_params);
+                }
+            }
+            Stmt::TernaryValue { e } => fix_e(e, pool, caller_params),
+            Stmt::MonitorEnter(e) | Stmt::MonitorExit(e) => fix_e(e, pool, caller_params),
+            _ => {}
+        }
+    }
+    rec(s, pool, caller_params);
 }
 
 fn compute_witness(
