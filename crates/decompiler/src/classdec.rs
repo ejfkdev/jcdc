@@ -2856,6 +2856,7 @@ fn emit_method_with(
             add_throw_witnesses(&mut body, msig.as_ref(), pool);
             strip_erasure_casts_generic_ret(&mut body, msig.as_ref(), pool);
             witness_generic_returns(&mut body, msig.as_ref(), pool, pc);
+            push_witness_into_branches(&mut body, msig.as_ref(), pool, pc);
             witness_comparison_operands(&mut body, msig.as_ref(), pool);
             // Scope the extern-decl registry to THIS method's emission:
             // names extracted here must suppress re-declaration inside
@@ -5361,6 +5362,434 @@ fn cast_typevar_param_args(
         let inner = std::mem::replace(a, Expr::This);
         *a = Expr::Cast { ty: want, e: Box::new(inner) };
     }
+}
+
+thread_local! {
+    /// Lambda impl methods whose cond branches must be repaired at PRINT
+    /// time (push_witness_into_branches): key "owner|impl_name" -> the
+    /// enclosing method's generic return (witness target) and its
+    /// Signature params (caller_params for bound checks). The Printer
+    /// re-decompiles lambda bodies from bytecode, so AST-level mutation
+    /// cannot reach them; the decision is made on a fresh analysis
+    /// decompile and the recipe applied when the body is printed.
+    static BRANCH_WITNESS_PUSH: std::cell::RefCell<
+        HashMap<String, (jcdc_jvm::GenericType, Vec<jcdc_jvm::TypeParam>)>,
+    > = std::cell::RefCell::new(HashMap::new());
+}
+
+pub(crate) fn branch_witness_pushed(
+    owner: &str,
+    name: &str,
+) -> Option<(jcdc_jvm::GenericType, Vec<jcdc_jvm::TypeParam>)> {
+    BRANCH_WITNESS_PUSH.with(|m| m.borrow().get(&format!("{}|{}", owner, name)).cloned())
+}
+
+/// Repair one lambda impl body per a registered pushdown recipe: drop
+/// erasure-raw casts over generic calls (`(CompletionStage) fn.apply(ex)` —
+/// synthesized against the impl's erased capture parameter; unnecessary
+/// once the printed body references the outer generically-typed local) and
+/// attach the enclosing return's witness to bare generic call branches
+/// (`this.<T>handleAsync(..)` — the source shape; without it the cond sits
+/// at CompletionStage<CAP#1> and the outer chain's inference dies).
+pub(crate) fn repair_pushed_branches(
+    body: &mut Stmt,
+    want: &jcdc_jvm::GenericType,
+    params: &[jcdc_jvm::TypeParam],
+    pool: &ClassPool,
+) {
+    fn fix_branch(
+        e: &mut Expr,
+        want: &jcdc_jvm::GenericType,
+        params: &[jcdc_jvm::TypeParam],
+        pool: &ClassPool,
+    ) {
+        // raw erasure cast over a call on a GENERIC DECLARING TYPE ->
+        // unwrap. The cast bridges the impl method's ERASED signature
+        // (fn.apply on a raw Function capture returns Object); printed in
+        // the lambda's lexical position the receiver names the OUTER
+        // generically-typed local, so the call types as the capture itself
+        // and reaches the target unchecked.
+        if let Expr::Cast { ty, e: inner } = e {
+            let raw_erased = matches!(ty, TypeRef::J(jcdc_jvm::JavaType::Object(_)));
+            if raw_erased && generic_decl_call(inner, pool) {
+                let v = std::mem::replace(e, Expr::This);
+                if let Expr::Cast { e: inner, .. } = v {
+                    *e = *inner;
+                }
+            }
+        }
+        // bare generic call -> witness, but only a DIRECTLY this-rooted
+        // one: witnessing a chained call pins its final typevar against an
+        // unpinned receiver (handleAsync(..).<T>thenCompose(identity) —
+        // identity can never satisfy it); the chained source shape stays
+        // fully bare and infers from the cond/return position.
+        let igc = is_generic_call(e, pool)
+            && matches!(e, Expr::Method { owner, .. }
+                if owner.is_none() || matches!(owner.as_deref(), Some(Expr::This)));
+        if let Expr::Method { cls, name, desc, type_args, .. } = e {
+            if type_args.is_empty() && igc {
+                if let Some((w, _)) =
+                    compute_witness(cls.as_str(), name.as_str(), desc, None, want, pool, Some(params))
+                {
+                    *type_args = w;
+                }
+            }
+        }
+    }
+    let ret = match body {
+        Stmt::Return(Some(e)) => Some(e),
+        Stmt::Block(v) if v.len() == 1 => match &mut v[0] {
+            Stmt::Return(Some(e)) => Some(e),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(e) = ret else { return };
+    if let Expr::Cond { t, f, .. } = e {
+        fix_branch(t, want, params, pool);
+        fix_branch(f, want, params, pool);
+    } else {
+        fix_branch(e, want, params, pool);
+    }
+}
+
+/// True when the call's DECLARING TYPE is generic and the declared method
+/// carries a Signature: in the printed lambda body the receiver names the
+/// outer generically-typed local, so the call's return types as the
+/// substituted Signature return (a capture) rather than the erased
+/// descriptor return the impl-method pipeline saw.
+fn generic_decl_call(e: &Expr, pool: &ClassPool) -> bool {
+    let Expr::Method { cls, name, desc, .. } = e else { return false };
+    let Some(dpc) = pool.get(cls) else { return false };
+    let cls_generic = dpc
+        .class_attr("Signature")
+        .map(|b| b.len() >= 2)
+        .unwrap_or(false);
+    if !cls_generic {
+        return false;
+    }
+    let want_desc = {
+        let mut a = String::new();
+        for t in &desc.args {
+            a.push_str(&t.to_descriptor());
+        }
+        format!("({}){}", a, desc.ret.to_descriptor())
+    };
+    let Some(mi) = (0..dpc.cf.methods.len())
+        .find(|&i| dpc.method_name(i) == Some(name.as_str()) && dpc.method_desc(i) == Some(want_desc.as_str()))
+    else {
+        return false
+    };
+    dpc.cf.methods[mi]
+        .attributes
+        .iter()
+        .any(|a| dpc.utf8(a.attribute_name_index) == Some("Signature"))
+}
+
+/// Source-shape witnesses for bare generic calls that sit as lambda-cond
+/// branches inside a returned generic call chain (jdk17 CompletionStage
+/// exceptionallyAsync/exceptionallyCompose family, 12 errors across trees).
+///
+/// The source pins the INNER branch:
+/// `handle((r, ex) -> ex != null ? this.<T>handleAsync(..) : this)
+///      .thenCompose(Function.identity())`
+/// The return-position machinery instead witnesses the OUTERMOST call
+/// (`.<T>thenCompose`), which is actively wrong here: pinning the final U
+/// turns `Function.identity()` into
+/// `Function<CompletionStage<CompletionStage<T>>, ..>`, not convertible to
+/// `Function<? super .., ? extends CompletionStage<T>>`, and the
+/// unwitnessed inner branch leaves the cond at CompletionStage<CAP#1>
+/// ("推论变量 T#1 具有不兼容的上限").
+///
+/// Fires only when the outermost returned call carries a computed witness
+/// binding a typevar of the ENCLOSING method's own return (the
+/// pinned-final shape) AND a sibling lambda-cond branch can be repaired
+/// (bare generic branch takes the witness, or a droppable erasure-raw cast
+/// exists). The outer witness is dropped so the chain infers from the
+/// return position, and the branch recipe is registered for print time.
+/// All-or-nothing: on any failed classification the tree is untouched.
+fn push_witness_into_branches(
+    s: &mut Stmt,
+    msig: Option<&jcdc_jvm::MethodSignature>,
+    pool: &ClassPool,
+    pc: &PoolClass,
+) {
+    use jcdc_jvm::GenericType as G;
+    BRANCH_WITNESS_PUSH.with(|m| m.borrow_mut().clear());
+    let Some(sig) = msig else { return };
+    if !generic_ret_ish(&sig.ret) {
+        return;
+    }
+    fn ret_tvars(g: &G, out: &mut Vec<String>) {
+        match g {
+            G::TypeVar(n) => {
+                if !out.contains(n) {
+                    out.push(n.clone());
+                }
+            }
+            G::Array(i) => ret_tvars(i, out),
+            G::Class(cs) => cs
+                .parts
+                .iter()
+                .for_each(|p| p.args.iter().for_each(|a| ret_tvars(a, out))),
+            G::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
+            | G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => ret_tvars(t, out),
+            _ => {}
+        }
+    }
+    let mut tvars: Vec<String> = Vec::new();
+    ret_tvars(&sig.ret, &mut tvars);
+    if tvars.is_empty() {
+        return;
+    }
+    // Collect (lambda key, impl method index) candidates along a call's
+    // owner chain: the pushdown walks the receiver calls' lambda args.
+    fn impl_bodies(owner: &Expr, pc: &PoolClass, out: &mut Vec<(String, usize)>) {
+        let Expr::Method { args, owner: oo, .. } = owner else { return };
+        for a in args {
+            if let Expr::Lambda(l) = a {
+                if l.impl_owner == pc.internal_name {
+                    if let Some(mi) = pc.find_own_method(&l.impl_name, &l.impl_desc.to_string()) {
+                        out.push((format!("{}|{}", l.impl_owner, l.impl_name), mi));
+                    }
+                }
+            }
+        }
+        if let Some(o) = oo {
+            impl_bodies(o, pc, out);
+        }
+    }
+    // Classify one candidate impl body: Return(Cond) whose branches are
+    // all (a) This, (b) a DIRECTLY this-rooted bare generic call that
+    // TAKES the witness, (c) a droppable erasure-raw cast over a call on a
+    // generic declaring type, or (d) a fully-bare CHAIN whose nested
+    // lambda impls are themselves droppable-cast/bare (jdk17
+    // exceptionallyComposeAsync: `handleAsync((r1, ex1) -> fn.apply(ex1))
+    // .thenCompose(identity())` — the source shape is bare end to end and
+    // javac infers it from the return position; verified compilable, while
+    // the raw-cast + outer-witness shape is not). Returns the nested lambda
+    // impl keys to register alongside, or None when the candidate must keep
+    // the status quo.
+    fn classify(
+        pc: &PoolClass,
+        pool: &ClassPool,
+        mi: usize,
+        want: &G,
+        sig: &jcdc_jvm::MethodSignature,
+    ) -> Option<Vec<String>> {
+        let Ok(Some(mb)) = decompile_method(pc, pool, mi) else { return None };
+        let ret = match &mb.body {
+            Stmt::Return(Some(e)) => Some(e),
+            Stmt::Block(v) if v.len() == 1 => match &v[0] {
+                Stmt::Return(Some(e)) => Some(e),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(ret) = ret else { return None };
+        let branches: Vec<&Expr> = match ret {
+            Expr::Cond { t, f, .. } => vec![t.as_ref(), f.as_ref()],
+            other => vec![other],
+        };
+        fn collect_lambdas<'x>(e: &'x Expr, out: &mut Vec<&'x crate::expr::LambdaExpr>) {
+            match e {
+                Expr::Lambda(l) => out.push(l),
+                Expr::Method { args, owner, .. } => {
+                    args.iter().for_each(|a| collect_lambdas(a, out));
+                    if let Some(o) = owner {
+                        collect_lambdas(o, out);
+                    }
+                }
+                Expr::Cast { e: i, .. } => collect_lambdas(i, out),
+                Expr::Cond { c, t, f } => {
+                    collect_lambdas(c, out);
+                    collect_lambdas(t, out);
+                    collect_lambdas(f, out);
+                }
+                _ => {}
+            }
+        }
+        let mut repairable = false;
+        let mut nested_keys: Vec<String> = Vec::new();
+        for b in &branches {
+            match b {
+                Expr::This => {}
+                Expr::Method { type_args, .. } if type_args.is_empty() => {
+                    if !is_generic_call(b, pool) {
+                        return None;
+                    }
+                    let this_rooted = matches!(b, Expr::Method { owner, .. }
+                        if owner.is_none() || matches!(owner.as_deref(), Some(Expr::This)));
+                    if !this_rooted {
+                        // Chained branch: it stays bare, but every nested
+                        // lambda impl must be bare or droppable-cast — the
+                        // chain's inference only survives with bare
+                        // generics end to end.
+                        let mut lams: Vec<&crate::expr::LambdaExpr> = Vec::new();
+                        collect_lambdas(b, &mut lams);
+                        for l in lams {
+                            if l.impl_owner != pc.internal_name {
+                                return None;
+                            }
+                            let Some(nmi) =
+                                pc.find_own_method(&l.impl_name, &l.impl_desc.to_string())
+                            else {
+                                return None;
+                            };
+                            let Ok(Some(nmb)) = decompile_method(pc, pool, nmi) else { return None };
+                            let nret = match &nmb.body {
+                                Stmt::Return(Some(e)) => Some(e),
+                                Stmt::Block(v) if v.len() == 1 => match &v[0] {
+                                    Stmt::Return(Some(e)) => Some(e),
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
+                            match nret {
+                                Some(Expr::Cast { ty, e: inner }) => {
+                                    let raw_erased =
+                                        matches!(ty, TypeRef::J(jcdc_jvm::JavaType::Object(_)));
+                                    if !raw_erased || !generic_decl_call(inner, pool) {
+                                        return None;
+                                    }
+                                    nested_keys
+                                        .push(format!("{}|{}", l.impl_owner, l.impl_name));
+                                    repairable = true;
+                                }
+                                Some(Expr::Method { type_args: nta, .. }) if nta.is_empty() => {}
+                                Some(Expr::This) | None => {}
+                                _ => return None,
+                            }
+                        }
+                        continue;
+                    }
+                    let Expr::Method { cls, name, desc, .. } = b else { unreachable!() };
+                    if compute_witness(
+                        cls.as_str(),
+                        name.as_str(),
+                        desc,
+                        None,
+                        want,
+                        pool,
+                        Some(&sig.params),
+                    )
+                    .is_some()
+                    {
+                        repairable = true;
+                    }
+                }
+                Expr::Cast { ty, e: inner } => {
+                    // Erasure-raw cast over a call on a GENERIC declaring
+                    // type: synthesized against the impl's erased capture
+                    // parameter (raw Function.apply returns Object);
+                    // printed in the lambda's lexical position the receiver
+                    // names the OUTER generically-typed local, so the call
+                    // types as the capture itself and reaches the target
+                    // unchecked.
+                    let raw_erased = matches!(ty, TypeRef::J(jcdc_jvm::JavaType::Object(_)));
+                    let gdc = generic_decl_call(inner, pool);
+                    if raw_erased && gdc {
+                        repairable = true;
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        // Repair-only: a fully-bare shape keeps the outer witness (it is
+        // the return-position machinery's normal, usually-correct output).
+        if repairable {
+            Some(nested_keys)
+        } else {
+            None
+        }
+    }
+    fn fix(
+        e: &mut Expr,
+        want: &G,
+        sig: &jcdc_jvm::MethodSignature,
+        tvars: &[String],
+        pool: &ClassPool,
+        pc: &PoolClass,
+    ) {
+        {
+            let Expr::Method { type_args, owner: Some(_), .. } = e else { return };
+            if type_args.is_empty()
+                || !type_args.iter().any(|t| tvars.iter().any(|n| n == t))
+            {
+                return;
+            }
+        }
+        let Expr::Method { owner: Some(owner), .. } = &*e else { return };
+        let mut cand: Vec<(String, usize)> = Vec::new();
+        impl_bodies(owner, pc, &mut cand);
+        if cand.is_empty() {
+            return;
+        }
+        let mut keys: Vec<String> = Vec::new();
+        for (key, mi) in &cand {
+            if let Some(mut nested) = classify(pc, pool, *mi, want, sig) {
+                keys.push(key.clone());
+                keys.append(&mut nested);
+            }
+        }
+        if keys.is_empty() {
+            return;
+        }
+        // Drop the outer witness and register the print-time recipes.
+        if let Expr::Method { type_args, .. } = e {
+            type_args.clear();
+        }
+        BRANCH_WITNESS_PUSH.with(|m| {
+            let mut m = m.borrow_mut();
+            for key in &keys {
+                m.insert(key.clone(), (want.clone(), sig.params.clone()));
+            }
+        });
+    }
+    fn rec(s: &mut Stmt, want: &G, sig: &jcdc_jvm::MethodSignature, tvars: &[String], pool: &ClassPool, pc: &PoolClass) {
+        match s {
+            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, want, sig, tvars, pool, pc)),
+            Stmt::Return(Some(e)) => fix(e, want, sig, tvars, pool, pc),
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                rec(then_stmt, want, sig, tvars, pool, pc);
+                if let Some(x) = else_stmt {
+                    rec(x, want, sig, tvars, pool, pc);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::Labeled { body, .. }
+            | Stmt::Synchronized { body, .. } => rec(body, want, sig, tvars, pool, pc),
+            Stmt::For { init, body, .. } => {
+                init.iter_mut().for_each(|i| rec(i, want, sig, tvars, pool, pc));
+                rec(body, want, sig, tvars, pool, pc);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    for st in c.body.iter_mut() {
+                        rec(st, want, sig, tvars, pool, pc);
+                    }
+                }
+                if let Some(d) = default {
+                    rec(d, want, sig, tvars, pool, pc);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                rec(body, want, sig, tvars, pool, pc);
+                for c in catches.iter_mut() {
+                    rec(&mut c.body, want, sig, tvars, pool, pc);
+                }
+                if let Some(f) = finally {
+                    rec(f, want, sig, tvars, pool, pc);
+                }
+            }
+            _ => {}
+        }
+    }
+    rec(s, &sig.ret, sig, &tvars, pool, pc);
 }
 
 fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, pool: &ClassPool, pc: &PoolClass) {

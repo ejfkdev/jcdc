@@ -1674,6 +1674,21 @@ impl<'a> Printer<'a> {
                             }
                             vt = snap_vt;
                         }
+                        // Pushdown-recipe repair (classdec::
+                        // push_witness_into_branches): the impl body is
+                        // decompiled fresh here, so registered branch
+                        // repairs (drop erasure-raw casts, attach the
+                        // enclosing return's witness) apply at this point.
+                        if let Some((want, params)) =
+                            crate::classdec::branch_witness_pushed(&l.impl_owner, &l.impl_name)
+                        {
+                            crate::classdec::repair_pushed_branches(
+                                &mut body,
+                                &want,
+                                &params,
+                                self.pool,
+                            );
+                        }
                         // Lambda impl params carry erased types (no LVTT
                         // on synthetic methods): lift generic types from
                         // the indy-site capture expressions, then restore
@@ -1849,6 +1864,21 @@ impl<'a> Printer<'a> {
                                 let jcdc_jvm::JavaType::Object(t) = target else {
                                     return false;
                                 };
+                                // A parameterized (generic) value whose
+                                // erasure IS the target reaches it unchecked
+                                // (jdk17 CompletionStage exceptionallyCompose:
+                                // the cond branch fn.apply(ex) types as the
+                                // capture ? extends CompletionStage<T>; the
+                                // erased impl return CompletionStage needs no
+                                // cast, and printing one breaks the outer
+                                // chain's inference).
+                                if let TypeRef::G(g0) = e.type_ref() {
+                                    if let jcdc_jvm::GenericType::Class(cs) = &g0 {
+                                        if crate::method::classsig_internal(cs) == *t {
+                                            return true;
+                                        }
+                                    }
+                                }
                                 let jcdc_jvm::JavaType::Object(e0) = e.type_ref().erased() else {
                                     return false;
                                 };
