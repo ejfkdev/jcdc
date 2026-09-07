@@ -284,6 +284,21 @@ impl<'a> Printer<'a> {
                 line.push_str(&info.name);
                 if let Some(e) = init {
                     line.push_str(" = ");
+                    // A lambda initializing a generically-typed SAM local:
+                    // the declared type is the only record of the
+                    // instantiated SAM return (the indy's
+                    // instantiatedMethodType is erased — IntFunction<T[]>
+                    // records (I)[Object), so prime the lambda-body cast
+                    // from it (jdk11 ForEachOps: `IntFunction<T[]>
+                    // generator = size -> (T[]) new Object[size]` —
+                    // without the cast "lambda 表达式中的返回类型错误").
+                    if let (TypeRef::G(g @ jcdc_jvm::GenericType::Class(_)), Expr::Lambda(l)) =
+                        (&info.ty, e)
+                    {
+                        if self.lambda_sam_ret.is_none() {
+                            self.lambda_sam_ret = self.sam_ret_cast(g, &l.sam_name);
+                        }
+                    }
                     // Assigning a concrete type to a type-variable local
                     // needs the (erased-away) cast back in source form.
                     let need_cast = matches!(
