@@ -579,3 +579,41 @@ demote/hoist 会吃掉第一遍的 blank 声明。
 外部中断/空 then 无条件 throw（语义）、FloatingDecimal !ssign!=45 布尔化
 错树、匿名构造器内联 super() 形状（SplitConstantPool/ProcessBuilder）、
 Optional.map 链 witness（ClassPrinterImpl）、Object 栈合并变量推断尾。
+
+### 2026-09-07 深夜第三波（普查 158/169/244 → 120/127/186，total 433）
+
+1. **比较操作数 witness**：==/!= 一侧为参数化类型、另一侧为裸泛型调用
+   时，用 compute_witness 恢复 type args（Gatherer.<A,R>defaultFinisher()，
+   不可比较家族清零）；unify_types 支持通配符界递归；捕获替换引入 RawT
+   （带原局部变量声明类型的预渲染文本）+ 会话级 G 类型注册表升级；lambda
+   impl 参数类型从 indy 站点捕获表达式提升 + rewrite_local_types 同步内嵌
+   Local 类型。
+2. **method_ref_type_args**：SAM 形参与方法引用目标 Signature 合一
+   （receiver 填 callee typevar；Integrator$Greedy 继承 SAM 走父接口查找）
+   —— 仅在比较上下文挂接：独立位置的 witness 会钉死推论饿死外层链
+   （ofSequential finisher 回归教训）。want-threading 基础设施已铺
+   （返回位/赋值/cast/调用参数），diamond ctor 参数刻意留白。
+3. **Cond 类型合一**：分支引用类型分歧时 type_ref 归 Object（CodePointTrie
+   Small32/Fast32 合并变量——条件表达式类型错）；cond 分支各自贡献赋值目
+   标证据。
+4. **booleanize 上下文**：数值 cast 目标与排序比较操作数是 int 上下文
+   （(long)(c?1:0)、i-start > (pt!=0?1:0) 保持 int）；Eq/Ne 任一侧 boolean
+   即 boolean 上下文。expr_bool 支持 boolish 操作数的 ^/&/|（javac 用 IXOR
+   算 boolean !=——DecimalFormat isNegative），复合侧加括号（^ 优先级陷阱）。
+5. **args_typed**：char 参数走 expr_char（条件分支渲染为字符字面量——
+   BasicAuthentication super(!isProxy ? 's' : 'p')）；byte/short 保留强制
+   显式 cast —— expr_narrow 对范围内常量省 cast，赋值上下文合法但调用参
+   数非法（当轮 +1200 错回归，同会话抓获回滚）。
+6. **needs_owner_cast**：私有/跨包成员经子类型 receiver 调用恢复声明类
+   cast（((ZipFile) jar).getManifestNum()——javac 对已是子类型的 receiver
+   省略该上转型，无字节码痕迹）；Raw/This owner 除外（HashMap.this 的
+   raw cast 会擦除整条泛型成员链——keysToArray T[] 回归教训）。
+7. **strip_outer_super_arg 槽位门**：仅 slot-1 的 outer 参数可吃——裸
+   is_param 判定把真实 super 参数当 outer 吃掉（ExplodedImage PathNode
+   super(name,attrs) 丢 name；StackStreamFactory ClassBuffer super
+   (batchSize) 丢参数——三 JDK 共 -56，本波最大单点收益）。
+8. **赋值目标类型走 VarTable**：booleanize 在 embedded Local ty 冻结后翻
+   转 vt 类型，Assign 渲染须查 vt（Security boolean var = 1）。
+
+回归教训再+2：调用参数位的窄化 cast 不可省（与赋值位规则相反）；
+witness 只能挂在有可命名目标类型的上下文，独立位置钉死推论。
