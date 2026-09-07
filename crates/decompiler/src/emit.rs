@@ -1123,7 +1123,14 @@ impl<'a> Printer<'a> {
                 self.expr(f, 2, out);
             }
             Expr::Assign { target, op, value } => {
-                let tgt_er = target.type_ref().erased();
+                // The local's VarTable type is authoritative: booleanize
+                // flips vt types after the embedded Local tys were frozen
+                // (Security `boolean var4_122 = 1` printed the int form —
+                // "int无法转换为boolean").
+                let tgt_er = match &**target {
+                    Expr::Local { var, .. } => self.vt.var(*var).ty.erased(),
+                    other => other.type_ref().erased(),
+                };
                 self.expr(target, 1, out);
                 out.push(' ');
                 out.push_str(op.symbol());
