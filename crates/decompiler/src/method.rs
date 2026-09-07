@@ -8947,10 +8947,17 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
                     matches!(a, Expr::Const(crate::expr::ConstVal::ClassLit(_)))
                 }))
                 && crate::classdec::classlit_want_conflict(value, want, pool);
+            // Target-driven inference violating a callee bound needs the
+            // source's cast (the standalone inference + unchecked hop):
+            // jdk26 ReverseOrderSortedSetView `(Comparator<E>)
+            // Comparator.naturalOrder()`.
+            let bound_conflict = generic_here
+                && crate::classdec::target_binding_bound_conflict(value, want, pool, pc);
             if !crate::classdec::is_generic_call(value, pool)
                 || reflective_array
-                || wildcard_want
+                || (wildcard_want && bound_conflict)
                 || class_lit_conflict
+                || bound_conflict
             {
                 let inner = std::mem::replace(value, Expr::This);
                 *value = Expr::Cast { ty: want.clone(), e: Box::new(inner) };

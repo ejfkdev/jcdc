@@ -1332,7 +1332,16 @@ impl<'a> Printer<'a> {
                                     for (i, (a, f)) in
                                         args.iter().zip(formals.iter()).enumerate()
                                     {
-                                        if let Expr::Lambda(l) = a {
+                                        // A raw-SAM-cast wrapper still
+                                        // exposes the lambda (the overload
+                                        // disambiguation cast; the primed
+                                        // body return types the lambda
+                                        // precisely).
+                                        let a_inner = match a {
+                                            Expr::Cast { e: ce, .. } => ce.as_ref(),
+                                            other => other,
+                                        };
+                                        if let Expr::Lambda(l) = a_inner {
                                             // A formal still carrying the
                                             // callee's own method typevars
                                             // is not denotable at this
@@ -1805,8 +1814,10 @@ impl<'a> Printer<'a> {
                     self.expr_narrow_arg(a, &param_types[i].clone(), out);
                 }
                 _ => {
+                    let lam_under_cast = matches!(a, Expr::Lambda(_))
+                        || matches!(a, Expr::Cast { e: ce, .. } if matches!(&**ce, Expr::Lambda(_)));
                     match sam_rets.get(i).and_then(|x| x.as_ref()) {
-                        Some(t) if matches!(a, Expr::Lambda(_)) => {
+                        Some(t) if lam_under_cast => {
                             let prev = self.lambda_sam_ret.replace(t.clone());
                             self.expr(a, 1, out);
                             self.lambda_sam_ret = prev;
@@ -2158,6 +2169,21 @@ impl<'a> Printer<'a> {
                                 if sam_ok(t, e) {
                                     let v = std::mem::replace(e, Expr::This);
                                     *e = Expr::Cast { ty: t.clone(), e: Box::new(v) };
+                                } else if let TypeRef::G(_) = t {
+                                    // The body already carries the erasure
+                                    // checkcast: retype it to the generic
+                                    // SAM return (jdk26
+                                    // CopyOnWriteArrayList.toArray `i ->
+                                    // (T[]) new Object[i]` printed
+                                    // `(Object[])` — Object[]无法转换为T[]
+                                    // against IntFunction<T[]>).
+                                    if let Expr::Cast { ty: ct, e: ce } = e {
+                                        if ct.erased() == t.erased()
+                                            && !matches!(&**ce, Expr::Cast { .. })
+                                        {
+                                            *ct = t.clone();
+                                        }
+                                    }
                                 }
                             } else {
                                 wrap_returns(&mut body, t);
@@ -2230,17 +2256,47 @@ impl<'a> Printer<'a> {
                                 false
                             }
                             let want = TypeRef::J(inst.ret.clone());
+                            // The sam_wrap prime (declared local / pinned
+                            // ctor formal / generic-call formal) carries the
+                            // GENERIC SAM return the erased
+                            // instantiatedMethodType lost: upgrade an
+                            // existing erasure-equal cast on the body (jdk26
+                            // CopyOnWriteArrayList.toArray's `i -> (T[]) new
+                            // Object[i]` printed `(Object[])` — the real
+                            // checkcast erases T[] and Object[] alike;
+                            // Object[]无法转换为T[] against
+                            // IntFunction<T[]>).
+                            let g_want: Option<TypeRef> = sam_wrap.as_ref().and_then(|t| {
+                                if let TypeRef::G(g) = t {
+                                    if TypeRef::G(g.clone()).erased() == inst.ret {
+                                        return Some(t.clone());
+                                    }
+                                }
+                                None
+                            });
                             if let Some(e) = &mut single_expr {
                                 if std::env::var("JCDC_DBG_LAMRET").is_ok() {
                                     eprintln!(
-                                        "LAMRET2 inst_ret={:?} expr_ty={:?} sam_ok={} upcast_ok={}",
+                                        "LAMRET2 inst_ret={:?} expr_ty={:?} sam_ok={} upcast_ok={} g_want={:?}",
                                         inst.ret,
                                         e.type_ref(),
                                         sam_ok(&want, e),
-                                        upcast_ok(e, &inst.ret, self.pool)
+                                        upcast_ok(e, &inst.ret, self.pool),
+                                        g_want
                                     );
                                 }
-                                if sam_ok(&want, e) && upcast_ok(e, &inst.ret, self.pool) {
+                                let mut upgraded = false;
+                                if let Some(gw) = &g_want {
+                                    if let Expr::Cast { ty, e: ce } = e {
+                                        if ty.erased() == inst.ret
+                                            && !matches!(&**ce, Expr::Cast { .. })
+                                        {
+                                            *ty = gw.clone();
+                                            upgraded = true;
+                                        }
+                                    }
+                                }
+                                if !upgraded && sam_ok(&want, e) && upcast_ok(e, &inst.ret, self.pool) {
                                     let v = std::mem::replace(e, Expr::This);
                                     *e = Expr::Cast { ty: want, e: Box::new(v) };
                                 }

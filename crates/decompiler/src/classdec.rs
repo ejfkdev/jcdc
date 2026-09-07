@@ -10051,12 +10051,67 @@ pub(crate) fn generic_call_formals(
     if class_params.len() != decl_args.len() {
         return None;
     }
-    let formals = msig
+    let mut formals: Vec<jcdc_jvm::GenericType> = msig
         .args
         .iter()
         .map(|a| crate::method::subst_typevars(a, &class_params, &decl_args))
         .collect();
-    let mtvars = msig.params.iter().map(|p| p.name.clone()).collect();
+    let mut mtvars: Vec<String> = msig.params.iter().map(|p| p.name.clone()).collect();
+    // An explicitly witnessed call binds its own method typevars: swap
+    // them for the witness types so formals like IntFunction<T[]> become
+    // denotable at the call site (jdk26 CopyOnWriteArrayList.toArray
+    // `this.<T>toArray(i -> (T[]) new Object[i])`). Simple witness
+    // strings (bare identifiers) map to TypeVars — they render
+    // identically to the caller's same-named typevar; complex ones fall
+    // back to the method-ref mapping when an unbound ref arg produced
+    // the witness.
+    let Expr::Method { type_args, args, .. } = m else { unreachable!() };
+    if !type_args.is_empty() && type_args.len() == msig.params.len() {
+        let mut ref_map: Option<Vec<(String, jcdc_jvm::GenericType)>> = None;
+        for (pi, p) in msig.params.iter().enumerate() {
+            let mut g: Option<jcdc_jvm::GenericType> = None;
+            let ta = &type_args[pi];
+            if !ta.contains('<') && !ta.contains('.') && !ta.contains('[') {
+                g = Some(jcdc_jvm::GenericType::TypeVar(ta.clone()));
+            } else {
+                if ref_map.is_none() {
+                    ref_map = args.iter().find_map(|a| {
+                        let lam = match a {
+                            Expr::Lambda(l) => Some(l),
+                            Expr::Cast { e: ce, .. } => match &**ce {
+                                Expr::Lambda(l) => Some(l),
+                                _ => None,
+                            },
+                            _ => None,
+                        }?;
+                        if lam.kind != crate::expr::LambdaKind::MethodRef
+                            || lam.impl_is_static
+                            || !lam.captures.is_empty()
+                        {
+                            return None;
+                        }
+                        method_ref_type_args(cls, name, desc, lam, pool).map(|(_, m)| m)
+                    });
+                }
+                g = ref_map
+                    .as_ref()
+                    .and_then(|m| m.iter().find(|(n, _)| *n == p.name).map(|(_, v)| v.clone()));
+            }
+            if let Some(g) = g {
+                if let Some(idx) = formals.iter().enumerate().map(|(k, _)| k).find(|_| true) {
+                    let _ = idx;
+                }
+                for f in formals.iter_mut() {
+                    *f = crate::method::subst_typevars(
+                        f,
+                        std::slice::from_ref(p),
+                        std::slice::from_ref(&g),
+                    );
+                }
+                mtvars.retain(|n| *n != p.name);
+            }
+        }
+    }
     Some((formals, mtvars))
 }
 
@@ -16561,6 +16616,120 @@ pub(crate) fn classlit_want_conflict(value: &Expr, want: &TypeRef, pool: &ClassP
             if conflicts {
                 return true;
             }
+        }
+    }
+    false
+}
+
+/// True when binding a generic call's typevars from the assignment target
+/// VIOLATES a declared bound: bare, javac resolves the callee typevar from
+/// the target and then rejects the bound (jdk26
+/// ReverseOrderSortedSetView.Subset: `c = Comparator.naturalOrder()` —
+/// T := E from Comparator<E> against `T extends Comparable<? super T>`
+/// with the class's E unbounded; the source casts
+/// `(Comparator<E>) Comparator.naturalOrder()` — under the cast the call
+/// infers standalone and the unchecked hop bridges).
+pub(crate) fn target_binding_bound_conflict(
+    value: &Expr,
+    want: &TypeRef,
+    pool: &ClassPool,
+    pc: &PoolClass,
+) -> bool {
+    use jcdc_jvm::GenericType as G;
+    let Expr::Method { cls, name, desc, type_args, .. } = value else { return false };
+    if !type_args.is_empty() {
+        return false;
+    }
+    let TypeRef::G(want_g) = want else { return false };
+    let Some(dpc) = pool.get(cls.as_str()) else { return false };
+    let want_desc = format!(
+        "({}){}",
+        desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+        desc.ret.to_descriptor()
+    );
+    let Some(mi) = (0..dpc.cf.methods.len())
+        .find(|&i| dpc.method_name(i) == Some(name.as_str()) && dpc.method_desc(i) == Some(want_desc.as_str()))
+    else {
+        return false;
+    };
+    let Some(msig) = method_signature_of(&dpc, mi) else { return false };
+    if msig.params.is_empty() {
+        return false;
+    }
+    let mut map: Vec<(String, G)> = Vec::new();
+    if !unify_types(&msig.ret, want_g, &mut map) {
+        return false;
+    }
+    fn trivial_bound(p: &jcdc_jvm::TypeParam) -> bool {
+        if !p.interface_bounds.is_empty() {
+            return false;
+        }
+        match &p.class_bound {
+            None => true,
+            Some(G::Class(cs)) => {
+                cs.parts.len() == 1 && cs.parts[0].name == "Object" && cs.parts[0].args.is_empty()
+            }
+            Some(G::TypeVar(_)) => false,
+            _ => false,
+        }
+    }
+    // The enclosing class's own typevar bounds (E in the example).
+    let class_params: Vec<jcdc_jvm::TypeParam> = pc
+        .class_attr("Signature")
+        .and_then(|b| {
+            if b.len() >= 2 {
+                pc.utf8(u16::from_be_bytes([b[0], b[1]])).and_then(|x| parse_class_signature(x))
+            } else {
+                None
+            }
+        })
+        .map(|cs| cs.params)
+        .unwrap_or_default();
+    for p in &msig.params {
+        if trivial_bound(p) {
+            continue;
+        }
+        let Some((_, bound_to)) = map.iter().find(|(n, _)| n == &p.name) else { continue };
+        // The declared bound's own class (Comparable<? super T> ->
+        // java/lang/Comparable); the bound typevar T's identity does not
+        // change the required supertype.
+        let bound_class = match p.class_bound.as_ref().or_else(|| p.interface_bounds.first()) {
+            Some(G::Class(cs)) => crate::method::classsig_internal(cs),
+            Some(G::TypeVar(_)) | None => continue, // typevar bound: not cheaply checkable
+            _ => continue,
+        };
+        let er = TypeRef::G(bound_to.clone()).erased();
+        let violates = match &er {
+            jcdc_jvm::JavaType::Object(n) => {
+                if n == &bound_class {
+                    false
+                } else if let G::TypeVar(tn) = bound_to {
+                    // A caller typevar: its own declared bound's erasure
+                    // must reach the required supertype.
+                    let own_bound = class_params
+                        .iter()
+                        .find(|cp| &cp.name == tn)
+                        .and_then(|cp| {
+                            cp.class_bound
+                                .clone()
+                                .or_else(|| cp.interface_bounds.first().cloned())
+                        })
+                        .map(|b| TypeRef::G(b).erased())
+                        .unwrap_or(jcdc_jvm::JavaType::Object("java/lang/Object".into()));
+                    match &own_bound {
+                        jcdc_jvm::JavaType::Object(m) => {
+                            !is_subtype_of(pool, &jcdc_jvm::JavaType::Object(m.clone()), &bound_class)
+                        }
+                        _ => true,
+                    }
+                } else {
+                    !is_subtype_of(pool, &jcdc_jvm::JavaType::Object(n.clone()), &bound_class)
+                }
+            }
+            _ => true,
+        };
+        if violates {
+            return true;
         }
     }
     false
