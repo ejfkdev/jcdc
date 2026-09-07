@@ -9785,7 +9785,9 @@ fn instantiated_ctor_params(e: &Expr, pool: &ClassPool) -> Option<Vec<jcdc_jvm::
     if let TypeRef::G(jcdc_jvm::GenericType::Class(cs)) = ty {
         if let Some(part) = cs.parts.last() {
             if !part.args.is_empty() {
-                return instantiated_ctor_params_core(cls, &part.args, args.len(), pool);
+                let arg_tys: Vec<jcdc_jvm::JavaType> =
+                    args.iter().map(|a| a.type_ref().erased()).collect();
+                return instantiated_ctor_params_core(cls, &part.args, args.len(), pool, &arg_tys);
             }
         }
     }
@@ -9794,7 +9796,9 @@ fn instantiated_ctor_params(e: &Expr, pool: &ClassPool) -> Option<Vec<jcdc_jvm::
     // `(Class<? extends Enum<?>>, String)` — the source cast on the arg
     // leaves only an erased checkcast in bytecode). Generic classes with
     // an empty domain safely bail on the arity check inside.
-    instantiated_ctor_params_core(cls, &[], args.len(), pool)
+    let arg_tys: Vec<jcdc_jvm::JavaType> =
+        args.iter().map(|a| a.type_ref().erased()).collect();
+    instantiated_ctor_params_core(cls, &[], args.len(), pool, &arg_tys)
 }
 
 fn instantiated_ctor_params_core(
@@ -9802,6 +9806,7 @@ fn instantiated_ctor_params_core(
     inst_args: &[jcdc_jvm::GenericType],
     nargs: usize,
     pool: &ClassPool,
+    arg_tys: &[jcdc_jvm::JavaType],
 ) -> Option<Vec<jcdc_jvm::GenericType>> {
     let dpc = { let x = pool.get(cls); if x.is_none() && std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA s1 dpc {}", cls); } x? };
     // A class WITHOUT a class Signature is non-generic: empty substitution
@@ -9838,8 +9843,50 @@ fn instantiated_ctor_params_core(
             .map(|md| md.args.len() == nargs)
             .unwrap_or(false)
     };
-    let mi = (0..dpc.cf.methods.len())
-        .find(|&i| dpc.method_name(i) == Some("<init>") && arity_ok(i) && has_sig(i))
+    // Among same-arity ctors prefer Signature-bearing ones, scored by
+    // erased-formal compatibility with the actual arg types: jdk17
+    // Nodes$ToArrayTask$OfPrimitive has TWO 3-arg ctors —
+    // (T_NODE, T_ARR, int) and (OfPrimitive<..>, T_NODE, int) — arity
+    // order picked the first and the makeChild diamond args lost their
+    // (T_NODE) casts (无法推断OfPrimitive<> x3 trees).
+    let score = |i: usize| -> Option<i32> {
+        if !has_sig(i) {
+            return None;
+        }
+        let md = dpc.method_desc(i).and_then(|d| parse_method_descriptor(d))?;
+        if arg_tys.is_empty() || md.args.len() != arg_tys.len() {
+            return Some(0);
+        }
+        let mut sc = 0i32;
+        for (f, a) in md.args.iter().zip(arg_tys.iter()) {
+            sc += match (f, a) {
+                (jcdc_jvm::JavaType::Object(x), jcdc_jvm::JavaType::Object(y)) if x == y => 2,
+                (jcdc_jvm::JavaType::Array(_), jcdc_jvm::JavaType::Array(_)) => 2,
+                (x, y) if x == y => 2,
+                (_, jcdc_jvm::JavaType::Object(y)) if y == "java/lang/Object" => 1,
+                (jcdc_jvm::JavaType::Object(x), jcdc_jvm::JavaType::Object(y))
+                    if is_subtype_of(pool, &jcdc_jvm::JavaType::Object(y.clone()), x) =>
+                {
+                    1
+                }
+                _ => 0,
+            };
+        }
+        Some(sc)
+    };
+    let mut best: Option<(usize, i32)> = None;
+    for i in 0..dpc.cf.methods.len() {
+        if dpc.method_name(i) != Some("<init>") || !arity_ok(i) {
+            continue;
+        }
+        if let Some(sc) = score(i) {
+            if best.map(|(_, b)| sc > b).unwrap_or(true) {
+                best = Some((i, sc));
+            }
+        }
+    }
+    let mi = best
+        .map(|(i, _)| i)
         .or_else(|| {
             (0..dpc.cf.methods.len())
                 .find(|&i| dpc.method_name(i) == Some("<init>") && arity_ok(i))
@@ -10002,11 +10049,16 @@ fn apply_param_casts(
                             };
                             {
                                 if !wargs.is_empty() {
+                                    let arg_tys: Vec<jcdc_jvm::JavaType> = aargs
+                                        .iter()
+                                        .map(|x| x.type_ref().erased())
+                                        .collect();
                                     if let Some(sub) = instantiated_ctor_params_core(
                                         acls,
                                         &wargs,
                                         aargs.len(),
                                         pool,
+                                        &arg_tys,
                                     ) {
                                         let off = aargs.len().saturating_sub(sub.len());
                                         for (na, np) in
@@ -11181,7 +11233,7 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
         ty: &TypeRef,
         value: &Expr,
         pool: &ClassPool,
-    ) -> Option<(String, Vec<jcdc_jvm::GenericType>, usize)> {
+    ) -> Option<(String, Vec<jcdc_jvm::GenericType>, usize, Vec<jcdc_jvm::JavaType>)> {
         let (cls, args) = match value {
             Expr::New { cls, args, .. } => (cls, args),
             Expr::Cast { e, .. } => match &**e {
@@ -11201,9 +11253,11 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
             _ => return None,
         };
         let last = cs.parts.last().filter(|p| !p.args.is_empty())?;
+        let arg_tys: Vec<jcdc_jvm::JavaType> =
+            args.iter().map(|a| a.type_ref().erased()).collect();
         let ty_internal = crate::method::classsig_internal(cs);
         if ty_internal == *cls {
-            return Some((cls.clone(), last.args.clone(), args.len()));
+            return Some((cls.clone(), last.args.clone(), args.len(), arg_tys));
         }
         // Diamond against a SUPERTYPE-typed local (`Spliterator<Provider
         // <S>> s = new ProviderSpliterator<>(it)`): the local's args are
@@ -11215,7 +11269,7 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
         // declared supertype instantiation (with own typevars symbolic)
         // against the local's concrete type.
         let resolved = diamond_args_from_target(cls, cs, pool)?;
-        Some((cls.clone(), resolved, args.len()))
+        Some((cls.clone(), resolved, args.len(), arg_tys))
     }
     fn apply_to_value(value: &mut Expr, params: &[jcdc_jvm::GenericType], pool: &ClassPool) {
         match value {
@@ -11230,8 +11284,8 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
     }
     match s {
         Stmt::LocalDef { var, init: Some(value), .. } => {
-            if let Some((cls, iargs, n)) = inst_from(&vt.var(*var).ty, value, pool) {
-                if let Some(params) = instantiated_ctor_params_core(&cls, &iargs, n, pool) {
+            if let Some((cls, iargs, n, atys)) = inst_from(&vt.var(*var).ty, value, pool) {
+                if let Some(params) = instantiated_ctor_params_core(&cls, &iargs, n, pool, &atys) {
                     if let Stmt::LocalDef { init: Some(v), .. } = s {
                         apply_to_value(v, &params, pool);
                     }
@@ -11262,8 +11316,8 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
                 },
                 _ => None,
             };
-            if let Some((cls, iargs, n)) = target {
-                if let Some(params) = instantiated_ctor_params_core(&cls, &iargs, n, pool) {
+            if let Some((cls, iargs, n, atys)) = target {
+                if let Some(params) = instantiated_ctor_params_core(&cls, &iargs, n, pool, &atys) {
                     if let Expr::Assign { value, .. } = &mut *inner {
                         apply_to_value(value, &params, pool);
                     }
@@ -13133,8 +13187,10 @@ fn cast_generic_returns(s: &mut Stmt, want: &TypeRef, pc: &PoolClass, pool: &Cla
                     diamond_args_from_target(ncls, wcs, pool).unwrap_or_default()
                 };
                 if !own.is_empty() {
+                    let arg_tys: Vec<jcdc_jvm::JavaType> =
+                        args.iter().map(|x| x.type_ref().erased()).collect();
                     if let Some(sub) =
-                        instantiated_ctor_params_core(ncls, &own, args.len(), pool)
+                        instantiated_ctor_params_core(ncls, &own, args.len(), pool, &arg_tys)
                     {
                         apply_ctor_param_casts(args, &sub, pool, Some(pc), &[]);
                     }
