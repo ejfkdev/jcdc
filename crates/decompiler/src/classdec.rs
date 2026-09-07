@@ -16456,6 +16456,70 @@ fn cast_object_locals_at_typed_formals(e: &mut Expr) {
     }
 }
 
+/// True when a generic call's Class-literal actual pins a callee typevar
+/// to a concrete class that CONFLICTS with the binding the assignment
+/// target imposes on the same typevar (RandomGeneratorFactory.of:
+/// factoryOf(String, Class<T#1>) returns RandomGeneratorFactory<T#1>; the
+/// target RandomGeneratorFactory<T#2> binds T#1 := T#2 while
+/// RandomGenerator.class at the Class<T#1> formal binds T#1 :=
+/// RandomGenerator — bare inference: 推论变量T#1具有不兼容的等式约束条件).
+pub(crate) fn classlit_want_conflict(value: &Expr, want: &TypeRef, pool: &ClassPool) -> bool {
+    use jcdc_jvm::GenericType as G;
+    let Expr::Method { cls, name, desc, args, type_args, .. } = value else { return false };
+    if !type_args.is_empty() {
+        return false;
+    }
+    let TypeRef::G(want_g) = want else { return false };
+    let Some(dpc) = pool.get(cls.as_str()) else { return false };
+    let want_desc = format!(
+        "({}){}",
+        desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+        desc.ret.to_descriptor()
+    );
+    let Some(mi) = (0..dpc.cf.methods.len())
+        .find(|&i| dpc.method_name(i) == Some(name.as_str()) && dpc.method_desc(i) == Some(want_desc.as_str()))
+    else {
+        return false;
+    };
+    let Some(msig) = method_signature_of(&dpc, mi) else { return false };
+    if msig.params.is_empty() {
+        return false;
+    }
+    // Bindings the TARGET imposes via the generic return.
+    let mut map: Vec<(String, G)> = Vec::new();
+    if !unify_types(&msig.ret, want_g, &mut map) {
+        return false;
+    }
+    // Class-literal actuals at Class<typevar> formals pin concretely.
+    for (a, formal) in args.iter().zip(msig.args.iter()) {
+        let Expr::Const(crate::expr::ConstVal::ClassLit(lit)) = a else { continue };
+        let G::Class(fc) = formal else { continue };
+        let lit_internal = match lit {
+            TypeRef::J(jcdc_jvm::JavaType::Object(n)) => n.clone(),
+            TypeRef::G(G::Class(cs)) => crate::method::classsig_internal(cs),
+            _ => continue,
+        };
+        let Some(last) = fc.parts.last() else { continue };
+        if crate::method::classsig_internal(fc) != "java/lang/Class" || last.args.len() != 1 {
+            continue;
+        }
+        let G::TypeVar(tn) = &last.args[0] else { continue };
+        if let Some((_, bound)) = map.iter().find(|(n, _)| n == tn) {
+            // The target bound must be a DIFFERENT concrete type than the
+            // literal (a typevar bound is the usual conflicting shape).
+            let conflicts = match bound {
+                G::TypeVar(_) => true,
+                G::Class(bc) => crate::method::classsig_internal(bc) != lit_internal,
+                _ => true,
+            };
+            if conflicts {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn cast_generic_returns(s: &mut Stmt, want: &TypeRef, pc: &PoolClass, pool: &ClassPool) {
     fn fix(e: &mut Expr, want: &TypeRef, pc: &PoolClass, pool: &ClassPool) {
         if matches!(e, Expr::Const(_)) {

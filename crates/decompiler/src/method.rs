@@ -8934,9 +8934,23 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
                 if wcs.parts.iter().any(|p| p.args.iter().any(|a| {
                     matches!(a, jcdc_jvm::GenericType::Wildcard(_))
                 })));
+            // A CLASS-LITERAL actual pins the callee's typevar to a
+            // concrete class while the target binds the SAME typevar to
+            // something else: bare inference collects both equalities and
+            // dies (jdk11/17/26 RandomGeneratorFactory.of:
+            // `RandomGeneratorFactory<T> f = factoryOf(name,
+            // RandomGenerator.class)` — T#1 := T#2 from the target vs
+            // T#1 := RandomGenerator from the Class<T#1> formal; the
+            // source casts (RandomGeneratorFactory<T>)).
+            let class_lit_conflict = generic_here
+                && matches!(value, Expr::Method { args, .. } if args.iter().any(|a| {
+                    matches!(a, Expr::Const(crate::expr::ConstVal::ClassLit(_)))
+                }))
+                && crate::classdec::classlit_want_conflict(value, want, pool);
             if !crate::classdec::is_generic_call(value, pool)
                 || reflective_array
                 || wildcard_want
+                || class_lit_conflict
             {
                 let inner = std::mem::replace(value, Expr::This);
                 *value = Expr::Cast { ty: want.clone(), e: Box::new(inner) };
