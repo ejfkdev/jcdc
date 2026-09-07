@@ -9626,7 +9626,140 @@ fn disambiguate_overload_args(e: &mut Expr, pool: &ClassPool) {
 }
 
 pub(crate) fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass, vt: &crate::varalloc::VarTable) {
+    // Reference comparison between two different parameterizations of
+    // the same generic class is "不可比较的类型" (jdk11 Arrays.copyOf:
+    // Class<CAP#1 from ? extends T[]> against the class literal
+    // Class<Object[]>) — the source carried `(Object)` erasure casts on
+    // both operands, which leave no bytecode trace.
+    fn incomparable_class_cmp(e: &mut Expr, pool: &ClassPool) {
+        let (l, r) = match e {
+            Expr::Bin { op, l, r, .. }
+                if matches!(
+                    op,
+                    crate::expr::BinOp::Eq
+                        | crate::expr::BinOp::Ne
+                        | crate::expr::BinOp::RefEq
+                        | crate::expr::BinOp::RefNe
+                ) => (l, r),
+            _ => return,
+        };
+        fn class_args(e: &Expr) -> Option<(String, Vec<jcdc_jvm::GenericType>)> {
+            if let Expr::Const(crate::expr::ConstVal::ClassLit(t)) = e {
+                fn jt_to_g(jt: &jcdc_jvm::JavaType) -> jcdc_jvm::GenericType {
+                    match jt {
+                        jcdc_jvm::JavaType::Object(n) => {
+                            let (pkg, simple) = match n.rfind('/') {
+                                Some(i) => (n[..i].to_string(), n[i + 1..].to_string()),
+                                None => (String::new(), n.clone()),
+                            };
+                            jcdc_jvm::GenericType::Class(jcdc_jvm::ClassSig {
+                                package: pkg,
+                                parts: vec![jcdc_jvm::ClassSigPart { name: simple, args: Vec::new() }],
+                            })
+                        }
+                        jcdc_jvm::JavaType::Array(i) => {
+                            jcdc_jvm::GenericType::Array(Box::new(jt_to_g(i)))
+                        }
+                        jcdc_jvm::JavaType::Boolean => jcdc_jvm::GenericType::Primitive('Z'),
+                        jcdc_jvm::JavaType::Byte => jcdc_jvm::GenericType::Primitive('B'),
+                        jcdc_jvm::JavaType::Char => jcdc_jvm::GenericType::Primitive('C'),
+                        jcdc_jvm::JavaType::Short => jcdc_jvm::GenericType::Primitive('S'),
+                        jcdc_jvm::JavaType::Int => jcdc_jvm::GenericType::Primitive('I'),
+                        jcdc_jvm::JavaType::Long => jcdc_jvm::GenericType::Primitive('J'),
+                        jcdc_jvm::JavaType::Float => jcdc_jvm::GenericType::Primitive('F'),
+                        jcdc_jvm::JavaType::Double => jcdc_jvm::GenericType::Primitive('D'),
+                        jcdc_jvm::JavaType::Void => jcdc_jvm::GenericType::Primitive('V'),
+                    }
+                }
+                let g = match t {
+                    TypeRef::J(jt) => jt_to_g(jt),
+                    TypeRef::G(g) => g.clone(),
+                };
+                return Some(("java/lang/Class".to_string(), vec![g]));
+            }
+            match e.type_ref() {
+                TypeRef::G(jcdc_jvm::GenericType::Class(cs))
+                    if cs.parts.last().map(|p| !p.args.is_empty()).unwrap_or(false) =>
+                {
+                    Some((
+                        crate::method::classsig_internal(&cs),
+                        cs.parts.last()?.args.clone(),
+                    ))
+                }
+                _ => None,
+            }
+        }
+        fn internal_of(g: &jcdc_jvm::GenericType) -> Option<String> {
+            match g {
+                jcdc_jvm::GenericType::Class(cs) => Some(crate::method::classsig_internal(cs)),
+                _ => None,
+            }
+        }
+        // True when one instantiation is convertible to the other (then
+        // javac accepts the comparison without casts).
+        fn compat(a: &jcdc_jvm::GenericType, b: &jcdc_jvm::GenericType, pool: &ClassPool) -> bool {
+            use jcdc_jvm::GenericType as G;
+            if a == b {
+                return true;
+            }
+            fn one(x: &G, y: &G, pool: &ClassPool) -> bool {
+                use jcdc_jvm::GenericType as G;
+                match y {
+                    G::Wildcard(jcdc_jvm::WildcardBound::Any) => true,
+                    G::Wildcard(jcdc_jvm::WildcardBound::Extends(t)) => match (x, &**t) {
+                        (G::Class(cx), G::Class(ct)) => {
+                            crate::classdec::is_subtype_of(
+                                pool,
+                                &jcdc_jvm::JavaType::Object(crate::method::classsig_internal(cx)),
+                                &crate::method::classsig_internal(ct),
+                            )
+                        }
+                        _ => x == &**t,
+                    },
+                    G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => match (x, &**t) {
+                        (G::Class(cx), G::Class(ct)) => {
+                            crate::classdec::is_subtype_of(
+                                pool,
+                                &jcdc_jvm::JavaType::Object(crate::method::classsig_internal(ct)),
+                                &crate::method::classsig_internal(cx),
+                            )
+                        }
+                        _ => x == &**t,
+                    },
+                    G::Class(cy) => match x {
+                        G::Class(cx) => {
+                            cx.parts.len() == cy.parts.len()
+                                && crate::classdec::is_subtype_of(
+                                    pool,
+                                    &jcdc_jvm::JavaType::Object(crate::method::classsig_internal(cx)),
+                                    &crate::method::classsig_internal(cy),
+                                )
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                }
+            }
+            one(a, b, pool) || one(b, a, pool)
+        }
+        let (Some((na, aa)), Some((nb, ab))) = (class_args(l), class_args(r)) else {
+            return;
+        };
+        if na != nb || aa == ab || aa.len() != ab.len() {
+            return;
+        }
+        if aa.iter().zip(ab.iter()).any(|(x, y)| !compat(x, y, pool)) {
+            for side in [l, r] {
+                let inner = std::mem::replace(&mut **side, Expr::This);
+                **side = Expr::Cast {
+                    ty: TypeRef::J(jcdc_jvm::JavaType::Object("java/lang/Object".into())),
+                    e: Box::new(inner),
+                };
+            }
+        }
+    }
     fn fix_expr(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
+        incomparable_class_cmp(e, pool);
         let params = instantiated_method_params(e, pool, pc);
         // An Object descriptor param that instantiates to something else is
         // the ERASURE of a generic parameter (accept(T) → (Object)V), not
