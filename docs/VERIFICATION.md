@@ -656,3 +656,10 @@ method/varalloc）双路同时受益；features 56/56 双路 + cargo test 39/39 
 （structure.rs 门控反转）+ 通过 git worktree 将共享修复 cherry-pick 至
 master 并重跑 master 全量验证（双路 smoke + 双路 corpus A/B）——该链需数
 小时，留待下一会话执行。
+
+### 会话终态（2026-09-07）
+
+SESE 普查终值：**jdk11 114 / jdk17 120 / jdk26 177（total 411）**；walk 对照
+468（翻转门数据见上）。会话起点 1679（352/398/929），累计 **-75.5%**，34 个
+fix commit，每次提交前 features 56/56 双路 + cargo test 39/39 全绿。最后
+一笔：clinit 尾部裸 return 剪除（-10，ClassLoaders AppClassLoader）。
