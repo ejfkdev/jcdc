@@ -1594,7 +1594,19 @@ impl<'a> Builder<'a> {
                     _ => None,
                 };
                 let sam = sam_md.unwrap_or_else(|| mdesc.clone());
-                if let Some(le) = self.build_lambda(&name, &sam, args.clone(), impl_handle_idx)? {
+                // instantiatedMethodType = bootstrap arg 2 (CONSTANT_MethodType)
+                let inst_md = bsm.bootstrap_arguments.get(2).and_then(|&ia| {
+                    match jcdc_classfile::get_entry(&self.pc.cf.constant_pool, ia) {
+                        Some(ConstantPoolEntry::MethodType(mt)) => self
+                            .pc
+                            .utf8(mt.descriptor_index)
+                            .and_then(|d| parse_method_descriptor(d)),
+                        _ => None,
+                    }
+                });
+                if let Some(le) =
+                    self.build_lambda(&name, &sam, args.clone(), impl_handle_idx, inst_md)?
+                {
                     let e = Expr::Lambda(Box::new(le));
                     if mdesc.ret == JavaType::Void {
                         stmts.push(Stmt::ExprStmt(e));
@@ -1697,6 +1709,7 @@ impl<'a> Builder<'a> {
         sam_desc: &MethodDescriptor,
         dynamic_args: Vec<Expr>,
         impl_handle_idx: u16,
+        inst_sam_desc: Option<MethodDescriptor>,
     ) -> BResult<Option<LambdaExpr>> {
         let (kind, ref_index) = match jcdc_classfile::get_entry(&self.pc.cf.constant_pool, impl_handle_idx) {
             Some(ConstantPoolEntry::MethodHandle(h)) => (h.reference_kind, h.reference_index),
@@ -1726,6 +1739,7 @@ impl<'a> Builder<'a> {
                 kind: LambdaKind::Lambda,
                 sam_name: sam_name.to_string(),
                 sam_desc: sam_desc.clone(),
+                inst_sam_desc: inst_sam_desc.clone(),
                 impl_owner,
                 impl_name,
                 impl_desc: impl_mdesc,
@@ -1751,6 +1765,7 @@ impl<'a> Builder<'a> {
                 kind: LambdaKind::Lambda,
                 sam_name: sam_name.to_string(),
                 sam_desc: sam_desc.clone(),
+                inst_sam_desc: inst_sam_desc.clone(),
                 impl_owner,
                 impl_name,
                 impl_desc: impl_mdesc,
@@ -1777,6 +1792,7 @@ impl<'a> Builder<'a> {
             kind: LambdaKind::MethodRef,
             sam_name: sam_name.to_string(),
             sam_desc: sam_desc.clone(),
+            inst_sam_desc: inst_sam_desc.clone(),
             impl_owner: impl_owner.clone(),
             impl_name: impl_name.to_string(),
             impl_desc: impl_mdesc,

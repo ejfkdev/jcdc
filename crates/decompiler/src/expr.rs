@@ -220,6 +220,13 @@ pub struct LambdaExpr {
     /// Functional interface method name/desc for casting ambiguity if needed.
     pub sam_name: String,
     pub sam_desc: MethodDescriptor,
+    /// LambdaMetafactory instantiatedMethodType (bootstrap arg 2): the
+    /// SAM descriptor as javac INSTANTIATED it at this site — for
+    /// `.<ConstantDesc>map(Utf8Entry::stringValue)` it is
+    /// `(LUtf8Entry;)LConstantDesc;` against the erased samMethodType
+    /// `(LObject;)LObject;`. The only bytecode record of explicit type
+    /// arguments on a lambda/method-ref call.
+    pub inst_sam_desc: Option<MethodDescriptor>,
     /// Implementation method (for Lambda kind: the body is emitted from it,
     /// or referenced by name when it belongs to another class).
     pub impl_owner: String,

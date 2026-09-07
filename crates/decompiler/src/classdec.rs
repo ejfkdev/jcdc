@@ -9627,6 +9627,25 @@ pub(crate) fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolC
         if !erased_generic_param {
             disambiguate_overload_args(e, pool);
         }
+        // Explicit type arguments recorded in the invokedynamic's
+        // instantiatedMethodType (Optional.<ConstantDesc>map(
+        // Utf8Entry::stringValue) — the raw methodref leaves the chain
+        // Optional<String> and the sibling orElse(BSM_NULL_CONSTANT)
+        // fails to convert).
+        if let Expr::Method { cls, name, desc, type_args, args, .. } = e {
+            if type_args.is_empty() {
+                if let Some(Expr::Lambda(lam)) = args.first() {
+                    if lam.inst_sam_desc.is_some() {
+                        if let Some(w) = method_ref_inst_type_args(cls, name, desc, lam, pool) {
+                            if std::env::var("JCDC_DBG_WIT").is_ok() {
+                                eprintln!("INSTTA {}.{} -> {:?}", cls, name, w);
+                            }
+                            *type_args = w;
+                        }
+                    }
+                }
+            }
+        }
         if params.is_none() && !matches!(e, Expr::New { .. }) {
             raw_witness_generic_method_args(e, pool, pc);
         }
@@ -10106,13 +10125,24 @@ fn add_return_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, 
 /// 无效"). Conservative v1: the receiver fills the first SAM param when
 /// it is a callee typevar; remaining SAM params unify against the target's
 /// Signature; every callee typevar must end up bound and denotable.
-fn method_ref_type_args(
+/// Shared resolution prefix for method-ref witnesses: the caller method's
+/// generic Signature, its typevar names, the SAM class signature in the
+/// formal, and the SAM method's own signature + class params + the
+/// formal's actual type arguments.
+fn method_ref_common(
     cls: &str,
     name: &str,
     desc: &jcdc_jvm::MethodDescriptor,
     lam: &crate::expr::LambdaExpr,
     pool: &ClassPool,
-) -> Option<Vec<String>> {
+) -> Option<(
+    jcdc_jvm::MethodSignature,
+    Vec<String>,
+    jcdc_jvm::ClassSig,
+    jcdc_jvm::MethodSignature,
+    Vec<jcdc_jvm::TypeParam>,
+    Vec<jcdc_jvm::GenericType>,
+)> {
     use jcdc_jvm::GenericType as G;
     if lam.kind != crate::expr::LambdaKind::MethodRef || lam.impl_is_static {
         if std::env::var("JCDC_DBG_WIT").is_ok() {
@@ -10212,6 +10242,141 @@ fn method_ref_type_args(
         }
         pl?.args.clone()
     };
+    Some((msig, tvar_names, sam_cs, sam_msig, sam_cls_params, inst_args))
+}
+
+/// Witness from the invokedynamic's instantiatedMethodType — javac's own
+/// record of the SAM instantiation at this site. Authoritative; unlike
+/// the unification heuristic it never guesses.
+fn method_ref_inst_type_args(
+    cls: &str,
+    name: &str,
+    desc: &jcdc_jvm::MethodDescriptor,
+    lam: &crate::expr::LambdaExpr,
+    pool: &ClassPool,
+) -> Option<Vec<String>> {
+    use jcdc_jvm::GenericType as G;
+    let inst = lam.inst_sam_desc.as_ref()?;
+    let (msig, tvar_names, _sam_cs, sam_msig, sam_cls_params, inst_args) =
+        method_ref_common(cls, name, desc, lam, pool)?;
+    // The invokedynamic's instantiatedMethodType is javac's own record of
+    // the SAM instantiation: `.<ConstantDesc>map(Utf8Entry::stringValue)`
+    // compiles samMethodType `(LObject;)LObject;` with instantiated
+    // `(LUtf8Entry;)LConstantDesc;` (jdk26 ClassPrinterImpl — without the
+    // explicit witness the raw methodref types the lambda against the
+    // erased Function and the orElse argument fails to convert). Pair it
+    // positionally with the SAM method's generic signature to recover the
+    // SAM class typevar values, then read the CALLER's typevars off the
+    // formal's (wildcard-wrapped) type arguments.
+    if let Some(inst) = &lam.inst_sam_desc {
+        if inst.args.len() == sam_msig.args.len() && inst != &lam.sam_desc {
+            fn jt_to_g(jt: &jcdc_jvm::JavaType) -> G {
+                match jt {
+                    jcdc_jvm::JavaType::Object(n) => {
+                        let (pkg, simple) = match n.rfind('/') {
+                            Some(i) => (n[..i].to_string(), n[i + 1..].to_string()),
+                            None => (String::new(), n.clone()),
+                        };
+                        G::Class(jcdc_jvm::ClassSig {
+                            package: pkg,
+                            parts: vec![jcdc_jvm::ClassSigPart { name: simple, args: Vec::new() }],
+                        })
+                    }
+                    jcdc_jvm::JavaType::Array(i) => G::Array(Box::new(jt_to_g(i))),
+                    jcdc_jvm::JavaType::Boolean => G::Primitive('Z'),
+                    jcdc_jvm::JavaType::Byte => G::Primitive('B'),
+                    jcdc_jvm::JavaType::Char => G::Primitive('C'),
+                    jcdc_jvm::JavaType::Short => G::Primitive('S'),
+                    jcdc_jvm::JavaType::Int => G::Primitive('I'),
+                    jcdc_jvm::JavaType::Long => G::Primitive('J'),
+                    jcdc_jvm::JavaType::Float => G::Primitive('F'),
+                    jcdc_jvm::JavaType::Double => G::Primitive('D'),
+                    jcdc_jvm::JavaType::Void => G::Primitive('V'),
+                }
+            }
+            // SAM class typevar name -> instantiated concrete type.
+            let mut sam_vals: Vec<(String, G)> = Vec::new();
+            for (sa, ia) in sam_msig.args.iter().zip(inst.args.iter()) {
+                if let G::TypeVar(n) = sa {
+                    if !sam_vals.iter().any(|(m, _)| m == n) {
+                        sam_vals.push((n.clone(), jt_to_g(ia)));
+                    }
+                }
+            }
+            if let G::TypeVar(n) = &sam_msig.ret {
+                if !sam_vals.iter().any(|(m, _)| m == n) {
+                    sam_vals.push((n.clone(), jt_to_g(&inst.ret)));
+                }
+            }
+            if !sam_vals.is_empty() && sam_cls_params.len() == inst_args.len() {
+                let mut mapping: Vec<(String, G)> = Vec::new();
+                let mut ok = true;
+                for (p, actual) in sam_cls_params.iter().zip(inst_args.iter()) {
+                    let Some((_, concrete)) =
+                        sam_vals.iter().find(|(n, _)| *n == p.name)
+                    else {
+                        ok = false;
+                        break;
+                    };
+                    let inner = match actual {
+                        G::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
+                        | G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => t.as_ref(),
+                        other => other,
+                    };
+                    // Only slots mentioning a CALLER METHOD typevar bind
+                    // it; receiver-side class typevars (`? super T` of
+                    // Optional<T>) and concrete pins are the receiver's
+                    // business — skip them (failing there blocked the
+                    // Function<? super T, ? extends U> case entirely).
+                    if let G::TypeVar(v) = inner {
+                        if tvar_names.iter().any(|t| t == v) {
+                            match mapping.iter().find(|(m, _)| m == v) {
+                                Some((_, prev)) if prev != concrete => {
+                                    ok = false;
+                                    break;
+                                }
+                                Some(_) => {}
+                                None => mapping.push((v.clone(), concrete.clone())),
+                            }
+                        }
+                    }
+                }
+                if ok && !mapping.is_empty() {
+                    let mut out = Vec::with_capacity(msig.params.len());
+                    let mut done = true;
+                    for p in &msig.params {
+                        match mapping.iter().find(|(n, _)| n == &p.name) {
+                            Some((_, t)) => out.push(t.to_java()),
+                            None => {
+                                done = false;
+                                break;
+                            }
+                        }
+                    }
+                    if done && !out.is_empty() {
+                        return Some(out);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn method_ref_type_args(
+    cls: &str,
+    name: &str,
+    desc: &jcdc_jvm::MethodDescriptor,
+    lam: &crate::expr::LambdaExpr,
+    pool: &ClassPool,
+) -> Option<Vec<String>> {
+    use jcdc_jvm::GenericType as G;
+    if let Some(w) = method_ref_inst_type_args(cls, name, desc, lam, pool) {
+        return Some(w);
+    }
+    let (msig, tvar_names, sam_cs, sam_msig, sam_cls_params, inst_args) =
+        method_ref_common(cls, name, desc, lam, pool)?;
+    let _ = (&tvar_names, &sam_cs);
     let sam_params: Vec<G> = sam_msig
         .args
         .iter()
