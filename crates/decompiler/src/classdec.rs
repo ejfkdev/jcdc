@@ -2775,7 +2775,7 @@ fn emit_method_with(
             let captys_save =
                 CAPTURE_GENERIC_TYPES.with(|m| std::mem::take(&mut *m.borrow_mut()));
             fix_lambda_captures(&mut body, &mut mb.vt, pc, pool, fam);
-            disambiguate_lambda_locals(pc, pool, &mut mb.vt, &body);
+            disambiguate_lambda_locals(pc, pool, &mut mb.vt, &mut body);
             line.push_str(" {\n");
             out.push_str(&line);
             let ret_bool = mdesc.as_ref().map(|d| d.ret == jcdc_jvm::JavaType::Boolean).unwrap_or(false)
@@ -8804,39 +8804,33 @@ fn instantiated_method_params(
                         (crate::method::classsig_internal(&cs), cs.parts.last()?.args.clone())
                     }
                     _ => {
-                        // Inherited generic method on an implicit `this`:
-                        // the methodref names the DECLARING supertype
-                        // (FindSink.accept(T) from OfDouble) — instantiate
-                        // its params through pc's supertype signature so
-                        // apply_param_casts can restore the source-level
-                        // `accept((Double) value)` cast that disambiguates
-                        // it from the primitive overloads.
-                        if cls != pc.internal_name {
-                            if let Some(inst) = supertype_instantiation(pc, cls, pool) {
-                                (cls.to_string(), inst)
-                            } else {
-                                (cls.to_string(), Vec::new())
+                        // implicit `this` or erased owner: the enclosing
+                        // class. The super-chain BFS below walks pc's
+                        // supers when pc does not declare name+desc (an
+                        // inherited generic like FindSink.accept(T) whose
+                        // methodref owner is the receiver class), carrying
+                        // each hop's real instantiation — so decl starts
+                        // at pc even when cls names a supertype (setting
+                        // decl=cls with pc's own typevars instantiates
+                        // foreign methods against the wrong parameters:
+                        // `(T) u` regression in ReferencePipeline).
+                        let cs = pc.class_attr("Signature").and_then(|b| {
+                            if b.len() < 2 {
+                                return None;
                             }
-                        } else {
-                            // implicit `this` or erased owner: the enclosing class
-                            let cs = pc.class_attr("Signature").and_then(|b| {
-                                if b.len() < 2 {
-                                    return None;
-                                }
-                                let idx = u16::from_be_bytes([b[0], b[1]]);
-                                pc.utf8(idx).and_then(|s| jcdc_jvm::parse_class_signature(s))
-                            });
-                            let args = cs
-                                .as_ref()
-                                .map(|c| {
-                                    c.params
-                                        .iter()
-                                        .map(|p| jcdc_jvm::GenericType::TypeVar(p.name.clone()))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            (pc.internal_name.clone(), args)
-                        }
+                            let idx = u16::from_be_bytes([b[0], b[1]]);
+                            pc.utf8(idx).and_then(|s| jcdc_jvm::parse_class_signature(s))
+                        });
+                        let args = cs
+                            .as_ref()
+                            .map(|c| {
+                                c.params
+                                    .iter()
+                                    .map(|p| jcdc_jvm::GenericType::TypeVar(p.name.clone()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        (pc.internal_name.clone(), args)
                     }
                 }
             }
@@ -9012,11 +9006,59 @@ fn witness_ambiguous_lambda_args(e: &mut Expr, pool: &ClassPool, pc: &PoolClass)
         return;
     }
     let Expr::Method { args, .. } = e else { return };
+    // The chosen overload's generic Signature parameter (when concrete and
+    // non-generic-method): a RAW SAM cast types the lambda params at the
+    // erasure (DerInputStream `(Predicate) t -> t.byteValue()` — t:Object,
+    // 找不到符号), while `(Predicate<Byte>)` keeps the body well-typed.
+    let msig_args: Option<(bool, Vec<jcdc_jvm::GenericType>)> = (0..dref.cf.methods.len())
+        .find(|&i| {
+            dref.method_name(i) == Some(name.as_str())
+                && dref.method_desc(i) == Some(format!(
+                    "({}){}",
+                    desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+                    desc.ret.to_descriptor()
+                ).as_str())
+        })
+        .and_then(|mi| {
+            dref.cf.methods[mi].attributes.iter().find_map(|a| {
+                if dref.utf8(a.attribute_name_index) == Some("Signature") {
+                    Some(a.info.as_slice())
+                } else {
+                    None
+                }
+            })
+        })
+        .and_then(|b| {
+            if b.len() < 2 {
+                return None;
+            }
+            dref.utf8(u16::from_be_bytes([b[0], b[1]]))
+                .and_then(|x| jcdc_jvm::parse_method_signature(x))
+        })
+        .map(|ms| (ms.params.is_empty(), ms.args.clone()));
+    fn mentions_tvar(g: &jcdc_jvm::GenericType) -> bool {
+        use jcdc_jvm::GenericType as G;
+        match g {
+            G::TypeVar(_) => true,
+            G::Array(i) => mentions_tvar(i),
+            G::Class(cs) => cs.parts.iter().any(|p| p.args.iter().any(mentions_tvar)),
+            G::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
+            | G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => mentions_tvar(t),
+            _ => false,
+        }
+    }
     for (i, a) in args.iter_mut().enumerate() {
         if !ambiguous[i] || !matches!(a, Expr::Lambda(_)) {
             continue;
         }
-        let sam = TypeRef::J(desc.args[i].clone());
+        let mut sam = TypeRef::J(desc.args[i].clone());
+        if let Some((true, sig_args)) = &msig_args {
+            if let Some(g @ jcdc_jvm::GenericType::Class(cs)) = sig_args.get(i) {
+                if cs.parts.iter().any(|p| !p.args.is_empty()) && !mentions_tvar(g) {
+                    sam = TypeRef::G(g.clone());
+                }
+            }
+        }
         let inner = std::mem::replace(a, Expr::This);
         *a = Expr::Cast { ty: sam, e: Box::new(inner) };
     }
@@ -10085,7 +10127,7 @@ fn disambiguate_lambda_locals(
     pc: &PoolClass,
     pool: &ClassPool,
     vt: &mut crate::varalloc::VarTable,
-    body: &Stmt,
+    body: &mut Stmt,
 ) {
     fn collect_lambda_names(
         e: &Expr,
@@ -10272,6 +10314,7 @@ fn disambiguate_lambda_locals(
         return;
     }
     let existing: HashSet<String> = vt.vars.iter().map(|v| v.name.clone()).collect();
+    let mut renames: HashMap<u32, String> = HashMap::new();
     for v in vt.vars.iter_mut() {
         if v.is_param || !lambda_names.contains(&v.name) {
             continue;
@@ -10281,11 +10324,73 @@ fn disambiguate_lambda_locals(
         loop {
             let cand = format!("{}${}", base, k);
             if !lambda_names.contains(&cand) && !existing.contains(&cand) {
-                v.name = cand;
+                v.name = cand.clone();
+                renames.insert(v.id, cand);
                 break;
             }
             k += 1;
         }
+    }
+    // Catch declarations carry a frozen `var_name` override — without the
+    // sync the decl prints the old name while references print the renamed
+    // one (ModuleHashes `catch (NoSuchAlgorithmException e1) { throw new
+    // IllegalArgumentException(e1$1); }` — 找不到符号 e1$1).
+    if !renames.is_empty() {
+        fn sync(s: &mut Stmt, renames: &HashMap<u32, String>) {
+            match s {
+                Stmt::Block(v) => v.iter_mut().for_each(|x| sync(x, renames)),
+                Stmt::If { then_stmt, else_stmt, .. } => {
+                    sync(then_stmt, renames);
+                    if let Some(x) = else_stmt {
+                        sync(x, renames);
+                    }
+                }
+                Stmt::While { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::ForEach { body, .. }
+                | Stmt::Labeled { body, .. }
+                | Stmt::Synchronized { body, .. } => sync(body, renames),
+                Stmt::For { init, body, .. } => {
+                    init.iter_mut().for_each(|x| sync(x, renames));
+                    sync(body, renames);
+                }
+                Stmt::Switch { cases, default, .. } => {
+                    for c in cases {
+                        c.body.iter_mut().for_each(|x| sync(x, renames));
+                    }
+                    if let Some(d) = default {
+                        sync(d, renames);
+                    }
+                }
+                Stmt::Try { body, catches, finally } => {
+                    sync(body, renames);
+                    for c in catches {
+                        if let Some(n) = renames.get(&c.var) {
+                            c.var_name = Some(n.clone());
+                        }
+                        sync(&mut c.body, renames);
+                    }
+                    if let Some(f) = finally {
+                        sync(f, renames);
+                    }
+                }
+                Stmt::TryWithResources { resources, body, catches, finally } => {
+                    resources.iter_mut().for_each(|x| sync(x, renames));
+                    sync(body, renames);
+                    for c in catches {
+                        if let Some(n) = renames.get(&c.var) {
+                            c.var_name = Some(n.clone());
+                        }
+                        sync(&mut c.body, renames);
+                    }
+                    if let Some(f) = finally {
+                        sync(f, renames);
+                    }
+                }
+                _ => {}
+            }
+        }
+        sync(body, &renames);
     }
 }
 

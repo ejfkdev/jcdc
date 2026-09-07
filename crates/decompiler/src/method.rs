@@ -6133,6 +6133,14 @@ fn match_j7(v: &[Stmt], i: usize) -> Option<J7Plan> {
         if dbg { eprintln!("TWR reject: resource var escapes try"); }
         return None;
     }
+    // A kept (user) catch must not reference the resource either: in a
+    // real try-with-resources the resource is out of scope in the catch.
+    // A hand-rolled try whose handler closes the stream (MimeLauncher
+    // `catch (IOException e1) { os.close(); .. }`) is not TWR.
+    if keep_catches.iter().any(|c| stmt_uses_var(&c.body, r_var)) {
+        if dbg { eprintln!("TWR reject: kept catch uses resource var"); }
+        return None;
+    }
     if dbg { eprintln!("TWR MATCH res_idx={} inits={:?} keep={}", ri, init_idxs, keep_catches.len()); }
     Some(J7Plan { res_idx: ri, init_idxs, keep_catches, try_idx: i })
 }
