@@ -8425,7 +8425,7 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
             _ => false,
         }
     }
-    fn fix(value: &mut Expr, want: &TypeRef, pool: &ClassPool) {
+    fn fix(value: &mut Expr, want: &TypeRef, pool: &ClassPool, pc: &PoolClass) {
         if matches!(value, Expr::Const(_)) {
             return;
         }
@@ -8507,6 +8507,22 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
                 return;
             }
         }
+        // A call whose SOURCE-level return — instantiated through the
+        // owner and the declaring super chain — IS the target type also
+        // needs no cast: `SliceTask<P_IN,P_OUT> parent = getParent()`
+        // (AbstractTask.getParent returns K := SliceTask<P_IN,P_OUT> for
+        // a SliceTask receiver; strip_selftype_checkcasts already dropped
+        // the raw erasure cast). Without this, the fallback below cast to
+        // the value's own erasure — `(AbstractTask)` — inconvertible to
+        // the target (AbstractTask无法转换为SliceTask<P_IN,P_OUT>, jdk11
+        // SliceOps.isLeftCompleted x2 per tree).
+        if matches!(value, Expr::Method { .. }) && matches!(want, TypeRef::G(_)) {
+            if let Some(inst) = crate::classdec::instantiated_method_ret(value, pool, pc) {
+                if TypeRef::G(inst) == *want {
+                    return;
+                }
+            }
+        }
         // Erasures must line up (both arrays, or same class name).
         let have = value.type_ref().erased();
         let want_er = want.erased();
@@ -8549,13 +8565,13 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
         Stmt::Block(v) => v.iter_mut().for_each(|x| cast_generic_locals(vt, pool, pc, x)),
         Stmt::LocalDef { var, init: Some(e), .. } => {
             let want = vt.var(*var).ty.clone();
-            fix(e, &want, pool);
+            fix(e, &want, pool, pc);
         }
         Stmt::ExprStmt(Expr::Assign { target, value, .. }) => {
             match &**target {
                 Expr::Local { var, .. } => {
                     let want = vt.var(*var).ty.clone();
-                    fix(value, &want, pool);
+                    fix(value, &want, pool, pc);
                 }
                 // `e.next = (Entry<K,V>) x;` — a generic field write whose
                 // cast erases away; re-insert against the instantiated
@@ -8567,7 +8583,7 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
                     // `this.signum = this.mag.length != 0;`).
                     let want = instantiated_field_type(owner.as_deref(), cls, name, pool, pc)
                         .unwrap_or_else(|| ty.clone());
-                    fix(value, &want, pool);
+                    fix(value, &want, pool, pc);
                 }
                 // `tArr[i] = (T) v;` — the element cast erases away.
                 Expr::ArrayIndex { array, .. } => {
@@ -8578,7 +8594,7 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
                     match &aty {
                         TypeRef::G(jcdc_jvm::GenericType::Array(comp)) => {
                             let want = TypeRef::G((**comp).clone());
-                            fix(value, &want, pool);
+                            fix(value, &want, pool, pc);
                         }
                         // Primitive-element stores need the same value
                         // fixups as locals: booleanize folds `b ? 1 : 0`
@@ -8587,7 +8603,7 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
                         // `stamp[i] = isSet[i]` — boolean无法转换为int).
                         TypeRef::J(jcdc_jvm::JavaType::Array(elem)) => {
                             let want = TypeRef::J((**elem).clone());
-                            fix(value, &want, pool);
+                            fix(value, &want, pool, pc);
                         }
                         _ => {}
                     }

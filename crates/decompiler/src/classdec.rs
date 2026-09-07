@@ -8872,7 +8872,7 @@ fn supertype_instantiation(
 /// receiver declares R on AbstractTask<P_IN,P_OUT,R,K> → T_NODE). None
 /// for statics, unresolvable owners, erased declarations, or returns
 /// that mention no typevar after substitution.
-fn instantiated_method_ret(
+pub(crate) fn instantiated_method_ret(
     m: &Expr,
     pool: &ClassPool,
     pc: &PoolClass,
