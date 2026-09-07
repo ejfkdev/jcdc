@@ -213,6 +213,22 @@ impl<'a> Printer<'a> {
     /// or local-decl of byte/short with int constants needs explicit
     /// casts: `byte normalVirtual = !if() ? (byte) 5 : (byte) 9;`).
     pub fn expr_narrow(&mut self, e: &Expr, ty: &jcdc_jvm::JavaType, out: &mut String) {
+        self.expr_narrow_f(e, ty, false, out)
+    }
+
+    /// `force_consts`: the enclosing conditional's condition is not a
+    /// compile-time constant, so the whole expression is not a constant
+    /// expression and javac's assignment-context narrowing does NOT apply
+    /// to in-range int constants either (byte getDirectionality: `return
+    /// (ch & 0xFFFE) == 0xFFFE ? -1 : 0` — 从int转换到byte可能会有损失;
+    /// the source branches are byte static finals the bytecode inlined).
+    fn expr_narrow_f(
+        &mut self,
+        e: &Expr,
+        ty: &jcdc_jvm::JavaType,
+        force_consts: bool,
+        out: &mut String,
+    ) {
         match e {
             Expr::Const(ConstVal::Int(n)) => {
                 let (lo, hi) = match ty {
@@ -220,7 +236,7 @@ impl<'a> Printer<'a> {
                     jcdc_jvm::JavaType::Short => (-32768i64, 32767i64),
                     _ => (i32::MIN as i64, i32::MAX as i64),
                 };
-                if (*n as i64) < lo || (*n as i64) > hi {
+                if force_consts || (*n as i64) < lo || (*n as i64) > hi {
                     out.push('(');
                     out.push_str(&self.type_name(&TypeRef::J(ty.clone())));
                     out.push_str(") ");
@@ -228,11 +244,51 @@ impl<'a> Printer<'a> {
                 out.push_str(&n.to_string());
             }
             Expr::Cond { c, t, f } => {
+                let force = force_consts || !matches!(&**c, Expr::Const(_));
                 self.expr(c, 3, out);
                 out.push_str(" ? ");
-                self.expr_narrow(t, ty, out);
+                self.expr_narrow_f(t, ty, force, out);
                 out.push_str(" : ");
-                self.expr_narrow(f, ty, out);
+                self.expr_narrow_f(f, ty, force, out);
+            }
+            // An int-typed local (typically a branch-merge stack temp)
+            // under a byte/short target needs the explicit narrowing cast
+            // (jdk17 InvokerBytecodeGenerator `return stack61;` —
+            // 从int转换到byte可能会有损失; the merged branches carried
+            // byte values the evidence widened to int).
+            Expr::Local { var, .. } => {
+                if matches!(
+                    (self.vt.var(*var).ty.erased(), ty),
+                    (jcdc_jvm::JavaType::Int, jcdc_jvm::JavaType::Byte)
+                        | (jcdc_jvm::JavaType::Int, jcdc_jvm::JavaType::Short)
+                ) {
+                    out.push('(');
+                    out.push_str(&self.type_name(&TypeRef::J(ty.clone())));
+                    out.push_str(") ");
+                }
+                self.expr(e, 1, out);
+            }
+            _ => self.expr(e, 1, out),
+        }
+    }
+
+    /// Call-argument variant of expr_narrow: invocation conversion never
+    /// narrows, so in-range int constants keep the explicit cast too, and
+    /// int conditionals get it per branch.
+    fn expr_narrow_arg(&mut self, e: &Expr, ty: &jcdc_jvm::JavaType, out: &mut String) {
+        match e {
+            Expr::Const(ConstVal::Int(n)) => {
+                out.push('(');
+                out.push_str(&self.type_name(&TypeRef::J(ty.clone())));
+                out.push_str(") ");
+                out.push_str(&n.to_string());
+            }
+            Expr::Cond { c, t, f } => {
+                self.expr(c, 3, out);
+                out.push_str(" ? ");
+                self.expr_narrow_arg(t, ty, out);
+                out.push_str(" : ");
+                self.expr_narrow_arg(f, ty, out);
             }
             _ => self.expr(e, 1, out),
         }
@@ -1398,20 +1454,13 @@ impl<'a> Printer<'a> {
                 Some(jcdc_jvm::JavaType::Char) => self.expr_char(a, out),
                 // Byte/short parameters: an int literal argument needs an
                 // explicit cast (invocation conversion never narrows, even
-                // for in-range constants).
-                Some(jcdc_jvm::JavaType::Byte) => {
-                    if let Expr::Const(ConstVal::Int(n)) = a {
-                        out.push_str(&format!("(byte) {}", n));
-                        continue;
-                    }
-                    self.expr(a, 1, out);
-                }
-                Some(jcdc_jvm::JavaType::Short) => {
-                    if let Expr::Const(ConstVal::Int(n)) = a {
-                        out.push_str(&format!("(short) {}", n));
-                        continue;
-                    }
-                    self.expr(a, 1, out);
+                // for in-range constants) — and so do the branches of an
+                // int conditional (jdk CompressedResourceHeader
+                // `buffer.put(isTerminal ? (byte) 1 : (byte) 0)` — the
+                // byte casts fold away in bytecode; a bare int ternary is
+                // "对于put(int), 找不到合适的方法" x3 trees).
+                Some(jcdc_jvm::JavaType::Byte) | Some(jcdc_jvm::JavaType::Short) => {
+                    self.expr_narrow_arg(a, &param_types[i].clone(), out);
                 }
                 _ => self.expr(a, 1, out),
             }
