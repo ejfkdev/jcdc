@@ -110,6 +110,27 @@ impl<'a> Printer<'a> {
         }
     }
 
+    /// bool_ish_expr with VarTable resolution: booleanize retypes the vt
+    /// while embedded Local tys stay frozen, and a bitwise bin over
+    /// bool-ish sides is itself boolean (jdk26 LinkedTransferQueue
+    /// `(spin & !upc) == 0`).
+    fn bool_ish_vt(&self, x: &Expr) -> bool {
+        match x {
+            Expr::Local { var, .. } => {
+                matches!(self.vt.var(*var).ty.erased(), jcdc_jvm::JavaType::Boolean)
+            }
+            Expr::Bin { op, l, r, .. }
+                if matches!(
+                    op,
+                    crate::expr::BinOp::And | crate::expr::BinOp::Or | crate::expr::BinOp::Xor
+                ) =>
+            {
+                self.bool_ish_vt(l) && self.bool_ish_vt(r)
+            }
+            _ => Self::bool_ish_expr(x),
+        }
+    }
+
     pub fn expr_bool(&mut self, e: &Expr, out: &mut String) {
         match e {
             Expr::Const(ConstVal::Int(n)) => {
@@ -124,8 +145,8 @@ impl<'a> Printer<'a> {
                 if matches!(
                     bop,
                     crate::expr::BinOp::Xor | crate::expr::BinOp::And | crate::expr::BinOp::Or
-                ) && Self::bool_ish_expr(l)
-                    && Self::bool_ish_expr(r) =>
+                ) && self.bool_ish_vt(l)
+                    && self.bool_ish_vt(r) =>
             {
                 let sym = match bop {
                     crate::expr::BinOp::Xor => "^",
@@ -1423,10 +1444,21 @@ impl<'a> Printer<'a> {
                 self.expr(e, 14, out);
             }
             Expr::Bin { op, l, r, .. } => {
-                // Boolean context special cases: `b == 0` → `!b`.
-                let lt = l.type_ref().erased();
+                // Boolean context special cases: `b == 0` → `!b`. A
+                // Local's embedded type can be stale (booleanize retypes
+                // the VarTable), and a boolified bitwise bin over
+                // bool-ish operands is boolean too (jdk26
+                // LinkedTransferQueue `(spin & !upc) == 0` — the frozen-Int
+                // And with an int-form ternary side printed
+                // `spin & (!upc ? 1 : 0)`: boolean & int).
+                let lt = match &**l {
+                    Expr::Local { var, .. } => self.vt.var(*var).ty.erased(),
+                    other => other.type_ref().erased(),
+                };
+                let l_bool = lt == JavaType::Boolean;
+                let l_boolish = l_bool || self.bool_ish_vt(l);
                 if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::RefEq | BinOp::RefNe)
-                    && lt == JavaType::Boolean
+                    && l_boolish
                 {
                     if let Expr::Const(ConstVal::Int(n)) = &**r {
                         let polarity = matches!(op, BinOp::Eq | BinOp::RefEq);
@@ -1434,7 +1466,15 @@ impl<'a> Printer<'a> {
                         if !want_true {
                             out.push('!');
                         }
-                        self.expr(l, 14, out);
+                        if l_bool {
+                            self.expr(l, 14, out);
+                        } else {
+                            // Composite boolean (a bitwise bin): parenthesize
+                            // so a leading `!` binds the whole value.
+                            out.push('(');
+                            self.expr_bool(l, out);
+                            out.push(')');
+                        }
                         if parens {
                             out.push(')');
                         }
