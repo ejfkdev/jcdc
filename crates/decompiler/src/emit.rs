@@ -167,7 +167,21 @@ impl<'a> Printer<'a> {
                             self.expr_bool(inner, out);
                         } else {
                             out.push('!');
+                            // expr_bool renders composite conditions bare:
+                            // `!` + `ssign != 45` would regroup as
+                            // `(!ssign) != 45` (jdk26 FloatingDecimal
+                            // "一元运算符 '!' 的操作数类型int错误").
+                            let needs = matches!(
+                                &**c,
+                                Expr::Bin { .. } | Expr::Cond { .. } | Expr::Assign { .. }
+                            );
+                            if needs {
+                                out.push('(');
+                            }
                             self.expr_bool(c, out);
+                            if needs {
+                                out.push(')');
+                            }
                         }
                     }
                     _ => {
@@ -1169,7 +1183,52 @@ impl<'a> Printer<'a> {
                 let base_s = self.type_name(base);
                 out.push_str(&base_s);
                 out.push('(');
-                self.args(args, out);
+                // Render the ctor args through the base class's matching
+                // <init> descriptor: an int 0/1 at a boolean parameter
+                // must print as false/true (jdk11 Console's anonymous
+                // PrintWriter subclass — `new PrintWriter(out, 1)` finds
+                // no ctor). Pick the arity-matching ctor whose param
+                // erasures best fit the actual arg types.
+                let base_internal = match base {
+                    TypeRef::J(jcdc_jvm::JavaType::Object(n)) => Some(n.clone()),
+                    TypeRef::G(jcdc_jvm::GenericType::Class(cs)) => {
+                        Some(crate::method::classsig_internal(cs))
+                    }
+                    _ => None,
+                };
+                let ctor_params = base_internal.and_then(|bi| {
+                    let bpc = self.pool.get(&bi)?;
+                    let mut best: Option<(usize, Vec<jcdc_jvm::JavaType>)> = None;
+                    for mi in 0..bpc.cf.methods.len() {
+                        if bpc.method_name(mi) != Some("<init>") {
+                            continue;
+                        }
+                        let d = bpc.method_desc(mi)?;
+                        let md = jcdc_jvm::parse_method_descriptor(d)?;
+                        if md.args.len() != args.len() {
+                            continue;
+                        }
+                        let score = md
+                            .args
+                            .iter()
+                            .zip(args.iter())
+                            .filter(|(pt, a)| {
+                                matches!(a.type_ref().erased(), jcdc_jvm::JavaType::Object(an)
+                                    if matches!(pt, jcdc_jvm::JavaType::Object(pn) if pn == &an))
+                                    || (matches!(pt, jcdc_jvm::JavaType::Boolean)
+                                        && matches!(a, Expr::Const(ConstVal::Int(0 | 1))))
+                            })
+                            .count();
+                        if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+                            best = Some((score, md.args));
+                        }
+                    }
+                    best.map(|(_, a)| a)
+                });
+                match ctor_params {
+                    Some(pt) => self.args_typed(args, &pt, out),
+                    None => self.args(args, out),
+                }
                 out.push_str(") {\n");
                 for line in body.lines() {
                     for _ in 0..self.indent + 1 {
@@ -1459,6 +1518,17 @@ impl<'a> Printer<'a> {
                             }
                         }
                         crate::classdec::restore_enum_switches(&mut body, self.pc, self.pool);
+                        // Nested calls inside lambda bodies need the same
+                        // overload-disambiguation/instantiation witnesses
+                        // as top-level method bodies (BootstrapLogger
+                        // doPrivileged(() -> .., acc) stays ambiguous
+                        // without the raw SAM cast).
+                        crate::classdec::cast_wildcard_call_args(
+                            &mut body,
+                            self.pool,
+                            self.pc,
+                            &vt,
+                        );
                         crate::method::prune_post_loop_label_breaks(&mut body);
                         crate::method::demote_undefined_label_jumps(&mut body);
                         // Single-return body → expression lambda.

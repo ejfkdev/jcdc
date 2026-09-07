@@ -9606,7 +9606,7 @@ fn disambiguate_overload_args(e: &mut Expr, pool: &ClassPool) {
     }
 }
 
-fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass, vt: &crate::varalloc::VarTable) {
+pub(crate) fn cast_wildcard_call_args(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass, vt: &crate::varalloc::VarTable) {
     fn fix_expr(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
         let params = instantiated_method_params(e, pool, pc);
         // An Object descriptor param that instantiates to something else is
@@ -9911,9 +9911,44 @@ fn args_have_generic_new(args: &[Expr], pool: &ClassPool) -> bool {
                 if is_generic_class(cls, pool) {
                     return true;
                 }
+                // An anonymous class new carries its parameterized
+                // supertype in the class Signature (PollingWatchService$1
+                // implements PrivilegedExceptionAction<PollingWatchKey>):
+                // that pinning must block an outer return witness the
+                // same way a diamond does.
+                if let Some(npc) = pool.get(cls) {
+                    if let Some(sig) = npc.class_attr("Signature").and_then(|b| {
+                        if b.len() >= 2 {
+                            npc.utf8(u16::from_be_bytes([b[0], b[1]]))
+                                .and_then(|x| parse_class_signature(x))
+                        } else {
+                            None
+                        }
+                    }) {
+                        let parameterized = |g: &jcdc_jvm::GenericType| {
+                            matches!(g, jcdc_jvm::GenericType::Class(cs)
+                                if cs.parts.iter().any(|p| !p.args.is_empty()))
+                        };
+                        if sig.params.is_empty()
+                            && (parameterized(&sig.superclass)
+                                || sig.interfaces.iter().any(parameterized))
+                        {
+                            return true;
+                        }
+                    }
+                }
                 args.iter().any(|a| has(a, pool))
             }
-            Expr::AnonNew { args, .. } => args.iter().any(|a| has(a, pool)),
+            Expr::AnonNew { base, args, .. } => {
+                // The anon's own parameterized supertype pins the
+                // enclosing call's typevars (doPrivileged(new
+                // PrivilegedExceptionAction<PollingWatchKey>..) — an
+                // explicit return witness <WatchKey> clashes with the
+                // invariant formal).
+                matches!(base, TypeRef::G(jcdc_jvm::GenericType::Class(cs))
+                    if cs.parts.iter().any(|p| !p.args.is_empty()))
+                    || args.iter().any(|a| has(a, pool))
+            }
             Expr::Method { owner, args, .. } => {
                 owner.as_deref().map(|o| has(o, pool)).unwrap_or(false)
                     || args.iter().any(|a| has(a, pool))
