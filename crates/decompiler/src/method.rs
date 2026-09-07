@@ -5418,6 +5418,21 @@ fn booleanize_deep(e: &mut crate::expr::Expr) {
                             | JavaType::Double
                     )
                 };
+                // Any boolean side makes the comparison a BOOLEAN context:
+                // a facing 0/1 ternary must fold to bool (`flag == (c ? 1
+                // : 0)` → `flag == c`; keeping the int form is "二元运算
+                // 符 '==' 的操作数类型错误"). Only pure-primitive equality
+                // keeps int operands.
+                let bool_ish = |x: &Expr| {
+                    matches!(x.type_ref().erased(), JavaType::Boolean)
+                        || matches!(
+                            x,
+                            Expr::Un { op: crate::expr::UnOp::Not, .. } | Expr::InstanceOf { .. }
+                        )
+                };
+                if bool_ish(a) || bool_ish(b) {
+                    return false;
+                }
                 prim(a) || prim(b)
             };
             let numeric = match op {
