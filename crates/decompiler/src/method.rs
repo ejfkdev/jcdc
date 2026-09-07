@@ -2218,7 +2218,19 @@ fn resolve_catch_vars(vt: &mut VarTable, s: &mut Stmt) {
                             .unwrap_or(JavaType::Object("java/lang/Throwable".into()));
                         let new_var = {
                             let slot = vt.vars[v as usize].slot;
-                            vt.add_catch_var(slot, "e".to_string(), TypeRef::J(exc_ty))
+                            // Prefer the LVT name of the handler's own
+                            // variable (catch (Exception e0) — jdk17
+                            // SocketExceptions.create: the synthesized "e"
+                            // shadowed the anon body's substituted outer
+                            // capture `return e`, binding it to the catch
+                            // param instead — Exception无法转换为IOException).
+                            let vi = &vt.vars[v as usize];
+                            let nm = if vi.synthetic_name {
+                                "e".to_string()
+                            } else {
+                                vi.name.clone()
+                            };
+                            vt.add_catch_var(slot, nm, TypeRef::J(exc_ty))
                         };
                         remove_first_stmt(&mut c.body);
                         rewrite_var_until_assign(&mut c.body, v, new_var);
@@ -2261,7 +2273,19 @@ fn resolve_catch_vars(vt: &mut VarTable, s: &mut Stmt) {
                             .unwrap_or(JavaType::Object("java/lang/Throwable".into()));
                         let new_var = {
                             let slot = vt.vars[v as usize].slot;
-                            vt.add_catch_var(slot, "e".to_string(), TypeRef::J(exc_ty))
+                            // Prefer the LVT name of the handler's own
+                            // variable (catch (Exception e0) — jdk17
+                            // SocketExceptions.create: the synthesized "e"
+                            // shadowed the anon body's substituted outer
+                            // capture `return e`, binding it to the catch
+                            // param instead — Exception无法转换为IOException).
+                            let vi = &vt.vars[v as usize];
+                            let nm = if vi.synthetic_name {
+                                "e".to_string()
+                            } else {
+                                vi.name.clone()
+                            };
+                            vt.add_catch_var(slot, nm, TypeRef::J(exc_ty))
                         };
                         remove_first_stmt(&mut c.body);
                         rewrite_var_until_assign(&mut c.body, v, new_var);
