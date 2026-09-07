@@ -1903,6 +1903,7 @@ impl<'a> Printer<'a> {
                             }
                         }
                         crate::classdec::witness_comparison_operands(&mut body, None, self.pool);
+                        crate::classdec::upgrade_typevar_array_casts(&mut body, self.pool, self.pc);
                         {
                             let fam = crate::classdec::Family::collect(self.pc, self.pool);
                             let _depth = crate::classdec::lambda_body_depth_enter();

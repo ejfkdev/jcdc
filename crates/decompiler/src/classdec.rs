@@ -2705,6 +2705,7 @@ fn emit_method_with(
             // instantiated returns (later raw-cast fallbacks must not be
             // rewritten — see upgrade_erased_call_casts).
             upgrade_erased_call_casts(&mut body, pool, pc);
+            upgrade_typevar_array_casts(&mut body, pool, pc);
             // Generic methods returning a type variable: javac elides the
             // `(E)` cast when the erasure already matches, but source needs
             // it back.
@@ -11131,6 +11132,46 @@ fn disambiguate_overload_args(e: &mut Expr, pool: &ClassPool) {
 /// ever touches casts that exist at this point, i.e. real checkcasts
 /// (jdk17 ModulePatcher: (List) e.getValue() upgrades to (List<String>)
 /// feeding the stream/map chain — Object无法转换为String).
+/// A raw-GENERIC-ELEMENT array cast over a generic call whose Signature
+/// returns a typevar array erases to exactly this shape
+/// (Arrays.copyOfRange(Class<?>[],..) -> (Class[]) — jdk26 MethodHandles
+/// .longestParameterList: List.of over the raw Class[] types the chain at
+/// List<Class>, inconvertible to the source's List<Class<?>>). Restore the
+/// element form the call's actual array carries. Runs over the whole body
+/// (the cast typically sits deep inside a lambda chain) and again in the
+/// lambda-body print pipeline.
+pub(crate) fn upgrade_typevar_array_casts(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass) {
+    fn fix(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
+        if let Expr::Cast { ty, e: ce } = e {
+            if let TypeRef::J(jcdc_jvm::JavaType::Array(el)) = ty {
+                if let jcdc_jvm::JavaType::Object(en) = el.as_ref() {
+                    let generic = pool
+                        .get(en.as_str())
+                        .and_then(|epc| {
+                            epc.class_attr("Signature").and_then(|b| {
+                                if b.len() >= 2 {
+                                    epc.utf8(u16::from_be_bytes([b[0], b[1]])).and_then(|x| parse_class_signature(x))
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .map(|cs| !cs.params.is_empty())
+                        .unwrap_or(false);
+                    if generic {
+                        if let Some(el_g) = typevar_array_call_elem(ce, en, pool, pc) {
+                            *ty = TypeRef::G(jcdc_jvm::GenericType::Array(Box::new(el_g)));
+                        }
+                    }
+                }
+            }
+        }
+        let f: fn(&mut Expr, &ClassPool, &PoolClass) = fix;
+        walk_expr_children(e, pool, pc, &mut { f });
+    }
+    walk_stmt_exprs(s, pool, pc, &mut { fix });
+}
+
 pub(crate) fn upgrade_erased_call_casts(s: &mut Stmt, pool: &ClassPool, pc: &PoolClass) {
     fn fix(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
         type_field_reads(e, pool, pc, true);
@@ -15618,6 +15659,224 @@ fn pin_underdetermined_return_diamonds(
         *ty = TypeRef::G(jcdc_jvm::GenericType::Class(ncs));
         let _ = nargs;
     }
+    // A diamond new at a return position whose own params are NOT all
+    // bound by the direct target (the method returns a SUPERTYPE with
+    // fewer params — jdk26 GathererOp.of returns Stream<R> while the
+    // diamond is GathererOp<T,A,R>): resolve the gaps from the ctor
+    // formals unified against the G-typed actuals (wildcard formal slots
+    // impose nothing) and pin explicitly. When ONE actual conflicts, the
+    // source re-parameterized it with an unchecked cast
+    // ((ReferencePipeline<?,T>) upstream — bare, its P_OUT clashes with
+    // the gatherer's T on the diamond's T2 and javac gives up: 无法推断
+    // GathererOp<>): resolve without it, pin, then retype it to the
+    // substituted formal.
+    fn unify_formal_relaxed(
+        formal: &jcdc_jvm::GenericType,
+        actual: &jcdc_jvm::GenericType,
+        subst: &mut Vec<(String, jcdc_jvm::GenericType)>,
+    ) -> bool {
+        use jcdc_jvm::GenericType as G;
+        match formal {
+            G::Wildcard(_) => true, // a wildcard formal slot imposes nothing
+            G::TypeVar(n) => {
+                if let Some((_, prev)) = subst.iter().find(|(m, _)| m == n) {
+                    return prev == actual;
+                }
+                subst.push((n.clone(), actual.clone()));
+                true
+            }
+            G::Array(fi) => match actual {
+                G::Array(ai) => unify_formal_relaxed(fi, ai, subst),
+                _ => false,
+            },
+            G::Class(fc) => {
+                let G::Class(ac) = actual else { return false };
+                if crate::method::classsig_internal(fc) != crate::method::classsig_internal(ac)
+                    || fc.parts.len() != ac.parts.len()
+                {
+                    return false;
+                }
+                for (pf, pa) in fc.parts.iter().zip(ac.parts.iter()) {
+                    if pf.name != pa.name || pf.args.len() != pa.args.len() {
+                        return false;
+                    }
+                    for (x, y) in pf.args.iter().zip(pa.args.iter()) {
+                        if !unify_formal_relaxed(x, y, subst) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            }
+            other => other == actual,
+        }
+    }
+    fn pin_new_from_ctor_args(e: &mut Expr, pool: &ClassPool) {
+        let dbgp = std::env::var("JCDC_DBG_PIN").is_ok();
+        if dbgp {
+            if let Expr::New { cls, .. } = &*e {
+                if cls.contains("GathererOp") {
+                    eprintln!("PINCAND {}", cls);
+                }
+            }
+        }
+        let (ncls, already, nargs) = match &*e {
+            Expr::New { cls, ty, args, .. } => {
+                let already = matches!(ty, TypeRef::G(jcdc_jvm::GenericType::Class(cs))
+                    if cs.parts.last().map(|p| !p.args.is_empty()).unwrap_or(false));
+                (cls.clone(), already, args.len())
+            }
+            _ => return,
+        };
+        if already {
+            return;
+        }
+        let Some(npc) = pool.get(&ncls) else { return };
+        let Some(csig) = npc.class_attr("Signature").and_then(|b| {
+            if b.len() >= 2 {
+                npc.utf8(u16::from_be_bytes([b[0], b[1]])).and_then(|x| parse_class_signature(x))
+            } else {
+                None
+            }
+        }) else {
+            return;
+        };
+        if csig.params.is_empty() {
+            return;
+        }
+        let Some(cmi) = (0..npc.cf.methods.len()).find(|&i| {
+            npc.method_name(i) == Some("<init>")
+                && npc
+                    .method_desc(i)
+                    .and_then(parse_method_descriptor)
+                    .map(|md| md.args.len() == nargs)
+                    .unwrap_or(false)
+                && method_signature_of(&npc, i).is_some()
+        }) else {
+            return;
+        };
+        let Some(cmsig) = method_signature_of(&npc, cmi) else { return };
+        if cmsig.args.len() != nargs {
+            return;
+        }
+        // Resolve, allowing a single conflicting G actual to be excluded
+        // (it becomes the cast).
+        enum Resolve {
+            Ok(Vec<(String, jcdc_jvm::GenericType)>),
+            Conflict(usize),
+            Fail,
+        }
+        fn try_resolve(
+            e: &Expr,
+            csig: &jcdc_jvm::ClassSignature,
+            cmsig: &jcdc_jvm::MethodSignature,
+            skip: Option<usize>,
+        ) -> Resolve {
+            let Expr::New { args, .. } = e else { return Resolve::Fail };
+            let mut subst: Vec<(String, jcdc_jvm::GenericType)> = Vec::new();
+            for (i, (a, formal)) in args.iter().zip(cmsig.args.iter()).enumerate() {
+                if Some(i) == skip {
+                    continue;
+                }
+                let TypeRef::G(ag) = a.type_ref() else { continue };
+                if !unify_formal_relaxed(formal, &ag, &mut subst) {
+                    return if skip.is_none() {
+                        Resolve::Conflict(i)
+                    } else {
+                        Resolve::Fail
+                    };
+                }
+            }
+            // Every own param bound and denotable.
+            let resolved: Option<Vec<jcdc_jvm::GenericType>> = csig
+                .params
+                .iter()
+                .map(|p| {
+                    subst.iter().find(|(n, _)| *n == p.name).and_then(|(_, g)| {
+                        let ok = match g {
+                            jcdc_jvm::GenericType::Wildcard(_) => false,
+                            jcdc_jvm::GenericType::TypeVar(n) => {
+                                n == &p.name || !g_has_typevar_in(g, &csig.params)
+                            }
+                            other => !g_has_typevar_in(other, &csig.params),
+                        };
+                        if ok {
+                            Some(g.clone())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
+            match resolved {
+                Some(_) => Resolve::Ok(subst),
+                None => Resolve::Fail,
+            }
+        }
+        let (subst, skipped) = match try_resolve(e, &csig, &cmsig, None) {
+            Resolve::Ok(su) => (su, None),
+            _ => {
+                // A conflicting/incomplete actual may be the one the source
+                // re-parameterized with a cast: try excluding EACH actual
+                // in turn and accept the resolution only when exactly one
+                // exclusion completes (GathererOp: dropping upstream lets
+                // the gatherer bind T,A,R; dropping the gatherer binds
+                // nothing).
+                let mut wins: Vec<(Vec<(String, jcdc_jvm::GenericType)>, usize)> = Vec::new();
+                for j in 0..nargs {
+                    if let Resolve::Ok(su) = try_resolve(e, &csig, &cmsig, Some(j)) {
+                        wins.push((su, j));
+                    }
+                }
+                if wins.len() != 1 {
+                    if dbgp && ncls.contains("GathererOp") { eprintln!("PINRES skip-wins={}", wins.len()); }
+                    return;
+                }
+                let (su, j) = wins.into_iter().next().unwrap();
+                if dbgp && ncls.contains("GathererOp") { eprintln!("PINRES skip={}", j); }
+                (su, Some(j))
+            }
+        };
+        if dbgp && ncls.contains("GathererOp") { eprintln!("PINRES ok subst={:?}", subst.iter().map(|(k,v)| (k.clone(), format!("{:?}", v))).collect::<Vec<_>>()); }
+        let resolved: Vec<jcdc_jvm::GenericType> = csig
+            .params
+            .iter()
+            .map(|p| {
+                subst
+                    .iter()
+                    .find(|(n, _)| *n == p.name)
+                    .map(|(_, g)| g.clone())
+                    .unwrap_or(jcdc_jvm::GenericType::TypeVar(p.name.clone()))
+            })
+            .collect();
+        // Retype the conflicting actual to its substituted formal (the
+        // source's unchecked re-parameterization cast).
+        if let Some(si) = skipped {
+            if let Expr::New { args, .. } = e {
+                if let Some(a) = args.get_mut(si) {
+                    let formal_inst =
+                        crate::method::subst_typevars(&cmsig.args[si], &csig.params, &resolved);
+                    if let TypeRef::G(_) = a.type_ref() {
+                        let inner = std::mem::replace(a, Expr::This);
+                        *a = Expr::Cast {
+                            ty: TypeRef::G(formal_inst),
+                            e: Box::new(inner),
+                        };
+                    }
+                }
+            }
+        }
+        let ncs = jcdc_jvm::ClassSig {
+            package: ncls.rfind('/').map(|i| ncls[..i].to_string()).unwrap_or_default(),
+            parts: vec![jcdc_jvm::ClassSigPart {
+                name: ncls.rsplit('/').next().unwrap_or(&ncls).to_string(),
+                args: resolved,
+            }],
+        };
+        if let Expr::New { ty, .. } = e {
+            *ty = TypeRef::G(jcdc_jvm::GenericType::Class(ncs));
+        }
+    }
     fn pin(e: &mut Expr, want: &jcdc_jvm::GenericType, pool: &ClassPool) {
         let (ncls, under) = match &*e {
             Expr::New { cls, ty, .. } => {
@@ -15651,6 +15910,7 @@ fn pin_underdetermined_return_diamonds(
                 if let Some(w) = want {
                     pin(e, w, pool);
                 }
+                pin_new_from_ctor_args(e, pool);
             }
             Stmt::If { then_stmt, else_stmt, .. } => {
                 rec(then_stmt, want, pool);
@@ -15690,6 +15950,103 @@ fn pin_underdetermined_return_diamonds(
         }
     }
     rec(s, want.as_ref(), pool);
+}
+
+/// For a generic call whose Signature return is a TYPEVAR ARRAY (T[]),
+/// resolve T's element instantiation from the first array formal's actual
+/// (declared/instantiated return — Arrays.copyOfRange(ptypes(), ..) with
+/// ptypes(): Class<?>[]). Returns the element type when it is a
+/// parameterization of `en` (the raw cast's element class).
+fn typevar_array_call_elem(
+    e: &Expr,
+    en: &str,
+    pool: &ClassPool,
+    pc: &PoolClass,
+) -> Option<jcdc_jvm::GenericType> {
+    use jcdc_jvm::GenericType as G;
+    let Expr::Method { cls, name, desc, args, owner, .. } = e else { return None };
+    let dpc = pool.get(cls.as_str())?;
+    let want_desc = format!(
+        "({}){}",
+        desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+        desc.ret.to_descriptor()
+    );
+    let mi = (0..dpc.cf.methods.len())
+        .find(|&i| dpc.method_name(i) == Some(name.as_str()) && dpc.method_desc(i) == Some(want_desc.as_str()))?;
+    let msig = method_signature_of(&dpc, mi)?;
+    let G::Array(inner) = &msig.ret else { return None };
+    let G::TypeVar(tn) = inner.as_ref() else { return None };
+    // The formal that is T[] (or mentions T) paired with an array actual.
+    for (formal, actual) in msig.args.iter().zip(args.iter()) {
+        let is_tv_array = matches!(formal, G::Array(fi) if matches!(fi.as_ref(), G::TypeVar(n) if n == tn));
+        if !is_tv_array {
+            continue;
+        }
+        // The actual's declared generic element type.
+        let g = match actual {
+            Expr::Method { .. } => {
+                let mut r = instantiated_method_ret(actual, pool, pc);
+                if r.is_none() {
+                    // Fall back to the DECLARED Signature return: valid
+                    // as-is when the declaring class is non-generic (a raw
+                    // owner still calls the same declared method —
+                    // MethodType.ptypes(): Class<?>[]; the lambda impl's
+                    // erased param starves instantiated_method_ret).
+                    if let Expr::Method { cls: acls, name: aname, desc: adesc, .. } = actual {
+                        if let Some(adpc) = pool.get(acls.as_str()) {
+                            let cls_generic = adpc
+                                .class_attr("Signature")
+                                .and_then(|b| {
+                                    if b.len() >= 2 {
+                                        adpc.utf8(u16::from_be_bytes([b[0], b[1]])).and_then(|x| parse_class_signature(x))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .map(|cs| !cs.params.is_empty())
+                                .unwrap_or(false);
+                            if !cls_generic {
+                                let awant = format!(
+                                    "({}){}",
+                                    adesc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+                                    adesc.ret.to_descriptor()
+                                );
+                                if let Some(ami) = (0..adpc.cf.methods.len()).find(|&i| {
+                                    adpc.method_name(i) == Some(aname.as_str())
+                                        && adpc.method_desc(i) == Some(awant.as_str())
+                                }) {
+                                    if let Some(amsig) = method_signature_of(&adpc, ami) {
+                                        if matches!(amsig.ret, jcdc_jvm::GenericType::Array(_)) {
+                                            r = Some(amsig.ret.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if std::env::var("JCDC_DBG_TVA").is_ok() {
+                    eprintln!("TVA call={} actual_ret={:?}", name, r);
+                }
+                r?
+            }
+            other => match other.type_ref() {
+                TypeRef::G(g) => g,
+                _ => return None,
+            },
+        };
+        let G::Array(el_g) = &g else { return None };
+        let G::Class(el_cs) = el_g.as_ref() else { return None };
+        if crate::method::classsig_internal(el_cs) != en {
+            return None;
+        }
+        if el_cs.parts.last().map(|p| p.args.is_empty()).unwrap_or(true) {
+            return None; // still raw: nothing gained
+        }
+        let _ = owner;
+        return Some((**el_g).clone());
+    }
+    None
 }
 
 fn cast_generic_returns(s: &mut Stmt, want: &TypeRef, pc: &PoolClass, pool: &ClassPool) {
