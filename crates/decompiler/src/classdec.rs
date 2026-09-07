@@ -10160,10 +10160,68 @@ fn apply_param_casts(
                                 &cw_internal,
                             )
                         {
-                            let raw =
-                                TypeRef::J(jcdc_jvm::JavaType::Object(cw_internal.clone()));
+                            // Prefer the PRECISE cast when the actual's
+                            // source-level type converts to the formal
+                            // (jdk17 PKIX: new ArrayList<>((List<
+                            // X509Certificate>) certPath.getCertificates())
+                            // — the raw (Collection) form forced the
+                            // diamond's E := Object against the target's
+                            // X509Certificate equality, 无法推断ArrayList<>;
+                            // Properties stays raw — its precise
+                            // Map<Object,Object> is inconvertible to
+                            // Map<? extends String,..>).
+                            // Precise form: rebuild the actual's SOURCE
+                            // class with the formal's wildcard-stripped
+                            // args (jdk17 PKIX: getCertificates() sources
+                            // as List<? extends Certificate>, the formal
+                            // is Collection<? extends X509Certificate> —
+                            // the source cast (List<X509Certificate>) is
+                            // the unchecked downcast that feeds the
+                            // diamond E := X509Certificate; the raw
+                            // (Collection) form forced E := Object,
+                            // 无法推断ArrayList<>).
+                            let precise_ty: Option<TypeRef> = match pc {
+                                Some(p) => instantiated_method_ret(a, pool, p).and_then(|src| {
+                                    let cs_src = match &src {
+                                        jcdc_jvm::GenericType::Class(c) => c,
+                                        _ => return None,
+                                    };
+                                    let last_src = cs_src.parts.last()?;
+                                    let last_w = cw.parts.last()?;
+                                    if last_src.args.len() != last_w.args.len() {
+                                        return None;
+                                    }
+                                    let stripped: Option<Vec<jcdc_jvm::GenericType>> = last_w
+                                        .args
+                                        .iter()
+                                        .map(|w| match w {
+                                            jcdc_jvm::GenericType::Wildcard(
+                                                jcdc_jvm::WildcardBound::Extends(t),
+                                            )
+                                            | jcdc_jvm::GenericType::Wildcard(
+                                                jcdc_jvm::WildcardBound::Super(t),
+                                            ) if !g_has_wildcard(t) => Some((**t).clone()),
+                                            jcdc_jvm::GenericType::Wildcard(_) => None,
+                                            other => Some(other.clone()),
+                                        })
+                                        .collect();
+                                    let stripped = stripped?;
+                                    if stripped.iter().any(g_has_wildcard) {
+                                        return None;
+                                    }
+                                    let mut fixed = cs_src.clone();
+                                    if let Some(lp) = fixed.parts.last_mut() {
+                                        lp.args = stripped;
+                                    }
+                                    Some(TypeRef::G(jcdc_jvm::GenericType::Class(fixed)))
+                                }),
+                                None => None,
+                            };
+                            let cast_ty = precise_ty.unwrap_or_else(|| {
+                                TypeRef::J(jcdc_jvm::JavaType::Object(cw_internal.clone()))
+                            });
                             let inner = std::mem::replace(a, Expr::This);
-                            *a = Expr::Cast { ty: raw, e: Box::new(inner) };
+                            *a = Expr::Cast { ty: cast_ty, e: Box::new(inner) };
                             continue;
                         }
                     }
@@ -11279,12 +11337,17 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
         let resolved = diamond_args_from_target(cls, cs, pool)?;
         Some((cls.clone(), resolved, args.len(), arg_tys))
     }
-    fn apply_to_value(value: &mut Expr, params: &[jcdc_jvm::GenericType], pool: &ClassPool) {
+    fn apply_to_value(
+        value: &mut Expr,
+        params: &[jcdc_jvm::GenericType],
+        pool: &ClassPool,
+        pc: &PoolClass,
+    ) {
         match value {
-            Expr::New { args, .. } => apply_ctor_param_casts(args, params, pool, None, &[]),
+            Expr::New { args, .. } => apply_ctor_param_casts(args, params, pool, Some(pc), &[]),
             Expr::Cast { e, .. } => {
                 if let Expr::New { args, .. } = &mut **e {
-                    apply_ctor_param_casts(args, params, pool, None, &[]);
+                    apply_ctor_param_casts(args, params, pool, Some(pc), &[]);
                 }
             }
             _ => {}
@@ -11295,7 +11358,7 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
             if let Some((cls, iargs, n, atys)) = inst_from(&vt.var(*var).ty, value, pool) {
                 if let Some(params) = instantiated_ctor_params_core(&cls, &iargs, n, pool, &atys) {
                     if let Stmt::LocalDef { init: Some(v), .. } = s {
-                        apply_to_value(v, &params, pool);
+                        apply_to_value(v, &params, pool, pc);
                     }
                 }
             }
@@ -11327,7 +11390,7 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
             if let Some((cls, iargs, n, atys)) = target {
                 if let Some(params) = instantiated_ctor_params_core(&cls, &iargs, n, pool, &atys) {
                     if let Expr::Assign { value, .. } = &mut *inner {
-                        apply_to_value(value, &params, pool);
+                        apply_to_value(value, &params, pool, pc);
                     }
                 }
             }
