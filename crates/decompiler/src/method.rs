@@ -563,8 +563,10 @@ pub fn decompile_method(
     cleanup(&mut body);
     dedupe_finally(&mut body);
     cleanup(&mut body);
+    dbg_body!("post-dedupe");
     prune_finally_rethrows(&mut body);
     cleanup(&mut body);
+    dbg_body!("post-prune-rethrows");
     fix_empty_catchall(&mut body);
     cleanup(&mut body);
     let stack_vars = vt.stack_vars.clone();
@@ -7836,8 +7838,14 @@ fn prune_finally_rethrows(s: &mut Stmt) {
                 prune_finally_rethrows(&mut c.body);
             }
             if let Some(f) = finally {
-                let _ = &inflight;
-                strip_inflight_throws(f, &std::collections::HashSet::new());
+                // A `throw v` where v is THIS try's own in-flight slot (a
+                // catch-all/pending handler var) is the bytecode's
+                // explicit pending-rethrow: the Java finally propagates it
+                // implicitly, so the copy must go (leaving it fights the
+                // dual-terminator retry-tail shape). A throw of any OTHER
+                // Throwable local is a real source throw (the ThreadDeath
+                // override `throw t`) and stays.
+                strip_inflight_throws(f, &inflight);
                 prune_finally_rethrows(f);
             }
         }
@@ -7849,8 +7857,7 @@ fn prune_finally_rethrows(s: &mut Stmt) {
                 prune_finally_rethrows(&mut c.body);
             }
             if let Some(f) = finally {
-                let _ = &inflight;
-                strip_inflight_throws(f, &std::collections::HashSet::new());
+                strip_inflight_throws(f, &inflight);
                 prune_finally_rethrows(f);
             }
         }
@@ -7889,25 +7896,25 @@ fn catch_vars_of(catches: &[crate::stmt::Catch]) -> std::collections::HashSet<u3
         .collect()
 }
 
-fn strip_inflight_throws(s: &mut Stmt, _inflight: &std::collections::HashSet<u32>) {
+fn strip_inflight_throws(s: &mut Stmt, inflight: &std::collections::HashSet<u32>) {
     match s {
         Stmt::Block(v) => {
-            v.iter_mut().for_each(|x| strip_inflight_throws(x, _inflight));
-            v.retain(|x| !is_inflight_throw(x));
+            v.iter_mut().for_each(|x| strip_inflight_throws(x, inflight));
+            v.retain(|x| !is_inflight_throw(x, inflight));
         }
         Stmt::If { then_stmt, else_stmt, .. } => {
             // An in-flight rethrow AS a whole branch becomes an empty
             // block (rotate/cleanup collapse it afterwards).
-            if is_inflight_throw(then_stmt) {
+            if is_inflight_throw(then_stmt, inflight) {
                 *then_stmt = Box::new(Stmt::Block(vec![]));
             } else {
-                strip_inflight_throws(then_stmt, _inflight);
+                strip_inflight_throws(then_stmt, inflight);
             }
             if let Some(e) = else_stmt {
-                if is_inflight_throw(e) {
+                if is_inflight_throw(e, inflight) {
                     *e = Box::new(Stmt::Block(vec![]));
                 } else {
-                    strip_inflight_throws(e, _inflight);
+                    strip_inflight_throws(e, inflight);
                 }
             }
         }
@@ -7918,29 +7925,29 @@ fn strip_inflight_throws(s: &mut Stmt, _inflight: &std::collections::HashSet<u32
         // finally { deregisterWorker }` — 未报告的异常错误Throwable x2).
         Stmt::Try { body, catches, finally, .. }
         | Stmt::TryWithResources { body, catches, finally, .. } => {
-            strip_inflight_throws(body, _inflight);
+            strip_inflight_throws(body, inflight);
             for c in catches.iter_mut() {
-                strip_inflight_throws(&mut c.body, _inflight);
+                strip_inflight_throws(&mut c.body, inflight);
             }
             if let Some(f) = finally {
-                strip_inflight_throws(f, _inflight);
+                strip_inflight_throws(f, inflight);
             }
         }
         Stmt::While { body, .. }
         | Stmt::DoWhile { body, .. }
         | Stmt::ForEach { body, .. }
         | Stmt::Labeled { body, .. }
-        | Stmt::Synchronized { body, .. } => strip_inflight_throws(body, _inflight),
+        | Stmt::Synchronized { body, .. } => strip_inflight_throws(body, inflight),
         Stmt::For { init, body, .. } => {
-            init.iter_mut().for_each(|x| strip_inflight_throws(x, _inflight));
-            strip_inflight_throws(body, _inflight);
+            init.iter_mut().for_each(|x| strip_inflight_throws(x, inflight));
+            strip_inflight_throws(body, inflight);
         }
         Stmt::Switch { cases, default, .. } => {
             for c in cases {
-                c.body.iter_mut().for_each(|x| strip_inflight_throws(x, _inflight));
+                c.body.iter_mut().for_each(|x| strip_inflight_throws(x, inflight));
             }
             if let Some(d) = default {
-                strip_inflight_throws(d, _inflight);
+                strip_inflight_throws(d, inflight);
             }
         }
         _ => {}
@@ -7950,7 +7957,7 @@ fn strip_inflight_throws(s: &mut Stmt, _inflight: &std::collections::HashSet<u32
 /// A `throw t` where `t` is a plain Throwable-typed local inside a finally
 /// is the bytecode's in-flight exception rethrow (an artifact of javac's
 /// finally duplication), never source-level code.
-fn is_inflight_throw(s: &Stmt) -> bool {
+fn is_inflight_throw(s: &Stmt, _inflight: &std::collections::HashSet<u32>) -> bool {
     match s {
         Stmt::Throw(Expr::Local { ty, .. }) => {
             matches!(ty, crate::expr::TypeRef::J(JavaType::Object(n)) if n == "java/lang/Throwable")

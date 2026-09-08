@@ -543,6 +543,45 @@ impl<'a> Structurer<'a> {
 
 /// Strip a trailing `Goto{target}` from a region (at any tail position:
 /// end of a sequence, or the tail of an if/else branch).
+/// True when every flow path out of this region ends in a terminator
+/// (return/throw): the region cannot complete normally, so a following
+/// continuation would be unreachable (javac: 无法访问的语句). Goto/Empty
+/// are conservative negatives (a Goto may resolve to a fallthrough).
+pub(crate) fn region_terminates(r: &Region, results: &[crate::builder::BlockResult]) -> bool {
+    region_terminates_ex(r, results, &[])
+}
+
+/// Like `region_terminates`, but a `Goto` into `handler_exits` (loop exits
+/// that are exception-handler entries) also counts as terminating: inside
+/// the finally-retry loop such a Goto converts to `break`, and the exit it
+/// targets is the bytecode's explicit pending-exception rethrow — the
+/// enclosing Java finally propagates it implicitly, so NOTHING may be
+/// rendered after the loop (the continuation would copy the wrong exit's
+/// throw onto the break path). A break toward a NON-handler exit is a real
+/// loop completion and must NOT suppress the continuation.
+pub(crate) fn region_terminates_ex(
+    r: &Region,
+    results: &[crate::builder::BlockResult],
+    handler_exits: &[usize],
+) -> bool {
+    match r {
+        Region::CopyStmts { block } | Region::Basic { block } => matches!(
+            results[*block].term,
+            crate::builder::Term::Return(_) | crate::builder::Term::Throw(_)
+        ),
+        Region::Goto { target } => handler_exits.contains(target),
+        Region::Seq(v) => v
+            .last()
+            .map(|x| region_terminates_ex(x, results, handler_exits))
+            .unwrap_or(false),
+        Region::If { then_r, else_r, .. } => {
+            region_terminates_ex(then_r, results, handler_exits)
+                && region_terminates_ex(else_r, results, handler_exits)
+        }
+        _ => false,
+    }
+}
+
 fn strip_trailing_goto_to(r: &mut Region, target: usize) {
     match r {
         Region::Goto { target: t } if *t == target => *r = Region::Empty,
@@ -635,7 +674,7 @@ impl<'a> Structurer<'a> {
 
     /// True if `b` is an exception-handler head; such blocks must only be
     /// entered through their Try region, never through the normal flow.
-    fn is_handler(&self, b: usize) -> bool {
+    pub(crate) fn is_handler(&self, b: usize) -> bool {
         self.handler_group.contains_key(&b)
     }
 
@@ -645,6 +684,63 @@ impl<'a> Structurer<'a> {
 
     /// Sub-scope for a branch walk: reachable region minus already-claimed
     /// blocks (e.g. the surrounding loop header reached via a back edge).
+    /// Branch region for a dual-terminator stop exit (both If targets are
+    /// terminator blocks in `stop` — the check tail of javac's finally
+    /// retry idiom, jdk11 ObjectInputStream.readSerialData copy2:
+    /// `if (t != null) throw t; <rethrow pending>`). Inside a loop: a
+    /// Goto resolves to `break` — for a handler-entry exit the pending
+    /// exception is already in flight and the enclosing Java finally
+    /// rethrows it implicitly, so breaking out of the retry loop IS the
+    /// source semantics (the explicit `throw pending` copy would be
+    /// stripped as in-flight scaffolding, leaving an empty branch that
+    /// traps the loop forever → the whole post-finally flow 无法访问).
+    /// Outside a loop: inline the throw (the handler's own rethrow tail).
+    fn dual_terminator_branch(&self, target: usize, active: &[usize]) -> Region {
+        let _ = active;
+        if !self.loops_stack.is_empty() && self.is_pending_rethrow(target) {
+            // Inside the finally-retry loop, an exit that rethrows the
+            // PENDING exception (the local a handler entry stored) is the
+            // bytecode's explicit in-flight rethrow — the enclosing Java
+            // finally propagates it implicitly, so `break` out of the
+            // retry loop is the source-equivalent exit (the copied
+            // `throw pending` is out of lexical scope in the finally AND
+            // strip_inflight_throws eats it, leaving an empty branch that
+            // traps the loop forever — jdk11 ObjectInputStream
+            // .readSerialData 无法访问的语句). Any other terminator exit
+            // is a real source throw (the ThreadDeath override `throw t`
+            // — t is a plain method local, not a handler store): inline.
+            return Region::Goto { target };
+        }
+        Region::CopyStmts { block: target }
+    }
+
+    /// True when `b`'s terminal is `throw v` where some exception-handler
+    /// entry block stores `v` (the in-flight/pending exception slot).
+    fn is_pending_rethrow(&self, b: usize) -> bool {
+        let var = match &self.results[b].term {
+            crate::builder::Term::Throw(Expr::Local { var, .. }) => *var,
+            _ => return false,
+        };
+        // The store must be the CATCH-PARAMETER store itself (the handler
+        // entry's incoming stack is the null exception placeholder): the
+        // retry idiom's accumulator `t` is also handler-stored, but from a
+        // Local (`catch (ThreadDeath e) { t = e; }`) — inlining `throw t`
+        // must stay (it is the source's ThreadDeath override), only the
+        // pending-slot rethrow becomes the implicit-propagation break.
+        self.cfg.exc_edges.iter().any(|e| {
+            self.results[e.to].stmts.iter().any(|s| match s {
+                crate::stmt::Stmt::LocalDef { var: v, init, .. } => {
+                    *v == var && matches!(init, Some(crate::expr::Expr::Const(crate::expr::ConstVal::Null)))
+                }
+                crate::stmt::Stmt::ExprStmt(crate::expr::Expr::Assign { target, value, .. }) => {
+                    matches!(target.as_ref(), crate::expr::Expr::Local { var: v, .. } if *v == var)
+                        && matches!(&**value, crate::expr::Expr::Const(crate::expr::ConstVal::Null))
+                }
+                _ => false,
+            })
+        })
+    }
+
     fn sub_scope(
         &self,
         from: usize,
@@ -882,7 +978,28 @@ impl<'a> Structurer<'a> {
             let at_preclaimed_entry = entry_preclaimed && cur == entry && parts.is_empty();
             if !at_preclaimed_entry && self.is_loop_header(cur, universe, &dom) {
                 let loop_r = self.structure_loop(cur, universe, stop, active, claimed, &dom);
-                let next = self.next_after_loop(&loop_r, universe, stop, claimed);
+                // A body that cannot complete normally (both arms of its
+                // tail check inline the loop's terminator exits — the
+                // finally-retry dual-throw shape, jdk11 ObjectInputStream
+                // .readSerialData) makes any post-loop continuation
+                // unreachable (无法访问的语句): neither continue at a
+                // follow nor copy a terminator exit after it.
+                let body_done = match &loop_r {
+                    Region::Loop { body, exits, .. } => {
+                        let handler_exits: Vec<usize> = exits
+                            .iter()
+                            .copied()
+                            .filter(|e| self.is_handler(*e))
+                            .collect();
+                        region_terminates_ex(body, self.results, &handler_exits)
+                    }
+                    _ => false,
+                };
+                let next = if body_done {
+                    None
+                } else {
+                    self.next_after_loop(&loop_r, universe, stop, claimed)
+                };
                 let loop_exits = match &loop_r {
                     Region::Loop { exits, .. } => exits.clone(),
                     _ => Vec::new(),
@@ -899,10 +1016,12 @@ impl<'a> Structurer<'a> {
                         // of the universe). When that block is a shared
                         // terminator (return/throw), copy it here so this
                         // path does not silently fall through.
-                        for &e in &loop_exits {
-                            if !stop.contains(&e) && self.is_terminator_block(e) {
-                                parts.push(Region::CopyStmts { block: e });
-                                break;
+                        if !body_done {
+                            for &e in &loop_exits {
+                                if !stop.contains(&e) && self.is_terminator_block(e) {
+                                    parts.push(Region::CopyStmts { block: e });
+                                    break;
+                                }
                             }
                         }
                         break;
@@ -1086,6 +1205,15 @@ impl<'a> Structurer<'a> {
                     if std::env::var("JCDC_DBG_IF").is_ok() {
                         eprintln!("COND cur={} follow={:?}", cur, follow);
                     }
+                    if std::env::var("JCDC_DBG_IF").is_ok() {
+                        eprintln!(
+                            "THENDECIDE cur={} taken={} fall={} follow={:?} stop_t={} stop_f={} term_t={} term_f={} univ_t={} claim_t={} absorb={}",
+                            cur, taken, fall, follow, stop.contains(&taken), stop.contains(&fall),
+                            self.is_terminator_block(taken), self.is_terminator_block(fall),
+                            universe.contains(&taken), claimed.contains(&taken),
+                            self.absorb_pure(taken, universe, &bstop, claimed).is_some()
+                        );
+                    }
                     let then_r = if Some(taken) == follow && !stop.contains(&taken) {
                         Region::Empty
                     } else if Some(taken) == follow
@@ -1166,6 +1294,12 @@ impl<'a> Structurer<'a> {
                             } else {
                                 Region::Goto { target: taken }
                             }
+                        } else if self.is_terminator_block(taken)
+                            && stop.contains(&taken)
+                            && self.is_terminator_block(fall)
+                            && stop.contains(&fall)
+                        {
+                            self.dual_terminator_branch(taken, active)
                         } else {
                             Region::Empty
                         }
@@ -1250,6 +1384,14 @@ impl<'a> Structurer<'a> {
                         } else {
                             Region::Goto { target: fall }
                         }
+                    } else if self.is_terminator_block(fall)
+                        && stop.contains(&fall)
+                        && self.is_terminator_block(taken)
+                        && stop.contains(&taken)
+                    {
+                        // Dual-terminator stop exits: see the taken side
+                        // (jdk11 ObjectInputStream.readSerialData).
+                        self.dual_terminator_branch(fall, active)
                     } else {
                         if std::env::var("JCDC_DBG_IF").is_ok() {
                             eprintln!(

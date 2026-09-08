@@ -22,7 +22,8 @@ use crate::expr::Expr;
 use crate::stmt::Stmt;
 
 use crate::structure::{
-    compute_dominators, compute_postdominators, reachable_within, DomInfo, Region, Structurer,
+    compute_dominators, compute_postdominators, reachable_within, region_terminates_ex, DomInfo,
+    Region, Structurer,
 };
 
 /// Per-method precomputation for the SESE decomposition.
@@ -1150,6 +1151,17 @@ impl<'a> Structurer<'a> {
                 let body = self.sese_region_with_scope(header, &body_stop, body_scope, ctx);
                 self.loops_stack.pop();
                 ctx.loop_stack.pop();
+                // A body that cannot complete normally (both arms of its
+                // tail check inline the loop's terminator exits — the
+                // finally-retry dual-throw shape, jdk11 ObjectInputStream
+                // .readSerialData) makes the post-loop continuation
+                // unreachable (无法访问的语句): emit the loop and stop.
+                let handler_exits: Vec<usize> = exits
+                    .iter()
+                    .copied()
+                    .filter(|e| self.is_handler(*e))
+                    .collect();
+                let body_done = region_terminates_ex(&body, self.results, &handler_exits);
                 if is_header {
                     ctx.loop_headers.insert(header);
                 }
@@ -1237,6 +1249,14 @@ impl<'a> Structurer<'a> {
                     eprintln!("LOOPFOLLOW header={} exits={:?} natural_follow={:?} consumed_nf={:?}",
                         header_id, exits, natural_follow,
                         natural_follow.iter().map(|f| ctx.consumed.contains(f)).collect::<Vec<_>>());
+                }
+                if body_done {
+                    ctx.depth -= 1;
+                    return match parts.len() {
+                        0 => Region::Empty,
+                        1 => parts.into_iter().next().unwrap(),
+                        _ => Region::Seq(parts),
+                    };
                 }
                 match natural_follow.first().copied() {
                     // No `!consumed` gate: a follow already consumed by a
