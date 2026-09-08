@@ -6672,6 +6672,49 @@ pub(crate) fn is_generic_call(a: &Expr, pool: &ClassPool) -> bool {
         .unwrap_or(false)
 }
 
+/// An anonymous class (all-digit final name segment) is inlined into the
+/// enclosing method at print time — the method's typevars stay denotable
+/// inside its body.
+fn anon_inlined(cls: &str) -> bool {
+    cls.rsplit('$')
+        .next()
+        .map(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or(false)
+}
+
+/// True when `ty` mentions a typevar name that is NOT one of the outer
+/// class's own parameters — such a type cannot be denoted inside a nested
+/// class body.
+fn mentions_foreign_typevar(ty: &TypeRef, class_tvs: &[String]) -> bool {
+    fn walk(g: &jcdc_jvm::GenericType, class_tvs: &[String], foreign: &mut bool) {
+        use jcdc_jvm::GenericType as G;
+        match g {
+            G::TypeVar(n) => {
+                if !class_tvs.iter().any(|c| c == n) {
+                    *foreign = true;
+                }
+            }
+            G::Class(cs) => {
+                for p in &cs.parts {
+                    for a in &p.args {
+                        walk(a, class_tvs, foreign);
+                    }
+                }
+            }
+            G::Array(i) => walk(i, class_tvs, foreign),
+            G::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
+            | G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => walk(t, class_tvs, foreign),
+            _ => {}
+        }
+    }
+    let mut foreign = false;
+    match ty {
+        TypeRef::G(g) => walk(g, class_tvs, &mut foreign),
+        TypeRef::J(_) => {}
+    }
+    foreign
+}
+
 fn render_captures(
     captures: HashMap<String, Expr>,
     outer_pc: &PoolClass,
@@ -6726,15 +6769,43 @@ fn render_captures(
                 // declared type (nested anon: $11's body substituted
                 // val$mapper -> RawT("mapper", BiConsumer<? super P_OUT,
                 // ? super Consumer<R>>) before $11$1's captures render).
-                Expr::RawT(_, ty0) => ty0.clone(),
+                // An already-substituted outer capture carries its
+                // declared type. A NAMED local class is emitted as a
+                // class DECLARATION — only the outer CLASS's typevars are
+                // in scope there: inheriting an outer METHOD's typevar put
+                // foreign names in scope (sj17/p11 ReduceOps makeRef: the
+                // Collector variant's `I` leaked into the <T,R> variant's
+                // `(I) this.state` — 找不到符号). An ANONYMOUS class body
+                // is inlined into the enclosing method, where that
+                // method's typevars ARE denotable (jdk26 mapMulti's
+                // `Consumer<R>`): inherit freely.
+                Expr::RawT(_, ty0) => {
+                    if anon_inlined(owner_cls)
+                        || !mentions_foreign_typevar(ty0, &class_typevar_names(outer_pc))
+                    {
+                        ty0.clone()
+                    } else {
+                        TypeRef::J(jcdc_jvm::JavaType::Object("java/lang/Object".into()))
+                    }
+                }
                 // A nested capture: the expr reads the OUTER anon's val$X
                 // field — recover the type registered when the outer level
                 // rendered its own captures.
+                // val$ ONLY: a this$0 link is the enclosing INSTANCE —
+                // its type is the outer class, never the new-site
+                // argument's declared type (inheriting the arg's G type
+                // put foreign typevars in scope for nested-class field
+                // reads — sj17/p11 ReduceOps `(I) this.state`, I belongs
+                // to the outer method).
                 Expr::Field { cls: fc, name: fn0, .. }
-                    if fn0.starts_with("val$") || fn0.starts_with("this$") =>
+                    if fn0.starts_with("val$") =>
                 {
                     let got = CAPTURE_FIELD_TYPES
-                        .with(|m| m.borrow().get(&(fc.clone(), fn0.clone())).cloned());
+                        .with(|m| m.borrow().get(&(fc.clone(), fn0.clone())).cloned())
+                        .filter(|t| {
+                            anon_inlined(owner_cls)
+                                || !mentions_foreign_typevar(t, &class_typevar_names(outer_pc))
+                        });
                     if std::env::var("JCDC_DBG_ANON").is_ok() {
                         eprintln!("NESTCAP {}.{} -> {:?}", fc, fn0, got);
                     }
