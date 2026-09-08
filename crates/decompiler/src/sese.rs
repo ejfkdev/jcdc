@@ -475,9 +475,18 @@ impl<'a> Structurer<'a> {
         let mut x = cur;
         for _ in 0..8 {
             if matches!(self.results[x].term, Term::Return(_) | Term::Throw(_)) {
-                return ctx.consumed.contains(&x);
+                // Statement-bearing claimed terminators are the post-loop
+                // continuation tail (shared clinit tails get claimed by the
+                // first arrival), NOT absorbed restart-loop scaffolding —
+                // copying them into the exit test duplicates blank-final
+                // assignments inside the loop (SecurityProviderConstants
+                // 可能在 loop 中分配了变量 x18). See the walk-side twin.
+                return ctx.consumed.contains(&x) && self.results[x].stmts.is_empty();
             }
             if !matches!(self.results[x].term, Term::Fallthrough | Term::Goto) {
+                return false;
+            }
+            if !self.results[x].stmts.is_empty() && !ctx.consumed.contains(&x) {
                 return false;
             }
             let succs = &self.cfg.blocks[x].succ;

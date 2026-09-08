@@ -1505,7 +1505,10 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                     } else {
                         // Target is the follow (empty), or already structured
                         // (loop header → continue; loop exit → break).
-                        if self.is_terminator_block(taken) && !stop.contains(&taken) {
+                        if self.is_terminator_block(taken)
+                            && !stop.contains(&taken)
+                            && !self.terminator_writes_final(taken)
+                        {
                             // Shared return/throw block: inline a copy at
                             // this branch (safe — terminators have no
                             // outgoing flow). Loop-exit terminators (in
@@ -1516,6 +1519,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             if !stop.contains(&taken)
                                 && !bstop.contains(&taken)
                                 && !self.loops_stack.contains(&taken)
+                                && !self.terminator_writes_final(taken)
                             {
                                 match self.copy_walk(taken, &bstop, active, cur) {
                                     Some(r) => r,
@@ -1604,12 +1608,16 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             eprintln!("IF cur={} else walk fall={} sub={:?}", cur, fall, sub);
                         }
                         self.walk(fall, &sub, &bstop, active, claimed, false)
-                    } else if self.is_terminator_block(fall) && !stop.contains(&fall) {
+                    } else if self.is_terminator_block(fall)
+                        && !stop.contains(&fall)
+                        && !self.terminator_writes_final(fall)
+                    {
                         Region::CopyStmts { block: fall }
                     } else if claimed.contains(&fall) {
                         if !stop.contains(&fall)
                             && !bstop.contains(&fall)
                             && !self.loops_stack.contains(&fall)
+                            && !self.terminator_writes_final(fall)
                         {
                             if let Some(r) = self.copy_walk(fall, &bstop, active, cur) {
                                 r
@@ -1625,7 +1633,10 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             }
                             Region::Goto { target: fall }
                         }
-                    } else if self.is_terminator_block(fall) && !stop.contains(&fall) {
+                    } else if self.is_terminator_block(fall)
+                        && !stop.contains(&fall)
+                        && !self.terminator_writes_final(fall)
+                    {
                         Region::CopyStmts { block: fall }
                     } else if stop.contains(&fall) && !self.is_terminator_block(fall) {
                         // Jump to an enclosing loop's exit (or other
@@ -2040,9 +2051,25 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         let mut x = cur;
         for _ in 0..8 {
             if matches!(self.results[x].term, Term::Return(_) | Term::Throw(_)) {
-                return claimed.contains(&x);
+                // The restart-loop guarded case is a chain of EMPTY jump
+                // stubs into an absorbed terminator — breaking would land
+                // where nothing remains. A STATEMENT-BEARING claimed
+                // terminator is the post-loop continuation tail (a shared
+                // clinit tail claimed early by the first arrival): the
+                // enclosing walk structures it after the loop and the
+                // barrier Goto must stay a `break`. Copying the tail into
+                // the exit test put the blank-final assignments INSIDE the
+                // for-each loop (javac: 可能在 loop 中分配了变量 x18,
+                // SecurityProviderConstants) and duplicated them into the
+                // catch.
+                return claimed.contains(&x) && self.results[x].stmts.is_empty();
             }
             if !matches!(self.results[x].term, Term::Fallthrough | Term::Goto) {
+                return false;
+            }
+            // An UNCLAIMED statement-bearing link means the chain is real
+            // post-loop code, not absorbed scaffolding (see above).
+            if !self.results[x].stmts.is_empty() && !claimed.contains(&x) {
                 return false;
             }
             let succs = &self.cfg.blocks[x].succ;
@@ -2227,6 +2254,30 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             self.results[b].term,
             Term::Return(_) | Term::Throw(_)
         )
+    }
+
+    /// True when the block's statements assign a FINAL field of the
+    /// emitting class: copying such a shared terminator at an extra
+    /// arrival site duplicates the final's assignment (javac:
+    /// 可能在 loop 中分配了变量 / 可能已分配变量 — jdk11
+    /// SecurityProviderConstants clinit tail assigned its blank-final
+    /// key sizes in the loop-exit copy AND the handler copy). Such
+    /// arrivals emit a Goto instead — conversion's term_copy refuses it
+    /// for the same final_fields reason and elides to the real tail the
+    /// enclosing flow emits next.
+    fn terminator_writes_final(&self, b: usize) -> bool {
+        !self.final_fields.is_empty()
+            && self.results[b].stmts.iter().any(|s| {
+                matches!(
+                    s,
+                    crate::stmt::Stmt::ExprStmt(crate::expr::Expr::Assign { target, .. })
+                        if matches!(
+                            target.as_ref(),
+                            crate::expr::Expr::Field { name, .. }
+                                if self.final_fields.contains(name)
+                        )
+                )
+            })
     }
 
     /// Unique enclosing barrier block reachable from `cur`'s branch region.
