@@ -9463,7 +9463,14 @@ fn collapse_ctor_delegation_multi(body: &mut Stmt, pc: &PoolClass) {
     // statement (the legal shape needs no folding).
     fn has_mid_ctor(v: &[Stmt], own: &str) -> bool {
         v.iter().skip(1).any(|s| match s {
-            Stmt::ExprStmt(Expr::Method { name, .. }) if name == "<init>" => true,
+            // ONLY own-class this(...) delegations: a mid-body super(...)
+            // is the LEGAL pre-super-statements shape (`if (!valid) throw;
+            // super(..); field = ..;`). Folding it erased the guard AND
+            // every post-super assignment (jdk26 Utf8EntryImpl
+            // (cpm,index,String,int) kept only `super(cpm, index, 0);` --
+            // 7 final-field assignments lost: 可能尚未初始化变量rawBytes).
+            Stmt::ExprStmt(Expr::Method { name, cls, .. })
+                if name == "<init>" && cls == own => true,
             Stmt::If { then_stmt, else_stmt, .. } => {
                 let t = match then_stmt.as_ref() {
                     Stmt::Block(b) => has_mid_ctor(b, own),
@@ -9552,12 +9559,12 @@ fn collapse_ctor_delegation_multi(body: &mut Stmt, pc: &PoolClass) {
         }
     }
 
-    fn exec(s: &Stmt, env0: &Env, calls: &mut Vec<Expr>) -> Option<Flow> {
+    fn exec(s: &Stmt, env0: &Env, calls: &mut Vec<Expr>, own: &str) -> Option<Flow> {
         let mut env = env0.clone();
         match s {
             Stmt::Block(v) => {
                 for st in v {
-                    match exec(st, &env, calls)? {
+                    match exec(st, &env, calls, own)? {
                         Flow::Falls(e2) => env = e2,
                         f => return Some(f),
                     }
@@ -9584,7 +9591,12 @@ fn collapse_ctor_delegation_multi(body: &mut Stmt, pc: &PoolClass) {
                     None
                 }
             }
-            Stmt::ExprStmt(e @ Expr::Method { name, .. }) if name == "<init>" => {
+            Stmt::ExprStmt(e @ Expr::Method { name, cls, .. }) if name == "<init>" => {
+                if cls != own {
+                    // super(...) — not a foldable delegation (see
+                    // has_mid_ctor); bail and leave the legal shape intact.
+                    return None;
+                }
                 let raw_args: Vec<Expr> = match e {
                     Expr::Method { args, .. } => args.clone(),
                     _ => return None,
@@ -9606,9 +9618,9 @@ fn collapse_ctor_delegation_multi(body: &mut Stmt, pc: &PoolClass) {
             Stmt::Return(None) => Some(Flow::Falls(env)),
             Stmt::Throw(_) => Some(Flow::Throws),
             Stmt::If { cond, then_stmt, else_stmt } => {
-                let tf = exec(then_stmt, &env, calls)?;
+                let tf = exec(then_stmt, &env, calls, own)?;
                 let ef = match else_stmt {
-                    Some(e) => exec(e, &env, calls)?,
+                    Some(e) => exec(e, &env, calls, own)?,
                     None => Flow::Falls(env.clone()),
                 };
                 let mut c = cond.clone();
@@ -9692,7 +9704,7 @@ fn collapse_ctor_delegation_multi(body: &mut Stmt, pc: &PoolClass) {
     }
 
     let mut calls: Vec<Expr> = Vec::new();
-    let flow = match exec(&Stmt::Block(items.clone()), &Env::new(), &mut calls) {
+    let flow = match exec(&Stmt::Block(items.clone()), &Env::new(), &mut calls, &pc.internal_name) {
         Some(f) => f,
         None => return,
     };
