@@ -10504,6 +10504,54 @@ fn desc_raw(pc: &PoolClass, mi: usize) -> String {
     pc.method_desc(mi).unwrap_or("").to_string()
 }
 
+/// Drop the raw-SAM disambiguation casts once the call carries an
+/// explicit type witness: the witness pins the overload, and the raw cast
+/// would type the lambda against the erased SAM (jdk26
+/// CopyOnWriteArrayList.toArray: `(IntFunction) i -> (T[]) ..` — raw, the
+/// body faces Object[] instead of T[]: Object[]无法转换为T[]). Only the
+/// RAW erasure form of a formal's own class is dropped; parameterized
+/// overload-disambiguation casts (DoubleConsumer vs Consumer<Double>)
+/// stay.
+fn prune_witnessed_raw_sam_casts(e: &mut Expr, pool: &ClassPool) {
+    let Expr::Method { cls, name, desc, type_args, args, .. } = e else { return };
+    if type_args.is_empty() {
+        return;
+    }
+    let Some(dpc) = pool.get(cls.as_str()) else { return };
+    let want_desc = format!(
+        "({}){}",
+        desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+        desc.ret.to_descriptor()
+    );
+    let Some(mi) = (0..dpc.cf.methods.len())
+        .find(|&i| dpc.method_name(i) == Some(name.as_str()) && dpc.method_desc(i) == Some(want_desc.as_str()))
+    else {
+        return;
+    };
+    let Some(msig) = method_signature_of(&dpc, mi) else { return };
+    if msig.args.len() != args.len() {
+        return;
+    }
+    for (a, formal) in args.iter_mut().zip(msig.args.iter()) {
+        let Expr::Cast { ty, e: inner } = a else { continue };
+        if !matches!(&**inner, Expr::Lambda(_)) {
+            continue;
+        }
+        let TypeRef::J(jcdc_jvm::JavaType::Object(raw_n)) = ty else { continue };
+        let formal_class = match formal {
+            jcdc_jvm::GenericType::Class(cs) => crate::method::classsig_internal(cs),
+            _ => continue,
+        };
+        if &formal_class != raw_n {
+            continue;
+        }
+        let v = std::mem::replace(a, Expr::This);
+        if let Expr::Cast { e: inner, .. } = v {
+            *a = *inner;
+        }
+    }
+}
+
 /// SAM-interface cast for a lambda argument at an AMBIGUOUS overload
 /// position: `AccessController.doPrivileged(() -> x)` matches both
 /// doPrivileged(PrivilegedAction<T>) and doPrivileged(
@@ -12872,6 +12920,7 @@ pub(crate) fn cast_wildcard_call_args(
             raw_witness_generic_method_args(e, pool, pc);
         }
         witness_ambiguous_lambda_args(e, pool, pc);
+        prune_witnessed_raw_sam_casts(e, pool);
         let params = params.or_else(|| instantiated_ctor_params(e, pool));
         if let Some(params) = params {
             match e {
