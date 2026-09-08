@@ -2689,7 +2689,38 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             });
             // Also exclude the post-try continuation flow: blocks reachable
             // from the group's end are shared with the normal path and must
-            // not be absorbed into the handler.
+            // not be absorbed into the handler. `block_at(g.end)` misses the
+            // merge when the handler itself sits at the span end (javac
+            // excludes the try body's trailing return from the protected
+            // range: jdk26 AlgorithmId.getName span (27,62), areturn at 62,
+            // handler astore at 63 -> block_at(62) resolves to the areturn,
+            // and the `goto merge` tail from 63 drags the WHOLE shared
+            // `if (o != null) return o.stdName(); else ...` merge into the
+            // catch, leaving every other path without its return --
+            // 缺少返回语句). Gate on the merge shape directly: an unclaimed
+            // non-group block whose normal preds are already claimed by the
+            // surrounding flow is the post-try merge -- the handler reaches
+            // it only by jumping out, which strip_handler_exit_goto already
+            // renders as the natural fallthrough.
+            let shared_merge: Vec<usize> = huniverse
+                .iter()
+                .copied()
+                .filter(|b| {
+                    *b != *hb
+                        && !claimed.contains(b)
+                        && self.body_group.get(b) != Some(&gi)
+                        && self.handler_group.get(b) != Some(&gi)
+                        && self.cfg.blocks[*b].pred.iter().any(|p| {
+                            claimed.contains(p)
+                                && !self.handler_group.contains_key(p)
+                                && self.body_group.get(p) != Some(&gi)
+                        })
+                })
+                .collect();
+            if !shared_merge.is_empty() {
+                let tail = reachable_within(self.cfg, shared_merge[0], &HashSet::new());
+                huniverse.retain(|b| !tail.contains(b) || *b == *hb);
+            }
             if let Some(cont) = self.cfg.block_at(g.end) {
                 let tail = reachable_within(self.cfg, cont, &HashSet::new());
                 huniverse.retain(|b| !tail.contains(b));
