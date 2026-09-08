@@ -24,12 +24,45 @@ pub struct MethodBody {
 
 /// Decompile one method. Returns Err only for malformed input; unsupported
 /// constructs degrade to comments inside the statement tree.
+#[track_caller]
 pub fn decompile_method(
     pc: &PoolClass,
     pool: &ClassPool,
     m_idx: usize,
 ) -> Result<Option<MethodBody>, String> {
     let m = &pc.cf.methods[m_idx];
+    if std::env::var("JCDC_TRACE_METHOD").is_ok() {
+        let loc = std::panic::Location::caller();
+        eprintln!("mtrace {}.{}{} <- {}:{}", pc.internal_name,
+            pc.method_name(m_idx).unwrap_or("?"),
+            pc.method_desc(m_idx).unwrap_or("?"),
+            loc.file(), loc.line());
+    }
+    thread_local! {
+        static DECOMP_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    let d = DECOMP_DEPTH.with(|c| { let v = c.get() + 1; c.set(v); v });
+    struct DepthGuard;
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            DECOMP_DEPTH.with(|c| c.set(c.get() - 1));
+        }
+    }
+    let _dg = DepthGuard;
+    if d > 64 {
+        // Safety net: a self-referential method-ref cycle (impl body
+        // contains a lambda whose impl is the method being decompiled)
+        // recurses decompile_method forever; the 512 MB worker stack
+        // overflows and aborts the WHOLE process (uncatchable), silently
+        // truncating tree runs (jdk26 FallbackLinker.assertNotEmpty ->
+        // forEach(FallbackLinker::assertNotEmpty), 56k re-entries).
+        // Bail gracefully instead — callers treat Err as "no body".
+        return Err(format!(
+            "decompile_method recursion depth {} at {}.{}",
+            d, pc.internal_name,
+            pc.method_name(m_idx).unwrap_or("?")
+        ));
+    }
     let access = m.access_flags;
     if access.contains(MethodAccessFlags::ABSTRACT) || access.contains(MethodAccessFlags::NATIVE) {
         return Ok(None);

@@ -14030,6 +14030,7 @@ fn disambiguate_lambda_locals(
         pc: &PoolClass,
         pool: &ClassPool,
         names: &mut HashSet<String>,
+        seen: &mut HashSet<usize>,
     ) {
         if let Expr::Lambda(l) = e {
             for n in &l.param_names {
@@ -14040,6 +14041,15 @@ fn disambiguate_lambda_locals(
             // scope rules — collect both.
             if l.impl_owner == pc.internal_name {
                 if let Some(mi) = pc.find_own_method(&l.impl_name, &l.impl_desc.to_string()) {
+                    // A method ref to the ENCLOSING method itself
+                    // (jdk26 FallbackLinker.assertNotEmpty:
+                    // `forEach(FallbackLinker::assertNotEmpty)`) would
+                    // re-decompile and re-collect forever — the impl's
+                    // names are already accumulated (or in progress) on
+                    // this stack, so a repeat visit adds nothing.
+                    if !seen.insert(mi) {
+                        return;
+                    }
                     if let Ok(Some(mb)) = decompile_method(pc, pool, mi) {
                         // Params split into [captures..., SAM params...]:
                         // capture params are LEXICAL references to outer
@@ -14068,144 +14078,145 @@ fn disambiguate_lambda_locals(
                         // Nested lambdas inside this impl body share the
                         // same shadow rules (Resolver: the m2 lambda lives
                         // inside the flatMap lambda's body).
-                        collect_stmt(&mb.body, pc, pool, names);
+                        collect_stmt(&mb.body, pc, pool, names, seen);
                     }
                 }
             }
         }
         match e {
             Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
-                args.iter().for_each(|a| collect_lambda_names(a, pc, pool, names));
+                args.iter().for_each(|a| collect_lambda_names(a, pc, pool, names, seen));
             }
             Expr::Method { owner, args, .. } => {
                 if let Some(o) = owner {
-                    collect_lambda_names(o, pc, pool, names);
+                    collect_lambda_names(o, pc, pool, names, seen);
                 }
-                args.iter().for_each(|a| collect_lambda_names(a, pc, pool, names));
+                args.iter().for_each(|a| collect_lambda_names(a, pc, pool, names, seen));
             }
-            Expr::Field { owner: Some(o), .. } => collect_lambda_names(o, pc, pool, names),
+            Expr::Field { owner: Some(o), .. } => collect_lambda_names(o, pc, pool, names, seen),
             Expr::ArrayIndex { array, index } => {
-                collect_lambda_names(array, pc, pool, names);
-                collect_lambda_names(index, pc, pool, names);
+                collect_lambda_names(array, pc, pool, names, seen);
+                collect_lambda_names(index, pc, pool, names, seen);
             }
             Expr::Cast { e: i, .. }
             | Expr::InstanceOf { e: i, .. }
             | Expr::Un { e: i, .. }
             | Expr::PreIncDec { e: i, .. }
-            | Expr::PostIncDec { e: i, .. } => collect_lambda_names(i, pc, pool, names),
+            | Expr::PostIncDec { e: i, .. } => collect_lambda_names(i, pc, pool, names, seen),
             Expr::Bin { l, r, .. } => {
-                collect_lambda_names(l, pc, pool, names);
-                collect_lambda_names(r, pc, pool, names);
+                collect_lambda_names(l, pc, pool, names, seen);
+                collect_lambda_names(r, pc, pool, names, seen);
             }
             Expr::Cond { c, t, f } => {
-                collect_lambda_names(c, pc, pool, names);
-                collect_lambda_names(t, pc, pool, names);
-                collect_lambda_names(f, pc, pool, names);
+                collect_lambda_names(c, pc, pool, names, seen);
+                collect_lambda_names(t, pc, pool, names, seen);
+                collect_lambda_names(f, pc, pool, names, seen);
             }
             Expr::Assign { target, value, .. } => {
-                collect_lambda_names(target, pc, pool, names);
-                collect_lambda_names(value, pc, pool, names);
+                collect_lambda_names(target, pc, pool, names, seen);
+                collect_lambda_names(value, pc, pool, names, seen);
             }
             Expr::NewArray { dims, init, .. } => {
-                dims.iter().for_each(|d| collect_lambda_names(d, pc, pool, names));
+                dims.iter().for_each(|d| collect_lambda_names(d, pc, pool, names, seen));
                 if let Some(vals) = init {
-                    vals.iter().for_each(|x| collect_lambda_names(x, pc, pool, names));
+                    vals.iter().for_each(|x| collect_lambda_names(x, pc, pool, names, seen));
                 }
             }
             Expr::NewMultiArray { dims, .. } => {
-                dims.iter().for_each(|d| collect_lambda_names(d, pc, pool, names));
+                dims.iter().for_each(|d| collect_lambda_names(d, pc, pool, names, seen));
             }
             Expr::StringConcat(parts) => parts.iter().for_each(|pp| {
                 if let crate::expr::ConcatPart::Str(i) = pp {
-                    collect_lambda_names(i, pc, pool, names);
+                    collect_lambda_names(i, pc, pool, names, seen);
                 }
             }),
-            Expr::Lambda(l) => l.captures.iter().for_each(|c| collect_lambda_names(c, pc, pool, names)),
+            Expr::Lambda(l) => l.captures.iter().for_each(|c| collect_lambda_names(c, pc, pool, names, seen)),
             Expr::Invokedynamic { args, .. } => {
-                args.iter().for_each(|a| collect_lambda_names(a, pc, pool, names));
+                args.iter().for_each(|a| collect_lambda_names(a, pc, pool, names, seen));
             }
             _ => {}
         }
     }
-    fn collect_stmt(s: &Stmt, pc: &PoolClass, pool: &ClassPool, names: &mut HashSet<String>) {
+    fn collect_stmt(s: &Stmt, pc: &PoolClass, pool: &ClassPool, names: &mut HashSet<String>, seen: &mut HashSet<usize>) {
         match s {
-            Stmt::Block(v) => v.iter().for_each(|x| collect_stmt(x, pc, pool, names)),
-            Stmt::ExprStmt(e) => collect_lambda_names(e, pc, pool, names),
-            Stmt::LocalDef { init: Some(e), .. } => collect_lambda_names(e, pc, pool, names),
-            Stmt::Return(Some(e)) | Stmt::Throw(e) => collect_lambda_names(e, pc, pool, names),
+            Stmt::Block(v) => v.iter().for_each(|x| collect_stmt(x, pc, pool, names, seen)),
+            Stmt::ExprStmt(e) => collect_lambda_names(e, pc, pool, names, seen),
+            Stmt::LocalDef { init: Some(e), .. } => collect_lambda_names(e, pc, pool, names, seen),
+            Stmt::Return(Some(e)) | Stmt::Throw(e) => collect_lambda_names(e, pc, pool, names, seen),
             Stmt::If { cond, then_stmt, else_stmt } => {
-                collect_lambda_names(cond, pc, pool, names);
-                collect_stmt(then_stmt, pc, pool, names);
+                collect_lambda_names(cond, pc, pool, names, seen);
+                collect_stmt(then_stmt, pc, pool, names, seen);
                 if let Some(e) = else_stmt {
-                    collect_stmt(e, pc, pool, names);
+                    collect_stmt(e, pc, pool, names, seen);
                 }
             }
             Stmt::While { cond, body } => {
-                collect_lambda_names(cond, pc, pool, names);
-                collect_stmt(body, pc, pool, names);
+                collect_lambda_names(cond, pc, pool, names, seen);
+                collect_stmt(body, pc, pool, names, seen);
             }
             Stmt::DoWhile { body, cond } => {
-                collect_stmt(body, pc, pool, names);
-                collect_lambda_names(cond, pc, pool, names);
+                collect_stmt(body, pc, pool, names, seen);
+                collect_lambda_names(cond, pc, pool, names, seen);
             }
             Stmt::For { init, cond, update, body } => {
-                init.iter().for_each(|i| collect_stmt(i, pc, pool, names));
+                init.iter().for_each(|i| collect_stmt(i, pc, pool, names, seen));
                 if let Some(c) = cond {
-                    collect_lambda_names(c, pc, pool, names);
+                    collect_lambda_names(c, pc, pool, names, seen);
                 }
-                update.iter().for_each(|u| collect_lambda_names(u, pc, pool, names));
-                collect_stmt(body, pc, pool, names);
+                update.iter().for_each(|u| collect_lambda_names(u, pc, pool, names, seen));
+                collect_stmt(body, pc, pool, names, seen);
             }
             Stmt::ForEach { iterable, body, .. } => {
-                collect_lambda_names(iterable, pc, pool, names);
-                collect_stmt(body, pc, pool, names);
+                collect_lambda_names(iterable, pc, pool, names, seen);
+                collect_stmt(body, pc, pool, names, seen);
             }
             Stmt::Switch { selector, cases, default, .. } => {
-                collect_lambda_names(selector, pc, pool, names);
+                collect_lambda_names(selector, pc, pool, names, seen);
                 for c in cases {
-                    c.body.iter().for_each(|st| collect_stmt(st, pc, pool, names));
+                    c.body.iter().for_each(|st| collect_stmt(st, pc, pool, names, seen));
                 }
                 if let Some(d) = default {
-                    collect_stmt(d, pc, pool, names);
+                    collect_stmt(d, pc, pool, names, seen);
                 }
             }
             Stmt::Try { body, catches, finally } => {
-                collect_stmt(body, pc, pool, names);
+                collect_stmt(body, pc, pool, names, seen);
                 for c in catches {
-                    collect_stmt(&c.body, pc, pool, names);
+                    collect_stmt(&c.body, pc, pool, names, seen);
                 }
                 if let Some(f) = finally {
-                    collect_stmt(f, pc, pool, names);
+                    collect_stmt(f, pc, pool, names, seen);
                 }
             }
             Stmt::TryWithResources { resources, body, catches, finally } => {
-                resources.iter().for_each(|r| collect_stmt(r, pc, pool, names));
-                collect_stmt(body, pc, pool, names);
+                resources.iter().for_each(|r| collect_stmt(r, pc, pool, names, seen));
+                collect_stmt(body, pc, pool, names, seen);
                 for c in catches {
-                    collect_stmt(&c.body, pc, pool, names);
+                    collect_stmt(&c.body, pc, pool, names, seen);
                 }
                 if let Some(f) = finally {
-                    collect_stmt(f, pc, pool, names);
+                    collect_stmt(f, pc, pool, names, seen);
                 }
             }
             Stmt::Synchronized { lock, body } => {
-                collect_lambda_names(lock, pc, pool, names);
-                collect_stmt(body, pc, pool, names);
+                collect_lambda_names(lock, pc, pool, names, seen);
+                collect_stmt(body, pc, pool, names, seen);
             }
-            Stmt::Labeled { body, .. } => collect_stmt(body, pc, pool, names),
+            Stmt::Labeled { body, .. } => collect_stmt(body, pc, pool, names, seen),
             Stmt::Assert { cond, msg } => {
-                collect_lambda_names(cond, pc, pool, names);
+                collect_lambda_names(cond, pc, pool, names, seen);
                 if let Some(m) = msg {
-                    collect_lambda_names(m, pc, pool, names);
+                    collect_lambda_names(m, pc, pool, names, seen);
                 }
             }
-            Stmt::TernaryValue { e } => collect_lambda_names(e, pc, pool, names),
-            Stmt::MonitorEnter(e) | Stmt::MonitorExit(e) => collect_lambda_names(e, pc, pool, names),
+            Stmt::TernaryValue { e } => collect_lambda_names(e, pc, pool, names, seen),
+            Stmt::MonitorEnter(e) | Stmt::MonitorExit(e) => collect_lambda_names(e, pc, pool, names, seen),
             _ => {}
         }
     }
     let mut lambda_names: HashSet<String> = HashSet::new();
-    collect_stmt(body, pc, pool, &mut lambda_names);
+    let mut seen_impls: HashSet<usize> = HashSet::new();
+    collect_stmt(body, pc, pool, &mut lambda_names, &mut seen_impls);
     if lambda_names.is_empty() {
         return;
     }
