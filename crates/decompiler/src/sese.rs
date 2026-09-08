@@ -1719,17 +1719,29 @@ impl<'a> Structurer<'a> {
                     if std::env::var("JCDC_DBG_SWF").is_ok() {
                         eprintln!("SWF-RESOLVED cur={} follow={:?}", cur, follow);
                     }
+                    // CROSSING follow: see the walk-side twin in
+                    // structure.rs — a nested switch's stop-confluence
+                    // belongs to an enclosing construct; region-level
+                    // follow stays None so conversion binds the case-tail
+                    // goto to the OWNER (labeled break), while `stop`
+                    // still bounds the case walks at the confluence.
+                    let region_follow = match follow {
+                        Some(f) if stop.contains(&f) && self.switch_depth > 0 => None,
+                        other => other,
+                    };
                     let mut claimed = ctx.consumed.clone();
+                    self.switch_depth += 1;
                     let sw = self.structure_switch(
                         cur,
                         selector,
                         &targets,
                         &ctx.universe,
                         stop,
-                        follow,
+                        region_follow,
                         &ctx.top_groups,
                         &mut claimed,
                     );
+                    self.switch_depth -= 1;
                     ctx.consumed = claimed;
                     parts.push(sw);
                     if std::env::var("JCDC_DBG_GOTO").is_ok() {

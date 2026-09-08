@@ -445,9 +445,19 @@ pub fn decompile_method(
                     Ok(r) => {
                         if std::env::var("JCDC_DBG_BLOCKS").is_ok() {
                             eprintln!(
-                                "build block {} [{}..{}) ins={} in_stack={} stmts={} out={}",
+                                "build block {} [{}..{}) ins={} in_stack={} stmts={} out={} succ={:?} term={}",
                                 bid, b.start, b.end, b.ins.len(), in_stacks[bid].len(),
-                                r.stmts.len(), r.out_stack.len()
+                                r.stmts.len(), r.out_stack.len(), b.succ,
+                                match &r.term {
+                                    crate::builder::Term::Fallthrough => "Fall".to_string(),
+                                    crate::builder::Term::Goto => format!("Goto->{}", b.succ.first().copied().unwrap_or(usize::MAX)),
+                                    crate::builder::Term::Cond { .. } => format!("Cond(f={},t={})", b.succ.first().copied().unwrap_or(0), b.succ.get(1).copied().unwrap_or(0)),
+                                    crate::builder::Term::Switch { .. } => format!("Switch{:?}", b.succ),
+                                    crate::builder::Term::Return(_) => "Return".to_string(),
+                                    crate::builder::Term::Throw(_) => "Throw".to_string(),
+                                    crate::builder::Term::Jsr => "Jsr".to_string(),
+                                    crate::builder::Term::Ret => "Ret".to_string(),
+                                }
                             );
                         }
                         let keep_out = !matches!(

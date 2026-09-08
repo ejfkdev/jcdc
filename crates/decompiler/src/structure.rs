@@ -484,6 +484,13 @@ pub struct Structurer<'a> {
     pub copied_tails: HashSet<usize>,
     /// Headers of loops currently being structured (nesting barriers).
     pub loops_stack: Vec<usize>,
+    /// Nesting depth of structure_switch case walks: >0 while walking
+    /// inside another switch's case regions. A stop-confluence follow of
+    /// a NESTED switch crosses construct boundaries (it is typically the
+    /// ENCLOSING switch's own follow) — passing it as this switch's
+    /// follow makes conversion resolve the case-tail goto to a bare
+    /// `break` that binds to the WRONG (inner) switch.
+    pub switch_depth: usize,
     /// Loop headers detected at the SESE method level (including
     /// exception-edge back edges from no-normal-pred retry handlers).
     /// Walk-based sub-builders consult this so a retry `goto header`
@@ -876,7 +883,7 @@ impl<'a> Structurer<'a> {
         for (&merge, (root, _vis)) in &fold_regions {
             fold_root_to_merge.insert(*root, merge);
         }
-        Structurer { cfg, results, groups, body_group, handler_group, diamond_merges, fold_regions, fold_root_to_merge, copied_tails: HashSet::new(), loops_stack: Vec::new(), sese_loop_headers: std::collections::HashSet::new(), sese_exc_retry_headers: std::collections::HashSet::new(), walk_depth: 0, final_fields: HashSet::new(), structuring_groups: std::cell::RefCell::new(Vec::new()) }
+        Structurer { cfg, results, groups, body_group, handler_group, diamond_merges, fold_regions, fold_root_to_merge, copied_tails: HashSet::new(), loops_stack: Vec::new(), switch_depth: 0, sese_loop_headers: std::collections::HashSet::new(), sese_exc_retry_headers: std::collections::HashSet::new(), walk_depth: 0, final_fields: HashSet::new(), structuring_groups: std::cell::RefCell::new(Vec::new()) }
     }
 
     /// Immediate post-dominator of `entry` within `universe`. Delegates to the
@@ -1982,7 +1989,24 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         // cases escape to is still the logical follow for
                         // break resolution.
                         .or_else(|| self.switch_stop_confluence(cur, universe, stop));
-                    let sw = self.structure_switch(cur, selector, &targets, universe, stop, follow, active, claimed);
+                    // CROSSING follow: a stop-confluence of a NESTED
+                    // switch belongs to an enclosing construct (jdk26 xml
+                    // impl.Parser.bappend: the inner switch(ch)'s cases
+                    // break to the OUTER switch(mode)'s follow — passing
+                    // it as the inner follow resolved the default's goto
+                    // to a bare `break` binding the inner switch, case
+                    // 105 fell through into case 99 and the outer tail
+                    // went unreachable). With follow=None the conversion's
+                    // labeled-break logic binds it to the outer switch
+                    // (`break L1`); the confluence still bounds the case
+                    // walks via `stop`. Calendar (depth 0) keeps Some(f).
+                    let region_follow = match follow {
+                        Some(f) if stop.contains(&f) && self.switch_depth > 0 => None,
+                        other => other,
+                    };
+                    self.switch_depth += 1;
+                    let sw = self.structure_switch(cur, selector, &targets, universe, stop, region_follow, active, claimed);
+                    self.switch_depth -= 1;
                     parts.push(sw);
                     match follow {
                         Some(f) if universe.contains(&f) && !stop.contains(&f) && !claimed.contains(&f) => {
@@ -2253,6 +2277,20 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                 escapes.clear();
                 escapes.insert(t);
             }
+            if escapes.is_empty() {
+                // The case flow terminates ENTIRELY inside the universe
+                // (every exit is a return/throw leaf — no edge leaves it):
+                // an always-terminating case contributes no escape and
+                // must not veto the confluence of the others (jdk26 xml
+                // impl.Parser.bappend: the whitespace case's
+                // if/else-if/else chain all-returns zeroed the escape set
+                // and the whole-switch None made the inner switch's
+                // `break`-to-outer-follow default unresolvable — the case
+                // fell through into `case 99`, corrupting the outer
+                // switch's completion and stranding its follow —
+                // 无法访问的语句).
+                continue;
+            }
             if escapes.len() != 1 {
                 return None;
             }
@@ -2348,9 +2386,82 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             // Single non-terminating case flow: its exit out of the case
             // region is the switch follow.
             let d = &dists[0];
+            // Multi-pred blocks INSIDE a nested switch's span are that
+            // switch's own merge, not this switch's follow (jdk26 xml
+            // impl.Parser.dtdsub: switch(ch)'s case '!' flow merges the
+            // nested switch(bkeyword) at the shared `st = 1; goto head`
+            // stub — taking it as the follow put `st = 1` after the inner
+            // switch in case '<' and left the arm without its continue,
+            // falling through into case '%' — unreachable code past the
+            // all-continue arms plus a corrupted state machine, 无法访问
+            // 的语句 x5 methods x3 trees). A nested-switch merge is
+            // claimed by that switch's own follow resolution.
+            let in_nested_switch = |c: usize, d: &HashMap<usize, u32>| -> bool {
+                let preds = &self.cfg.blocks[c].pred;
+                if preds.len() < 2 {
+                    return false;
+                }
+                self.cfg.blocks.iter().any(|b| {
+                    if b.id == cur
+                        || !matches!(self.results[b.id].term, Term::Switch { .. })
+                        || !d.contains_key(&b.id)
+                    {
+                        return false;
+                    }
+                    preds.iter().all(|&p| {
+                        b.succ.iter().any(|&t| {
+                            let mut seen: HashSet<usize> = HashSet::new();
+                            let mut q: VecDeque<usize> = VecDeque::new();
+                            q.push_back(t);
+                            while let Some(x) = q.pop_front() {
+                                if x == p {
+                                    return true;
+                                }
+                                if !seen.insert(x) || !d.contains_key(&x) {
+                                    continue;
+                                }
+                                for &sx in &self.cfg.blocks[x].succ {
+                                    q.push_back(sx);
+                                }
+                            }
+                            false
+                        })
+                    })
+                })
+            };
+            // A RETURN/THROW merge whose preds all live inside this one
+            // flow is the case's private terminator confluence, not the
+            // switch's follow (jdk26 xml impl.Parser.bappend: the
+            // whitespace case's if-chain arms all converge on the shared
+            // `return` leaf; electing it follow made the switch "complete"
+            // into a bogus `return;` and the case group fall through into
+            // `case 99` — 无法访问的语句 on the outer tail). A shared
+            // return that IS the lexical follow keeps preds from the
+            // sibling (terminator-excluded) case flows and stays elected.
+            let private_terminator_merge = |c: usize, d: &HashMap<usize, u32>| -> bool {
+                if !matches!(self.results[c].term, Term::Return(_) | Term::Throw(_)) {
+                    return false;
+                }
+                if !self.cfg.blocks[c]
+                    .pred
+                    .iter()
+                    .all(|p| d.contains_key(p) || *p == cur)
+                {
+                    return false;
+                }
+                // A SINGLE case target whose flow ends at this return IS
+                // the lexical switch tail (`switch (x) { default: g(); }
+                // return v;` — the default completes the switch into the
+                // return): keep it as the follow. With two or more live
+                // targets the return is one case's private confluence
+                // (bappend's whitespace if-chain), not the follow.
+                self.cfg.blocks[cur].succ.len() > 1
+            };
             let mut best: Option<usize> = None;
             for &cand in d.keys() {
                 if self.cfg.blocks[cand].pred.len() >= 2
+                    && !in_nested_switch(cand, d)
+                    && !private_terminator_merge(cand, d)
                     && best.map(|b| self.cfg.blocks[cand].start < self.cfg.blocks[b].start).unwrap_or(true)
                 {
                     best = Some(cand);
