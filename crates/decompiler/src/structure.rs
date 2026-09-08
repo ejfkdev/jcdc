@@ -664,25 +664,6 @@ impl<'a> Structurer<'a> {
                     .iter()
                     .all(|p| hf.contains(p) || in_body(*p) || self.handler_group.contains_key(p))
                 {
-                    // A successor OWNED by another (nested/sibling) try
-                    // group is that group's body or handler — a finally
-                    // copy block, a post-inner-try statement — NOT this
-                    // handler's private tail. Without this, a try body
-                    // that always throws makes the enclosing inline-finally
-                    // copy singly-pred'd by the catch handler, and the
-                    // fixpoint swallows the whole downstream normal
-                    // continuation (feat Exceptions nestedTry: hf(catch)
-                    // absorbed the finally-d copy + append-e + append-g,
-                    // the shared_merge tail-strip was skipped, the catch
-                    // inlined `d; e; return toString()` — snapshotting the
-                    // return before the real finally g ran: output lost
-                    // its trailing g). The genuine private tails
-                    // (AQS.acquireQueued selfInterrupt+athrow,
-                    // putInCache monitorexit-rethrow) are unowned
-                    // post-span blocks and stay classified.
-                    if self.body_group.contains_key(&s) {
-                        continue;
-                    }
                     hf.insert(s);
                     q.push_back(s);
                 }
@@ -2080,36 +2061,6 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             if std::env::var("JCDC_DBG_IF").is_ok() {
                                 eprintln!("GOTO-FT cur={} n={} univ={} stop={} claimed={} entry={}", cur, n, universe.contains(&n), stop.contains(&n), claimed.contains(&n), entry);
                             }
-                            // Shared-tail arrival: `n` is CLAIMED (hence
-                            // out of this walk's universe — sub_scope
-                            // retains unclaimed blocks only). A bare Goto
-                            // here is elided at conversion as the walk's
-                            // last part (goto_is_last), silently severing
-                            // this path's flow into the shared tail (jdk26
-                            // DatagramChannelImpl.innerJoin's IPv4 arm:
-                            // `key = new Type4(..)` fell off the method
-                            // without the `registry.add(key); return key;`
-                            // copy — 缺少返回语句 x2 trees). Per-arrival
-                            // copies are exactly the bytecode semantics:
-                            // a claimed terminator inlines as CopyStmts
-                            // (the walk's GOTO-CLAIMED discipline),
-                            // anything else copy_walks when its flow does
-                            // not circle back (copy_walk's own guard).
-                            if claimed.contains(&n)
-                                && !stop.contains(&n)
-                                && !self.loops_stack.contains(&n)
-                                && !self.is_handler(n)
-                                && !self.terminator_writes_final(n)
-                            {
-                                if self.is_terminator_block(n) {
-                                    parts.push(Region::CopyStmts { block: n });
-                                    break;
-                                }
-                                if let Some(r) = self.copy_walk(n, stop, active, cur) {
-                                    parts.push(r);
-                                    break;
-                                }
-                            }
                             parts.push(Region::Goto { target: n });
                             break;
                         }
@@ -2571,40 +2522,6 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         }
         if std::env::var("JCDC_DBG_ABSORB").is_ok() {
             eprintln!("absorb ACCEPT blk={} claimed={}", blk, claimed.contains(&blk));
-        }
-        // The unwalkable successor is an already-CLAIMED terminator this
-        // arm's normal walk would inline-copy (the shared
-        // `registry.add(key); return key;` tail): absorbing blk ends the
-        // arm AT blk and the path to the tail is silently severed — the
-        // enclosing walk breaks at the if with follow=None and the method
-        // falls off without a return on this path (jdk26
-        // DatagramChannelImpl.innerJoin's IPv4 arm lost the tail after
-        // `key = new Type4(..)` — 缺少返回语句 x2 trees). Refuse: the
-        // normal walk branch emits Basic{blk} and, arriving at the
-        // claimed terminator, CopyStmts/copy_walk — per-arrival copies
-        // are exactly the bytecode semantics.
-        {
-            let succ = self.cfg.blocks[blk].succ[0];
-            if claimed.contains(&succ)
-                && !bstop.contains(&succ)
-                && !self.loops_stack.contains(&succ)
-            {
-                // The walk's claimed-arrival handling would inline this
-                // successor (CopyStmts for a shared terminator, copy_walk
-                // otherwise); absorption must yield to it. A
-                // final-writing terminator stays absorbed — copying it
-                // would double-assign the blank final (the
-                // UntrustedCertificates discipline).
-                if !self.terminator_writes_final(succ) {
-                    if dbg_absorb {
-                        eprintln!(
-                            "absorb REJECT blk={} succ={} claimed inline-copy tail",
-                            blk, succ
-                        );
-                    }
-                    return None;
-                }
-            }
         }
         // Shared pure blocks (reached from several branches) get their
         // statements duplicated into each branch — exactly the bytecode
@@ -3487,41 +3404,59 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                     // handler-only but semantically the continuation —
                     // swallowing it into the catch snapshotted the return
                     // before the real finally g ran, output lost its g).
+                    // Private-tail keep set: successors not owned by
+                    // ANOTHER group (nor another group's handler) whose
+                    // preds stay within the handler's own flow. Only for
+                    // SOLE-ENTRY handlers (the body always completes
+                    // abruptly — nestedTry); a multi-entry handler's
+                    // reachable set mixes in the genuine shared
+                    // continuation and stripping it starves the post-try
+                    // walk (jdk Module TWR).
+                    let sole_entry_hb = self.cfg.blocks[*hb]
+                        .pred
+                        .iter()
+                        .all(|p| self.handler_group.contains_key(p));
                     let mut private: HashSet<usize> = HashSet::new();
-                    let mut pq: VecDeque<usize> = VecDeque::new();
-                    for &s0 in &self.cfg.blocks[*hb].succ {
-                        pq.push_back(s0);
-                    }
-                    while let Some(x) = pq.pop_front() {
-                        if private.contains(&x) || x == *hb {
-                            continue;
+                    if sole_entry_hb {
+                        let mut pq: VecDeque<usize> = VecDeque::new();
+                        for &s0 in &self.cfg.blocks[*hb].succ {
+                            pq.push_back(s0);
                         }
-                        let owned_by_other = self
-                            .body_group
-                            .get(&x)
-                            .map(|og| *og != gi)
-                            .unwrap_or(false)
-                            || self
-                                .handler_group
+                        while let Some(x) = pq.pop_front() {
+                            if private.contains(&x) || x == *hb {
+                                continue;
+                            }
+                            let owned_by_other = self
+                                .body_group
                                 .get(&x)
                                 .map(|og| *og != gi)
-                                .unwrap_or(false);
-                        if owned_by_other {
-                            continue;
-                        }
-                        if self.cfg.blocks[x].pred.iter().all(|p| {
-                            *p == *hb
-                                || private.contains(p)
-                                || self.handler_group.get(p) == Some(&gi)
-                        }) {
-                            private.insert(x);
-                            for &s1 in &self.cfg.blocks[x].succ {
-                                pq.push_back(s1);
+                                .unwrap_or(false)
+                                || self
+                                    .handler_group
+                                    .get(&x)
+                                    .map(|og| *og != gi)
+                                    .unwrap_or(false);
+                            if owned_by_other {
+                                continue;
+                            }
+                            if self.cfg.blocks[x].pred.iter().all(|p| {
+                                *p == *hb
+                                    || private.contains(p)
+                                    || self.handler_group.get(p) == Some(&gi)
+                            }) {
+                                private.insert(x);
+                                for &s1 in &self.cfg.blocks[x].succ {
+                                    pq.push_back(s1);
+                                }
                             }
                         }
                     }
                     let tail = reachable_within(self.cfg, cont, &HashSet::new());
-                    huniverse.retain(|b| !tail.contains(b) || private.contains(b));
+                    if sole_entry_hb {
+                        huniverse.retain(|b| !tail.contains(b) || private.contains(b));
+                    }
+                    // Multi-entry cont==hb: no strip (the f4472a5f shape —
+                    // the shared_merge machinery and outer walks handle it).
                 } else if !self.handler_group.contains_key(&cont) && !hf.contains(&cont) {
                     let tail = reachable_within(self.cfg, cont, &HashSet::new());
                     huniverse.retain(|b| !tail.contains(b) || hf.contains(b));
