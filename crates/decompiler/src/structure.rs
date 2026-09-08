@@ -3925,12 +3925,114 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                     // reachable set mixes in the genuine shared
                     // continuation and stripping it starves the post-try
                     // walk (jdk Module TWR).
-                    let sole_entry_hb = self.cfg.blocks[*hb]
-                        .pred
-                        .iter()
-                        .all(|p| self.handler_group.contains_key(p));
+
+                    // Body-flow reachability per enclosing group: a block
+                    // owned by group og that og's own body flow REACHES
+                    // (from its span-start block, through blocks it owns,
+                    // without stepping on handler heads) will be re-emitted
+                    // by og's body walk — stripping it from this handler's
+                    // universe is safe (feat Exceptions nestedTry: the
+                    // d/e/g continuation chain is gi=0 body flow). A block
+                    // merely GEOGRAPHICALLY inside og's span but reachable
+                    // only through handler flow is this handler's private
+                    // tail — stripping loses it entirely (jdk11
+                    // ServerSocketAdaptor.accept: the catch(Exception)'s
+                    // assert-throw / `return sc.socket()` tail sits inside
+                    // the enclosing sync group's span but its body flow
+                    // never reaches it — stripped, the catch fell off the
+                    // method end: 缺少返回语句).
+                    let mut og_body_reach: HashMap<usize, HashSet<usize>> = HashMap::new();
+                    {
+                        let mut by_og: HashMap<usize, Vec<usize>> = HashMap::new();
+                        for (b, og) in self.body_group.iter() {
+                            by_og.entry(*og).or_default().push(*b);
+                        }
+                        for (og, _) in by_og {
+                            // Normal-flow reachability from the group's
+                            // body entry, bounded by the group's span and
+                            // barred at handler heads: nested groups'
+                            // blocks lie on the body flow (the walk
+                            // carves them out but continues after), so
+                            // the BFS must pass through them.
+                            let g = &self.groups[og];
+                            let mut reach: HashSet<usize> = HashSet::new();
+                            if let Some(entry) = self.cfg.block_at(g.start) {
+                                let mut q: VecDeque<usize> = VecDeque::new();
+                                q.push_back(entry);
+                                reach.insert(entry);
+                                // Groups carved out of this span: the
+                                // body walk resumes at their post-try
+                                // continuation, so the BFS hops the same
+                                // way — BUT never onto handler-flow-only
+                                // blocks of THIS structure_try's group
+                                // (accept's gi=0 body cont would land on
+                                // the catch's private assert-throw tail;
+                                // the hf_after filter skips it there, and
+                                // letting the BFS see it would mark the
+                                // tail re-emittable and strip it).
+                                let mut conts: HashMap<usize, usize> = HashMap::new();
+                                for (j, gj) in self.groups.iter().enumerate() {
+                                    if j == og {
+                                        continue;
+                                    }
+                                    if gj.start < g.start || gj.end > g.end.max(g.start + 1) {
+                                        continue;
+                                    }
+                                    // The exclusion set must be the
+                                    // CARVED group's own hf (that is what
+                                    // the body walk's continuation_after
+                                    // filter consults), not this
+                                    // structure_try's hf.
+                                    let hf_j = self.handler_flow_only(j);
+                                    let mut cont: Option<usize> = None;
+                                    for nb in self.cfg.blocks.iter() {
+                                        if nb.start < gj.end || nb.ins.is_empty() {
+                                            continue;
+                                        }
+                                        if self.handler_group.contains_key(&nb.id) {
+                                            continue;
+                                        }
+                                        if hf_j.contains(&nb.id) {
+                                            continue;
+                                        }
+                                        cont = Some(nb.id);
+                                        break;
+                                    }
+                                    if let Some(c) = cont {
+                                        for nb in self.cfg.blocks.iter() {
+                                            if !nb.ins.is_empty()
+                                                && nb.start >= g.start
+                                                && nb.end <= gj.end.max(gj.start + 1)
+                                                && !self.handler_group.contains_key(&nb.id)
+                                            {
+                                                conts.entry(nb.id).or_insert(c);
+                                            }
+                                        }
+                                    }
+                                }
+                                while let Some(x) = q.pop_front() {
+                                    let mut edges: Vec<usize> =
+                                        self.cfg.blocks[x].succ.clone();
+                                    if let Some(&c) = conts.get(&x) {
+                                        edges.push(c);
+                                    }
+                                    for sx in edges {
+                                        let sb = &self.cfg.blocks[sx];
+                                        if sb.start >= g.start
+                                            && sb.end <= g.end.max(g.start + 1)
+                                            && !self.handler_group.contains_key(&sx)
+                                            && reach.insert(sx)
+                                        {
+                                            q.push_back(sx);
+                                        }
+                                    }
+                                }
+                            }
+                            og_body_reach.insert(og, reach);
+                        }
+                    }
                     let mut private: HashSet<usize> = HashSet::new();
-                    if sole_entry_hb {
+                    {
                         let mut pq: VecDeque<usize> = VecDeque::new();
                         for &s0 in &self.cfg.blocks[*hb].succ {
                             pq.push_back(s0);
@@ -3939,17 +4041,22 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             if private.contains(&x) || x == *hb {
                                 continue;
                             }
-                            let owned_by_other = self
-                                .body_group
-                                .get(&x)
-                                .map(|og| *og != gi)
-                                .unwrap_or(false)
-                                || self
-                                    .handler_group
-                                    .get(&x)
-                                    .map(|og| *og != gi)
-                                    .unwrap_or(false);
-                            if owned_by_other {
+                            match self.body_group.get(&x) {
+                                Some(og) if *og != gi => {
+                                    // Owned by another group: private only
+                                    // when that group's body flow cannot
+                                    // re-emit it.
+                                    if og_body_reach
+                                        .get(og)
+                                        .map(|r| r.contains(&x))
+                                        .unwrap_or(false)
+                                    {
+                                        continue;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            if self.handler_group.get(&x).map(|og| *og != gi).unwrap_or(false) {
                                 continue;
                             }
                             if self.cfg.blocks[x].pred.iter().all(|p| {
@@ -3964,6 +4071,10 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             }
                         }
                     }
+                    let sole_entry_hb = self.cfg.blocks[*hb]
+                        .pred
+                        .iter()
+                        .all(|p| self.handler_group.contains_key(p));
                     let tail = reachable_within(self.cfg, cont, &HashSet::new());
                     if sole_entry_hb {
                         huniverse.retain(|b| !tail.contains(b) || private.contains(b));
