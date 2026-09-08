@@ -2130,6 +2130,42 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             // re-executes the whole tail, so re-walk it
                             // with a fresh claimed set (a structural copy)
                             // and splice the region in here.
+                            //
+                            // UNLESS the follow is a loop BACKEDGE STUB
+                            // (`reset(); goto head`): the fresh walk would
+                            // re-walk the ENTIRE loop from the header
+                            // (fresh claimed knows nothing) and paste the
+                            // loop body into this branch (jdk11 KeyStore
+                            // .getInstance(File)'s IOException catch
+                            // swallowed the provider loop with an
+                            // unprotected Security.getImpl — 未报告的异常
+                            // 错误NoSuchProviderException). Copy the stub's
+                            // own statements and attach an explicit Goto
+                            // to the header — conversion resolves it to
+                            // `continue`; a fall-through must NOT reach
+                            // the head (it would re-run the loop test).
+                            let stub_header =
+                                if matches!(self.results[f].term, Term::Goto)
+                                    && self.cfg.blocks[f].succ.len() == 1
+                                {
+                                    let t = self.cfg.blocks[f].succ[0];
+                                    self.loops_stack
+                                        .iter()
+                                        .chain(self.sese_loop_headers.iter())
+                                        .find(|&&h| {
+                                            h == t || self.is_stmt_free_chain_to_block(t, h)
+                                        })
+                                        .copied()
+                                } else {
+                                    None
+                                };
+                            if let Some(h) = stub_header {
+                                parts.push(Region::Seq(vec![
+                                    Region::CopyStmts { block: f },
+                                    Region::Goto { target: h },
+                                ]));
+                                break;
+                            }
                             let mut barriers = stop.clone();
                             barriers.insert(cur);
                             let tail_universe = reachable_within(self.cfg, f, &barriers);
@@ -3764,6 +3800,13 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                 }
             }
             let mut huniverse = reachable_within(self.cfg, *hb, &hstop);
+            if std::env::var("JCDC_DBG_HUNIV").is_ok() {
+                eprintln!("HUNIV0 gi={} hb={} hstop={:?} reach={:?}", gi, hb, {
+                    let mut v: Vec<usize> = hstop.iter().copied().collect(); v.sort(); v
+                }, {
+                    let mut v: Vec<usize> = huniverse.iter().copied().collect(); v.sort(); v
+                });
+            }
             // Keep the handler walk out of try-body blocks that start before
             // this group's end (real protected code), and out of other
             // handlers' heads. Blocks past the group end may legitimately
@@ -3793,6 +3836,31 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             // it only by jumping out, which strip_handler_exit_goto already
             // renders as the natural fallthrough.
             let hf = self.handler_flow_only(gi);
+            // An enclosing loop's BACKEDGE STUB (a Goto block whose
+            // single target is/leads to an open loop header — the
+            // handler's `dataStream.reset(); goto head` continue tail)
+            // is NOT a post-try merge: stripping it from the handler
+            // universe leaves the handler's branch arms dangling
+            // (Region::Empty) and the flow re-copies the whole loop body
+            // into the catch (jdk11 KeyStore.getInstance(File)'s
+            // IOException catch swallowed the provider loop with an
+            // unprotected Security.getImpl — 未报告的异常错误
+            // NoSuchProviderException; regression of the loop-header
+            // circulation guard exposing this path).
+            let backedge_stub = |b: usize| -> bool {
+                if !matches!(self.results[b].term, Term::Goto) {
+                    return false;
+                }
+                let succs = &self.cfg.blocks[b].succ;
+                if succs.len() != 1 {
+                    return false;
+                }
+                let t = succs[0];
+                self.loops_stack
+                    .iter()
+                    .chain(self.sese_loop_headers.iter())
+                    .any(|&h| h == t || self.is_stmt_free_chain_to_block(t, h))
+            };
             let shared_merge: Vec<usize> = huniverse
                 .iter()
                 .copied()
@@ -3800,6 +3868,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                     *b != *hb
                         && !hf.contains(b)
                         && !claimed.contains(b)
+                        && !backedge_stub(*b)
                         && self.body_group.get(b) != Some(&gi)
                         && self.handler_group.get(b) != Some(&gi)
                         && self.cfg.blocks[*b].pred.iter().any(|p| {
@@ -3809,9 +3878,21 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         })
                 })
                 .collect();
+            if std::env::var("JCDC_DBG_HUNIV").is_ok() {
+                eprintln!(
+                    "HUNIV1 gi={} hb={} shared_merge={:?} huniverse={:?}",
+                    gi, hb, shared_merge,
+                    { let mut v: Vec<usize> = huniverse.iter().copied().collect(); v.sort(); v }
+                );
+            }
             if !shared_merge.is_empty() {
                 let tail = reachable_within(self.cfg, shared_merge[0], &HashSet::new());
                 huniverse.retain(|b| !tail.contains(b) || *b == *hb || hf.contains(b));
+                if std::env::var("JCDC_DBG_HUNIV").is_ok() {
+                    eprintln!("HUNIV2 gi={} after-strip={:?}", gi, {
+                        let mut v: Vec<usize> = huniverse.iter().copied().collect(); v.sort(); v
+                    });
+                }
             }
             // The cont-tail exclusion must not fire when the block at the
             // span end IS the handler flow (javac excludes the body's
