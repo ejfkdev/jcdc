@@ -82,109 +82,6 @@ pub fn decompile_method(
         .collect();
     let cfg = Cfg::build(pc, &code.code, &exc);
 
-    // Temp-local forwarding pairs: a slot stored EXACTLY once and loaded
-    // EXACTLY once by the immediately-following instruction in the same
-    // block (javac's pattern-match temps: `checkcast X; astore n;
-    // aload n`). Forwarding removes the temp's LocalDef so value-diamond
-    // arms stay pure and fold to ternaries (jdk26 PrintWriter ctor
-    // delegation `this(out, autoFlush, out instanceof PrintStream ?
-    // ((PrintStream) out).charset() : Charset.defaultCharset())`).
-    let fwd = {
-        use jcdc_classfile::Opcode as O;
-        let mut stores_by_slot: HashMap<u16, Vec<(usize, usize)>> = HashMap::new();
-        let mut loads_by_slot: HashMap<u16, Vec<(usize, usize)>> = HashMap::new();
-        for b in &cfg.blocks {
-            for (idx, ins) in b.ins.iter().enumerate() {
-                let (slot, kind) = match ins.op {
-                    O::Istore | O::Lstore | O::Fstore | O::Dstore | O::Astore => {
-                        (ins.a as u16, 1u8)
-                    }
-                    O::Istore0 | O::Istore1 | O::Istore2 | O::Istore3 => {
-                        ((ins.op as u8 - O::Istore0 as u8) as u16, 1)
-                    }
-                    O::Lstore0 | O::Lstore1 | O::Lstore2 | O::Lstore3 => {
-                        ((ins.op as u8 - O::Lstore0 as u8) as u16, 1)
-                    }
-                    O::Fstore0 | O::Fstore1 | O::Fstore2 | O::Fstore3 => {
-                        ((ins.op as u8 - O::Fstore0 as u8) as u16, 1)
-                    }
-                    O::Dstore0 | O::Dstore1 | O::Dstore2 | O::Dstore3 => {
-                        ((ins.op as u8 - O::Dstore0 as u8) as u16, 1)
-                    }
-                    O::Astore0 | O::Astore1 | O::Astore2 | O::Astore3 => {
-                        ((ins.op as u8 - O::Astore0 as u8) as u16, 1)
-                    }
-                    O::Iload | O::Lload | O::Fload | O::Dload | O::Aload => {
-                        (ins.a as u16, 2u8)
-                    }
-                    O::Iload0 | O::Iload1 | O::Iload2 | O::Iload3 => {
-                        ((ins.op as u8 - O::Iload0 as u8) as u16, 2)
-                    }
-                    O::Lload0 | O::Lload1 | O::Lload2 | O::Lload3 => {
-                        ((ins.op as u8 - O::Lload0 as u8) as u16, 2)
-                    }
-                    O::Fload0 | O::Fload1 | O::Fload2 | O::Fload3 => {
-                        ((ins.op as u8 - O::Fload0 as u8) as u16, 2)
-                    }
-                    O::Dload0 | O::Dload1 | O::Dload2 | O::Dload3 => {
-                        ((ins.op as u8 - O::Dload0 as u8) as u16, 2)
-                    }
-                    O::Aload0 | O::Aload1 | O::Aload2 | O::Aload3 => {
-                        ((ins.op as u8 - O::Aload0 as u8) as u16, 2)
-                    }
-                    // iinc reads AND writes: registering it on both sides
-                    // disqualifies the slot from forwarding.
-                    O::Iinc => (ins.a as u16, 3u8),
-                    _ => continue,
-                };
-                match kind {
-                    1 => stores_by_slot.entry(slot).or_default().push((b.id, idx)),
-                    2 => loads_by_slot.entry(slot).or_default().push((b.id, idx)),
-                    _ => {
-                        stores_by_slot.entry(slot).or_default().push((b.id, idx));
-                        loads_by_slot.entry(slot).or_default().push((b.id, idx));
-                    }
-                }
-            }
-        }
-        let mut pend: u16 = if is_static { 0 } else { 1 };
-        for a in &desc.args {
-            pend += match a {
-                jcdc_jvm::JavaType::Long | jcdc_jvm::JavaType::Double => 2,
-                _ => 1,
-            };
-        }
-        let mut fwd_stores: std::collections::HashSet<u16> = std::collections::HashSet::new();
-        let mut fwd_loads: HashMap<u16, u16> = HashMap::new();
-        for (slot, ss) in &stores_by_slot {
-            if *slot < pend || *slot >= code.max_locals {
-                continue;
-            }
-            if ss.len() != 1 {
-                continue;
-            }
-            let Some(ls) = loads_by_slot.get(slot) else { continue };
-            if ls.len() != 1 {
-                continue;
-            }
-            let (sb, si) = ss[0];
-            let (lb, li) = ls[0];
-            if sb != lb || si + 1 != li {
-                continue; // load must be the instruction right AFTER the store
-            }
-            let insb = &cfg.blocks[sb].ins;
-            let (st, ld) = (&insb[si], &insb[li]);
-            if st.pc + st.size != ld.pc {
-                continue;
-            }
-            // The stored value must not be a plain load of the SAME slot.
-            // (defensive; cannot happen with single store+load)
-            fwd_stores.insert(st.pc);
-            fwd_loads.insert(ld.pc, *slot);
-        }
-        (fwd_stores, fwd_loads)
-    };
-
     // Build expressions per block in reverse postorder so that operand
     // stacks propagate across block boundaries. At merge points whose
     // predecessors bring different stacks, introduce synthetic "stack
@@ -439,8 +336,7 @@ pub fn decompile_method(
                 }
                 built_once[bid] = true;
                 changed_this_iter = true;
-                let builder = Builder::new(pc, pool, &vt, &desc, is_static)
-                    .with_fwd(fwd.clone());
+                let builder = Builder::new(pc, pool, &vt, &desc, is_static);
                 match builder.build_block(&b.ins, in_stack) {
                     Ok(r) => {
                         if std::env::var("JCDC_DBG_BLOCKS").is_ok() {

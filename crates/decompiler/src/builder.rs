@@ -74,18 +74,6 @@ pub struct Builder<'a> {
     /// Pending array initializers keyed by (element type descriptor, dims
     /// literal string). Stores append values; uses materialize `new T[]{...}`.
     pub arrays: RefCell<HashMap<ArrayKey, Vec<Expr>>>,
-    /// Temp-local forwarding (computed per method in method.rs):
-    /// (store pcs that skip their LocalDef, load pc -> slot that pushes
-    /// the stored expr). javac's pattern-match temps (`checkcast X;
-    /// astore n; aload n`) make a diamond arm statement-bearing, which
-    /// blocks value-diamond folding (jdk26 PrintWriter ctor: the
-    /// `out instanceof PrintStream ? ps.charset() : defaultCharset()`
-    /// argument degraded to merge vars + a duplicated ctor call,
-    /// 此处不允许使用显式构造器调用).
-    fwd: Option<(std::collections::HashSet<u16>, HashMap<u16, u16>)>,
-    /// In-flight forwarded values, keyed by slot (store and load are
-    /// adjacent in one block, so at most one entry per slot).
-    fwd_pending: RefCell<HashMap<u16, Expr>>,
 }
 
 /// Identity key for a freshly created array expression.
@@ -135,19 +123,7 @@ impl<'a> Builder<'a> {
             is_static,
             declared: RefCell::new(Vec::new()),
             arrays: RefCell::new(HashMap::new()),
-            fwd: None,
-            fwd_pending: RefCell::new(HashMap::new()),
         }
-    }
-
-    pub fn with_fwd(
-        mut self,
-        fwd: (std::collections::HashSet<u16>, HashMap<u16, u16>),
-    ) -> Self {
-        if !fwd.0.is_empty() {
-            self.fwd = Some(fwd);
-        }
-        self
     }
 
     /// Build statements for one basic block, starting from `initial_stack`
@@ -1160,13 +1136,6 @@ impl<'a> Builder<'a> {
     }
 
     fn load(&self, slot: u16, at_pc: u16) -> BResult<Expr> {
-        if let Some((_, loads)) = &self.fwd {
-            if loads.contains_key(&at_pc) {
-                if let Some(e) = self.fwd_pending.borrow_mut().remove(&slot) {
-                    return Ok(e);
-                }
-            }
-        }
         let v = self.var_at(slot, at_pc)?;
         if !self.is_static && slot == 0 && self.vt.var(v).name == "this" {
             return Ok(Expr::This);
@@ -1366,14 +1335,6 @@ impl<'a> Builder<'a> {
     fn store(&self, stmts: &mut Vec<Stmt>, slot: u16, at_pc: u16, next_pc: u16, val: Expr) -> BResult<()> {
         if !self.is_static && slot == 0 && matches!(val, Expr::This) {
             return Ok(()); // storing `this` to slot 0: noise
-        }
-        if let Some((stores, _)) = &self.fwd {
-            if stores.contains(&at_pc) {
-                // Forwarded temp: no statement; the adjacent load pushes
-                // the value expression directly.
-                self.fwd_pending.borrow_mut().insert(slot, val);
-                return Ok(());
-            }
         }
         // The stored variable is the one live right AFTER the store (LVT
         // ranges start at the following pc); fall back to the store pc.
