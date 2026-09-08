@@ -2663,11 +2663,38 @@ fn emit_method_with(
     // Merge the Exceptions attribute, skipping entries that are just the
     // erasure of a signature throws clause (`throws E` with E extends
     // Exception lists java/lang/Exception in Exceptions).
+    // Erasure resolution sees the method's own typevars PLUS the
+    // enclosing class's: an interface-level throws typevar
+    // (ThrowingConsumer<T, X extends Throwable>'s `accept throws X` —
+    // jdk26 MembershipRegistry.forEach) is not in the method Signature's
+    // params, so its erasure (java/lang/Throwable from the class bound)
+    // went unresolved and the Exceptions attribute's erasure entry
+    // printed alongside it (`throws X, Throwable`): every accept() call
+    // then "threw Throwable" where only X was declared (未报告的异常错误
+    // Throwable x2 trees).
+    let mut erasure_params: Vec<jcdc_jvm::TypeParam> = match &msig {
+        Some(sig) => sig.params.clone(),
+        None => Vec::new(),
+    };
+    if let Some(cs) = pc
+        .class_attr("Signature")
+        .and_then(|b| {
+            if b.len() >= 2 {
+                Some(u16::from_be_bytes([b[0], b[1]]))
+            } else {
+                None
+            }
+        })
+        .and_then(|idx| pc.utf8(idx))
+        .and_then(|s| parse_class_signature(s))
+    {
+        erasure_params.extend(cs.params.iter().cloned());
+    }
     let sig_erasures: Vec<String> = match &msig {
         Some(sig) => sig
             .throws
             .iter()
-            .filter_map(|t| generic_erasure(t, &sig.params))
+            .filter_map(|t| generic_erasure(t, &erasure_params))
             .collect(),
         None => Vec::new(),
     };
