@@ -1009,8 +1009,50 @@ impl<'a> Structurer<'a> {
                 // loop-header branch below win; the body walk re-finds
                 // this group at its start. try{while} keeps group-first:
                 // its back edge is INSIDE the protected span.
+                //
+                // FINALLY-WRAP exception: `try { while (true) { ... }
+                // finally { ... } }` (jdk26 KQueuePort
+                // EventHandlerTask.run) — javac splits the protection
+                // around the inlined finally copies, so the FIRST range
+                // ends mid-loop and the back edges sit outside it: the
+                // ClassValue span shape. What separates the two is the
+                // handler's TAIL: ClassValue's catch continues the
+                // retry (the loop must own the header), while a finally
+                // handler ends in a pending rethrow and never returns
+                // to the header. Fingerprint: an `any`-range of this
+                // group's handler set whose end extends INTO the handler
+                // block — the protection blankets the whole loop up to
+                // the handler entry (KQueuePort range 171..211 over
+                // handler 209). Loop-first there nests the try inside
+                // the loop and walks the loop's break-path finally copy
+                // (pollTask()==null fall-out) as the post-loop
+                // continuation — a second threadExit after the
+                // all-paths-return while(true): 无法访问的语句 x3 trees.
+                let finally_wrap = |gi: usize| -> bool {
+                    let g = &self.groups[gi];
+                    self.cfg.exc_ranges.iter().any(|r| {
+                        r.catch_type.is_none()
+                            && g.handlers.iter().any(|(h2, t2)| t2.is_none() && *h2 == r.handler)
+                            && r.start < r.handler
+                            && self.cfg.block_at(r.handler).is_some_and(|hb| {
+                                r.end > self.cfg.blocks[hb].start
+                                    && r.end < self.cfg.blocks[hb].end.saturating_add(8)
+                            })
+                    })
+                };
+                // The finally-wrap fingerprint overrides BOTH loop-first
+                // rules (back-edge-outside-span and exc-retry-header):
+                // KQueuePort's loop is also an exc-retry loop (the
+                // InterruptedException handler's `goto 16` continue), and
+                // the wrap still belongs outside it — structure_try's
+                // body walk re-structures the loop at the header via
+                // sese_exc_retry_headers (the parseBest mechanism). The
+                // typed-catch retry shapes (parseBest DateTimeException,
+                // Process.waitFor) have no `any` handler and never trip
+                // the fingerprint.
                 let group_here = group_here.filter(|&gi| {
                     !ctx.loop_headers.contains(&cur)
+                        || finally_wrap(gi)
                         || (!ctx.exc_retry_headers.contains(&cur)
                             && !self.cfg.blocks[cur].pred.iter().any(|&p| {
                                 p != cur
