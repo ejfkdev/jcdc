@@ -852,8 +852,42 @@ impl<'a> Structurer<'a> {
             return;
         };
         let hf = self.handler_flow_only(gi);
+        // Handler-EXCLUSIVE blocks: normal flow from the method entry,
+        // barred at EVERY handler head, never reaches them — their only
+        // entry is through exception flow. No normal-path walk ever
+        // emits them, so dropping them from the arm strands them in no
+        // region: jdk17 Files.createDirectories' outermost
+        // NoSuchFileException retry level lost the iterator loop +
+        // `return dir` tail (blocks past a loop header are invisible to
+        // the hf fixpoint — the header's pred chain crosses the
+        // break-stub merge that body flow also reaches, and the
+        // loop-header skip stops the fixpoint at the header itself);
+        // SESE's bottom fallback then re-peeled the orphaned loop
+        // without its exit return — 缺少返回语句 x2 trees. Loops whose
+        // header is handler-exclusive structure normally inside the arm
+        // walk (structure_loop keys off sese_loop_headers). A pred-based
+        // closure cannot compute this: the loop header and its body
+        // preds form a cycle that never bootstraps.
+        let mut normal_reach: HashSet<usize> = HashSet::new();
+        let mut q: VecDeque<usize> = VecDeque::new();
+        if !self.handler_group.contains_key(&self.cfg.entry) {
+            q.push_back(self.cfg.entry);
+            normal_reach.insert(self.cfg.entry);
+        }
+        while let Some(b) = q.pop_front() {
+            for &s in &self.cfg.blocks[b].succ {
+                if normal_reach.contains(&s) || self.handler_group.contains_key(&s) {
+                    continue;
+                }
+                normal_reach.insert(s);
+                q.push_back(s);
+            }
+        }
         sub.retain(|b| {
-            *b == entry || hf.contains(b) || self.handler_group.get(b) == Some(&gi)
+            *b == entry
+                || hf.contains(b)
+                || !normal_reach.contains(b)
+                || self.handler_group.get(b) == Some(&gi)
         });
         sub.insert(entry);
     }

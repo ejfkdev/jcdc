@@ -516,6 +516,13 @@ pub fn decompile_method(
         })
         .filter_map(|f| pc.utf8(f.name_index).map(|n| n.to_string()))
         .collect();
+    if std::env::var("JCDC_DBG_MNAME").is_ok() {
+        eprintln!(
+            "METHOD {} {}",
+            pc.method_name(m_idx).unwrap_or("?"),
+            desc_str
+        );
+    }
     let region = structurer.structure_method();
 
     // Convert to statements.
