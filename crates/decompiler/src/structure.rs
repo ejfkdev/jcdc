@@ -801,6 +801,27 @@ impl<'a> Structurer<'a> {
                 if hf.contains(&s) || in_body(s) || self.handler_group.contains_key(&s) {
                     continue;
                 }
+                // Never classify a LOOP HEADER as handler-flow-only: a
+                // loop is an independent construct that some scope must
+                // structure — when the fixpoint swallowed one, every
+                // hf-keyed consumer inherited the whole loop as
+                // "private tail" (jdk17 Files.createDirectories: the
+                // parent-check handler's hf ran 10→12→16→17 absorbing
+                // the iterator loop, restrict_handler_branch then
+                // truncated the if-arm walk to universe {16,3}, and the
+                // loop plus its `return child` tail were never
+                // structured at the top level — 缺少返回语句 x2 trees).
+                // Stopping AT the header keeps the handler's real
+                // private blocks (Module's goto-pending stub, accept's
+                // assert-throw/return chain, acquireQueued's
+                // selfInterrupt+athrow) while the loop's enclosing scope
+                // structures it and the post-If continuation copies
+                // handle the rest.
+                if self.sese_loop_headers.contains(&s)
+                    || self.loops_stack.contains(&s)
+                {
+                    continue;
+                }
                 if self.cfg.blocks[s]
                     .pred
                     .iter()
