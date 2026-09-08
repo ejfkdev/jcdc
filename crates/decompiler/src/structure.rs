@@ -695,6 +695,46 @@ impl<'a> Structurer<'a> {
         sub.insert(entry);
     }
 
+    /// True when block `n` is the post-try continuation of some group
+    /// currently being structured (or active in this walk): the owner
+    /// walk emits it at the right level after the Try region, so a
+    /// claimed-arrival Goto must stay a bare Goto (conversion strips it
+    /// as the try-follow fallthrough) instead of an inline copy. The
+    /// forward scan tolerates already-claimed blocks: by the time a
+    /// sibling body path arrives at `n`, an earlier arm may have walked
+    /// it (jdk11 Module.loadModuleInfoClass: block pc 20 was claimed by
+    /// the if-then arm walk, yet it is gi=1's cont — copying at the
+    /// fallthrough arrival duplicated the close+return chain into the
+    /// body and defeated twr_j11's fold).
+    fn is_cont_of_active_group(
+        &self,
+        n: usize,
+        stop: &HashSet<usize>,
+        claimed: &HashSet<usize>,
+        active: &[usize],
+    ) -> bool {
+        let scan = |a: usize| -> bool {
+            let gend = self.groups[a].end;
+            for nb in self.cfg.blocks.iter() {
+                if (nb.start as u32) < gend as u32 {
+                    continue;
+                }
+                if stop.contains(&nb.id) {
+                    return false;
+                }
+                if nb.id == n {
+                    return true;
+                }
+                if !claimed.contains(&nb.id) && !self.is_handler(nb.id) {
+                    return false;
+                }
+            }
+            false
+        };
+        active.iter().copied().any(scan)
+            || self.structuring_groups.borrow().iter().copied().any(scan)
+    }
+
     /// First unclaimed non-handler block at or after `pc` that the outer
     /// walk will actually continue at. `exclude` carries the enclosing
     /// scope's barriers (loop exits, follows): a barrier block is never the
@@ -2061,6 +2101,55 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             if std::env::var("JCDC_DBG_IF").is_ok() {
                                 eprintln!("GOTO-FT cur={} n={} univ={} stop={} claimed={} entry={}", cur, n, universe.contains(&n), stop.contains(&n), claimed.contains(&n), entry);
                             }
+                            // Shared-tail arrival: `n` is CLAIMED (hence
+                            // out of this walk's universe — sub_scope
+                            // retains unclaimed blocks only). A bare Goto
+                            // here is elided at conversion as the walk's
+                            // last part (goto_is_last), silently severing
+                            // this path's flow into the shared tail (jdk26
+                            // DatagramChannelImpl.innerJoin's IPv4 arm:
+                            // `key = new Type4(..)` fell off the method
+                            // without the `registry.add(key); return key;`
+                            // copy — 缺少返回语句 x3 trees). Per-arrival
+                            // copies are exactly the bytecode semantics.
+                            // Shared-tail arrival: `n` is CLAIMED, so no
+                            // walk here will ever emit it again. A bare
+                            // Goto is elided at conversion as the walk's
+                            // last part (goto_is_last), silently severing
+                            // this path's flow into the tail (jdk26
+                            // DatagramChannelImpl.innerJoin's IPv4 arm:
+                            // `key = new Type4(..)` fell off the method
+                            // without the `registry.add(key); return key;`
+                            // copy — 缺少返回语句 x3 trees) — UNLESS `n`
+                            // is an ACTIVE group's post-try continuation:
+                            // the owner walk emits it at the right level
+                            // after the Try region (jdk11 Module
+                            // .loadModuleInfoClass's in.close() block is
+                            // gi=1's cont — copying it here duplicated the
+                            // close+return chain into the body, defeated
+                            // twr_j11's try-with-resources fold, and the
+                            // pending-rethrow scaffolding leaked —
+                            // 未报告的异常错误Throwable x2 trees). The
+                            // conversion's strip_trailing_goto(try_follow)
+                            // renders the Goto as the natural fallthrough.
+                            let owned_cont =
+                                self.is_cont_of_active_group(n, stop, claimed, active);
+                            if claimed.contains(&n)
+                                && !owned_cont
+                                && !stop.contains(&n)
+                                && !self.loops_stack.contains(&n)
+                                && !self.is_handler(n)
+                                && !self.terminator_writes_final(n)
+                            {
+                                if self.is_terminator_block(n) {
+                                    parts.push(Region::CopyStmts { block: n });
+                                    break;
+                                }
+                                if let Some(r) = self.copy_walk(n, stop, active, cur) {
+                                    parts.push(r);
+                                    break;
+                                }
+                            }
                             parts.push(Region::Goto { target: n });
                             break;
                         }
@@ -2522,6 +2611,42 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         }
         if std::env::var("JCDC_DBG_ABSORB").is_ok() {
             eprintln!("absorb ACCEPT blk={} claimed={}", blk, claimed.contains(&blk));
+        }
+        // The unwalkable successor is an already-CLAIMED block this arm's
+        // normal walk would inline-copy (the shared `registry.add(key);
+        // return key;` tail): absorbing blk ends the arm AT blk and the
+        // path to the tail is silently severed — the enclosing walk
+        // breaks at the if with follow=None and the method falls off
+        // without a return on this path (jdk26
+        // DatagramChannelImpl.innerJoin's IPv4 arm lost the tail after
+        // `key = new Type4(..)` — 缺少返回语句 x3 trees). Refuse: the
+        // normal walk branch emits Basic{blk} and, arriving at the
+        // claimed successor, copies it per arrival — exactly the bytecode
+        // semantics. Final-writing successors stay absorbed (copying
+        // would double-assign the blank final — the UntrustedCertificates
+        // discipline). NOTE: Module.loadModuleInfoClass's TWR fold needs
+        // this refusal ABSENT when handler_flow_only carries the
+        // ownership check — the working combination is this refusal +
+        // the ORIGINAL f4472a5f fixpoint + the sole-entry private-tail
+        // cont==hb strip (gate-matrix verified).
+        {
+            let succ = self.cfg.blocks[blk].succ[0];
+            let succ_owned_cont =
+                self.is_cont_of_active_group(succ, bstop, claimed, active);
+            if claimed.contains(&succ)
+                && !succ_owned_cont
+                && !bstop.contains(&succ)
+                && !self.loops_stack.contains(&succ)
+                && !self.terminator_writes_final(succ)
+            {
+                if dbg_absorb {
+                    eprintln!(
+                        "absorb REJECT blk={} succ={} claimed inline-copy tail",
+                        blk, succ
+                    );
+                }
+                return None;
+            }
         }
         // Shared pure blocks (reached from several branches) get their
         // statements duplicated into each branch — exactly the bytecode
