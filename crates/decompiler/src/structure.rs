@@ -631,6 +631,20 @@ impl<'a> Structurer<'a> {
     /// out of the handler universe. A merge with any pred from normal code
     /// (jdk26 AlgorithmId.getName's shared return tail) is NOT handler-flow.
     pub(crate) fn handler_flow_only(&self, gi: usize) -> HashSet<usize> {
+        let hf = self.handler_flow_only_inner(gi);
+        if std::env::var("JCDC_DBG_HF").is_ok() {
+            let g = &self.groups[gi];
+            let mut hs: Vec<usize> = hf.iter().copied().collect();
+            hs.sort();
+            eprintln!(
+                "HF gi={} span=({},{}) handlers={:?} hf={:?}",
+                gi, g.start, g.end, g.handlers, hs
+            );
+        }
+        hf
+    }
+
+    fn handler_flow_only_inner(&self, gi: usize) -> HashSet<usize> {
         let g = &self.groups[gi];
         let mut hf: HashSet<usize> = HashSet::new();
         let mut q: VecDeque<usize> = VecDeque::new();
@@ -650,6 +664,25 @@ impl<'a> Structurer<'a> {
                     .iter()
                     .all(|p| hf.contains(p) || in_body(*p) || self.handler_group.contains_key(p))
                 {
+                    // A successor OWNED by another (nested/sibling) try
+                    // group is that group's body or handler — a finally
+                    // copy block, a post-inner-try statement — NOT this
+                    // handler's private tail. Without this, a try body
+                    // that always throws makes the enclosing inline-finally
+                    // copy singly-pred'd by the catch handler, and the
+                    // fixpoint swallows the whole downstream normal
+                    // continuation (feat Exceptions nestedTry: hf(catch)
+                    // absorbed the finally-d copy + append-e + append-g,
+                    // the shared_merge tail-strip was skipped, the catch
+                    // inlined `d; e; return toString()` — snapshotting the
+                    // return before the real finally g ran: output lost
+                    // its trailing g). The genuine private tails
+                    // (AQS.acquireQueued selfInterrupt+athrow,
+                    // putInCache monitorexit-rethrow) are unowned
+                    // post-span blocks and stay classified.
+                    if self.body_group.contains_key(&s) {
+                        continue;
+                    }
                     hf.insert(s);
                     q.push_back(s);
                 }
@@ -3441,7 +3474,55 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             // outer continuation emits it as a top-level sibling
             // (未报告的异常错误Throwable).
             if let Some(cont) = self.cfg.block_at(g.end) {
-                if !self.handler_group.contains_key(&cont) && !hf.contains(&cont) {
+                if cont == *hb {
+                    // The handler entry sits AT the span end (merged spans,
+                    // javac excluding the body's trailing terminator). Keep
+                    // the handler's PRIVATE tail — successors owned by no
+                    // group and no other group's handler (AQS.acquireQueued
+                    // `if (interrupted) selfInterrupt(); throw t;`) — and
+                    // strip the rest: successors OWNED by an enclosing try
+                    // are the shared post-try flow / inline finally copies
+                    // (feat Exceptions nestedTry: the try body always
+                    // throws, so the d/e/g/return chain is structurally
+                    // handler-only but semantically the continuation —
+                    // swallowing it into the catch snapshotted the return
+                    // before the real finally g ran, output lost its g).
+                    let mut private: HashSet<usize> = HashSet::new();
+                    let mut pq: VecDeque<usize> = VecDeque::new();
+                    for &s0 in &self.cfg.blocks[*hb].succ {
+                        pq.push_back(s0);
+                    }
+                    while let Some(x) = pq.pop_front() {
+                        if private.contains(&x) || x == *hb {
+                            continue;
+                        }
+                        let owned_by_other = self
+                            .body_group
+                            .get(&x)
+                            .map(|og| *og != gi)
+                            .unwrap_or(false)
+                            || self
+                                .handler_group
+                                .get(&x)
+                                .map(|og| *og != gi)
+                                .unwrap_or(false);
+                        if owned_by_other {
+                            continue;
+                        }
+                        if self.cfg.blocks[x].pred.iter().all(|p| {
+                            *p == *hb
+                                || private.contains(p)
+                                || self.handler_group.get(p) == Some(&gi)
+                        }) {
+                            private.insert(x);
+                            for &s1 in &self.cfg.blocks[x].succ {
+                                pq.push_back(s1);
+                            }
+                        }
+                    }
+                    let tail = reachable_within(self.cfg, cont, &HashSet::new());
+                    huniverse.retain(|b| !tail.contains(b) || private.contains(b));
+                } else if !self.handler_group.contains_key(&cont) && !hf.contains(&cont) {
                     let tail = reachable_within(self.cfg, cont, &HashSet::new());
                     huniverse.retain(|b| !tail.contains(b) || hf.contains(b));
                 }
