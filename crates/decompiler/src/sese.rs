@@ -1433,6 +1433,21 @@ impl<'a> Structurer<'a> {
                     // natural_follow was empty and the bi.longValue()
                     // body block was never structured — 缺少返回语句 x2
                     // methods).
+                    // Pre-stub-filter candidate set for the
+                    // shared-collector test (see the walk-side twin in
+                    // structure.rs next_after_loop).
+                    let claim_cands: HashSet<usize> = exits
+                        .iter()
+                        .copied()
+                        .filter(|e| {
+                            !ctx.consumed.contains(e)
+                                && !stop.contains(e)
+                                && ctx.universe.contains(e)
+                                && reach.contains(e)
+                                && !self.is_handler(*e)
+                                && *e != header_id
+                        })
+                        .collect();
                     let mut cands: Vec<usize> = exits
                         .iter()
                         .copied()
@@ -1456,6 +1471,11 @@ impl<'a> Structurer<'a> {
                                 && !ctx.loop_stack.iter().any(|h| {
                                     h != e
                                         && self.is_stmt_free_chain_to_block(*e, *h)
+                                        && !self.stub_chain_claims_continuation(
+                                            *e,
+                                            *h,
+                                            &claim_cands,
+                                        )
                                 })
                         })
                         .collect();

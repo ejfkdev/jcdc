@@ -475,25 +475,6 @@ impl<'a> Converter<'a> {
         // belongs to every enclosing loop's exit set, and breaking only the
         // innermost would wrongly re-enter the outer loop.
         if let Some(li) = (0..self.loops.len()).find(|&i| self.loops[i].exits.contains(&target)) {
-            // A member-boundary exit that is a statement-free jump chain
-            // back into a loop header is that loop's CONTINUE stub, not a
-            // break: breaking would land after the loop instead of
-            // re-entering it (jdk11 FutureTask.removeWaiter: the CAS-fail
-            // and pred.thread `continue retry` paths are inner-loop exits
-            // whose stubs `goto` the OUTER header — they must become
-            // `continue L1`, while the q==null exit to the post-loop stub
-            // stays a break).
-            for j in (0..=li).rev() {
-                let h = self.loops[j].header;
-                if self.chains_stmt_free_to(target, h) {
-                    let depth = self.loops.len() - 1 - j;
-                    return Some(if depth == 0 {
-                        Jump::Continue(None)
-                    } else {
-                        Jump::Continue(Some(self.loops[j].label.clone()))
-                    });
-                }
-            }
             // switches opened after that loop intercept a plain `break`
             let crosses_switch = !self.switches.is_empty();
             return Some(if li + 1 == self.loops.len() && !crosses_switch {
@@ -581,33 +562,6 @@ impl<'a> Converter<'a> {
                 && self.cfg.blocks[e.to].succ.len() == 1
                 && self.cfg.blocks[e.to].succ[0] == t
         })
-    }
-
-    /// True when `from` reaches `to` through statement-free
-    /// Fallthrough/Goto blocks (a pure jump stub chain), or is `to`.
-    fn chains_stmt_free_to(&self, from: usize, to: usize) -> bool {
-        let mut x = from;
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..8 {
-            if x == to {
-                return true;
-            }
-            if !seen.insert(x) {
-                return false;
-            }
-            if !self.results[x].stmts.is_empty() {
-                return false;
-            }
-            if !matches!(self.results[x].term, Term::Fallthrough | Term::Goto) {
-                return false;
-            }
-            let succs = &self.cfg.blocks[x].succ;
-            if succs.len() != 1 {
-                return false;
-            }
-            x = succs[0];
-        }
-        false
     }
 
     fn reaches_copy_tail(&self, t: usize) -> bool {

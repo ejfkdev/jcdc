@@ -2679,6 +2679,14 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             _ => return None,
         };
         let _ = claimed;
+        // Pre-stub-filter candidate set: the shared-collector test in
+        // stub_chain_claims_continuation checks chain intermediates
+        // against it.
+        let pre: HashSet<usize> = exits
+            .iter()
+            .copied()
+            .filter(|e| universe.contains(e) && !stop.contains(e))
+            .collect();
         exits
             .into_iter()
             .filter(|e| universe.contains(e) && !stop.contains(e))
@@ -2694,7 +2702,9 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             // trees). Real fall-out exits (post-loop code) are kept.
             .filter(|e| {
                 !self.loops_stack.iter().any(|&h| {
-                    h != *e && self.is_stmt_free_chain_to_block(*e, h)
+                    h != *e
+                        && self.is_stmt_free_chain_to_block(*e, h)
+                        && !self.stub_chain_claims_continuation(*e, h, &pre)
                 })
             })
             .min_by_key(|e| self.cfg.blocks[*e].start)
@@ -2719,6 +2729,56 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                 return false;
             }
             let succs = self.cfg.blocks[x].succ.clone();
+            if succs.len() != 1 {
+                return false;
+            }
+            x = succs[0];
+        }
+        false
+    }
+
+    /// True when `from`'s statement-free jump chain into loop header `to`
+    /// passes through a block that is ITSELF a continuation candidate for
+    /// the just-structured loop (in-universe, non-stop, non-stub exit with
+    /// multiple predecessors — a shared continue-collector). Such a chain
+    /// is the loop's real backedge merge, not a disposable conditional
+    /// break arm: filtering it lets a lower-priority candidate (a bare
+    /// `return` escape) become the continuation and the loop body loses
+    /// its trailing re-iteration (jdk17 AQS.cleanQueue: the traversal
+    /// loop's exits are the return block and the `goto 171` stub; block
+    /// 171 (`goto 0`) has 10 preds and is a candidate — dropping the stub
+    /// picked the return, the outer for(;;) body lost its `continue`, and
+    /// the do-while rotation relocated the CAS tail past the loop with
+    /// bare continues — continue 在 loop 外部). Direct-header backedges
+    /// (jdk11 FutureTask.removeWaiter's `goto retry` stubs, chain = the
+    /// exit block alone) have no intermediate shared block and stay
+    /// filtered: walking them re-emitted the conditional retry jump as an
+    /// unconditional continue after the inner loop.
+    pub(crate) fn stub_chain_claims_continuation(
+        &self,
+        from: usize,
+        to: usize,
+        cands: &HashSet<usize>,
+    ) -> bool {
+        let mut x = from;
+        let mut seen: HashSet<usize> = HashSet::new();
+        while x != to {
+            if !seen.insert(x) {
+                return false;
+            }
+            if x != from
+                && cands.contains(&x)
+                && self.cfg.blocks[x].pred.len() > 1
+            {
+                return true;
+            }
+            if !self.results[x].stmts.is_empty() {
+                return false;
+            }
+            if !matches!(self.results[x].term, Term::Fallthrough | Term::Goto) {
+                return false;
+            }
+            let succs = &self.cfg.blocks[x].succ;
             if succs.len() != 1 {
                 return false;
             }
