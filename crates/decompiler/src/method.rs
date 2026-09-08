@@ -494,6 +494,10 @@ pub fn decompile_method(
         fold_merged_new_inits(&mut body, pc);
         cleanup(&mut body);
     }
+    if pc.method_name(m_idx) == Some("<init>") {
+        hoist_ctor_call_guards(&mut body);
+        cleanup(&mut body);
+    }
     dedupe_declarations(&mut body);
     ensure_declared(&vt, &mut body);
     cleanup(&mut body);
@@ -1872,6 +1876,108 @@ fn switch_terminates_with(
     // case that breaks — e.g. DirectMethodHandle.makeImpl lost its post-switch
     // return, causing "missing return statement".)
     t.iter().take(n).all(|&x| x)
+}
+
+/// jdk26 (JEP 513, flexible constructor bodies): statements may PRECEDE
+/// super()/this(), but the delegation call itself must not sit inside a
+/// control-flow statement. A pre-super guard throw structures as
+/// `if (c) { super(..); ..; return; } else { throw ..; }` — semantically
+/// right, but javac rejects the nested explicit ctor call (AbstractPoolEntry
+/// Utf8EntryImpl). Rotate to the source shape:
+/// `if (!c) { throw ..; } super(..); ..`.
+fn hoist_ctor_call_guards(s: &mut Stmt) {
+    fn is_ctor_call(x: &Stmt) -> bool {
+        matches!(x, Stmt::ExprStmt(Expr::Method { name, .. }) if name == "<init>")
+    }
+    fn throw_terminated(x: &Stmt) -> bool {
+        match x {
+            Stmt::Throw(_) => true,
+            Stmt::Block(v) => matches!(v.last(), Some(Stmt::Throw(_))),
+            _ => false,
+        }
+    }
+    fn contains_ctor_call(x: &Stmt) -> bool {
+        match x {
+            Stmt::Block(v) => v.iter().any(contains_ctor_call),
+            other => is_ctor_call(other),
+        }
+    }
+    fn into_vec(x: Stmt) -> Vec<Stmt> {
+        match x {
+            Stmt::Block(v) => v,
+            other => vec![other],
+        }
+    }
+    fn strip_tail_return(v: &mut Vec<Stmt>) {
+        while matches!(v.last(), Some(Stmt::Return(None))) {
+            v.pop();
+        }
+    }
+    fn rotate_one(s: &mut Stmt) -> bool {
+        let (cond, then_stmt, else_stmt) = match s {
+            Stmt::If { cond, then_stmt, else_stmt: Some(e) } => (cond, then_stmt, e),
+            _ => return false,
+        };
+        let mut then_vec = into_vec(*std::mem::replace(then_stmt, Box::new(Stmt::Block(vec![]))));
+        let else_body = *std::mem::replace(else_stmt, Box::new(Stmt::Block(vec![])));
+        let cond_val = std::mem::replace(cond, Expr::This);
+        // then = ctor-call body, else = throw guard
+        if is_ctor_call(then_vec.first().unwrap_or(&Stmt::Return(None)))
+            && throw_terminated(&else_body)
+            && !contains_ctor_call(&else_body)
+        {
+            strip_tail_return(&mut then_vec);
+            let neg = match cond_val {
+                Expr::Un { op: crate::expr::UnOp::Not, e } => *e,
+                c => Expr::Un { op: crate::expr::UnOp::Not, e: Box::new(c) },
+            };
+            let mut out: Vec<Stmt> = Vec::with_capacity(1 + then_vec.len());
+            out.push(Stmt::If { cond: neg, then_stmt: Box::new(else_body), else_stmt: None });
+            out.extend(then_vec);
+            *s = Stmt::Block(out);
+            return true;
+        }
+        // else = ctor-call body, then = throw guard
+        let mut else_vec = into_vec(else_body);
+        if is_ctor_call(else_vec.first().unwrap_or(&Stmt::Return(None)))
+            && throw_terminated(then_stmt)
+            && !contains_ctor_call(then_stmt)
+        {
+            strip_tail_return(&mut else_vec);
+            let guard_body = *std::mem::replace(then_stmt, Box::new(Stmt::Block(vec![])));
+            let mut out: Vec<Stmt> = Vec::with_capacity(1 + else_vec.len());
+            out.push(Stmt::If { cond: cond_val, then_stmt: Box::new(guard_body), else_stmt: None });
+            out.extend(else_vec);
+            *s = Stmt::Block(out);
+            return true;
+        }
+        // Not rotatable: restore the original If.
+        *s = Stmt::If {
+            cond: cond_val,
+            then_stmt: Box::new(Stmt::Block(then_vec)),
+            else_stmt: Some(Box::new(Stmt::Block(else_vec))),
+        };
+        false
+    }
+    fn rec(s: &mut Stmt) {
+        match s {
+            Stmt::Block(v) => {
+                let mut i = 0;
+                while i < v.len() {
+                    if rotate_one(&mut v[i]) {
+                        i += 1;
+                        continue;
+                    }
+                    rec(&mut v[i]);
+                    i += 1;
+                }
+            }
+            other => {
+                rotate_one(other);
+            }
+        }
+    }
+    rec(s);
 }
 
 fn prune_unreachable(s: &mut Stmt) {
