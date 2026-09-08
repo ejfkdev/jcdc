@@ -1185,7 +1185,19 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             // Loop header? (skip for a pre-claimed entry: that loop is the
             // one we are currently structuring)
             let at_preclaimed_entry = entry_preclaimed && cur == entry && parts.is_empty();
-            if !at_preclaimed_entry && self.is_loop_header(cur, universe, &dom) {
+            // sese_loop_headers carries the exception-mediated retry
+            // headers (handler-flow back edges invisible to this scope's
+            // normal dominance): a try-group body walk that reaches the
+            // header of an enclosing `for(;;){try{..}catch{..continue}}`
+            // must structure the loop, else the handler's `goto head`
+            // copy_walks the head into nested duplicate tries (jdk26
+            // DateTimeFormatter.parseBest unrolled 5 deep, the
+            // loop-exhausted `throw DateTimeException` lost —
+            // 缺少返回语句 x3 trees).
+            if !at_preclaimed_entry
+                && (self.is_loop_header(cur, universe, &dom)
+                    || self.sese_loop_headers.contains(&cur))
+            {
                 let loop_r = self.structure_loop(cur, universe, stop, active, claimed, &dom);
                 // A body that cannot complete normally (both arms of its
                 // tail check inline the loop's terminator exits — the
