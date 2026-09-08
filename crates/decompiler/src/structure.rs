@@ -1082,11 +1082,46 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         universe: &HashSet<usize>,
         dom: &DomInfo,
     ) -> bool {
+        // Enclosing-loop circulation artifact: a walk entry whose only
+        // successor is an ENCLOSING loop header (a `st = -1; goto head`
+        // case stub) reaches every in-universe block through that header,
+        // so the scope-rooted dominator makes `cur` dominate its own
+        // switch-dispatch preds and the back-edge test fires on a cycle
+        // that belongs to the enclosing loop — a spurious single-member
+        // `while (true) { st = -1; continue L1; }` (jdk26 xml
+        // impl.Parser.xml's default-case wrappers: the switch lost its
+        // default semantics, sibling cases fell through, and the
+        // post-switch tail went unreachable — 无法访问的语句). The pred
+        // only counts when it is reachable from `cur` WITHOUT passing
+        // through the enclosing header (a genuine loop of `cur`).
+        let single_enclosing_succ = self.cfg.blocks[cur].succ.len() == 1
+            && {
+                let x = self.cfg.blocks[cur].succ[0];
+                x != cur
+                    && (self.loops_stack.contains(&x)
+                        || self.sese_loop_headers.contains(&x)
+                        || self.sese_exc_retry_headers.contains(&x))
+            };
         for &p in &self.cfg.blocks[cur].pred {
             if p == cur {
                 return true;
             }
             if universe.contains(&p) && dom.dominates(cur, p) {
+                if single_enclosing_succ {
+                    let x = self.cfg.blocks[cur].succ[0];
+                    let mut barriers: HashSet<usize> = HashSet::new();
+                    barriers.insert(x);
+                    if !can_reach_cfg_barred(
+                        self.cfg,
+                        &HashMap::new(),
+                        cur,
+                        p,
+                        &barriers,
+                        8192,
+                    ) {
+                        continue;
+                    }
+                }
                 return true;
             }
         }
