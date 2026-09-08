@@ -1114,9 +1114,18 @@ impl<'a> Structurer<'a> {
                     // finally-if + `return result` after the retry loop went
                     // missing — 缺少返回语句).
                     let mut next: Option<usize> = None;
+                    let dbg_next = std::env::var("JCDC_DBG_SWF").is_ok();
                     for nb in self.cfg.blocks.iter() {
                         if nb.start < gend {
                             continue;
+                        }
+                        if dbg_next {
+                            eprintln!("NEXTSCAN gend={} nb={} start={} absorbed={} hf={} univ={} stop={} handler={} consumed={} term={}",
+                                gend, nb.id, nb.start, Some(nb.id) == absorbed_tail,
+                                hf_after.contains(&nb.id), ctx.universe.contains(&nb.id),
+                                stop.contains(&nb.id), self.handler_group.contains_key(&nb.id),
+                                ctx.consumed.contains(&nb.id),
+                                matches!(self.results[nb.id].term, crate::builder::Term::Return(_) | crate::builder::Term::Throw(_)));
                         }
                         if Some(nb.id) == absorbed_tail || hf_after.contains(&nb.id) {
                             continue;

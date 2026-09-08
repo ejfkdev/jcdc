@@ -327,6 +327,17 @@ impl<'a> Converter<'a> {
                 // A jump to an enclosing if's follow that TERMINATES
                 // (return/throw) can be inlined: the copy ends this path
                 // exactly like the jump would, without needing a label.
+                // Same for a jump to a LOOP EXIT that heads a pure
+                // terminator chain (stmt-bearing fall-through links
+                // ending in return/throw): resolve_goto's loop-exit arm
+                // would turn it into a bare `break`, silently dropping
+                // the chain's statements between the loop end and the
+                // shared return (jdk26 Bits.reserveMemory phase-1:
+                // `if (interrupted) <goto interrupt-block>; ` rendered
+                // as else-break and the Thread.currentThread()
+                // .interrupt() vanished — interruption lost). The
+                // inlined copy keeps the abrupt ending (no fall-out
+                // duplication); a genuine fall-out exit still breaks.
                 let inline_terminator = self.if_follows.contains(&target)
                     && matches!(
                         self.results[target].term,
@@ -334,11 +345,32 @@ impl<'a> Converter<'a> {
                     )
                     && !self.stmts_write_final(&self.results[target].stmts);
                 if inline_terminator {
-                    let mut v = self.results[target].stmts.clone();
-                    match &self.results[target].term {
-                        Term::Return(e) => v.push(Stmt::Return(e.clone())),
-                        Term::Throw(e) => v.push(Stmt::Throw(e.clone())),
-                        _ => {}
+                    // Copy the WHOLE terminator chain: the target's own
+                    // statements plus every fall-through link down to
+                    // the final return/throw (a single-block chain is
+                    // the original if-follow case).
+                    let mut v: Vec<Stmt> = Vec::new();
+                    let mut t = target;
+                    let mut guard = 0;
+                    loop {
+                        v.extend(self.results[t].stmts.clone());
+                        match &self.results[t].term {
+                            Term::Return(e) => {
+                                v.push(Stmt::Return(e.clone()));
+                                break;
+                            }
+                            Term::Throw(e) => {
+                                v.push(Stmt::Throw(e.clone()));
+                                break;
+                            }
+                            Term::Fallthrough | Term::Goto
+                                if self.cfg.blocks[t].succ.len() == 1 && guard < 8 =>
+                            {
+                                t = self.cfg.blocks[t].succ[0];
+                                guard += 1;
+                            }
+                            _ => break,
+                        }
                     }
                     return if v.len() == 1 {
                         v.into_iter().next().unwrap()
@@ -942,9 +974,14 @@ fn stmts_to_stmt(v: Vec<Stmt>) -> Stmt {
 /// the test is not try-wrapped (plain rotation applies) or when the
 /// shape is ambiguous (both If arms materialized).
 fn try_protected_dowhile(inner: Stmt, cond: &Expr) -> Result<Stmt, Stmt> {
+    // The exit side of the embedded test: an Empty region conversion
+    // (empty block / missing else) or an ALREADY-materialized plain
+    // `break` (the merged-span shape walks the sleep region as the
+    // then-arm and breaks on the exit side directly).
     fn is_empty(s: &Stmt) -> bool {
         match s {
             Stmt::Block(v) => v.is_empty() || (v.len() == 1 && is_empty(&v[0])),
+            Stmt::Break(None) => false,
             _ => false,
         }
     }

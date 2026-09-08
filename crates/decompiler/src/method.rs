@@ -1929,6 +1929,16 @@ fn prune_dead_breaks(s: &mut Stmt) {
 /// True when control cannot fall out of the end of `s` (children are
 /// already pruned when this is consulted).
 /// Conservative: does `s` contain ANY `break` statement (at any nesting)?
+/// True when `s` contains a `break` that could complete the ENCLOSING
+/// loop normally. JLS 14.21: an unlabeled break binds the INNERMOST
+/// enclosing loop/switch — plain breaks nested inside a While/DoWhile/
+/// For/ForEach/Switch body never escape the outer loop and must not
+/// count (jdk26 Bits.reserveMemory: the inlined phase-2 do-while's own
+/// `break` made the phase-1 while(true) look escapable, prune kept the
+/// post-loop duplicate tail and javac flagged it 无法访问的语句).
+/// LABELED breaks stay conservatively counted — without the enclosing
+/// loop's label in scope we cannot tell whether they target it.
+/// Synchronized/Labeled/If/Block/Try wrappers are transparent.
 fn contains_break_stmt(s: &Stmt) -> bool {
     match s {
         Stmt::Break(_) => true,
@@ -1937,17 +1947,21 @@ fn contains_break_stmt(s: &Stmt) -> bool {
             contains_break_stmt(then_stmt)
                 || else_stmt.as_deref().map(contains_break_stmt).unwrap_or(false)
         }
+        Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => {
+            contains_break_stmt(body)
+        }
+        // Nested loop/switch bodies capture plain breaks; only labeled
+        // breaks inside them could reach the enclosing loop.
         Stmt::While { body, .. }
         | Stmt::DoWhile { body, .. }
         | Stmt::ForEach { body, .. }
-        | Stmt::Synchronized { body, .. }
-        | Stmt::Labeled { body, .. } => contains_break_stmt(body),
-        Stmt::For { init, body, .. } => {
-            init.iter().any(contains_break_stmt) || contains_break_stmt(body)
-        }
+        | Stmt::For { body, .. } => contains_labeled_break(body),
         Stmt::Switch { cases, default, .. } => {
-            cases.iter().flat_map(|c| c.body.iter()).any(contains_break_stmt)
-                || default.as_deref().map(contains_break_stmt).unwrap_or(false)
+            cases
+                .iter()
+                .flat_map(|c| c.body.iter())
+                .any(contains_labeled_break)
+                || default.as_deref().map(contains_labeled_break).unwrap_or(false)
         }
         Stmt::Try { body, catches, finally } => {
             contains_break_stmt(body)
@@ -1959,6 +1973,43 @@ fn contains_break_stmt(s: &Stmt) -> bool {
                 || contains_break_stmt(body)
                 || catches.iter().any(|c| contains_break_stmt(&c.body))
                 || finally.as_deref().map(contains_break_stmt).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+/// Only LABELED breaks (which may target an enclosing construct).
+fn contains_labeled_break(s: &Stmt) -> bool {
+    match s {
+        Stmt::Break(Some(_)) => true,
+        Stmt::Break(None) => false,
+        Stmt::Block(v) => v.iter().any(contains_labeled_break),
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            contains_labeled_break(then_stmt)
+                || else_stmt.as_deref().map(contains_labeled_break).unwrap_or(false)
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::ForEach { body, .. }
+        | Stmt::Synchronized { body, .. }
+        | Stmt::Labeled { body, .. } => contains_labeled_break(body),
+        Stmt::For { init, body, .. } => {
+            init.iter().any(contains_labeled_break) || contains_labeled_break(body)
+        }
+        Stmt::Switch { cases, default, .. } => {
+            cases.iter().flat_map(|c| c.body.iter()).any(contains_labeled_break)
+                || default.as_deref().map(contains_labeled_break).unwrap_or(false)
+        }
+        Stmt::Try { body, catches, finally } => {
+            contains_labeled_break(body)
+                || catches.iter().any(|c| contains_labeled_break(&c.body))
+                || finally.as_deref().map(contains_labeled_break).unwrap_or(false)
+        }
+        Stmt::TryWithResources { resources, body, catches, finally } => {
+            resources.iter().any(contains_labeled_break)
+                || contains_labeled_break(body)
+                || catches.iter().any(|c| contains_labeled_break(&c.body))
+                || finally.as_deref().map(contains_labeled_break).unwrap_or(false)
         }
         _ => false,
     }
