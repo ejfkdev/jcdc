@@ -1505,7 +1505,65 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                     } else if !stop.contains(&cur) && !self.loops_stack.contains(&cur) {
                         match self.copy_walk(cur, stop, active, entry) {
                             Some(r) => parts.push(r),
-                            None => parts.push(Region::Goto { target: cur }),
+                            None => {
+                                // copy_walk refused (typically the
+                                // re-entry guard: `cur` flows back into
+                                // this walk's entry region). When `cur`
+                                // is a STATEMENT-BEARING back-edge
+                                // preheader — its flow re-enters an
+                                // open loop header — a bare Goto
+                                // resolves to `continue` and SILENTLY
+                                // DROPS cur's statements at this
+                                // arrival (jdk26 ClassPrinterImpl
+                                // toYaml/toXml BLOCK case: the shared
+                                // toYaml(ternary-indent, ..) merge
+                                // block was claimed by the sibling
+                                // arm's copy; the indent+1 arm lost
+                                // the call and left a dangling
+                                // `stack0 = indent + 1`). Copy the
+                                // statements and keep the Goto for the
+                                // continue (KeyStore backedge-stub
+                                // pattern).
+                                if !self.results[cur].stmts.is_empty()
+                                    && self.cfg.blocks[cur].succ.iter().any(|&s2| {
+                                        self.loops_stack.contains(&s2)
+                                            || self.sese_loop_headers.contains(&s2)
+                                            || can_reach_cfg(self.cfg, s2, entry, 4096)
+                                    })
+                                {
+                                    parts.push(Region::Seq(vec![
+                                        Region::CopyStmts { block: cur },
+                                        Region::Goto { target: cur },
+                                    ]));
+                                } else if self.results[cur].stmts.is_empty()
+                                    && matches!(self.results[cur].term, Term::Fallthrough)
+                                    && self.cfg.blocks[cur].succ.len() == 1
+                                    && universe.contains(&self.cfg.blocks[cur].succ[0])
+                                    && !stop.contains(&self.cfg.blocks[cur].succ[0])
+                                    && parts
+                                        .iter()
+                                        .any(|p| region_head_block(p) == self.cfg.blocks[cur].succ[0])
+                                {
+                                    // Fall-into-sibling: `cur` is a
+                                    // statement-free fallthrough whose
+                                    // successor is THIS walk's immediate
+                                    // next part — an if-else chain's
+                                    // inner block boundary (jdk17
+                                    // JarFile.getBytes: the readNBytes
+                                    // A-arm's tail merge block 6 starts
+                                    // the B-arm copy that follows the
+                                    // chain; the plain Goto{6} was
+                                    // elided as a natural fallthrough
+                                    // and the A-arm ran straight into
+                                    // readAllBytes — double read +
+                                    // spurious EOFException). Materialize
+                                    // the jump so the sibling copy is
+                                    // skipped.
+                                    parts.push(Region::Goto { target: cur });
+                                } else {
+                                    parts.push(Region::Goto { target: cur });
+                                }
+                            }
                         }
                     } else {
                         parts.push(Region::Goto { target: cur });
