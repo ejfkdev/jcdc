@@ -236,6 +236,23 @@ impl<'a> Converter<'a> {
                 let ctx = self.loops.pop().unwrap();
                 let _ = members;
                 let mut st = self.classify_loop(header, body_stmt, ctx);
+                if std::env::var("JCDC_DBG_LOOP").is_ok() {
+                    let kind = match &st {
+                        Stmt::While { .. } => "While".to_string(),
+                        Stmt::DoWhile { .. } => "DoWhile".to_string(),
+                        Stmt::For { .. } => "For".to_string(),
+                        Stmt::Block(b) => format!("Block{}[{}]", b.len(), b.iter().map(|x| match x {
+                            Stmt::DoWhile { .. } => "DoWhile",
+                            Stmt::While { .. } => "While",
+                            Stmt::Break(_) => "Break",
+                            Stmt::Return(_) => "Return",
+                            _ => "_",
+                        }).collect::<Vec<_>>().join(",")),
+                        Stmt::Labeled { .. } => "Labeled".to_string(),
+                        _ => "Other".to_string(),
+                    };
+                    eprintln!("CLASSIFY-OUT header={} -> {}", header, kind);
+                }
                 if self.used_labels.contains(&label) {
                     st = Stmt::Labeled { label, body: Box::new(st) };
                 }
@@ -731,6 +748,22 @@ impl<'a> Converter<'a> {
                 // back to the header (`if (c) continue;` or inverted), or a
                 // COMPOUND run of such tests ending in the loop exit.
                 if let Some((stmts, c, exit)) = extract_compound_do_while(&body_stmt) {
+                    // Same guard as the self-loop compound path above: an
+                    // extracted exit that is the loop's OWN unlabeled break
+                    // must be dropped — the do-while condition false already
+                    // exits, and a `break;` re-emitted OUTSIDE the loop is a
+                    // stray (it also makes stmt_terminates treat the sequence
+                    // as terminated, so prune_unreachable drops the real
+                    // tail: jdk26 Resolver.bind `return this` — 缺少返回语句).
+                    // SESE's rotated do-whiles hit this shape: the tail test
+                    // block becomes `if (c) continue; else break;`.
+                    // return/throw/labeled-break exits stay (real fall-out).
+                    if matches!(exit, Stmt::Break(None)) {
+                        return Stmt::DoWhile {
+                            body: Box::new(Stmt::Block(stmts)),
+                            cond: c,
+                        };
+                    }
                     return Stmt::Block(vec![
                         Stmt::DoWhile { body: Box::new(Stmt::Block(stmts)), cond: c },
                         exit,
