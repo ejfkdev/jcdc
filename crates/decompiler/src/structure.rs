@@ -1345,6 +1345,26 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         Region::Empty
                     } else if Some(taken) == follow
                         && stop.contains(&taken)
+                        && self.is_terminator_block(taken)
+                        && !self.loops_stack.is_empty()
+                        && self.loops_stack[self.loops_stack.len() - 1] != cur
+                    {
+                        // Loop-bottom exit test with a TERMINATOR exit
+                        // (`if (i >= n) <return-tail>; else <digit; goto
+                        // head>;`): the then arm must materialize as
+                        // `break`. Leaving it Empty relies on the tail copy
+                        // after the loop, but a `while (true)` body without
+                        // any break is a JLS non-completing loop —
+                        // prune_unreachable then deletes the tail copy
+                        // (jdk11/17 InstantPrinterParser.format's second
+                        // loop copy lost `append('Z'); return true` —
+                        // 缺少返回语句). classify_loop's split_leading_if
+                        // still rotates a HEADER test into the while
+                        // condition (cur != header guard keeps top-tested
+                        // shapes on the old Empty path).
+                        Region::Goto { target: taken }
+                    } else if Some(taken) == follow
+                        && stop.contains(&taken)
                         && !self.is_terminator_block(taken)
                     {
                         // The "follow" is an enclosing barrier (loop exit):
@@ -1436,6 +1456,16 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             eprintln!("IF cur={} else Empty (fall==follow {})", cur, fall);
                         }
                         Region::Empty
+                    } else if Some(fall) == follow
+                        && stop.contains(&fall)
+                        && self.is_terminator_block(fall)
+                        && !self.loops_stack.is_empty()
+                        && self.loops_stack[self.loops_stack.len() - 1] != cur
+                    {
+                        // Loop-bottom exit test, inverted orientation: the
+                        // FALL side is the terminator exit (see the taken
+                        // side).
+                        Region::Goto { target: fall }
                     } else if Some(fall) == follow
                         && stop.contains(&fall)
                         && !self.is_terminator_block(fall)
@@ -2418,8 +2448,21 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         // (return/throw whose predecessor only falls into
                         // it) stays a member.
                         let preds = self.cfg.blocks[s].pred.clone();
+                        // A pred OUTSIDE this walk's universe is a dedicated
+                        // escape by definition: its flow belongs to the
+                        // enclosing scope, so `s` is a shared merge the loop
+                        // must not own. Without this, a copy_walk scope
+                        // rooted at a branch target (entry 24, single succ =
+                        // the loop header) makes the header dominate the
+                        // shared tail, and every in-scope pred reaches the
+                        // header around it -- the tail was absorbed as a
+                        // member, exits emptied, and the post-loop
+                        // `append('Z'); return true` landed INSIDE the
+                        // while(true) (jdk11/17 DateTimeFormatterBuilder
+                        // InstantPrinterParser.format: 缺少返回语句).
                         let mut exit_edge = preds.iter().any(|&p| {
                             p == header
+                                || !universe.contains(&p)
                                 || !can_reach_avoiding(self.cfg, &exc_succ, p, header, s, 8192)
                         });
                         if !exit_edge {

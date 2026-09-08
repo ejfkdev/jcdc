@@ -497,6 +497,27 @@ impl<'a> Converter<'a> {
         if self.if_follows.last() == Some(&target) {
             return None;
         }
+        // Inside a loop, a jump to an already-structured block that flows
+        // back into the loop is a CONTINUE of the innermost such loop: the
+        // target's statements were emitted earlier in this body, and the
+        // natural continuation after this region is the loop bottom (an
+        // if-follow or a fall-out exit), never the target. Eliding it as
+        // fallthrough (the RawGoto `goto_is_last` arm) silently dropped the
+        // iteration: jdk11/17 InstantPrinterParser.format's second loop
+        // copy emitted `if (i >= fractionalDigits) {}` with no way out --
+        // the digit append + back edge vanished (semantically an infinite
+        // loop; javac: 缺少返回语句 on the method tail).
+        if let Some(i) = (0..self.loops.len())
+            .rev()
+            .find(|&i| crate::structure::can_reach_cfg(self.cfg, target, self.loops[i].header, 4096))
+        {
+            let depth = self.loops.len() - 1 - i;
+            return Some(if depth == 0 {
+                Jump::Continue(None)
+            } else {
+                Jump::Continue(Some(self.loops[i].label.clone()))
+            });
+        }
         // Inside a loop, a forward escape that cannot reach back into the
         // loop is a break of the innermost loop.
         if !self.loops.is_empty()
