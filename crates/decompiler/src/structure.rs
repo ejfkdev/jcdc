@@ -490,6 +490,14 @@ pub struct Structurer<'a> {
     /// keeps loop precedence and resolves to `continue` (jdk26
     /// Future.exceptionNow).
     pub sese_loop_headers: std::collections::HashSet<usize>,
+    /// Subset of sese_loop_headers discovered via EXCEPTION-mediated back
+    /// edges (handler-flow retry gotos). The walk loop branch trusts only
+    /// this subset: normal back edges must keep failing the scoped
+    /// dominance check (the loop belongs to an enclosing scope then —
+    /// structuring it from the inner scope degraded ThreadPoolExecutor /
+    /// the blocking-queue family: int-boolean conditions, catch-less
+    /// tries x6 per tree).
+    pub sese_exc_retry_headers: std::collections::HashSet<usize>,
     /// Current `walk` recursion depth (hang guard for pathological methods
     /// whose shared-tail / branch decomposition does not converge).
     walk_depth: usize,
@@ -755,7 +763,7 @@ impl<'a> Structurer<'a> {
         for (&merge, (root, _vis)) in &fold_regions {
             fold_root_to_merge.insert(*root, merge);
         }
-        Structurer { cfg, results, groups, body_group, handler_group, diamond_merges, fold_regions, fold_root_to_merge, copied_tails: HashSet::new(), loops_stack: Vec::new(), sese_loop_headers: std::collections::HashSet::new(), walk_depth: 0, final_fields: HashSet::new(), structuring_groups: std::cell::RefCell::new(Vec::new()) }
+        Structurer { cfg, results, groups, body_group, handler_group, diamond_merges, fold_regions, fold_root_to_merge, copied_tails: HashSet::new(), loops_stack: Vec::new(), sese_loop_headers: std::collections::HashSet::new(), sese_exc_retry_headers: std::collections::HashSet::new(), walk_depth: 0, final_fields: HashSet::new(), structuring_groups: std::cell::RefCell::new(Vec::new()) }
     }
 
     /// Immediate post-dominator of `entry` within `universe`. Delegates to the
@@ -1196,7 +1204,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             // 缺少返回语句 x3 trees).
             if !at_preclaimed_entry
                 && (self.is_loop_header(cur, universe, &dom)
-                    || self.sese_loop_headers.contains(&cur))
+                    || self.sese_exc_retry_headers.contains(&cur))
             {
                 let loop_r = self.structure_loop(cur, universe, stop, active, claimed, &dom);
                 // A body that cannot complete normally (both arms of its

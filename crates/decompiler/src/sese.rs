@@ -93,6 +93,7 @@ impl<'a> Structurer<'a> {
         // block: handler -> h with h dominating the protected block is
         // a back edge, and the handler joins the loop.
         let mut exc_back_sources: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut exc_retry_only: HashSet<usize> = HashSet::new();
         for e in &self.cfg.exc_edges {
             if !(universe.contains(&e.from) && universe.contains(&e.to)) {
                 continue;
@@ -143,6 +144,7 @@ impl<'a> Structurer<'a> {
                     }
                     if universe.contains(&h) && idom.dominates(h, e.from) {
                         loop_headers.insert(h);
+                        exc_retry_only.insert(h);
                         let srcs = exc_back_sources.entry(h).or_default();
                         for &m in hf.iter() {
                             if !srcs.contains(&m) {
@@ -229,6 +231,7 @@ impl<'a> Structurer<'a> {
             })
             .collect();
         self.sese_loop_headers = loop_headers.clone();
+        self.sese_exc_retry_headers = exc_retry_only;
         let mut ctx = SeseCtx {
             universe,
             idom,
