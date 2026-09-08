@@ -11508,6 +11508,46 @@ fn instantiated_ctor_params(e: &Expr, pool: &ClassPool) -> Option<Vec<jcdc_jvm::
     instantiated_ctor_params_core(cls, &[], args.len(), pool, &arg_tys)
 }
 
+/// Formals for an explicit `super(..)` delegation: an
+/// Expr::Method{name:"<init>"} against the DIRECT superclass, instantiated
+/// with the current class's extends-clause args (GathererOp<T,A,R> extends
+/// ReferencePipeline<T,R,?>). Without it the source's reparameterization
+/// cast on a super argument is lost (jdk26 GathererOp fusion ctor:
+/// `(AbstractPipeline<?, T, ?>) upstream.upstream()` — a generics-only cast
+/// javac elides from bytecode; the bare capture-typed actual dies with
+/// 找不到合适的构造器).
+fn instantiated_super_ctor_params(
+    e: &Expr,
+    pool: &ClassPool,
+    pc: &PoolClass,
+) -> Option<Vec<jcdc_jvm::GenericType>> {
+    let Expr::Method { cls, name, args, .. } = e else { return None };
+    if name != "<init>" || cls == &pc.internal_name {
+        return None;
+    }
+    if pc.super_name() != Some(cls.as_str()) {
+        return None;
+    }
+    let sup_args = pc.class_attr("Signature").and_then(|b| {
+        if b.len() < 2 {
+            return None;
+        }
+        let idx = u16::from_be_bytes([b[0], b[1]]);
+        let sig = pc.utf8(idx).and_then(|s| parse_class_signature(s))?;
+        match &sig.superclass {
+            jcdc_jvm::GenericType::Class(cs)
+                if crate::method::classsig_internal(cs) == *cls =>
+            {
+                Some(cs.parts.last()?.args.clone())
+            }
+            _ => None,
+        }
+    })?;
+    let arg_tys: Vec<jcdc_jvm::JavaType> =
+        args.iter().map(|a| a.type_ref().erased()).collect();
+    instantiated_ctor_params_core(cls, &sup_args, args.len(), pool, &arg_tys)
+}
+
 fn instantiated_ctor_params_core(
     cls: &str,
     inst_args: &[jcdc_jvm::GenericType],
@@ -11712,7 +11752,26 @@ fn apply_param_casts(
                         }
                     }
                     let want = match pt {
-                        jcdc_jvm::GenericType::TypeVar(_) => Some(pt.clone()),
+                        // The typevar must be DENOTABLE at the call site:
+                        // an enclosing-class param or a caller method
+                        // param. A super-ctor formal can carry the
+                        // SUPERCLASS's foreign typevar (p11 BoundMethod
+                        // Handle.SpeciesData `super((K) outer, key)` — K
+                        // belongs to ClassSpecializer, 找不到符号 + 需要
+                        // 封闭实例): skip the cast instead.
+                        jcdc_jvm::GenericType::TypeVar(n) => {
+                            let denotable =
+                                caller_params.iter().any(|p| &p.name == n)
+                                    || pc.map(|p| {
+                                        class_typevar_names(p).iter().any(|c| c == n)
+                                    })
+                                    .unwrap_or(false);
+                            if denotable {
+                                Some(pt.clone())
+                            } else {
+                                None
+                            }
+                        }
                         jcdc_jvm::GenericType::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
                         | jcdc_jvm::GenericType::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => {
                             match t.as_ref() {
@@ -13698,7 +13757,9 @@ pub(crate) fn cast_wildcard_call_args(
         }
         witness_ambiguous_lambda_args(e, pool, pc);
         prune_witnessed_raw_sam_casts(e, pool);
-        let params = params.or_else(|| instantiated_ctor_params(e, pool));
+        let params = params
+            .or_else(|| instantiated_ctor_params(e, pool))
+            .or_else(|| instantiated_super_ctor_params(e, pool, pc));
         if std::env::var("JCDC_DBG_APC").is_ok() {
             if let Expr::Method { cls, name, .. } = &*e {
                 eprintln!("APC {}.{} params={:?}", cls, name, params);
