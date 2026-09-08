@@ -688,6 +688,18 @@ thread_local! {
     /// rendered afterwards.
     static CAPTURE_GENERIC_TYPES: std::cell::RefCell<HashMap<String, TypeRef>> =
         std::cell::RefCell::new(HashMap::new());
+    /// Nested capture chains: (anon-class internal name, `val$X`/`this$X`
+    /// field name) -> the generic type the OUTERMOST new-site argument
+    /// carried. javac emits no Signature on synthetic capture fields, so a
+    /// second-level anon (`$11$1` capturing `$11`'s val$mapper) would see
+    /// only the erasure and its calls lose the instantiated formals
+    /// (jdk26 ReferencePipeline.mapMulti: `(mapper).accept(u, downstream)`
+    /// — BiConsumer<? super P_OUT, ? super Consumer<R>> unresolved, the
+    /// `(Consumer<R>) downstream` cast never synthesized). Unlike
+    /// CAPTURE_GENERIC_TYPES this registry is NEVER taken by nested
+    /// emissions — capture-field types are immutable facts.
+    static CAPTURE_FIELD_TYPES: std::cell::RefCell<HashMap<(String, String), TypeRef>> =
+        std::cell::RefCell::new(HashMap::new());
 }
 
 fn g_mentions_tvar_named(g: &jcdc_jvm::GenericType, names: &[String]) -> bool {
@@ -5499,7 +5511,7 @@ fn walk_expr_anon(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, fam: &Family, 
                     .map(|n| n.simple.clone())
                     .unwrap_or_else(|| simple_name(cls));
                 let (kept, captures) = analyze_anon_ctor(&lpc, args.clone());
-                let captures = render_captures(captures, pc, pool, vt);
+                let captures = render_captures(captures, pc, pool, vt, cls);
                 emit_local_class_decl(cls, &lpc, &simple, pc, pool, fam, &captures, pending);
                 *e = Expr::New {
                     cls: format!("\u{2}{}", simple),
@@ -6665,6 +6677,7 @@ fn render_captures(
     outer_pc: &PoolClass,
     pool: &ClassPool,
     outer_vt: &VarTable,
+    owner_cls: &str,
 ) -> HashMap<String, Expr> {
     let outer_simple = simple_name(&outer_pc.internal_name);
     let outer_qthis = qualified_this_tail(&outer_pc.internal_name);
@@ -6709,8 +6722,32 @@ fn render_captures(
             // it).
             let mut ty = match &v {
                 Expr::Local { var, .. } => outer_vt.var(*var).ty.clone(),
+                // Already-substituted outer capture text carries its
+                // declared type (nested anon: $11's body substituted
+                // val$mapper -> RawT("mapper", BiConsumer<? super P_OUT,
+                // ? super Consumer<R>>) before $11$1's captures render).
+                Expr::RawT(_, ty0) => ty0.clone(),
+                // A nested capture: the expr reads the OUTER anon's val$X
+                // field — recover the type registered when the outer level
+                // rendered its own captures.
+                Expr::Field { cls: fc, name: fn0, .. }
+                    if fn0.starts_with("val$") || fn0.starts_with("this$") =>
+                {
+                    let got = CAPTURE_FIELD_TYPES
+                        .with(|m| m.borrow().get(&(fc.clone(), fn0.clone())).cloned());
+                    if std::env::var("JCDC_DBG_ANON").is_ok() {
+                        eprintln!("NESTCAP {}.{} -> {:?}", fc, fn0, got);
+                    }
+                    got.unwrap_or_else(|| {
+                        TypeRef::J(jcdc_jvm::JavaType::Object("java/lang/Object".into()))
+                    })
+                }
                 _ => TypeRef::J(jcdc_jvm::JavaType::Object("java/lang/Object".into())),
             };
+            if std::env::var("JCDC_DBG_ANON").is_ok() {
+                eprintln!("RENDCAP owner={} key={} vty={:?} ty={:?}", owner_cls, k,
+                    std::mem::discriminant(&v), ty);
+            }
             CAPTURE_GENERIC_TYPES.with(|m| {
                 let mut m = m.borrow_mut();
                 match m.get(&text) {
@@ -6722,6 +6759,14 @@ fn render_captures(
                     }
                 }
             });
+            // Register the recovered type for the NEW anon class's own
+            // capture field (deeper levels read it through the registry).
+            if matches!(ty, TypeRef::G(_)) {
+                CAPTURE_FIELD_TYPES.with(|m| {
+                    m.borrow_mut()
+                        .insert((owner_cls.to_string(), k.clone()), ty.clone());
+                });
+            }
             (k, Expr::RawT(text, ty))
         })
         .collect()
@@ -6769,7 +6814,7 @@ fn build_anon_new(
     };
 
     let (kept_args, captures) = analyze_anon_ctor(apc, args);
-    let captures = render_captures(captures, outer_pc, pool, outer_vt);
+    let captures = render_captures(captures, outer_pc, pool, outer_vt, &apc.internal_name);
 
     let mut body = String::new();
     let hoist_mark = ANON_HOIST.with(|h| h.borrow().len());
@@ -11914,40 +11959,71 @@ fn apply_param_casts(
                                 continue;
                             }
                         }
-                        // A G-typed actual of a DIFFERENT, unrelated class
-                        // than the stripped super-bound is inconvertible to
-                        // the capture formal; between two INTERFACES the
+                        // An actual of a DIFFERENT, unrelated class than
+                        // the stripped super-bound is inconvertible to the
+                        // capture formal; between two INTERFACES the
                         // source's unchecked cast is the only legal bridge
                         // (jdk26 ReferencePipeline.mapMulti:
                         // `mapper.accept(u, (Consumer<R>) downstream)` —
-                        // Sink<CAP#1>无法转换为CAP#2 without it). A
-                        // class-side or subtype pair converts naturally —
-                        // leave those bare.
+                        // Sink<CAP#1>无法转换为CAP#2 without it; the
+                        // downstream field read types at the ERASED Sink,
+                        // so J-typed actuals qualify too). A class-side or
+                        // subtype pair converts naturally — leave it bare.
                         if !matches!(a, Expr::Cast { .. } | Expr::Const(_))
                             && !g_has_wildcard(x)
                         {
-                            if let (TypeRef::G(jcdc_jvm::GenericType::Class(ca)),
-                                jcdc_jvm::GenericType::Class(cx)) =
-                                (&a.type_ref(), &**x)
+                            let ca_int_opt = match a.type_ref() {
+                                TypeRef::G(jcdc_jvm::GenericType::Class(ca)) => {
+                                    Some(crate::method::classsig_internal(&ca))
+                                }
+                                TypeRef::J(jcdc_jvm::JavaType::Object(n)) => Some(n),
+                                _ => None,
+                            };
+                            if let (Some(ca_int), jcdc_jvm::GenericType::Class(cx)) =
+                                (ca_int_opt, &**x)
                             {
-                                let ca_int = crate::method::classsig_internal(ca);
+                                if std::env::var("JCDC_DBG_APC").is_ok() {
+                                    eprintln!("XIFACE-TY aty={:?}", a.type_ref());
+                                }
                                 let cx_int = crate::method::classsig_internal(cx);
                                 let both_if = |n: &str| {
                                     pool.get(n).map(|p| p.is_interface()).unwrap_or(false)
                                 };
-                                if ca_int != cx_int
-                                    && !is_subtype_of(
+                                // Convertible without a cast only when the
+                                // actual matches x exactly (x <: CAP from
+                                // `? super x`). A DIFFERENT parameterization
+                                // of even a related class fails the capture
+                                // (Sink<? super R> is not <: CAP#2-from-
+                                // ? super Consumer<R> — jdk26 mapMulti);
+                                // the source's unchecked cast bridges it
+                                // whenever the cast itself is legal
+                                // (interface↔interface always is).
+                                let exact = match (&a.type_ref(), &**x) {
+                                    (
+                                        TypeRef::G(jcdc_jvm::GenericType::Class(ca2)),
+                                        jcdc_jvm::GenericType::Class(cx2),
+                                    ) => {
+                                        crate::method::classsig_internal(ca2) == cx_int
+                                            && ca2.parts.last().map(|p| p.args.clone())
+                                                == cx2.parts.last().map(|p| p.args.clone())
+                                    }
+                                    _ => false,
+                                };
+                                let cast_legal = both_if(&ca_int)
+                                    && both_if(&cx_int)
+                                    || is_subtype_of(
                                         pool,
                                         &jcdc_jvm::JavaType::Object(ca_int.clone()),
                                         &cx_int,
                                     )
-                                    && !is_subtype_of(
+                                    || is_subtype_of(
                                         pool,
                                         &jcdc_jvm::JavaType::Object(cx_int.clone()),
                                         &ca_int,
-                                    )
-                                    && both_if(&ca_int)
-                                    && both_if(&cx_int)
+                                    );
+                                if !exact
+                                    && cast_legal
+                                    && ca_int != cx_int
                                 {
                                     let inner = std::mem::replace(a, Expr::This);
                                     *a = Expr::Cast {
