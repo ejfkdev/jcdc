@@ -4093,9 +4093,28 @@ fn strip_enum_const_stores(s: &mut Stmt, pc: &PoolClass) {
 fn clinit_only_enum_init(pc: &PoolClass, pool: &ClassPool, ci: usize) -> bool {
     let Ok(Some(mb)) = decompile_method(pc, pool, ci) else { return false };
     let stmts = stmt_vec(&mb.body);
+    // Only the enum-constant stores, `$VALUES`, and synthetic `$`-prefixed
+    // bookkeeping (e.g. `$assertionsDisabled`) may be hidden — the constant
+    // list already renders the first two and the assert field is re-derived.
+    // Any OTHER static field assignment (jdk26 AccessFlag's `CLASS_FLAGS =
+    // createDefinition(..)`, Location's `SET_* = ..`) has no other
+    // initializer: hiding the clinit drops it and every read fails with
+    // 可能尚未初始化变量 (30 errors across the AccessFlag tree).
+    let const_names: HashSet<String> = pc
+        .cf
+        .fields
+        .iter()
+        .filter(|f| f.access_flags.contains(FieldAccessFlags::ENUM))
+        .filter_map(|f| pc.utf8(f.name_index).map(|n| n.to_string()))
+        .collect();
     !stmts.is_empty()
         && stmts.iter().all(|s| match s {
-            Stmt::ExprStmt(Expr::Assign { target, .. }) => matches!(&**target, Expr::Field { is_static: true, .. }),
+            Stmt::ExprStmt(Expr::Assign { target, .. }) => match &**target {
+                Expr::Field { name, is_static: true, .. } => {
+                    name == "$VALUES" || name.starts_with('$') || const_names.contains(name)
+                }
+                _ => false,
+            },
             Stmt::Return(None) => true,
             Stmt::Comment(_) => true,
             _ => false,
@@ -10532,7 +10551,7 @@ fn prune_witnessed_raw_sam_casts(e: &mut Expr, pool: &ClassPool) {
     if msig.args.len() != args.len() {
         return;
     }
-    for (a, formal) in args.iter_mut().zip(msig.args.iter()) {
+    for (pos, (a, formal)) in args.iter_mut().zip(msig.args.iter()).enumerate() {
         let Expr::Cast { ty, e: inner } = a else { continue };
         if !matches!(&**inner, Expr::Lambda(_)) {
             continue;
@@ -10543,6 +10562,36 @@ fn prune_witnessed_raw_sam_casts(e: &mut Expr, pool: &ClassPool) {
             _ => continue,
         };
         if &formal_class != raw_n {
+            continue;
+        }
+        // The witness pins the TYPE ARGUMENTS, not the overload: when a
+        // sibling same-name overload also takes an interface (lambda-
+        // targetable) formal at this position, the bare lambda stays
+        // ambiguous and the raw cast is the disambiguator
+        // (AccessController.doPrivileged: PrivilegedAction vs
+        // PrivilegedExceptionAction — pruning it revived 17
+        // 引用不明确 errors across p11/sj17). Prune only when no sibling
+        // can take the lambda (COWAL Reversed.toArray: the sibling
+        // formal is T[], an array — never lambda-compatible).
+        let sibling_sam = (0..dpc.cf.methods.len()).any(|oi| {
+            if oi == mi || dpc.method_name(oi) != Some(name.as_str()) {
+                return false;
+            }
+            let Some(od) = dpc.method_desc(oi).and_then(parse_method_descriptor) else {
+                return false;
+            };
+            if od.args.len() != desc.args.len() {
+                return false;
+            }
+            match od.args.get(pos) {
+                Some(jcdc_jvm::JavaType::Object(n)) if n != raw_n => pool
+                    .get(n.as_str())
+                    .map(|ipc| ipc.is_interface())
+                    .unwrap_or(false),
+                _ => false,
+            }
+        });
+        if sibling_sam {
             continue;
         }
         let v = std::mem::replace(a, Expr::This);
