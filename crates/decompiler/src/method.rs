@@ -209,7 +209,15 @@ pub fn decompile_method(
     }
 
     let mut vt = vt;
-    let mut merge_vars: HashMap<usize, Vec<u32>> = HashMap::new();
+    // A merge block's per-depth slot: a fresh stack var (divergent sides
+    // copy into it) or the expression every side agreed on (passed
+    // through verbatim — see the diverged-merge comment).
+    #[derive(Clone)]
+    enum MergeSlot {
+        Var(u32),
+        Pass(Expr),
+    }
+    let mut merge_vars: HashMap<usize, Vec<MergeSlot>> = HashMap::new();
     // Merge blocks whose input stack is a folded ternary expression.
     let mut merge_cond: HashMap<usize, Vec<Expr>> = HashMap::new();
     // Folded diamond regions: merge -> (root header, blocks absorbed).
@@ -247,7 +255,7 @@ pub fn decompile_method(
         let mut diverged = false;
         let mut new_merge_cond: HashMap<usize, Vec<Expr>> = HashMap::new();
         let mut new_fold_regions: HashMap<usize, (usize, HashSet<usize>)> = HashMap::new();
-        let mut new_merge_vars: HashMap<usize, Vec<u32>> = HashMap::new();
+        let mut new_merge_vars: HashMap<usize, Vec<MergeSlot>> = HashMap::new();
         let mut new_appends: HashMap<usize, Vec<Stmt>> = HashMap::new();
         let mut built_once = vec![false; n];
         let mut iter = 0;
@@ -267,9 +275,12 @@ pub fn decompile_method(
                     c.clone()
                 } else if let Some(vars) = merge_vars.get(&bid) {
                     vars.iter()
-                        .map(|&v| {
-                            let info = vt.var(v);
-                            Expr::Local { var: v, ty: info.ty.clone() }
+                        .map(|slot| match slot {
+                            MergeSlot::Var(v) => {
+                                let info = vt.var(*v);
+                                Expr::Local { var: *v, ty: info.ty.clone() }
+                            }
+                            MergeSlot::Pass(e) => e.clone(),
                         })
                         .collect()
                 } else {
@@ -300,13 +311,38 @@ pub fn decompile_method(
                                 f
                             } else {
                                 diverged = true;
-                                // Stack variables.
-                                let vars = match merge_vars.get(&bid) {
+                                // Stack variables. Per depth: None when
+                                // EVERY pred contributes the identical
+                                // expression — the merge passes it through
+                                // instead of copying it into a fresh var.
+                                // Two reasons: a FRESH expression (the
+                                // `new C` twin riding a dup across the
+                                // inner-ternary merge, jdk26 Gatherers
+                                // mapConcurrent) must not be duplicated —
+                                // each copy site would re-materialize
+                                // `new C(..)` (double side effect) or,
+                                // worse, the twin got a var the ctor never
+                                // assigned (invokespecial on a VAR receiver
+                                // emits a call stmt and pushes NOTHING
+                                // back), leaving the downstream throw
+                                // reading a never-assigned blank (可能尚未
+                                // 初始化变量stack389); and a plain Local
+                                // copy is pure noise. With pass-through the
+                                // ctor sees the raw New twin again, folds
+                                // it, and re-pushes the initialized object.
+                                let vars: Vec<MergeSlot> = match merge_vars.get(&bid) {
                                     Some(v) => v.clone(),
                                     None => {
                                         let depth = known.iter().map(|(_, o)| o.len()).min().unwrap_or(0);
-                                        let mut vs = Vec::with_capacity(depth);
+                                        let mut vs: Vec<MergeSlot> = Vec::with_capacity(depth);
                                         for d in 0..depth {
+                                            let first_at_d = known[0].1.get(d);
+                                            if let Some(e) = first_at_d {
+                                                if known.iter().all(|(_, o)| o.get(d) == first_at_d) {
+                                                    vs.push(MergeSlot::Pass(e.clone()));
+                                                    continue;
+                                                }
+                                            }
                                             // Join the divergent branch types:
                                             // the merge variable must accept
                                             // every side (String vs E, ...).
@@ -396,7 +432,7 @@ pub fn decompile_method(
                                             if is_wide {
                                                 vt.wide_stack_vars.insert(v);
                                             }
-                                            vs.push(v);
+                                            vs.push(MergeSlot::Var(v));
                                         }
                                         vs
                                     }
@@ -404,26 +440,29 @@ pub fn decompile_method(
                                 new_appends.remove(&bid);
                                 for (p, o) in &known {
                                     let mut adds = Vec::new();
-                                    for (d, v) in vars.iter().enumerate() {
+                                    for (d, slot) in vars.iter().enumerate() {
+                                        let MergeSlot::Var(v) = slot else { continue };
                                         if d < o.len() {
-                                            let info = vt.var(*v);
-                                            let target = Expr::Local { var: *v, ty: info.ty.clone() };
                                             adds.push(Stmt::LocalDef {
                                                 var: *v,
                                                 init: Some(o[d].clone()),
                                                 is_final: false,
                                                 force_type: true,
                                             });
-                                            let _ = &target;
                                         }
                                     }
                                     new_appends.entry(*p).or_default().extend(adds);
                                 }
                                 merge_vars.insert(bid, vars.clone());
                                 vars.iter()
-                                    .map(|&v| {
-                                        let info = vt.var(v);
-                                        Expr::Local { var: v, ty: info.ty.clone() }
+                                    .map(|slot| match slot {
+                                        MergeSlot::Var(v) => {
+                                            let info = vt.var(*v);
+                                            Expr::Local { var: *v, ty: info.ty.clone() }
+                                        }
+                                        // Identical on every pred: pass the
+                                        // common expression through.
+                                        MergeSlot::Pass(e) => e.clone(),
                                     })
                                     .collect()
                             }

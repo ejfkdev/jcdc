@@ -4159,7 +4159,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                     .chain(self.sese_loop_headers.iter())
                     .any(|&h| h == t || self.is_stmt_free_chain_to_block(t, h))
             };
-            let shared_merge: Vec<usize> = huniverse
+            let mut shared_merge: Vec<usize> = huniverse
                 .iter()
                 .copied()
                 .filter(|b| {
@@ -4176,6 +4176,16 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         })
                 })
                 .collect();
+            // Deterministic pick: huniverse is a HashSet whose iteration
+            // order varies per process, and shared_merge[0] selects the
+            // post-try tail to strip. Without the sort, jdk8
+            // JMXConnectorFactory.connect flip-flopped between the
+            // correct nested-if shape and a broken else-if chain that
+            // trapped the shared getProvider tail inside the IOException
+            // catch (losing it on the null-classloader and normal paths).
+            // Earliest-pc first: it is the flow confluence, and its
+            // reachable tail is the superset covering later candidates.
+            shared_merge.sort_by_key(|b| self.cfg.blocks[*b].start);
             if std::env::var("JCDC_DBG_HUNIV").is_ok() {
                 eprintln!(
                     "HUNIV1 gi={} hb={} shared_merge={:?} huniverse={:?}",
