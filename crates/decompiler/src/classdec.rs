@@ -10220,7 +10220,23 @@ pub(crate) fn instantiated_method_params(
                 };
                 match raw_outer {
                     Some(pair) => pair,
-                    None => match o.type_ref() {
+                    None => {
+                        // A call-owned receiver whose descriptor return is
+                        // ERASED: resolve the instantiated generic return
+                        // from its Signature (jdk26 BoundAttribute.writeTo:
+                        // attributeMapper() returns AttributeMapper<T>; the
+                        // erased read loses T, the writeAttribute formal A
+                        // cannot be substituted, and the source `(T) this`
+                        // cast is dropped — BoundAttribute<T>无法转换为T).
+                        let mut ot = o.type_ref();
+                        if matches!(o, Expr::Method { .. }) && !matches!(ot, TypeRef::G(_)) {
+                            if let Some(g @ jcdc_jvm::GenericType::Class(_)) =
+                                instantiated_method_ret(o, pool, pc)
+                            {
+                                ot = TypeRef::G(g);
+                            }
+                        }
+                        match ot {
                         TypeRef::G(jcdc_jvm::GenericType::Class(cs)) => {
                             (crate::method::classsig_internal(&cs), cs.parts.last()?.args.clone())
                         }
@@ -10241,6 +10257,7 @@ pub(crate) fn instantiated_method_params(
                             }
                             _ => return None,
                         },
+                        }
                     },
                 }
             }
@@ -11102,6 +11119,7 @@ fn apply_param_casts(
     pc: Option<&PoolClass>,
     caller_params: &[jcdc_jvm::TypeParam],
 ) {
+    let apc_dbg = std::env::var("JCDC_DBG_APC").is_ok();
     fn parameterized(t: &jcdc_jvm::GenericType) -> bool {
         match t {
             jcdc_jvm::GenericType::Class(cs) => cs.parts.iter().any(|p| !p.args.is_empty()),
@@ -11151,6 +11169,11 @@ fn apply_param_casts(
                         _ => None,
                     };
                     let Some(want) = want else { continue };
+                    if apc_dbg {
+                        eprintln!("APC2 pos want={:?} actual={:?} banned={:?}", want,
+                            std::mem::discriminant(a),
+                            CAST_BANNED_TVARS.with(|b| b.borrow().clone()));
+                    }
                     // Generic-method arguments infer their own type at the
                     // call site; a frozen cast would break unification.
                     if is_generic_call(a, pool) {
@@ -11442,7 +11465,15 @@ fn apply_param_casts(
                     // `(N)` cast because the erasures coincide, and
                     // Deque<N>.addFirst(Node<T>) fails without it).
                     let have_ty = a.type_ref();
-                    let have = have_ty.erased();
+                    let mut have = have_ty.erased();
+                    // `this` type_refs at java/lang/Object; the erasure
+                    // gate needs the ENCLOSING class (the `(T) this`
+                    // source cast against a self-bounded Attribute<T>).
+                    if matches!(a, Expr::This) {
+                        if let Some(p) = pc {
+                            have = jcdc_jvm::JavaType::Object(p.internal_name.clone());
+                        }
+                    }
                     let want_er = match &want {
                         jcdc_jvm::GenericType::TypeVar(n) => caller_params
                             .iter()
@@ -11458,10 +11489,28 @@ fn apply_param_casts(
                         _ => TypeRef::G(want.clone()).erased(),
                     };
                     let ok = match (&have, &want_er) {
-                        (jcdc_jvm::JavaType::Object(x), jcdc_jvm::JavaType::Object(y)) => x == y,
+                        (jcdc_jvm::JavaType::Object(x), jcdc_jvm::JavaType::Object(y)) if x == y => true,
+                        // A TYPEVAR formal whose bound the actual's erasure
+                        // SUBTYPES: javac elides the source `(T) x` cast
+                        // whenever the erasure conversion is a no-op
+                        // (jdk26 UnboundAttribute.writeTo: `(T) this`
+                        // against A extends Attribute<A>, this:Unbound-
+                        // Attribute implements Attribute — no checkcast in
+                        // bytecode, and the bare actual fails to convert:
+                        // UnboundAttribute<T>无法转换为T). Restrict to
+                        // TypeVar wants: for Class wants a subtype actual
+                        // is source-convertible without a cast.
+                        (jcdc_jvm::JavaType::Object(x), jcdc_jvm::JavaType::Object(y))
+                            if matches!(want, jcdc_jvm::GenericType::TypeVar(_)) =>
+                        {
+                            is_subtype_of(pool, &jcdc_jvm::JavaType::Object(x.clone()), y)
+                        }
                         (jcdc_jvm::JavaType::Array(_), jcdc_jvm::JavaType::Array(_)) => true,
                         _ => false,
                     };
+                    if apc_dbg {
+                        eprintln!("APC3 have={:?} want_er={:?} ok={}", have, want_er, ok);
+                    }
                     if !ok {
                         continue;
                     }
@@ -11484,6 +11533,9 @@ fn apply_param_casts(
                     } else {
                         TypeRef::G(want.clone())
                     };
+                    if apc_dbg {
+                        eprintln!("APC4 WRAPPED cast_ty={:?}", cast_ty);
+                    }
                     let inner = std::mem::replace(a, Expr::This);
                     *a = Expr::Cast { ty: cast_ty, e: Box::new(inner) };
     }
@@ -12971,6 +13023,11 @@ pub(crate) fn cast_wildcard_call_args(
         witness_ambiguous_lambda_args(e, pool, pc);
         prune_witnessed_raw_sam_casts(e, pool);
         let params = params.or_else(|| instantiated_ctor_params(e, pool));
+        if std::env::var("JCDC_DBG_APC").is_ok() {
+            if let Expr::Method { cls, name, .. } = &*e {
+                eprintln!("APC {}.{} params={:?}", cls, name, params);
+            }
+        }
         if let Some(params) = params {
             match e {
                 Expr::Method { args, .. } => apply_param_casts(args, &params, pool, Some(pc), caller_params),
