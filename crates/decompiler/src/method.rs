@@ -947,13 +947,57 @@ fn prune_dead_synth_stores(s: &mut Stmt, vt: &VarTable) {
     }
     let mut read: HashSet<u32> = HashSet::new();
     collect_stmt_reads(&*s, &mut read);
+    // A dead store whose VALUE has real effects must not vanish with the
+    // variable: `Class<?> c = Class.forName("jdk.net.ExtendedSocketOptions");`
+    // in the jdk11 ExtendedSocketOptions clinit is never read, but dropping
+    // the call skips the class-init trigger AND leaves the surrounding try
+    // body empty -- javac then rejects the checked-exception catch (在相应的
+    // try 语句主体中不能抛出异常错误ClassNotFoundException). Demote such
+    // statements to bare expression statements. Only top-level Java
+    // statement expressions qualify (call / new / assign / inc-dec); a dead
+    // store of a plain field or local read (the monitor-store shapes this
+    // pass exists for) stays fully dropped -- a bare field read is not a
+    // valid statement expression.
+    fn demote_value(e: &Expr) -> Option<Expr> {
+        match e {
+            Expr::Method { .. }
+            | Expr::New { .. }
+            | Expr::AnonNew { .. }
+            | Expr::Assign { .. }
+            | Expr::PreIncDec { .. }
+            | Expr::PostIncDec { .. } => Some(e.clone()),
+            _ => None,
+        }
+    }
+    fn cand_demote(s: &Stmt) -> Option<Expr> {
+        match s {
+            Stmt::ExprStmt(Expr::Assign { value, op: crate::expr::AssignOp::Plain, .. }) => {
+                demote_value(value)
+            }
+            Stmt::LocalDef { init: Some(e), .. } => demote_value(e),
+            _ => None,
+        }
+    }
     fn prune(s: &mut Stmt, vt: &VarTable, read: &HashSet<u32>) {
         match s {
             Stmt::Block(v) => {
-                v.retain(|st| match is_cand(st, vt) {
-                    Some(var) => read.contains(&var),
-                    None => true,
-                });
+                let mut i = 0;
+                while i < v.len() {
+                    match is_cand(&v[i], vt) {
+                        Some(var) if !read.contains(&var) => {
+                            match cand_demote(&v[i]) {
+                                Some(e) => {
+                                    v[i] = Stmt::ExprStmt(e);
+                                    i += 1;
+                                }
+                                None => {
+                                    v.remove(i);
+                                }
+                            }
+                        }
+                        _ => i += 1,
+                    }
+                }
                 v.iter_mut().for_each(|x| prune(x, vt, read));
             }
             Stmt::If { then_stmt, else_stmt, .. } => {
@@ -974,15 +1018,23 @@ fn prune_dead_synth_stores(s: &mut Stmt, vt: &VarTable) {
                 for c in cases.iter_mut() {
                     let mut i = 0;
                     while i < c.body.len() {
-                        let keep = match is_cand(&c.body[i], vt) {
-                            Some(var) => read.contains(&var),
-                            None => true,
+                        let dead = match is_cand(&c.body[i], vt) {
+                            Some(var) => !read.contains(&var),
+                            None => false,
                         };
-                        if keep {
+                        if dead {
+                            match cand_demote(&c.body[i]) {
+                                Some(e) => {
+                                    c.body[i] = Stmt::ExprStmt(e);
+                                    i += 1;
+                                }
+                                None => {
+                                    c.body.remove(i);
+                                }
+                            }
+                        } else {
                             prune(&mut c.body[i], vt, read);
                             i += 1;
-                        } else {
-                            c.body.remove(i);
                         }
                     }
                 }
@@ -1887,6 +1939,16 @@ fn stmt_terminates(s: &Stmt) -> bool {
             // A finally that cannot complete abruptly does not change
             // termination; if body and all catches terminate, so does the
             // try (javac agrees and flags following statements).
+            stmt_terminates(body)
+                && catches.iter().all(|c| stmt_terminates(&c.body))
+        }
+        // try-with-resources completes normally only when its body (and
+        // every catch) does: the implicit resource close cannot restore
+        // normal completion. Without this arm a fully-returning TWR let
+        // prune_unreachable keep the duplicated shared tail return after
+        // it (jdk17/26 JarFile.getBytes: 无法访问的语句 on the method-level
+        // `return var8_122`).
+        Stmt::TryWithResources { body, catches, .. } => {
             stmt_terminates(body)
                 && catches.iter().all(|c| stmt_terminates(&c.body))
         }
