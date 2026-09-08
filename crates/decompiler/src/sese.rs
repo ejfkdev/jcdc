@@ -1049,31 +1049,55 @@ impl<'a> Structurer<'a> {
                     // `throw <pending>;` into the normal flow (jdk26
                     // LambdaFormEditor.putInCache: 未报告的异常错误Throwable).
                     let hf_after = self.handler_flow_only(gi);
-                    let next = self.cfg.blocks.iter().find(|nb| {
+                    // Blocks are in ascending-start order. The scan STOPS at
+                    // the first stop (barrier) block: when the block right
+                    // after the span is the enclosing loop's exit, the flow
+                    // LEAVES this scope there (the try body's Goto resolved
+                    // to break) — continuing at some later non-stop block
+                    // pulls post-exit code into the loop body, whose
+                    // duplicated return then trips body_done and strands the
+                    // exit's own tail (jdk26 Future.resultNow: the normal
+                    // finally-if + `return result` after the retry loop went
+                    // missing — 缺少返回语句).
+                    let mut next: Option<usize> = None;
+                    for nb in self.cfg.blocks.iter() {
+                        if nb.start < gend {
+                            continue;
+                        }
+                        if Some(nb.id) == absorbed_tail || hf_after.contains(&nb.id) {
+                            continue;
+                        }
+                        if !ctx.universe.contains(&nb.id) {
+                            continue;
+                        }
+                        if stop.contains(&nb.id) {
+                            break;
+                        }
                         let is_term = matches!(
                             self.results[nb.id].term,
                             Term::Return(_) | Term::Throw(_)
                         );
-                        nb.start >= gend
-                            && Some(nb.id) != absorbed_tail
-                            && !hf_after.contains(&nb.id)
-                            && ctx.universe.contains(&nb.id)
-                            && !stop.contains(&nb.id)
-                            // A handler block is normally skipped (it belongs to
-                            // the try's catch/finally), but a handler that is a
-                            // shared return/throw is the method tail the finally
-                            // copy jumps to — the normal (try-completes) path
-                            // must still return it (nestedTry's lost return).
-                            && (!self.handler_group.contains_key(&nb.id) || is_term)
-                            && (!ctx.consumed.contains(&nb.id) || is_term)
-                    });
+                        // A handler block is normally skipped (it belongs to
+                        // the try's catch/finally), but a handler that is a
+                        // shared return/throw is the method tail the finally
+                        // copy jumps to — the normal (try-completes) path
+                        // must still return it (nestedTry's lost return).
+                        if self.handler_group.contains_key(&nb.id) && !is_term {
+                            continue;
+                        }
+                        if ctx.consumed.contains(&nb.id) && !is_term {
+                            continue;
+                        }
+                        next = Some(nb.id);
+                        break;
+                    }
                     match next {
                         // A consumed shared terminator right after the try is
                         // the method/region tail return that the catch also
                         // used; copy it inline so the normal (try-completes)
                         // path still returns (fixes nestedTry's lost return).
-                        Some(nb) if ctx.consumed.contains(&nb.id) => {
-                            parts.push(Region::CopyStmts { block: nb.id });
+                        Some(nb) if ctx.consumed.contains(&nb) => {
+                            parts.push(Region::CopyStmts { block: nb });
                             break;
                         }
                         Some(nb) => {
@@ -1085,7 +1109,7 @@ impl<'a> Structurer<'a> {
                             // block is unconsumed and forward (start >= gend), so
                             // structuring it is monotone and recovers the tail
                             // return (nestedTry's `return sb.toString()`).
-                            cur = nb.id;
+                            cur = nb;
                             last_via_goto = false;
                             continue;
                         }

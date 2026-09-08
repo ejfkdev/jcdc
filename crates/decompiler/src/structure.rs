@@ -568,6 +568,29 @@ impl<'a> Structurer<'a> {
         hf
     }
 
+    /// A handler scope's COND branch walk must stay inside the handler's
+    /// OWN flow: sub_scope's group expansion keys off body_group
+    /// membership of a block, and a handler-adjacent block owned by an
+    /// ENCLOSING try body widens the branch to the whole enclosing span --
+    /// the post-handler continuation re-walked with the handler's (empty)
+    /// group visibility emits its nested tries BARE (jdk17
+    /// SignerInfo.verify's catch(Exception) debug arm swallowed the rest
+    /// of the method: the initVerifyWithParam multi-catch copy lost its
+    /// try -- 未报告的异常错误InvalidAlgorithmParameterException). Blocks
+    /// outside the handler flow fall to the Goto arms instead;
+    /// strip_handler_exit_goto renders forward ones as the natural
+    /// fallthrough into the outer continuation.
+    fn restrict_handler_branch(&self, sub: &mut HashSet<usize>, entry: usize) {
+        let Some(&gi) = self.handler_group.get(&entry) else {
+            return;
+        };
+        let hf = self.handler_flow_only(gi);
+        sub.retain(|b| {
+            *b == entry || hf.contains(b) || self.handler_group.get(b) == Some(&gi)
+        });
+        sub.insert(entry);
+    }
+
     /// First unclaimed non-handler block at or after `pc` that the outer
     /// walk will actually continue at. `exclude` carries the enclosing
     /// scope's barriers (loop exits, follows): a barrier block is never the
@@ -586,17 +609,23 @@ impl<'a> Structurer<'a> {
         claimed: &HashSet<usize>,
         exclude: &HashSet<usize>,
     ) -> Option<usize> {
-        self.cfg
-            .blocks
-            .iter()
-            .find(|nb| {
-                nb.start >= pc
-                    && universe.contains(&nb.id)
-                    && !claimed.contains(&nb.id)
-                    && !self.is_handler(nb.id)
-                    && !exclude.contains(&nb.id)
-            })
-            .map(|nb| nb.id)
+        // Blocks are in ascending-start order; the scan STOPS at the first
+        // barrier (exclude) block: a continuation can never lie beyond a
+        // barrier — flow reaching it leaves this scope (loop-exit break,
+        // enclosing follow), and picking a block past it misroutes the
+        // post-try walk (jdk26 Future.resultNow).
+        for nb in self.cfg.blocks.iter() {
+            if nb.start < pc {
+                continue;
+            }
+            if exclude.contains(&nb.id) {
+                return None;
+            }
+            if universe.contains(&nb.id) && !claimed.contains(&nb.id) && !self.is_handler(nb.id) {
+                return Some(nb.id);
+            }
+        }
+        None
     }
 }
 
@@ -1397,7 +1426,8 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         && !(self.is_handler(taken) && active.is_empty())
                     {
                         let branch_universe = self.owner_scope(taken, universe);
-                        let sub = self.sub_scope(taken, &branch_universe, &bstop, claimed);
+                        let mut sub = self.sub_scope(taken, &branch_universe, &bstop, claimed);
+                        self.restrict_handler_branch(&mut sub, entry);
                         self.walk(taken, &sub, &bstop, active, claimed, false)
                     } else {
                         // Target is the follow (empty), or already structured
@@ -1495,7 +1525,8 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         && !(self.is_handler(fall) && active.is_empty())
                     {
                         let branch_universe = self.owner_scope(fall, universe);
-                        let sub = self.sub_scope(fall, &branch_universe, &bstop, claimed);
+                        let mut sub = self.sub_scope(fall, &branch_universe, &bstop, claimed);
+                        self.restrict_handler_branch(&mut sub, entry);
                         if std::env::var("JCDC_DBG_IF").is_ok() {
                             eprintln!("IF cur={} else walk fall={} sub={:?}", cur, fall, sub);
                         }
@@ -2713,15 +2744,30 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         // remain legal.
         let mut body_universe = body_universe;
         if let Some(cb) = self.cfg.block_at(g.end) {
+            // The absorbing tail must belong to THIS group's flow: a
+            // loop-exit block parked at exactly g.end (jdk26
+            // Future.resultNow's normal-path finally-if at pc 28, the
+            // retry loop's break target) has the protected block as its
+            // only pred but continues to the post-loop tail — absorbing it
+            // hides the exit from the enclosing loop's continuation
+            // (exits/natural_follow lose it) and strands `interrupt();
+            // return result;` (缺少返回语句). Preds may be body blocks,
+            // this group's handler heads, or handler-flow-only blocks
+            // (the pending-rethrow copy shapes).
+            let hf_own = self.handler_flow_only(gi);
+            let pred_in_group_flow = |p: &usize| {
+                self.body_group.get(p) == Some(&gi)
+                    || self.handler_group.get(p) == Some(&gi)
+                    || hf_own.contains(p)
+                    || body_universe.contains(p)
+            };
             if !body_universe.contains(&cb)
                 && self.is_terminator_block(cb)
                 && self.results[cb].stmts.is_empty()
                 && !self.handler_group.contains_key(&cb)
+                && !stop.contains(&cb)
                 && !self.cfg.blocks[cb].pred.is_empty()
-                && self.cfg.blocks[cb]
-                    .pred
-                    .iter()
-                    .all(|p| self.body_group.get(p) == Some(&gi))
+                && self.cfg.blocks[cb].pred.iter().all(pred_in_group_flow)
             {
                 body_universe.insert(cb);
             }
