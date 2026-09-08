@@ -13428,7 +13428,12 @@ fn witness_map_under_container_cast(e: &mut Expr) {
     ) {
         return;
     }
-    // Walk the owner chain for the element-producing map/flatMap.
+    // Walk the owner chain for the element-producing map/flatMap. STOP at
+    // any call that already carries a witness: pinning a second stage
+    // over-determines the chain (sj17/p11 ModuleFinder.find: this pass
+    // witnessed flatMap, the sibling-witness machinery then pinned
+    // `.<ModuleReference>map(f -> f.find(name))` from it — the map lambda
+    // returns Optional<ModuleReference>, lambda 表达式中的返回类型错误).
     let mut depth = 0;
     let mut x_opt = Some(xs);
     let mut cur: &mut Expr = inner;
@@ -13443,6 +13448,9 @@ fn witness_map_under_container_cast(e: &mut Expr) {
                     if let Some(x) = x_opt.take() {
                         type_args.push(x);
                     }
+                    return;
+                }
+                if !type_args.is_empty() {
                     return;
                 }
                 owner.as_deref_mut()
