@@ -11760,10 +11760,32 @@ fn apply_param_casts(
                         // belongs to ClassSpecializer, 找不到符号 + 需要
                         // 封闭实例): skip the cast instead.
                         jcdc_jvm::GenericType::TypeVar(n) => {
+                            // Nested classes denote every ENCLOSING class's
+                            // typevars too (IdentityHashMap$EntryIterator
+                            // casts to the outer K/V — gating on the own
+                            // class alone dropped those casts:
+                            // Object无法转换为K / 无法推断KeyValueHolder<>
+                            // x6 across the families).
                             let denotable =
                                 caller_params.iter().any(|p| &p.name == n)
                                     || pc.map(|p| {
-                                        class_typevar_names(p).iter().any(|c| c == n)
+                                        let mut name = p.internal_name.clone();
+                                        loop {
+                                            if let Some(cp) = pool.get(&name) {
+                                                if class_typevar_names(&cp)
+                                                    .iter()
+                                                    .any(|c| c == n)
+                                                {
+                                                    return true;
+                                                }
+                                            }
+                                            match name.rfind('$') {
+                                                Some(i) if i > 0 => {
+                                                    name.truncate(i);
+                                                }
+                                                _ => return false,
+                                            }
+                                        }
                                     })
                                     .unwrap_or(false);
                             if denotable {
