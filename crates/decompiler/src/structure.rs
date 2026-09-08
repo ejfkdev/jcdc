@@ -1955,7 +1955,6 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                                 && !stop.contains(&t)
                                 && !Self::ctx_is_loop_header(self, t)
                                 && !self.terminator_writes_final(t)
-                                && !self.is_active_group_continuation(t, active)
                             {
                                 // Shared terminator tail — but NOT a retry
                                 // loop header (a handler-entry `goto head`
