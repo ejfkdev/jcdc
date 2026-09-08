@@ -4248,7 +4248,7 @@ pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: 
                     // the method body). Definitions inside branches count
                     // (SESE-copied tails): decl lands after the branch
                     // structure — before every mention anyway.
-                    let pos = last_capture_def(v, &caps, 0, vt);
+                    let pos = last_capture_def(v, &caps, 0, 0, vt);
                     if pos < 0 {
                         0
                     } else if pos >> 32 == 0 {
@@ -4267,6 +4267,12 @@ pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: 
                 };
                 let mut first_use =
                     first_local_mention(v, &marker, &name, vt, fam).unwrap_or(v.len());
+                if std::env::var("JCDC_DBG_LDECL").is_ok() {
+                    eprintln!(
+                        "LDECL {} caps={:?} capture_end={} first_use={} vlen={}",
+                        name, caps, capture_end, first_use, v.len()
+                    );
+                }
                 if first_use < capture_end {
                     // The early mentions sit in hoisted `= null` decls:
                     // move them past the insertion point (their runtime
@@ -4484,12 +4490,21 @@ fn g_mentions_local(g: &jcdc_jvm::GenericType, name: &str, fam: &Family) -> bool
 /// local class (post-walk marker `\u{2}Name`) or mentions its simple
 /// name in any rendered TYPE (hoisted LocalDef decls, casts, array
 /// creates, instanceof, method type witnesses).
-/// Captured locals whose definitions live only in NESTED scopes: the
-/// class decl must sit at the block top (its sibling copy-tails mention
-/// it from every branch), but a branch-scoped capture definition is out
-/// of scope there — hoist a blank decl for it to the block top and
-/// demote the nested LocalDefs to assignments (jdk26 DoublePipeline
-/// flatMap: `fastPath` defined in each copied tail).
+/// Captured locals whose definitions live (wholly or partly) in NESTED
+/// scopes: the class decl must sit at the block top (its sibling
+/// copy-tails mention it from every branch), but a branch-scoped capture
+/// definition is out of scope there — hoist a blank decl for it to the
+/// block top and demote the nested LocalDefs to assignments (jdk26
+/// DoublePipeline flatMap: `fastPath` defined in each copied tail).
+/// BARE nested assigns (varalloc already blank-hoisted the decl, jdk26
+/// GathererOp.evaluate's `combiner = gatherer.combiner()` inside
+/// `if (parallel)`) are PULLED to the head after their blank — javac
+/// requires a captured local DA at the class-decl position, so the
+/// definition must TEXTUALLY precede the decl even when that makes it
+/// unconditional (javac's own source keeps such captures top-level).
+/// Returns (hoisted_blank_count, decl_position): the position is after
+/// the LAST top-level capture definition when one exists (the decl must
+/// follow it), else 0 (head, after the blanks).
 fn hoist_branch_captures(
     v: &mut Vec<Stmt>,
     caps: &[String],
@@ -4498,8 +4513,21 @@ fn hoist_branch_captures(
 ) -> (usize, usize) {
     use std::collections::HashSet;
     let mut seen: HashSet<u32> = HashSet::new();
+    fn is_cap_assign(st: &Stmt, caps: &[String], vt: &VarTable) -> Option<u32> {
+        if let Stmt::ExprStmt(Expr::Assign { target, .. }) = st {
+            if let Expr::Local { var, .. } = &**target {
+                if caps.iter().any(|n| vt.var(*var).name == *n) {
+                    return Some(*var);
+                }
+            }
+        }
+        None
+    }
     fn scan(v: &[Stmt], caps: &[String], vt: &VarTable, seen: &mut HashSet<u32>) {
         for st in v {
+            if let Some(var) = is_cap_assign(st, caps, vt) {
+                seen.insert(var);
+            }
             match st {
                 Stmt::LocalDef { var, init: Some(_), .. } => {
                     if caps.iter().any(|n| vt.var(*var).name == *n) {
@@ -4560,17 +4588,15 @@ fn hoist_branch_captures(
         return (0, pos);
     }
     // A capture defined at the TOP level must keep the decl after it;
-    // only nested (branch-copied) definitions are hoistable. Blank
-    // (init-less) decls are placeholders, not definitions.
+    // only nested definitions are hoistable/pullable. Blank (init-less)
+    // decls are placeholders, not definitions.
     let top_def = v.iter().rposition(|st| match st {
         Stmt::LocalDef { var, init: Some(_), .. } => seen.contains(var),
-        Stmt::ExprStmt(Expr::Assign { target, .. }) => {
-            matches!(&**target, Expr::Local { var, .. } if seen.contains(var))
-        }
-        _ => false,
+        other => is_cap_assign(other, caps, vt).map(|var| seen.contains(&var)).unwrap_or(false),
     });
     let mut blanks: Vec<Stmt> = Vec::new();
     let mut blanks_seen: HashSet<u32> = HashSet::new();
+    let mut pulled: Vec<Stmt> = Vec::new();
     fn demote_stmt(
         s: &mut Stmt,
         seen: &HashSet<u32>,
@@ -4664,22 +4690,142 @@ fn hoist_branch_captures(
     for x in v.iter_mut() {
         demote_stmt(x, &seen, &mut blanks, &mut blanks_seen, vt);
     }
-    let n = blanks.len();
-    // Blanks land at the block head (after any leading plain decls):
-    // the demoted assignments execute inside branches that precede the
-    // class-decl anchor position.
+    // Pull NESTED bare assigns of captures that have NO top-level def to
+    // the head (after their blank). Top-level ones stay put (top_def
+    // keeps the decl after them). The demote pass turned nested
+    // LocalDefs into bare assigns too — those get pulled here as well,
+    // so their branch keeps only... nothing: the blank + assign now live
+    // at the head. (A demoted assign nested in a branch executes
+    // unconditionally at the head instead — accepted: javac forces such
+    // captures to be defined before the class decl anyway.)
+    fn pull_assigns(
+        v: &mut Vec<Stmt>,
+        seen: &HashSet<u32>,
+        pulled: &mut Vec<Stmt>,
+        caps: &[String],
+        vt: &VarTable,
+    ) {
+        let mut i = 0;
+        while i < v.len() {
+            if is_cap_assign(&v[i], caps, vt).map(|var| seen.contains(&var)).unwrap_or(false) {
+                pulled.push(v.remove(i));
+                continue;
+            }
+            pull_one(&mut v[i], seen, pulled, caps, vt);
+            i += 1;
+        }
+    }
+    fn pull_one(
+        s: &mut Stmt,
+        seen: &HashSet<u32>,
+        pulled: &mut Vec<Stmt>,
+        caps: &[String],
+        vt: &VarTable,
+    ) {
+        match s {
+            Stmt::Block(v) => pull_assigns(v, seen, pulled, caps, vt),
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                pull_one(then_stmt, seen, pulled, caps, vt);
+                if let Some(e) = else_stmt {
+                    pull_one(e, seen, pulled, caps, vt);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::Labeled { body, .. }
+            | Stmt::Synchronized { body, .. } => {
+                pull_one(body, seen, pulled, caps, vt);
+            }
+            Stmt::For { init, body, .. } => {
+                let mut j = 0;
+                while j < init.len() {
+                    if is_cap_assign(&init[j], caps, vt).map(|var| seen.contains(&var)).unwrap_or(false) {
+                        pulled.push(init.remove(j));
+                        continue;
+                    }
+                    pull_one(&mut init[j], seen, pulled, caps, vt);
+                    j += 1;
+                }
+                pull_one(body, seen, pulled, caps, vt);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    pull_assigns(&mut c.body, seen, pulled, caps, vt);
+                }
+                if let Some(d) = default {
+                    pull_one(d, seen, pulled, caps, vt);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                pull_one(body, seen, pulled, caps, vt);
+                for c in catches.iter_mut() {
+                    pull_one(&mut c.body, seen, pulled, caps, vt);
+                }
+                if let Some(f) = finally {
+                    pull_one(f, seen, pulled, caps, vt);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                pull_assigns(resources, seen, pulled, caps, vt);
+                pull_one(body, seen, pulled, caps, vt);
+                for c in catches.iter_mut() {
+                    pull_one(&mut c.body, seen, pulled, caps, vt);
+                }
+                if let Some(f) = finally {
+                    pull_one(f, seen, pulled, caps, vt);
+                }
+            }
+            _ => {}
+        }
+    }
+    if top_def.is_none() {
+        pull_assigns(v, &seen, &mut pulled, caps, vt);
+    } else {
+        // Pull only NESTED assigns: skip the top-level statement that is
+        // the last top-level def and any nested assigns sitting at top
+        // level (there are none by definition — top-level assigns ARE
+        // the defs top_def found; pulling them would move real code).
+        // Walk with indices: pull nested ones inside each top-level
+        // statement except bare top-level assigns themselves.
+        for st in v.iter_mut() {
+            if is_cap_assign(st, caps, vt).is_some() {
+                continue; // top-level assign stays
+            }
+            let mut tmp = std::mem::replace(st, Stmt::Block(vec![]));
+            pull_one(&mut tmp, &seen, &mut pulled, caps, vt);
+            *st = tmp;
+        }
+    }
+    let n = blanks.len() + pulled.len();
+    // Blanks land at the block head (after any leading plain decls);
+    // pulled assigns follow the blanks so every capture is DA before
+    // the class decl position.
     let mut blank_pos = 0;
     while blank_pos < v.len() && matches!(&v[blank_pos], Stmt::LocalDef { .. }) {
         blank_pos += 1;
     }
     let _ = pos;
+    let blanks_len = blanks.len();
     for (k, b) in blanks.into_iter().enumerate() {
         v.insert(blank_pos + k, b);
+    }
+    let pull_pos = blank_pos + blanks_len;
+    for (k, a) in pulled.into_iter().enumerate() {
+        v.insert(pull_pos + k, a);
     }
     if n == 0 {
         return (0, pos);
     }
-    (n, top_def.map(|p| p + 1 + n).unwrap_or(0))
+    // Decl position: after the last TOP-LEVEL capture def (shifted by
+    // the head insertions) when one exists — the decl must follow real
+    // top-level definitions (Collectors.teeing0) — else at the head
+    // right after the blanks + pulled assigns.
+    let head_ins = n;
+    match top_def {
+        Some(t) => (n, t + 1 + head_ins),
+        None => (n, head_ins),
+    }
 }
 
 /// Last position (in a possibly-nested block list) where a captured/// Last position (in a possibly-nested block list) where a captured
@@ -4690,9 +4836,17 @@ fn hoist_branch_captures(
 /// DoublePipeline flatMap: `DoubleConsumer fastPath = stack0` lives in
 /// each copied tail), invisible to a flat scan, which parked the decl
 /// before every definition.
-fn last_capture_def(v: &[Stmt], caps: &[String], path: usize, vt: &VarTable) -> i64 {
+fn last_capture_def(v: &[Stmt], caps: &[String], top: usize, path: usize, vt: &VarTable) -> i64 {
     let mut best: i64 = -1;
     for (i, st) in v.iter().enumerate() {
+        // Low bits carry the TOP-LEVEL ANCESTOR index (the statement of
+        // `v` the definition lives under — its own index at depth 0): a
+        // decl must land after that whole statement. The old within-slice
+        // index made nested positions incomparable with top-level ones
+        // and decoded to nonsense slots (jdk26 GathererOp.evaluate:
+        // combiner's branch assign parked the Parallel decl at index 2 —
+        // before the definition — 可能尚未初始化变量combiner x2).
+        let my_top = if path == 0 { i } else { top };
         let defines = match st {
             Stmt::LocalDef { var, .. } => caps.iter().any(|n| vt.var(*var).name == *n),
             Stmt::ExprStmt(Expr::Assign { target, .. }) => {
@@ -4702,7 +4856,7 @@ fn last_capture_def(v: &[Stmt], caps: &[String], path: usize, vt: &VarTable) -> 
             _ => false,
         };
         if defines {
-            let cand = ((path as i64) << 32) | i as i64;
+            let cand = ((path as i64) << 32) | my_top as i64;
             if cand > best {
                 best = cand;
             }
@@ -4756,7 +4910,7 @@ fn last_capture_def(v: &[Stmt], caps: &[String], path: usize, vt: &VarTable) -> 
             _ => Vec::new(),
         };
         for x in sub {
-            let cand = last_capture_def(std::slice::from_ref(x), caps, path + 1, vt);
+            let cand = last_capture_def(std::slice::from_ref(x), caps, my_top, path + 1, vt);
             if cand > best {
                 best = cand;
             }
@@ -5102,12 +5256,15 @@ fn walk_stmt_anon(
                         let pdef = if caps.is_empty() {
                             -1
                         } else {
-                            last_capture_def(v, &caps, 0, vt)
+                            last_capture_def(v, &caps, 0, 0, vt)
                         };
+                        // Low bits = top-level ancestor index of the last
+                        // capture definition (both top-level and nested
+                        // defs now decode on the same axis).
                         let cpos = if pdef < 0 {
                             0
                         } else {
-                            ((pdef >> 32) as usize) + 1
+                            ((pdef & 0xFFFF_FFFF) as usize) + 1
                         };
                         let mut target =
                             first_local_mention(v, &marker, &name, vt, fam).unwrap_or(v.len());
@@ -8299,7 +8456,7 @@ fn relocate_multi_site_decls(
         if caps.is_empty() {
             continue;
         }
-        let p = last_capture_def(v, &caps, 0, vt);
+        let p = last_capture_def(v, &caps, 0, 0, vt);
         if p < 0 {
             continue;
         }
