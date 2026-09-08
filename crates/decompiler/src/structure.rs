@@ -1367,7 +1367,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             cur, taken, fall, follow, stop.contains(&taken), stop.contains(&fall),
                             self.is_terminator_block(taken), self.is_terminator_block(fall),
                             universe.contains(&taken), claimed.contains(&taken),
-                            self.absorb_pure(taken, universe, &bstop, claimed).is_some()
+                            self.absorb_pure(taken, universe, &bstop, claimed, active).is_some()
                         );
                     }
                     let then_r = if Some(taken) == follow && !stop.contains(&taken) {
@@ -1418,13 +1418,33 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         } else {
                             Region::Goto { target: taken }
                         }
-                    } else if let Some(absorbed) = self.absorb_pure(taken, universe, &bstop, claimed) {
+                    } else if let Some(absorbed) = self.absorb_pure(taken, universe, &bstop, claimed, active) {
                         absorbed
                     } else if universe.contains(&taken)
                         && !bstop.contains(&taken)
                         && !claimed.contains(&taken)
                         && !(self.is_handler(taken) && active.is_empty())
                     {
+                        let branch_universe = self.owner_scope(taken, universe);
+                        let mut sub = self.sub_scope(taken, &branch_universe, &bstop, claimed);
+                        self.restrict_handler_branch(&mut sub, entry);
+                        self.walk(taken, &sub, &bstop, active, claimed, false)
+                    } else if !stop.contains(&taken)
+                        && !claimed.contains(&taken)
+                        && !self.is_terminator_block(taken)
+                        && self.cfg.exc_edges.iter().any(|e| e.from == taken)
+                    {
+                        // A PROTECTED branch target outside this scope's
+                        // universe (an enclosing try body split it into
+                        // another owner group): walking it gives the flow
+                        // its own try carve-out and materializes its
+                        // statements. Region::Empty here silently deleted
+                        // the branch AND left the group unstructured —
+                        // jdk17 HttpURLConnection.getOutputStream's
+                        // `return getOutputStream0()` arm vanished and the
+                        // doPrivileged call lost its
+                        // catch(PrivilegedActionException)
+                        // (未报告的异常错误 x2 methods, sj17 tree).
                         let branch_universe = self.owner_scope(taken, universe);
                         let mut sub = self.sub_scope(taken, &branch_universe, &bstop, claimed);
                         self.restrict_handler_branch(&mut sub, entry);
@@ -1517,7 +1537,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         } else {
                             Region::Goto { target: fall }
                         }
-                    } else if let Some(absorbed) = self.absorb_pure(fall, universe, &bstop, claimed) {
+                    } else if let Some(absorbed) = self.absorb_pure(fall, universe, &bstop, claimed, active) {
                         absorbed
                     } else if universe.contains(&fall)
                         && !bstop.contains(&fall)
@@ -1580,6 +1600,16 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         // Dual-terminator stop exits: see the taken side
                         // (jdk11 ObjectInputStream.readSerialData).
                         self.dual_terminator_branch(fall, active)
+                    } else if !stop.contains(&fall)
+                        && !claimed.contains(&fall)
+                        && self.cfg.exc_edges.iter().any(|e| e.from == fall)
+                    {
+                        // Protected branch target outside the scope — see
+                        // the taken side (getOutputStream p==null arm).
+                        let branch_universe = self.owner_scope(fall, universe);
+                        let mut sub = self.sub_scope(fall, &branch_universe, &bstop, claimed);
+                        self.restrict_handler_branch(&mut sub, entry);
+                        self.walk(fall, &sub, &bstop, active, claimed, false)
                     } else {
                         if std::env::var("JCDC_DBG_IF").is_ok() {
                             eprintln!(
@@ -1864,6 +1894,20 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             *og == *gi
                                 || (self.groups[*og].start >= g.start
                                     && self.groups[*og].end <= g.end)
+                                // Blocks owned by a group ENCLOSING `gi`
+                                // are the arm's post-try continuation, not
+                                // a sibling's territory: a nested try whose
+                                // protected span ends before the enclosing
+                                // monitor/group span leaves its monitorexit
+                                // + return tail owned by the outer group,
+                                // and filtering it stranded the tail in no
+                                // region (jdk26 ZipFile.getComment: the
+                                // `return zipCoder.toString(comment)` value
+                                // block walked alone, its Goto into the
+                                // tail elided at conversion — empty try
+                                // body AND a missing return).
+                                || (self.groups[*og].start <= g.start
+                                    && self.groups[*og].end >= g.end)
                         }
                     })
                     .collect()
@@ -2177,8 +2221,22 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         universe: &HashSet<usize>,
         bstop: &HashSet<usize>,
         claimed: &mut HashSet<usize>,
+        active: &[usize],
     ) -> Option<Region> {
         if !universe.contains(&blk) {
+            return None;
+        }
+        // A block that STARTS a try group visible to this walk must be
+        // WALKED, not absorbed: absorption inlines its statements into
+        // the branch and silently drops the group's exception protection
+        // (jdk17 HttpURLConnection.getOutputStream: the
+        // doPrivilegedWithCombiner call absorbed out of its
+        // try/catch(PrivilegedActionException) into the `if (p == null)`
+        // else arm — 未报告的异常错误PrivilegedActionException).
+        let blk_start = self.cfg.blocks[blk].start;
+        if self.groups.iter().enumerate().any(|(gi, g)| {
+            g.start == blk_start && active.contains(&gi)
+        }) {
             return None;
         }
         let dbg_absorb = std::env::var("JCDC_DBG_ABSORB").is_ok();
@@ -2780,17 +2838,112 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                 body_universe.insert(cb);
             }
         }
+        // A protected VALUE PUSH whose consumer sits just past the span
+        // must stay inside the try: javac excludes the monitorexit+areturn
+        // tail from the protected range (jdk26 ZipFile.getComment's
+        // `return zipCoder.toString(comment)`), so the body block ends in
+        // Fallthrough with the value on the out-stack and the Return that
+        // names the call lives outside — converting that split either
+        // empties the try (checked catch illegal) or emits the throwing
+        // call UNPROTECTED. Absorb the linear statements-free fallthrough
+        // chain plus the single Return consumer. The return only runs
+        // after the chain completes, so it is exception-equivalent to the
+        // protected call; MonitorExit markers ride into the body where
+        // reconstruct_synchronized strips them again.
+        {
+            let entry_blk = self
+                .cfg
+                .blocks
+                .iter()
+                .find(|b| b.start == g.start && body_universe.contains(&b.id))
+                .map(|b| b.id);
+            if let Some(eb) = entry_blk {
+                let spans = |gi: usize, og: usize| {
+                    self.groups[og].start <= self.groups[gi].start
+                        && self.groups[og].end >= self.groups[gi].end
+                };
+                let ownable = |n: usize| match self.body_group.get(&n) {
+                    None => true,
+                    Some(&og) => {
+                        og == gi
+                            || (self.groups[og].start >= self.groups[gi].start
+                                && self.groups[og].end <= self.groups[gi].end)
+                            || spans(gi, og)
+                    }
+                };
+                if matches!(self.results[eb].term, Term::Fallthrough)
+                    && self.results[eb].out_stack.len() == 1
+                {
+                    let mut x = eb;
+                    for _ in 0..4 {
+                        let succs = self.cfg.blocks[x].succ.clone();
+                        if succs.len() != 1 {
+                            break;
+                        }
+                        let n = succs[0];
+                        if body_universe.contains(&n)
+                            || self.handler_group.contains_key(&n)
+                            || !ownable(n)
+                        {
+                            break;
+                        }
+                        let r = &self.results[n];
+                        // Monitor markers ride along (they are stripped by
+                        // reconstruct_synchronized); any OTHER statement
+                        // stops the chain — absorbing real code past the
+                        // span would newly protect it (a checked catch
+                        // would become illegal).
+                        if !r.stmts.is_empty()
+                            && !r
+                                .stmts
+                                .iter()
+                                .all(|s| matches!(s, crate::stmt::Stmt::MonitorExit(_) | crate::stmt::Stmt::MonitorEnter(_)))
+                        {
+                            break;
+                        }
+                        match &r.term {
+                            Term::Fallthrough => {
+                                body_universe.insert(n);
+                                x = n;
+                            }
+                            Term::Return(_) => {
+                                body_universe.insert(n);
+                                break;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+        }
         let body = match self.cfg.block_at(g.start) {
             Some(entry) if body_universe.contains(&entry) => {
-                let mut r = self.walk(entry, &body_universe, &HashSet::new(), &nested, claimed, false);
+                // A group whose protected span starts AT an enclosing
+                // loop's header arrives here with the header already
+                // claimed (structure_loop / the SESE loop branch claim it
+                // before walking the body, and the group-yield filter
+                // deliberately lets the body walk re-find the group at
+                // its start). The body walk must then tolerate the
+                // claimed entry like structure_loop does — refusing it
+                // collapsed the whole protected body into the back-edge
+                // Goto and the try emitted as `try { continue; }`
+                // (jdk11 HttpURLConnection$ErrorStream.getErrorStream:
+                // the `len = is.read(..)` do-while body lost —
+                // 在相应的try语句主体中不能抛出异常错误SocketTimeoutException).
+                let allow = claimed.contains(&entry);
+                let mut r = self.walk(entry, &body_universe, &HashSet::new(), &nested, claimed, allow);
                 // Flow leaving the try body to the post-try continuation is
                 // natural fallthrough (the outer walk picks it up there).
                 let cont = self
                     .continuation_after(g.end, outer_universe, claimed, stop)
-                    .filter(|c| !self.handler_flow_only(gi).contains(c));
+                    .filter(|c| {
+                        !self.handler_flow_only(gi).contains(c)
+                            && !body_universe.contains(c)
+                    });
                 if std::env::var("JCDC_DBG_IF").is_ok() {
-                    eprintln!("try gi={} cont={:?} universe_has_blocks_after_end={}", gi, cont,
-                        universe.iter().filter(|b| self.cfg.blocks[**b].start >= g.end).count());
+                    eprintln!("try gi={} cont={:?} universe_has_blocks_after_end={} outer_universe={:?} stop={:?}", gi, cont,
+                        universe.iter().filter(|b| self.cfg.blocks[**b].start >= g.end).count(),
+                        outer_universe, stop);
                 }
                 if let Some(c) = cont {
                     strip_trailing_goto_to(&mut r, c);
