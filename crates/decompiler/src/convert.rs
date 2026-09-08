@@ -507,6 +507,13 @@ impl<'a> Converter<'a> {
         // copy emitted `if (i >= fractionalDigits) {}` with no way out --
         // the digit append + back edge vanished (semantically an infinite
         // loop; javac: 缺少返回语句 on the method tail).
+        // A target that is a loop EXIT keeps its RawGoto resolution (the
+        // conv arm materializes the break): Pattern.clazz's switch-case
+        // `break` targets sit on the loop-bottom path AND name exits —
+        // continuing there made every switch exit abrupt and the post-
+        // switch tail unreachable (无法访问的语句 x3 trees).
+        let is_any_exit = self.loops.iter().any(|l| l.exits.contains(&target));
+        if !is_any_exit && self.switches.is_empty() {
         if let Some(i) = (0..self.loops.len())
             .rev()
             .find(|&i| crate::structure::can_reach_cfg(self.cfg, target, self.loops[i].header, 4096))
@@ -517,6 +524,7 @@ impl<'a> Converter<'a> {
             } else {
                 Jump::Continue(Some(self.loops[i].label.clone()))
             });
+        }
         }
         // Inside a loop, a forward escape that cannot reach back into the
         // loop is a break of the innermost loop.
