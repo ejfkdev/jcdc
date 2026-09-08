@@ -11629,6 +11629,50 @@ fn apply_param_casts(
                                 continue;
                             }
                         }
+                        // A G-typed actual of a DIFFERENT, unrelated class
+                        // than the stripped super-bound is inconvertible to
+                        // the capture formal; between two INTERFACES the
+                        // source's unchecked cast is the only legal bridge
+                        // (jdk26 ReferencePipeline.mapMulti:
+                        // `mapper.accept(u, (Consumer<R>) downstream)` —
+                        // Sink<CAP#1>无法转换为CAP#2 without it). A
+                        // class-side or subtype pair converts naturally —
+                        // leave those bare.
+                        if !matches!(a, Expr::Cast { .. } | Expr::Const(_))
+                            && !g_has_wildcard(x)
+                        {
+                            if let (TypeRef::G(jcdc_jvm::GenericType::Class(ca)),
+                                jcdc_jvm::GenericType::Class(cx)) =
+                                (&a.type_ref(), &**x)
+                            {
+                                let ca_int = crate::method::classsig_internal(ca);
+                                let cx_int = crate::method::classsig_internal(cx);
+                                let both_if = |n: &str| {
+                                    pool.get(n).map(|p| p.is_interface()).unwrap_or(false)
+                                };
+                                if ca_int != cx_int
+                                    && !is_subtype_of(
+                                        pool,
+                                        &jcdc_jvm::JavaType::Object(ca_int.clone()),
+                                        &cx_int,
+                                    )
+                                    && !is_subtype_of(
+                                        pool,
+                                        &jcdc_jvm::JavaType::Object(cx_int.clone()),
+                                        &ca_int,
+                                    )
+                                    && both_if(&ca_int)
+                                    && both_if(&cx_int)
+                                {
+                                    let inner = std::mem::replace(a, Expr::This);
+                                    *a = Expr::Cast {
+                                        ty: TypeRef::G((**x).clone()),
+                                        e: Box::new(inner),
+                                    };
+                                    continue;
+                                }
+                            }
+                        }
                     }
                     // Erasures must line up. A TypeVar formal erases to
                     // its leftmost BOUND, not Object (jdk11 Nodes.

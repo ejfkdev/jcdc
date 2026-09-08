@@ -503,6 +503,38 @@ impl<'a> Printer<'a> {
                 self.line(&format!("{} {{", head));
                 self.indent += 1;
                 for c in cases {
+                    // MULTIPLE pattern labels in one arm cannot share a
+                    // colon body: neither stacked (`case P1 x:` `case P2
+                    // y:` — 贯穿到模式非法) nor comma-joined (`case P1 x,
+                    // P2 y:` — javac still demands a break between pattern
+                    // labels) compile. Duplicate the body per label — the
+                    // source's arrow-form multi-pattern arm
+                    // (`case A _, B _ -> r;`, jdk26 ParserVerifier
+                    // valueSize) in colon form.
+                    if c.raw_labels.len() > 1
+                        && c.labels.is_empty()
+                        && c.string_labels.is_empty()
+                        && c.enum_labels.is_empty()
+                    {
+                        for l in &c.raw_labels {
+                            match &c.guard {
+                                Some(g) => {
+                                    let mut gtxt = String::new();
+                                    self.expr(g, 1, &mut gtxt);
+                                    self.line(&format!("case {} when {}:", l, gtxt));
+                                }
+                                None => self.line(&format!("case {}:", l)),
+                            }
+                            self.line("{");
+                            self.indent += 1;
+                            for st in &c.body {
+                                self.stmt(st);
+                            }
+                            self.indent -= 1;
+                            self.line("}");
+                        }
+                        continue;
+                    }
                     for l in &c.enum_labels {
                         self.line(&format!("case {}:", l));
                     }
