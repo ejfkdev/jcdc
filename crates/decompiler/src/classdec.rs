@@ -2795,7 +2795,7 @@ fn emit_method_with(
                 cast_wildcard_call_args(&mut body, pool, pc, &mb.vt, &caller_params);
                 witness_methodref_localdef_calls(&mut body, &mb.vt, pool, pc, &caller_params);
                 pin_underdetermined_return_diamonds(&mut body, msig.as_ref(), pool);
-                upgrade_raw_receiver_casts(&mut body, pool, pc, &caller_params);
+                upgrade_raw_receiver_casts(&mut body, pool, pc, &caller_params, static_ban);
                 if static_ban {
                     CAST_BANNED_TVARS.with(|b| b.borrow_mut().clear());
                 }
@@ -2916,7 +2916,13 @@ fn emit_method_with(
             cast_pruned_delegation_typevar_args(&mut body, pc, mi);
             add_throw_witnesses(&mut body, msig.as_ref(), pool);
             rethrow_typevar_witness(&mut body, msig.as_ref(), pool);
-            upgrade_raw_receiver_casts(&mut body, pool, pc, &caller_params);
+            upgrade_raw_receiver_casts(
+                &mut body,
+                pool,
+                pc,
+                &caller_params,
+                acc.contains(MethodAccessFlags::STATIC),
+            );
             strip_erasure_casts_generic_ret(&mut body, msig.as_ref(), pool);
             witness_generic_returns(&mut body, msig.as_ref(), pool, pc);
             push_witness_into_branches(&mut body, msig.as_ref(), pool, pc);
@@ -9948,22 +9954,41 @@ fn upgrade_raw_receiver_casts(
     pool: &ClassPool,
     pc: &PoolClass,
     caller_params: &[jcdc_jvm::TypeParam],
+    method_static: bool,
 ) {
+    fn has_this0(p: &PoolClass) -> bool {
+        p.cf
+            .fields
+            .iter()
+            .any(|f| p.utf8(f.name_index) == Some("this$0"))
+    }
     let mut scope: Vec<String> = caller_params.iter().map(|p| p.name.clone()).collect();
-    {
-        let mut name = pc.internal_name.clone();
-        loop {
-            if let Some(cp) = pool.get(&name) {
-                for t in class_typevar_names(&cp) {
-                    if !scope.contains(&t) {
-                        scope.push(t);
-                    }
+    // Class typevars are in scope only for INSTANCE methods; OUTER-chain
+    // typevars additionally require every hop to be a non-static inner
+    // class (a static nested class cannot denote them — p11 TreeMap
+    // SubMapIterator: `(NavigableSubMap<K,V>)` with K/V from the static
+    // context — 无法从静态上下文中引用非静态类型变量 x13).
+    if !method_static {
+        for t in class_typevar_names(pc) {
+            if !scope.contains(&t) {
+                scope.push(t);
+            }
+        }
+        let mut child = pc.internal_name.clone();
+        let mut child_inner = has_this0(pc);
+        while child_inner {
+            let Some(i) = child.rfind('$') else { break };
+            if i == 0 {
+                break;
+            }
+            child.truncate(i);
+            let Some(cp) = pool.get(&child) else { break };
+            for t in class_typevar_names(&cp) {
+                if !scope.contains(&t) {
+                    scope.push(t);
                 }
             }
-            match name.rfind('$') {
-                Some(i) if i > 0 => name.truncate(i),
-                _ => break,
-            }
+            child_inner = has_this0(&cp);
         }
     }
     if scope.is_empty() {
@@ -13369,6 +13394,69 @@ fn arg_driven_call_witness(
     Some(out)
 }
 
+/// Container-cast chain witness: `(Set<X>) src.map(k -> new Impl<>(..))
+/// .collect(toSet())` — the real checkcast in bytecode pins the chain at
+/// its inferred element type (Set<Impl<..>>), an invariant mismatch
+/// against the cast (jdk26 ReferencedKeyMap.entrySet:
+/// Set<SimpleEntry<K,V>>无法转换为Set<Entry<K,V>>). The source relied on
+/// return-position inference the cast now blocks; restoring it as an
+/// explicit `.<X>map` witness target-types the lambda/diamond so the
+/// chain produces exactly the cast's parameterization (stripping the cast
+/// instead is unsafe: GathererOp.evaluate's `(Node<R>)` feeds method-ref
+/// lower bounds that die bare — 推论变量 CR 具有不兼容的上限).
+fn witness_map_under_container_cast(e: &mut Expr) {
+    let Expr::Cast { ty, e: inner } = e else { return };
+    let TypeRef::G(jcdc_jvm::GenericType::Class(cs)) = ty else { return };
+    let Some(part) = cs.parts.last() else { return };
+    if part.args.len() != 1 {
+        return;
+    }
+    let x = &part.args[0];
+    if g_has_wildcard(x) {
+        return;
+    }
+    let xs = x.to_java();
+    if xs.is_empty() || xs.contains("CAP#") {
+        return;
+    }
+    let Expr::Method { name: tname, owner: Some(_), .. } = &**inner else {
+        return;
+    };
+    if !matches!(
+        tname.as_str(),
+        "collect" | "toList" | "toUnmodifiableList" | "toUnmodifiableSet" | "findFirst" | "findAny"
+    ) {
+        return;
+    }
+    // Walk the owner chain for the element-producing map/flatMap.
+    let mut depth = 0;
+    let mut x_opt = Some(xs);
+    let mut cur: &mut Expr = inner;
+    while depth < 8 {
+        depth += 1;
+        let next: Option<&mut Expr> = match cur {
+            Expr::Method { name, type_args, args, owner, .. } => {
+                if matches!(name.as_str(), "map" | "flatMap")
+                    && type_args.is_empty()
+                    && matches!(args.first(), Some(Expr::Lambda(_)))
+                {
+                    if let Some(x) = x_opt.take() {
+                        type_args.push(x);
+                    }
+                    return;
+                }
+                owner.as_deref_mut()
+            }
+            Expr::Cast { e: x2, .. } => Some(x2),
+            _ => None,
+        };
+        match next {
+            Some(n) => cur = n,
+            None => return,
+        }
+    }
+}
+
 pub(crate) fn cast_wildcard_call_args(
     s: &mut Stmt,
     pool: &ClassPool,
@@ -13985,6 +14073,7 @@ pub(crate) fn cast_wildcard_call_args(
         }
     }
     fn fix_expr(e: &mut Expr, pool: &ClassPool, pc: &PoolClass, caller_params: &[jcdc_jvm::TypeParam]) {
+        witness_map_under_container_cast(e);
         incomparable_class_cmp(e, pool);
         // Before raw_witness_capture_call_args: type_field_reads drops
         // bytecode self-casts over freshly typed field reads, and a
