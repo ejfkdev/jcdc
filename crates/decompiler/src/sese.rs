@@ -989,6 +989,15 @@ impl<'a> Structurer<'a> {
                                 .iter()
                                 .all(|p| self.body_group.get(p) == Some(&gi))
                     });
+                    // Handler-flow-only blocks (the handler's private tail,
+                    // e.g. the synchronized monitorexit-rethrow `aload t;
+                    // athrow`) are NOT shared method tails: the is_term
+                    // exception below exists for tails the NORMAL path also
+                    // reaches (nestedTry's lost return). Copying a
+                    // handler-only pending-rethrow after the try leaks
+                    // `throw <pending>;` into the normal flow (jdk26
+                    // LambdaFormEditor.putInCache: 未报告的异常错误Throwable).
+                    let hf_after = self.handler_flow_only(gi);
                     let next = self.cfg.blocks.iter().find(|nb| {
                         let is_term = matches!(
                             self.results[nb.id].term,
@@ -996,6 +1005,7 @@ impl<'a> Structurer<'a> {
                         );
                         nb.start >= gend
                             && Some(nb.id) != absorbed_tail
+                            && !hf_after.contains(&nb.id)
                             && ctx.universe.contains(&nb.id)
                             && !stop.contains(&nb.id)
                             // A handler block is normally skipped (it belongs to

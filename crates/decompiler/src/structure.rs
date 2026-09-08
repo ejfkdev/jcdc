@@ -532,6 +532,42 @@ impl<'a> Structurer<'a> {
         }
     }
 
+    /// Blocks reachable from this group's handler entries whose EVERY
+    /// normal pred stays within handler flow: the handler's private tail
+    /// (`if (interrupted) selfInterrupt(); throw t;` — jdk11 AQS
+    /// .acquireQueued). They are NOT the post-try continuation: treating
+    /// them as one emits the handler tail as a top-level sibling after the
+    /// try (未报告的异常错误Throwable on the leaked `throw t`) and strips it
+    /// out of the handler universe. A merge with any pred from normal code
+    /// (jdk26 AlgorithmId.getName's shared return tail) is NOT handler-flow.
+    pub(crate) fn handler_flow_only(&self, gi: usize) -> HashSet<usize> {
+        let g = &self.groups[gi];
+        let mut hf: HashSet<usize> = HashSet::new();
+        let mut q: VecDeque<usize> = VecDeque::new();
+        for (h, _) in &g.handlers {
+            if let Some(hb) = self.cfg.block_at(*h) {
+                q.push_back(hb);
+            }
+        }
+        let in_body = |b: usize| matches!(self.body_group.get(&b), Some(&og) if og == gi);
+        while let Some(b) = q.pop_front() {
+            for &s in &self.cfg.blocks[b].succ {
+                if hf.contains(&s) || in_body(s) || self.handler_group.contains_key(&s) {
+                    continue;
+                }
+                if self.cfg.blocks[s]
+                    .pred
+                    .iter()
+                    .all(|p| hf.contains(p) || in_body(*p) || self.handler_group.contains_key(p))
+                {
+                    hf.insert(s);
+                    q.push_back(s);
+                }
+            }
+        }
+        hf
+    }
+
     /// First unclaimed non-handler block at or after `pc`.
     fn continuation_after(&self, pc: u16, universe: &HashSet<usize>, claimed: &HashSet<usize>) -> Option<usize> {
         self.cfg
@@ -851,8 +887,13 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
     pub fn structure_method(&mut self) -> Region {
         // From-scratch SESE/dominator-tree structurer (rewrite), gated so the
         // default path is the verified `walk` baseline.
+        let dbg_regions = std::env::var("JCDC_DBG_REGIONS").is_ok();
         if std::env::var("JCDC_SESE").is_ok() {
-            return self.structure_method_sese();
+            let r = self.structure_method_sese();
+            if dbg_regions {
+                eprintln!("REGIONS_SESE {:#?}", r);
+            }
+            return r;
         }
         let universe: HashSet<usize> = self
             .cfg
@@ -1024,12 +1065,14 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                 let try_region = self.structure_try(gi, universe, &outer_universe, claimed);
                 parts.push(try_region);
                 let gend = self.groups[gi].end;
+                let hf_next = self.handler_flow_only(gi);
                 let next = self.cfg.blocks.iter().find(|nb| {
                     nb.start >= gend
                         && universe.contains(&nb.id)
                         && !stop.contains(&nb.id)
                         && !claimed.contains(&nb.id)
                         && !self.is_handler(nb.id)
+                        && !hf_next.contains(&nb.id)
                 });
                 match next {
                     Some(nb) => {
@@ -2627,7 +2670,9 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                 let mut r = self.walk(entry, &body_universe, &HashSet::new(), &nested, claimed, false);
                 // Flow leaving the try body to the post-try continuation is
                 // natural fallthrough (the outer walk picks it up there).
-                let cont = self.continuation_after(g.end, outer_universe, claimed);
+                let cont = self
+                    .continuation_after(g.end, outer_universe, claimed)
+                    .filter(|c| !self.handler_flow_only(gi).contains(c));
                 if std::env::var("JCDC_DBG_IF").is_ok() {
                     eprintln!("try gi={} cont={:?} universe_has_blocks_after_end={}", gi, cont,
                         universe.iter().filter(|b| self.cfg.blocks[**b].start >= g.end).count());
@@ -2702,11 +2747,13 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             // surrounding flow is the post-try merge -- the handler reaches
             // it only by jumping out, which strip_handler_exit_goto already
             // renders as the natural fallthrough.
+            let hf = self.handler_flow_only(gi);
             let shared_merge: Vec<usize> = huniverse
                 .iter()
                 .copied()
                 .filter(|b| {
                     *b != *hb
+                        && !hf.contains(b)
                         && !claimed.contains(b)
                         && self.body_group.get(b) != Some(&gi)
                         && self.handler_group.get(b) != Some(&gi)
@@ -2719,11 +2766,22 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                 .collect();
             if !shared_merge.is_empty() {
                 let tail = reachable_within(self.cfg, shared_merge[0], &HashSet::new());
-                huniverse.retain(|b| !tail.contains(b) || *b == *hb);
+                huniverse.retain(|b| !tail.contains(b) || *b == *hb || hf.contains(b));
             }
+            // The cont-tail exclusion must not fire when the block at the
+            // span end IS the handler flow (javac excludes the body's
+            // trailing return from the span, so the handler entry sits AT
+            // g.end: jdk11 AQS.acquireQueued span (2,57) merged from
+            // (2,37)+(38,57), handler at 57). Excluding reachable(handler)
+            // there strips the handler's OWN tail (`selfInterrupt();
+            // throw t;`) out of its universe -- the catch loses it and the
+            // outer continuation emits it as a top-level sibling
+            // (未报告的异常错误Throwable).
             if let Some(cont) = self.cfg.block_at(g.end) {
-                let tail = reachable_within(self.cfg, cont, &HashSet::new());
-                huniverse.retain(|b| !tail.contains(b));
+                if !self.handler_group.contains_key(&cont) && !hf.contains(&cont) {
+                    let tail = reachable_within(self.cfg, cont, &HashSet::new());
+                    huniverse.retain(|b| !tail.contains(b) || hf.contains(b));
+                }
             }
             huniverse.insert(*hb);
             // Exception groups nested inside the handler region (e.g. a
