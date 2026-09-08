@@ -6821,13 +6821,22 @@ fn render_captures(
             }
             CAPTURE_GENERIC_TYPES.with(|m| {
                 let mut m = m.borrow_mut();
-                match m.get(&text) {
-                    Some(g) if matches!(g, TypeRef::G(_)) => ty = g.clone(),
-                    _ => {
-                        if matches!(ty, TypeRef::G(_)) {
-                            m.insert(text.clone(), ty.clone());
+                // A Local capture's OWN declared type wins: the registry is
+                // keyed by rendered TEXT, and sibling methods' same-named
+                // locals collide (jdk26 ReferencePipeline: map's `mapper`
+                // (Function) poisoned mapMulti's `mapper` (BiConsumer) —
+                // the nested $11$1 inherited Function, accept's formals
+                // never resolved, `(Consumer<R>) downstream` was lost).
+                // Consult the registry only to UPGRADE an erased type.
+                if !matches!(ty, TypeRef::G(_)) {
+                    if let Some(g) = m.get(&text) {
+                        if matches!(g, TypeRef::G(_)) {
+                            ty = g.clone();
                         }
                     }
+                }
+                if matches!(ty, TypeRef::G(_)) {
+                    m.insert(text.clone(), ty.clone());
                 }
             });
             // Register the recovered type for the NEW anon class's own
