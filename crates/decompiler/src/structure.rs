@@ -1011,7 +1011,18 @@ pub(crate) fn region_terminates_ex(
             results[*block].term,
             crate::builder::Term::Return(_) | crate::builder::Term::Throw(_)
         ),
-        Region::Goto { target } => handler_exits.contains(target),
+        // A Goto into a handler exit counts (see fn doc); so does a Goto
+        // whose TARGET is a shared return/throw terminator — conversion
+        // inlines those at the arrival site (term copy), so the flow is
+        // abrupt here too (TempFileHelper.create's SE catch
+        // `if (dir != tmpdir) <goto throw-e>; ...`).
+        Region::Goto { target } => {
+            handler_exits.contains(target)
+                || matches!(
+                    results[*target].term,
+                    crate::builder::Term::Return(_) | crate::builder::Term::Throw(_)
+                )
+        }
         Region::Seq(v) => v
             .last()
             .map(|x| region_terminates_ex(x, results, handler_exits))
@@ -1019,6 +1030,24 @@ pub(crate) fn region_terminates_ex(
         Region::If { then_r, else_r, .. } => {
             region_terminates_ex(then_r, results, handler_exits)
                 && region_terminates_ex(else_r, results, handler_exits)
+        }
+        // A try completes abruptly when its body does and every catch
+        // does (no finally — with one, the finally's completion governs;
+        // stay conservative). This is exact for region trees: a Goto
+        // part names its block's terminal edge, and an If part is
+        // abrupt only when BOTH branches are (jdk11/17
+        // TempFileHelper.create: the for(;;) retry body =
+        // try(generatePath){both IPE arms throw} + try(create){4 abrupt
+        // catch arms + if/else of two areturns} — the old `_ => false`
+        // made body_done miss it, the bottom-tested natural_follow
+        // fallback named the IN-TRY areturns as the loop's follow, and
+        // the top chain re-emitted `return Files.createDirectory(..)`
+        // after the non-completing loop — 无法访问的语句 x2 trees).
+        Region::Try { body, catches, .. } => {
+            region_terminates_ex(body, results, handler_exits)
+                && catches.iter().all(|(_, _, c)| {
+                    region_terminates_ex(c, results, handler_exits)
+                })
         }
         _ => false,
     }

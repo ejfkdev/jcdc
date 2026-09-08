@@ -1313,31 +1313,65 @@ impl<'a> Structurer<'a> {
                 // Mirrors conv's break resolutions: a Goto to a loop exit
                 // or to any block that cannot reach back to the header
                 // converts to `break` — the loop is escapable.
-                fn region_has_break_goto(r: &Region, s: &Structurer, header: usize, exits: &[usize]) -> bool {
+                fn region_has_break_goto(
+                    r: &Region,
+                    s: &Structurer,
+                    header: usize,
+                    exits: &[usize],
+                    members: &HashSet<usize>,
+                ) -> bool {
                     let esc = |t: usize| {
-                        t != header
-                            && (exits.contains(&t)
-                                || !crate::structure::can_reach_cfg(s.cfg, t, header, 4096))
+                        if t == header || exits.contains(&t) {
+                            return t != header;
+                        }
+                        // A jump onto another MEMBER is an internal
+                        // landing (an inner construct's break/merge whose
+                        // statements render mid-body — TempFileHelper
+                        // .create's inner generatePath loop exit
+                        // `goto 28`); it never leaves THIS loop, so it
+                        // cannot make the loop completable.
+                        if members.contains(&t) {
+                            return false;
+                        }
+                        // A forward escape onto a shared return/throw
+                        // terminator is NOT a break: conversion inlines
+                        // the terminator at the arrival (if-follow inline
+                        // or RawGoto term-copy), so the path completes
+                        // abruptly right here (TempFileHelper.create's SE
+                        // catch `if (dir != tmpdir) <goto throw-e>` — the
+                        // old esc made body_done miss the non-completing
+                        // for(;;) and the chain re-emitted an in-try
+                        // areturn after the loop — 无法访问的语句 x2).
+                        !matches!(
+                            s.results[t].term,
+                            crate::builder::Term::Return(_) | crate::builder::Term::Throw(_)
+                        ) && !crate::structure::can_reach_cfg(s.cfg, t, header, 4096)
                     };
                     match r {
                         Region::Goto { target } => esc(*target),
-                        Region::Seq(v) => v.iter().any(|x| region_has_break_goto(x, s, header, exits)),
+                        Region::Seq(v) => v
+                            .iter()
+                            .any(|x| region_has_break_goto(x, s, header, exits, members)),
                         Region::If { then_r, else_r, .. } => {
-                            region_has_break_goto(then_r, s, header, exits)
-                                || region_has_break_goto(else_r, s, header, exits)
+                            region_has_break_goto(then_r, s, header, exits, members)
+                                || region_has_break_goto(else_r, s, header, exits, members)
                         }
-                        Region::Loop { body, .. } => region_has_break_goto(body, s, header, exits),
+                        Region::Loop { body, .. } => {
+                            region_has_break_goto(body, s, header, exits, members)
+                        }
                         Region::Try { body, catches, .. } => {
-                            region_has_break_goto(body, s, header, exits)
-                                || catches
-                                    .iter()
-                                    .any(|(_, _, cr)| region_has_break_goto(cr, s, header, exits))
+                            region_has_break_goto(body, s, header, exits, members)
+                                || catches.iter().any(|(_, _, cr)| {
+                                    region_has_break_goto(cr, s, header, exits, members)
+                                })
                         }
                         Region::Switch { cases, default, .. } => {
-                            cases.iter().any(|(_, cr)| region_has_break_goto(cr, s, header, exits))
+                            cases
+                                .iter()
+                                .any(|(_, cr)| region_has_break_goto(cr, s, header, exits, members))
                                 || default
                                     .as_ref()
-                                    .map(|d| region_has_break_goto(d, s, header, exits))
+                                    .map(|d| region_has_break_goto(d, s, header, exits, members))
                                     .unwrap_or(false)
                         }
                         _ => false,
@@ -1354,8 +1388,56 @@ impl<'a> Structurer<'a> {
                 // escapes — suppressing natural_follow there stranded the
                 // return-true tail after the loop (缺少返回语句, jdk11/17
                 // ThreadPoolExecutor.awaitTermination).
-                let body_done = region_terminates_ex(&body, self.results, &handler_exits)
-                    && !region_has_break_goto(&body, self, header, &exits);
+                // Loop-aware completion: a Goto back to the header is a
+                // `continue` — abrupt, and it never lands past the loop —
+                // so it counts as terminating HERE (the FAE retry catch of
+                // TempFileHelper.create's for(;;); region_terminates_ex
+                // cannot know the header).
+                fn region_done_or_continues(
+                    r: &Region,
+                    s: &Structurer,
+                    handler_exits: &[usize],
+                    header: usize,
+                ) -> bool {
+                    match r {
+                        Region::Goto { target } => {
+                            *target == header
+                                || crate::structure::region_terminates_ex(
+                                    r,
+                                    s.results,
+                                    handler_exits,
+                                )
+                        }
+                        Region::Seq(v) => v
+                            .last()
+                            .map(|x| region_done_or_continues(x, s, handler_exits, header))
+                            .unwrap_or(false),
+                        Region::If { then_r, else_r, .. } => {
+                            region_done_or_continues(then_r, s, handler_exits, header)
+                                && region_done_or_continues(else_r, s, handler_exits, header)
+                        }
+                        Region::Try { body, catches, .. } => {
+                            region_done_or_continues(body, s, handler_exits, header)
+                                && catches.iter().all(|(_, _, c)| {
+                                    region_done_or_continues(c, s, handler_exits, header)
+                                })
+                        }
+                        other => crate::structure::region_terminates_ex(
+                            other,
+                            s.results,
+                            handler_exits,
+                        ),
+                    }
+                }
+                let body_done = region_done_or_continues(&body, self, &handler_exits, header)
+                    && !region_has_break_goto(&body, self, header, &exits, &members);
+                if std::env::var("JCDC_DBG_SESE").is_ok() {
+                    eprintln!("BODYDONE header={} done={} term={} brk={} exits={:?} body={:#?}",
+                        header, body_done,
+                        region_done_or_continues(&body, self, &handler_exits, header),
+                        region_has_break_goto(&body, self, header, &exits, &members),
+                        exits, body);
+                }
                 if is_header {
                     ctx.loop_headers.insert(header);
                 }
@@ -1462,10 +1544,18 @@ impl<'a> Structurer<'a> {
                     // Goto. Gating on !consumed silently dropped the else
                     // path's return (missing-return compile error; walk
                     // keeps the tail).
-                    Some(f) if !stop.contains(&f) && reach.contains(&f) => Some(f),
+                    //
+                    // body_done vetoes: the loop cannot complete normally,
+                    // so NO continuation is reachable — including the
+                    // bottom-tested fallback's in-try areturn exits (the
+                    // shared terminator CopyStmts policy re-emitted
+                    // `return Files.createDirectory(..)` after the
+                    // non-completing for(;;) — TempFileHelper.create
+                    // 无法访问的语句 x2 trees).
+                    Some(f) if !body_done && !stop.contains(&f) && reach.contains(&f) => Some(f),
                     _ => None,
                 };
-                let follow_pick = follow_pick.or_else(|| {
+                let follow_pick = if body_done { None } else { follow_pick.or_else(|| {
                     // Stranded break landing: an exit some in-body
                     // `break L` targeted but neither the body nor any
                     // follow consumed (a guarded-pattern case body sits
@@ -1523,7 +1613,7 @@ impl<'a> Structurer<'a> {
                         .collect();
                     cands.sort_by_key(|e| self.cfg.blocks[*e].start);
                     cands.first().copied()
-                });
+                }) };
                 match follow_pick {
                     Some(f) => {
                         cur = f;
