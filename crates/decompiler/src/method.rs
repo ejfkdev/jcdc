@@ -2068,6 +2068,79 @@ fn switch_terminates_with(
             Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => {
                 last_falls_through(body)
             }
+            // A nested switch falls through to the next outer case ONLY
+            // when it can complete normally. Consulting it matters: a
+            // group whose every case ends in `break OUTER_LABEL`/throw
+            // never completes (jdk26 BytecodeHelpers.convertOpcode: the
+            // from-switch cases each hold a to-switch whose cases are
+            // `stack0 = Opcode.X; break L1;` + throwing default — the
+            // blind `true` made every outer case inherit the terminating
+            // default, the outer switch read as abrupt, and
+            // prune_unreachable deleted the merge `return stack0;` —
+            // 缺少返回语句).
+            Stmt::Switch { cases, default, .. } => {
+                // Does this nested switch complete normally? Group i does
+                // when it holds a PLAIN `break` (exits the switch), or its
+                // last statement is not abrupt (return/throw/break/
+                // continue — a LABELED break exits an OUTER construct, not
+                // this switch) and group i+1 completes normally.
+                fn has_plain_break(s: &Stmt) -> bool {
+                    match s {
+                        Stmt::Break(None) => true,
+                        Stmt::Block(v) => v.iter().any(has_plain_break),
+                        Stmt::If { then_stmt, else_stmt, .. } => {
+                            has_plain_break(then_stmt)
+                                || else_stmt.as_deref().map(has_plain_break).unwrap_or(false)
+                        }
+                        Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => {
+                            has_plain_break(body)
+                        }
+                        Stmt::Try { body, catches, .. } => {
+                            has_plain_break(body)
+                                || catches.iter().any(|c| has_plain_break(&c.body))
+                        }
+                        // Breaks inside loops or nested switches belong to
+                        // those constructs (labeled escapes are abrupt for
+                        // this switch but reach their own target, not the
+                        // switch end).
+                        _ => false,
+                    }
+                }
+                fn completes_normally(s: &Stmt) -> bool {
+                    match s {
+                        Stmt::Switch { cases, default, .. } => {
+                            let n = cases.len();
+                            let mut c = vec![false; n + 1];
+                            c[n] = default
+                                .as_deref()
+                                .map(|d| {
+                                    has_plain_break(d)
+                                        || (!stmt_terminates_with(d, false) && true)
+                                })
+                                .unwrap_or(true);
+                            for i in (0..n).rev() {
+                                let body = &cases[i].body;
+                                c[i] = match body.last() {
+                                    None => c[i + 1],
+                                    Some(l) => {
+                                        has_plain_break(l)
+                                            || (!stmt_terminates_with(l, false) && c[i + 1])
+                                    }
+                                };
+                            }
+                            c.iter().take(n + 1).any(|&x| x)
+                        }
+                        other => {
+                            has_plain_break(other) || !stmt_terminates_with(other, false)
+                        }
+                    }
+                }
+                completes_normally(s)
+            }
+            Stmt::Try { body, catches, .. } => {
+                last_falls_through(body)
+                    || catches.iter().any(|c| last_falls_through(&c.body))
+            }
             _ => true,
         }
     }
