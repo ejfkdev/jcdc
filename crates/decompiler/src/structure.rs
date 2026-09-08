@@ -626,6 +626,19 @@ pub struct Structurer<'a> {
     /// follow makes conversion resolve the case-tail goto to a bare
     /// `break` that binds to the WRONG (inner) switch.
     pub switch_depth: usize,
+    /// Innermost switch case-arm walk context: (case head block, that
+    /// switch's region follow, selector is a Java 21+ typeSwitch pattern
+    /// switch). A nested switch whose stop-confluence equals the ENCLOSING
+    /// pattern switch's follow may keep the plain-break binding when it is
+    /// the LAST construct of the case arm AND the arm walk is the case-arm
+    /// walk itself: the pattern-switch restoration appends the case's
+    /// terminal `break;`, which lands on the outer follow == the
+    /// confluence, so both bindings are equivalent and the plain one keeps
+    /// the appended outer break reachable (ClassPrinterImpl.toYaml/toXml).
+    /// Classic switches get NO appended break (case fall-through) — the
+    /// crossing nulling must stay for them (bkeyword's inner default
+    /// `return '?'` must not degrade to `break` + fall-through).
+    pub case_arm_ctx: Vec<(usize, Option<usize>, bool)>,
     /// Loop headers detected at the SESE method level (including
     /// exception-edge back edges from no-normal-pred retry handlers).
     /// Walk-based sub-builders consult this so a retry `goto header`
@@ -1036,6 +1049,43 @@ fn strip_fallthrough_goto(r: Region, heads: &HashSet<usize>) -> Region {
     }
 }
 
+/// Debug helper: first block id a region starts at (usize::MAX if none).
+fn region_head_block(r: &Region) -> usize {
+    match r {
+        Region::Basic { block } => *block,
+        Region::Seq(v) => v.first().map(region_head_block).unwrap_or(usize::MAX),
+        Region::If { block, .. } => *block,
+        Region::Loop { header, .. } => *header,
+        Region::Switch { block, .. } => *block,
+        _ => usize::MAX,
+    }
+}
+
+/// Debug helper: compact variant shape of a region for traces.
+fn region_shape(r: &Region) -> String {
+    match r {
+        Region::Basic { block } => format!("Basic({})", block),
+        Region::Seq(v) => format!(
+            "Seq{}[{}]",
+            v.len(),
+            v.iter().map(region_shape).collect::<Vec<_>>().join(",")
+        ),
+        Region::If { block, .. } => format!("If({})", block),
+        Region::Loop { header, exits, .. } => format!("Loop({} exits={:?})", header, exits),
+        Region::Switch { block, cases, default, .. } => format!(
+            "Switch({} cases={} def={})",
+            block,
+            cases.len(),
+            default.is_some()
+        ),
+        Region::Goto { target } => format!("Goto({})", target),
+        Region::Empty => "Empty".to_string(),
+        Region::Try { group_idx, .. } => format!("Try(g{})", group_idx),
+        Region::CopyStmts { block } => format!("Copy({})", block),
+        _ => "?".to_string(),
+    }
+}
+
 impl<'a> Structurer<'a> {
     pub fn new(cfg: &'a Cfg, results: &'a Vec<BlockResult>) -> Structurer<'a> {
         Self::with_diamonds(cfg, results, Default::default(), Default::default())
@@ -1073,7 +1123,7 @@ impl<'a> Structurer<'a> {
         for (&merge, (root, _vis)) in &fold_regions {
             fold_root_to_merge.insert(*root, merge);
         }
-        Structurer { cfg, results, groups, body_group, handler_group, diamond_merges, fold_regions, fold_root_to_merge, copied_tails: HashSet::new(), loops_stack: Vec::new(), switch_depth: 0, sese_loop_headers: std::collections::HashSet::new(), sese_exc_retry_headers: std::collections::HashSet::new(), walk_depth: 0, final_fields: HashSet::new(), structuring_groups: std::cell::RefCell::new(Vec::new()) }
+        Structurer { cfg, results, groups, body_group, handler_group, diamond_merges, fold_regions, fold_root_to_merge, copied_tails: HashSet::new(), loops_stack: Vec::new(), switch_depth: 0, case_arm_ctx: Vec::new(), sese_loop_headers: std::collections::HashSet::new(), sese_exc_retry_headers: std::collections::HashSet::new(), walk_depth: 0, final_fields: HashSet::new(), structuring_groups: std::cell::RefCell::new(Vec::new()) }
     }
 
     /// Immediate post-dominator of `entry` within `universe`. Delegates to the
@@ -2261,12 +2311,65 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                     // labeled-break logic binds it to the outer switch
                     // (`break L1`); the confluence still bounds the case
                     // walks via `stop`. Calendar (depth 0) keeps Some(f).
-                    let region_follow = match follow {
-                        Some(f) if stop.contains(&f) && self.switch_depth > 0 => None,
-                        other => other,
+                    // EXCEPTION — when every route past the built switch
+                    // lands on the confluence anyway (the switch is the
+                    // last construct of an abruptly-completing outer case
+                    // arm), the plain inner-break binding is equivalent
+                    // AND renderable: the labeled one makes the inner
+                    // switch non-completing and the outer case's appended
+                    // `break;` unreachable (ClassPrinterImpl.toYaml/toXml
+                    // 无法访问的语句 x2 trees). Rebuild with the follow.
+                    let crossing = match follow {
+                        Some(f) if stop.contains(&f) && self.switch_depth > 0 => Some(f),
+                        _ => None,
+                    };
+                    let region_follow = match crossing {
+                        Some(_) => None,
+                        None => follow,
                     };
                     self.switch_depth += 1;
-                    let sw = self.structure_switch(cur, selector, &targets, universe, stop, region_follow, active, claimed);
+                    let claimed_save = claimed.clone();
+                    let mut sw = self.structure_switch(cur, selector.clone(), &targets, universe, stop, region_follow, active, claimed);
+                    if let Some(f) = crossing {
+                        // What this scope does RIGHT AFTER the switch must
+                        // already land on `f`: either the scope's earlier
+                        // parts complete abruptly (nothing can fall through
+                        // the switch), or the walk's own next-step rule
+                        // continues exactly at `f` (an in-universe follow).
+                        // Anything else means the bare-break binding drops
+                        // flow into the enclosing continuation, re-running
+                        // code the bytecode skipped (bappend's outer tail,
+                        // bkeyword's case fall-through losing `return '?'`).
+                        let cont_dead = parts
+                            .last()
+                            .map(|p| region_terminates(p, self.results))
+                            .unwrap_or(false);
+                        let cont_is_f = universe.contains(&f)
+                            && !stop.contains(&f)
+                            && !claimed_save.contains(&f);
+                        // This walk IS a pattern-switch case arm and the
+                        // confluence is that switch's follow: the arm
+                        // renderer appends the case's terminal `break;`
+                        // (restore_one_switch), landing on the outer
+                        // follow == f — the plain-break binding is
+                        // equivalent and keeps the appended break
+                        // reachable (ClassPrinterImpl.toYaml/toXml).
+                        let cont_via_case_break = self
+                            .case_arm_ctx
+                            .last()
+                            .map(|&(head, ef, pat)| head == entry && pat && ef == Some(f))
+                            .unwrap_or(false);
+                        let bindable = (cont_dead || cont_is_f || cont_via_case_break)
+                            && self.switch_follow_bindable(&sw, cur, &targets, f);
+                        if std::env::var("JCDC_DBG_SWF").is_ok() {
+                            eprintln!("SWBIND cur={} f={} cont_dead={} cont_is_f={} cont_case={} bindable={}",
+                                cur, f, cont_dead, cont_is_f, cont_via_case_break, bindable);
+                        }
+                        if bindable {
+                            *claimed = claimed_save;
+                            sw = self.structure_switch(cur, selector, &targets, universe, stop, Some(f), active, claimed);
+                        }
+                    }
                     self.switch_depth -= 1;
                     parts.push(sw);
                     match follow {
@@ -2563,6 +2666,108 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             }
         }
         if saw_live { common } else { None }
+    }
+
+    /// For a NESTED switch whose confluence `f` is a stop block owned by
+    /// an enclosing construct (the CROSSING shape), decide whether `f` may
+    /// still be passed as the switch's OWN follow (case arms then resolve
+    /// to plain `break`s) or must be nulled (labeled breaks bind the
+    /// enclosing switch). The plain-break binding is safe ONLY when every
+    /// way flow could naturally continue past this switch inside the
+    /// enclosing region lands on `f` anyway: otherwise a case the bytecode
+    /// sends straight to `f` would fall out of the switch into that
+    /// continuation and re-execute code the bytecode skipped (jdk26 xml
+    /// impl.Parser.bappend: the inner switch(ch)'s cases break to the
+    /// OUTER switch(mode)'s follow, jumping over the outer case's tail —
+    /// nulling keeps `break L1`). When the switch is the LAST construct of
+    /// an abruptly-completing case arm both bindings land at `f` and the
+    /// plain inner break is the renderable one — binding the outer label
+    /// makes the inner switch unable to complete normally and the
+    /// pattern-switch restoration's appended outer-case `break;` becomes
+    /// unreachable (jdk26 ClassPrinterImpl.toYaml/toXml: the MapNode/List
+    /// inner ordinal switches have NO default stub — every arm `goto`s the
+    /// shared return directly — so the inner switch rendered `default:
+    /// break L1` + outer case `break;` — 无法访问的语句 x2 trees).
+    pub(crate) fn switch_follow_bindable(
+        &self,
+        sw: &Region,
+        block: usize,
+        targets: &SwitchTargets,
+        f: usize,
+    ) -> bool {
+        let (cases, default) = match sw {
+            Region::Switch { cases, default, .. } => (cases, default.as_deref()),
+            _ => return false,
+        };
+        let last = self.cfg.blocks[block].ins.last();
+        let default_pc = match (targets, last.and_then(|i| i.switch_data.as_deref())) {
+            (SwitchTargets::Table { .. }, Some(jcdc_classfile::SwitchData::Table { default, .. })) => *default,
+            (SwitchTargets::Lookup { .. }, Some(jcdc_classfile::SwitchData::Lookup { default, .. })) => *default,
+            _ => return false,
+        };
+        // The default route: the rendered default region must itself bind
+        // to `f`. `default_pc == f` is NOT automatically bindable: with
+        // the follow passed, structure_switch filters the default region
+        // away and unmatched-selector flow falls out of the switch into
+        // the ENCLOSING continuation (bkeyword's outer case then fell
+        // through into the next case, dropping the shared `return '?'`).
+        let default_ok = match default {
+            Some(d) => self.arm_binds_to(d, f),
+            None => false,
+        };
+        // Case arms in emission order. An Empty group is a fallthrough
+        // label: its route is the NEXT group's (checked in its own
+        // iteration), or the default's when it is the last group.
+        let n = cases.len();
+        let cases_ok = cases.iter().enumerate().all(|(i, (_, r))| {
+            if matches!(r, Region::Empty) {
+                return i + 1 < n || default_ok;
+            }
+            let ok = self.arm_binds_to(r, f);
+            if std::env::var("JCDC_DBG_SWF").is_ok() {
+                eprintln!("SWBIND-CASE i={} block={} f={} ok={} region={:?}", i,
+                    region_head_block(r), f, ok, region_shape(r));
+            }
+            ok
+        });
+        if std::env::var("JCDC_DBG_SWF").is_ok() {
+            eprintln!("SWBIND-DEF block={} default_pc={} f={} default_ok={} cases_ok={}",
+                block, default_pc, f, default_ok, cases_ok);
+        }
+        default_ok && cases_ok
+    }
+
+    /// Every completion path of this arm region lands on `f`: a trailing
+    /// goto to it, a block whose terminal edge is that goto, an if whose
+    /// both branches bind, a loop whose every exit IS `f`, or a nested
+    /// switch that is itself bindable.
+    fn arm_binds_to(&self, r: &Region, f: usize) -> bool {
+        match r {
+            Region::Basic { .. } => true,
+            Region::Goto { target } => *target == f,
+            Region::Empty => false,
+            Region::Seq(v) => v
+                .last()
+                .map(|x| self.arm_binds_to(x, f))
+                .unwrap_or(false),
+            Region::If { then_r, else_r, .. } => {
+                self.arm_binds_to(then_r, f) && self.arm_binds_to(else_r, f)
+            }
+            // The loop arm binds when ALL its exits are `f`: loop
+            // completion falls out of the switch (follow == `f`) and any
+            // in-body break targets an exit == `f` (ClassPrinterImpl's
+            // BLOCK-case iterator loop exits straight to the shared
+            // return — no default stub).
+            Region::Loop { exits, .. } => !exits.is_empty() && exits.iter().all(|&e| e == f),
+            Region::Switch { block, .. } => {
+                if let Term::Switch { targets, .. } = &self.results[*block].term {
+                    self.switch_follow_bindable(r, *block, targets, f)
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
     }
 
     /// True when `cur` flows through single-successor blocks to an
@@ -3580,6 +3785,11 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         }
 
         let mut cases = Vec::new();
+        // Java 21+ pattern switch: the restoration pass re-appends each
+        // labelled case's terminal `break;` — a case arm ending at a
+        // nested switch lands on THIS switch's follow (see case_arm_ctx).
+        let is_pattern = matches!(&selector, Expr::Invokedynamic { name, args, .. }
+            if name == "typeSwitch" && !args.is_empty());
         for (vals, b, is_follow) in case_groups {
             if is_follow {
                 // Empty case that breaks out to the confluence.
@@ -3609,7 +3819,9 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             let mut cstop = case_stop.clone();
             cstop.remove(&b);
             let sub = self.sub_scope(b, universe, &cstop, claimed);
+            self.case_arm_ctx.push((b, follow, is_pattern));
             let r = self.walk(b, &sub, &cstop, active, claimed, false);
+            self.case_arm_ctx.pop();
             cases.push((vals, strip_fallthrough_goto(r, &head_set)));
         }
         let default = default_block.map(|d| {
@@ -3626,7 +3838,9 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             let mut cstop = case_stop.clone();
             cstop.remove(&d);
             let sub = reachable_within(self.cfg, d, &cstop);
+            self.case_arm_ctx.push((d, follow, is_pattern));
             let r = self.walk(d, &sub, &cstop, active, claimed, false);
+            self.case_arm_ctx.pop();
             Box::new(strip_fallthrough_goto(r, &head_set))
         });
         Region::Switch { block, selector, cases, default, follow }

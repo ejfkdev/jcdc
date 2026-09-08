@@ -1725,15 +1725,24 @@ impl<'a> Structurer<'a> {
                     // follow stays None so conversion binds the case-tail
                     // goto to the OWNER (labeled break), while `stop`
                     // still bounds the case walks at the confluence.
-                    let region_follow = match follow {
-                        Some(f) if stop.contains(&f) && self.switch_depth > 0 => None,
-                        other => other,
+                    // Bindable exception (see switch_follow_bindable):
+                    // when every route past the switch lands on the
+                    // confluence anyway, rebuild with the follow so the
+                    // arms get plain breaks (ClassPrinterImpl.toYaml/toXml
+                    // 无法访问的语句 x2 trees).
+                    let crossing = match follow {
+                        Some(f) if stop.contains(&f) && self.switch_depth > 0 => Some(f),
+                        _ => None,
+                    };
+                    let region_follow = match crossing {
+                        Some(_) => None,
+                        None => follow,
                     };
                     let mut claimed = ctx.consumed.clone();
                     self.switch_depth += 1;
-                    let sw = self.structure_switch(
+                    let mut sw = self.structure_switch(
                         cur,
-                        selector,
+                        selector.clone(),
                         &targets,
                         &ctx.universe,
                         stop,
@@ -1741,6 +1750,42 @@ impl<'a> Structurer<'a> {
                         &ctx.top_groups,
                         &mut claimed,
                     );
+                    if let Some(f) = crossing {
+                        // See the walk-side twin: the post-switch
+                        // continuation of THIS scope must already land on
+                        // `f` (earlier parts abruptly complete, or the
+                        // chain continues exactly at `f`).
+                        let cont_dead = parts
+                            .last()
+                            .map(|p| crate::structure::region_terminates(p, self.results))
+                            .unwrap_or(false);
+                        let cont_is_f = reach.contains(&f);
+                        let cont_via_case_break = self
+                            .case_arm_ctx
+                            .last()
+                            .map(|&(head, ef, pat)| head == entry && pat && ef == Some(f))
+                            .unwrap_or(false);
+                        let bindable = (cont_dead || cont_is_f || cont_via_case_break)
+                            && self.switch_follow_bindable(&sw, cur, &targets, f);
+                        if std::env::var("JCDC_DBG_SWF").is_ok() {
+                            eprintln!("SWBIND-SESE cur={} f={} cont_dead={} cont_is_f={} cont_case={} bindable={}",
+                                cur, f, cont_dead, cont_is_f, cont_via_case_break, bindable);
+                        }
+                        if bindable {
+                            let mut claimed2 = ctx.consumed.clone();
+                            sw = self.structure_switch(
+                                cur,
+                                selector,
+                                &targets,
+                                &ctx.universe,
+                                stop,
+                                Some(f),
+                                &ctx.top_groups,
+                                &mut claimed2,
+                            );
+                            claimed = claimed2;
+                        }
+                    }
                     self.switch_depth -= 1;
                     ctx.consumed = claimed;
                     parts.push(sw);
