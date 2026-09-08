@@ -741,6 +741,20 @@ impl<'a> Converter<'a> {
                 // The body walk re-emitted the header's own If region; unwrap
                 // it so the loop reads `while (C) { else-part }`.
                 let (inner, exit_stmts) = split_leading_if(&body_stmt, &cond);
+                // A top test the structurer wrapped in a TRY (the header
+                // block sits inside its handler's protected range — jdk26
+                // Bits.reserveMemory's backoff retry loop tests
+                // tryReserveOrClean(..) throws InterruptedException under
+                // its own catch(IE) retry handler): rotating the test into
+                // `while (C)` evaluates the call OUTSIDE every handler —
+                // 未报告的异常错误InterruptedException. split_leading_if
+                // deliberately cannot reach through the Try (the rotated
+                // cond would still be unprotected), so keep the test where
+                // the bytecode has it and stay on while(true). The earlier
+                // implCloseSelectableChannel guard (raw-stmt bodies losing
+                // the leading If's statements) does not apply: the If lives
+                // intact inside the Try.
+
                 if std::env::var("JCDC_DBG_LOOP").is_ok() {
                     eprintln!(
                         "CLASSIFY header={} taken_is_exit={} exit_stmts={}",
@@ -755,7 +769,10 @@ impl<'a> Converter<'a> {
                     || matches!(exit_stmts.as_slice(), [Stmt::Break(_)])
                     || matches!(exit_stmts.as_slice(), [Stmt::Block(b)] if b.is_empty());
                 if taken_is_exit && plain_exit {
-                    Stmt::While { cond: while_cond, body: Box::new(inner) }
+                    match try_protected_dowhile(inner, &cond) {
+                        Ok(dw) => dw,
+                        Err(inner) => Stmt::While { cond: while_cond, body: Box::new(inner) },
+                    }
                 } else if taken_is_exit {
                     // Exit branch runs statements before leaving:
                     // while (true) { if (C_exit) { stmts; break; } body }
@@ -788,7 +805,10 @@ impl<'a> Converter<'a> {
                         || matches!(exit_stmts.as_slice(), [Stmt::Block(b)] if b.is_empty())
                     {
                         // then-side was the exit scaffolding; body is `inner`
-                        Stmt::While { cond: while_cond, body: Box::new(inner) }
+                        match try_protected_dowhile(inner, &cond) {
+                            Ok(dw) => dw,
+                            Err(inner) => Stmt::While { cond: while_cond, body: Box::new(inner) },
+                        }
                     } else {
                         // then-side carries the body ending with the back
                         // edge; fallthrough exits.
@@ -905,6 +925,61 @@ fn stmts_to_stmt(v: Vec<Stmt>) -> Stmt {
         0 => Stmt::Block(vec![]),
         1 => v.into_iter().next().unwrap(),
         _ => Stmt::Block(v),
+    }
+}
+
+/// When the loop's top test lives inside a Try in `inner` (the header
+/// block sits in its handler's protected range — jdk26
+/// Bits.reserveMemory's backoff retry loop tests
+/// `tryReserveOrClean(..) throws InterruptedException` under its own
+/// catch(IE) handler), the `while (C)` rotation would evaluate C
+/// OUTSIDE every handler — 未报告的异常错误InterruptedException.
+/// Rewrite as a do-while instead: inject `break` into the embedded
+/// If's EMPTY arm (the exit side — the exit blocks live outside the
+/// loop region as its continuation siblings, so the empty arm is the
+/// fall-out) and loop unconditionally. The sibling tail then stays
+/// reachable as the do-while's natural completion. Returns None when
+/// the test is not try-wrapped (plain rotation applies) or when the
+/// shape is ambiguous (both If arms materialized).
+fn try_protected_dowhile(inner: Stmt, cond: &Expr) -> Result<Stmt, Stmt> {
+    fn is_empty(s: &Stmt) -> bool {
+        match s {
+            Stmt::Block(v) => v.is_empty() || (v.len() == 1 && is_empty(&v[0])),
+            _ => false,
+        }
+    }
+    fn inject(s: &mut Stmt, cond: &Expr) -> bool {
+        match s {
+            Stmt::If { cond: c, then_stmt, else_stmt } if c == cond => {
+                let then_empty = is_empty(then_stmt);
+                let else_empty =
+                    else_stmt.as_ref().map(|e| is_empty(e)).unwrap_or(true);
+                if then_empty && !else_empty {
+                    *then_stmt = Box::new(Stmt::Break(None));
+                    true
+                } else if else_empty && !then_empty {
+                    *else_stmt = Some(Box::new(Stmt::Break(None)));
+                    true
+                } else {
+                    false
+                }
+            }
+            Stmt::Try { body, .. } | Stmt::TryWithResources { body, .. } => {
+                inject(body, cond)
+            }
+            Stmt::Block(v) => v.first_mut().map(|f| inject(f, cond)).unwrap_or(false),
+            Stmt::Labeled { body, .. } | Stmt::Synchronized { body, .. } => inject(body, cond),
+            _ => false,
+        }
+    }
+    let mut b = inner;
+    if inject(&mut b, cond) {
+        Ok(Stmt::DoWhile {
+            body: Box::new(b),
+            cond: Expr::Const(ConstVal::Int(1)),
+        })
+    } else {
+        Err(b)
     }
 }
 

@@ -22,7 +22,7 @@ use crate::expr::Expr;
 use crate::stmt::Stmt;
 
 use crate::structure::{
-    compute_dominators, compute_postdominators, reachable_within, region_terminates_ex, DomInfo,
+    compute_dominators, compute_postdominators, reachable_within, DomInfo,
     Region, Structurer,
 };
 
