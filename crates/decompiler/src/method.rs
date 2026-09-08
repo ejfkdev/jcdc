@@ -4625,6 +4625,17 @@ fn hoist_escaped_vars(body: &mut Stmt, vt: &VarTable) {
                 // path; javac's definite-assignment check re-proves it.
                 init: if captured_by_anon(body, var) && !assigns_null_to(body, var) {
                     None
+                } else if captured_by_anon(body, var) && !straight_null_init(body, var) {
+                    // Branch-internal null assignments are exclusive
+                    // definite assignments (the bytecode verifier proves
+                    // every read is dominated by its store), so the blank
+                    // decl stays effectively final for the capture — the
+                    // `= null` default plus the branch stores made it
+                    // non-effectively-final (jdk26 DateTimePrintContext
+                    // adjustSlow's blank `final ChronoLocalDate
+                    // effectiveDate` assigned null/value per branch:
+                    // 从内部类引用的本地变量必须是最终变量 x24).
+                    None
                 } else {
                     default_init_for(vt, var)
                 },
@@ -7394,6 +7405,29 @@ fn strip_kind(s: &mut Stmt, enters: bool) {
 /// default then duplicates a real store — the var is NOT a blank-final
 /// split-lineage shape and must keep its initializer (dropping it broke
 /// definite assignment: jdk11/17 ObjectInputFilter patternFilter3).
+/// True when `v` receives a null assignment on the STRAIGHT-LINE prefix of
+/// the body (before any control-flow statement): a genuine `v = null;`
+/// initializer the source carried at the declaration. Null stores INSIDE
+/// branches do not count — they are per-path definite assignments.
+fn straight_null_init(s: &Stmt, v: u32) -> bool {
+    let Stmt::Block(items) = s else { return false };
+    for st in items {
+        match st {
+            Stmt::ExprStmt(Expr::Assign { target, value, .. })
+                if matches!(&**target, Expr::Local { var, .. } if *var == v) =>
+            {
+                return matches!(&**value, Expr::Const(ConstVal::Null));
+            }
+            Stmt::LocalDef { var, init, .. } if *var == v => {
+                return matches!(init, Some(Expr::Const(ConstVal::Null)));
+            }
+            Stmt::ExprStmt(_) | Stmt::LocalDef { .. } | Stmt::Comment(_) => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn assigns_null_to(s: &Stmt, v: u32) -> bool {
     match s {
         Stmt::Block(x) => x.iter().any(|i| assigns_null_to(i, v)),
