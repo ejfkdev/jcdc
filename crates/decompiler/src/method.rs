@@ -8634,6 +8634,17 @@ fn split_walk(
         if vt.wide_stack_vars.contains(&var) {
             return cur;
         }
+        // `null` is assignable to every reference lineage: a branch that
+        // stores null into a merge variable must NOT split it off from the
+        // concrete-typed side. Splitting renamed only the null def (Object
+        // stackN1 = null) while every read kept the cast-side identity --
+        // the null path read a definitely-unassigned variable (jdk26
+        // SplitConstantPool.classEntry's `isArray && typeSym instanceof
+        // ClassDesc cd ? cd : null` ctor-arg diamond:
+        // 可能尚未初始化变量stack476).
+        if matches!(value, Expr::Const(crate::expr::ConstVal::Null)) {
+            return cur;
+        }
         let Some(nt) = value_concrete_type(value) else { return cur };
         let numeric = |t: &JavaType| {
             matches!(
