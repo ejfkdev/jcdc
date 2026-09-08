@@ -6556,36 +6556,19 @@ fn strip_erasure_casts_generic_ret(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodS
                     // nothing downstream would restore this cast.
                     let diamond_arg_call = matches!(&**inner, Expr::Method { args, .. }
                         if args_have_generic_new(args, pool));
-                    // A generic call whose Signature return is a bare
-                    // METHOD typevar erases to Object, so javac emits a
-                    // real checkcast to the target's erasure (Stream
-                    // .collect: ()Object + checkcast Set). In the return
-                    // position the source needs NO cast: the return type
-                    // is the inference target and drives R (jdk26
-                    // ReferencedKeyMap.entrySet — keeping the synthesized
-                    // (Set<Entry<K,V>>) cast pins the chain at
-                    // Set<SimpleEntry<K,V>>: invariant 无法转换; the real
-                    // source is the bare chain).
-                    let generic_ret_object = matches!(&**inner, Expr::Method { desc, .. }
-                        if desc.ret == jcdc_jvm::JavaType::Object("java/lang/Object".to_string()))
-                        && is_generic_call(inner, pool)
-                        && matches!(inner.type_ref(), TypeRef::J(jcdc_jvm::JavaType::Object(n))
-                            if n == "java/lang/Object")
-                        && {
-                            let want_cls = match ty {
-                                TypeRef::G(jcdc_jvm::GenericType::Class(cs)) => {
-                                    Some(crate::method::classsig_internal(cs))
-                                }
-                                TypeRef::J(jcdc_jvm::JavaType::Object(n)) => Some(n.clone()),
-                                _ => None,
-                            };
-                            matches!(ret_er, jcdc_jvm::JavaType::Object(rn)
-                                if want_cls.as_deref() == Some(rn.as_str()))
-                        };
+                    // NOTE: a generic call whose Signature return erases to
+                    // Object (Stream.collect) carries a REAL checkcast to the
+                    // target erasure. Stripping it in the return position
+                    // fixes chains whose bare inference reaches the target
+                    // (ReferencedKeyMap.entrySet), but BREAKS chains with
+                    // method-ref lower bounds (jdk26 GathererOp.build:
+                    // `(Node<R>) evaluate(.., NodeBuilder::new, ..)` bare
+                    // dies 推论变量 CR 具有不兼容的上限 — the source carries
+                    // this.<NodeBuilder<R>,Node<R>>evaluate). Keep the cast;
+                    // the RKM shape needs a chain witness instead (TODO).
                     let droppable = !diamond_arg_call
                         && ((matches!(inner.type_ref(), TypeRef::G(_)) && erasure_only)
                             || (is_generic_call(inner, pool) && erasure_only)
-                            || generic_ret_object
                             || matches!(&**inner, Expr::Method { name, owner: Some(o), .. }
                                 if name == "clone" && matches!(o.type_ref(), TypeRef::G(_))));
                     if droppable {

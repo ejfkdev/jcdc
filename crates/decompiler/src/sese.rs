@@ -442,6 +442,223 @@ impl<'a> Structurer<'a> {
         false
     }
 
+    /// Loop-tail switch follow recovery. A switch inside a loop whose cases
+    /// either `break` the SWITCH into a shared epilogue that flows back to
+    /// the header, exit the LOOP (stop), `continue` (header), or terminate:
+    /// ipdom post-dominates only at the virtual exit and the forward-merge
+    /// resolvers refuse header-reaching paths, so follow=None — the epilogue
+    /// is consumed by the first case walk that arrives, sibling cases lose
+    /// their `break`, and the post-loop continuation is stranded (jdk26
+    /// Pattern.sequence/expr: lost `node = closure(node)` epilogue and
+    /// post-loop `if (head == null) return end; root = tail; return head;`
+    /// → 缺少返回语句). E is the nearest block every case target SETTLES at:
+    /// each path from each target reaches E forward (no stop/header steps),
+    /// escapes to a stop (outer break), continues into an enclosing loop
+    /// header, or terminates (return/throw).
+    fn loop_tail_switch_follow(
+        &self,
+        ctx: &SeseCtx,
+        cur: usize,
+        stop: &HashSet<usize>,
+    ) -> Option<usize> {
+        if ctx.loop_stack.is_empty() {
+            return None;
+        }
+        let targets: Vec<usize> = self.cfg.blocks[cur].succ.clone();
+        if targets.is_empty() {
+            return None;
+        }
+        // Candidates: the DESTINATIONS of case-terminal transfers only —
+        // each case region's trailing `goto X` targets and fallthrough
+        // successors whose source block has multiple in-region succ paths
+        // (a full forward closure would offer every case-internal block,
+        // and a private `continue` stub settling on all paths could win
+        // the start-pc contest: Pattern.sequence case 40's `goto 4` block).
+        let mut cands: Vec<usize> = Vec::new();
+        {
+            let mut seen: HashSet<usize> = HashSet::new();
+            let mut stack: Vec<usize> = targets.clone();
+            let mut visited: HashSet<usize> = HashSet::new();
+            while let Some(b) = stack.pop() {
+                if stop.contains(&b) || ctx.loop_stack.contains(&b) || !visited.insert(b) {
+                    continue;
+                }
+                let succs = &self.cfg.blocks[b].succ;
+                match self.results[b].term {
+                    crate::builder::Term::Goto => {
+                        // A case-terminal jump: its destination is a
+                        // break/continue/epilogue candidate.
+                        if let Some(&t) = succs.first() {
+                            if !targets.contains(&t)
+                                && !ctx.loop_stack.contains(&t)
+                                && !stop.contains(&t)
+                                && seen.insert(t)
+                            {
+                                cands.push(t);
+                            }
+                        }
+                    }
+                    crate::builder::Term::Fallthrough => {
+                        if let Some(&t) = succs.first() {
+                            // Fallthrough into a block with preds from
+                            // ELSEWHERE in the switch (a shared epilogue
+                            // head): candidate. Purely linear flow keeps
+                            // walking (the case's own body).
+                            let shared = self.cfg.blocks[t].pred.iter().any(|&p| {
+                                p != b && (targets.contains(&p) || visited.contains(&p))
+                            });
+                            if shared
+                                && !targets.contains(&t)
+                                && !ctx.loop_stack.contains(&t)
+                                && !stop.contains(&t)
+                                && seen.insert(t)
+                            {
+                                cands.push(t);
+                            }
+                            stack.push(t);
+                        }
+                    }
+                    crate::builder::Term::Cond { .. } | crate::builder::Term::Switch { .. } => {
+                        stack.extend(succs.iter().copied());
+                    }
+                    // A case body can END in straight-line fallthrough into
+                    // the shared epilogue (Pattern.sequence case 92 flows
+                    // into the `node = closure(node)` tail): keep walking
+                    // non-branching blocks so its destination surfaces.
+                    _ if succs.len() == 1 && !matches!(self.results[b].term,
+                        crate::builder::Term::Return(_) | crate::builder::Term::Throw(_)) => {
+                        stack.extend(succs.iter().copied());
+                    }
+                    // Return/Throw: no continuation candidate.
+                    _ => {}
+                }
+            }
+        }
+        let mut best: Option<usize> = None;
+        let mut best_score: Option<(usize, u16)> = None;
+        for &e in &cands {
+            if stop.contains(&e) || ctx.consumed.contains(&e) {
+                continue;
+            }
+            // E must flow back to an enclosing loop header (it IS the loop
+            // tail) — otherwise the switch-break confluence is a plain
+            // post-switch block the forward resolvers would have found.
+            let mut to_header = false;
+            {
+                let mut seen: HashSet<usize> = HashSet::new();
+                let mut stack: Vec<usize> = vec![e];
+                while let Some(b) = stack.pop() {
+                    if !seen.insert(b) {
+                        continue;
+                    }
+                    for &s in &self.cfg.blocks[b].succ {
+                        if ctx.loop_stack.contains(&s) {
+                            to_header = true;
+                            break;
+                        }
+                        if !stop.contains(&s) {
+                            stack.push(s);
+                        }
+                    }
+                    if to_header {
+                        break;
+                    }
+                }
+            }
+            if !to_header {
+                continue;
+            }
+            if targets
+                .iter()
+                .all(|&t| self.settles_at(ctx, stop, t, e, 0))
+            {
+                // Score = how many DISTINCT case targets reach `e` forward:
+                // the switch-break confluence collects every breaking case,
+                // while a case-private merge/continue stub is reached only
+                // by its own case (Pattern.sequence b7 [case 40's
+                // `tail = root; goto EPI`] vs the true epilogue EPI which
+                // all eight breaking cases flow into). Ties: nearest by
+                // start pc (the epilogue's own head block).
+                let score = targets
+                    .iter()
+                    .filter(|&&t| self.reaches_fwd(ctx, stop, t, e, 0))
+                    .count();
+                best = match best_score {
+                    None => {
+                        best_score = Some((score, self.cfg.blocks[e].start));
+                        Some(e)
+                    }
+                    Some((bs, bstart)) => {
+                        let better = score > bs
+                            || (score == bs && self.cfg.blocks[e].start < bstart);
+                        if better {
+                            best_score = Some((score, self.cfg.blocks[e].start));
+                            Some(e)
+                        } else {
+                            best
+                        }
+                    }
+                };
+            }
+        }
+        best
+    }
+
+    /// Some forward path from `t` reaches `e` without stepping on stop
+    /// members or enclosing loop headers.
+    fn reaches_fwd(
+        &self,
+        ctx: &SeseCtx,
+        stop: &HashSet<usize>,
+        t: usize,
+        e: usize,
+        depth: usize,
+    ) -> bool {
+        if depth > 4096 {
+            return false;
+        }
+        if t == e {
+            return true;
+        }
+        if stop.contains(&t) || ctx.loop_stack.contains(&t) {
+            return false;
+        }
+        self.cfg.blocks[t]
+            .succ
+            .iter()
+            .any(|&s| self.reaches_fwd(ctx, stop, s, e, depth + 1))
+    }
+
+    /// Every path from `t` settles at `e`: reaches it forward, escapes to a
+    /// stop (outer break), continues into an enclosing loop header, or
+    /// terminates (return/throw). See `loop_tail_switch_follow`.
+    fn settles_at(
+        &self,
+        ctx: &SeseCtx,
+        stop: &HashSet<usize>,
+        t: usize,
+        e: usize,
+        depth: usize,
+    ) -> bool {
+        if depth > 4096 {
+            return false;
+        }
+        if t == e {
+            return true;
+        }
+        if stop.contains(&t) || ctx.loop_stack.contains(&t) {
+            return true; // outer break / continue: structured elsewhere
+        }
+        let succs = &self.cfg.blocks[t].succ;
+        if succs.is_empty() {
+            return matches!(
+                self.results[t].term,
+                crate::builder::Term::Return(_) | crate::builder::Term::Throw(_)
+            );
+        }
+        succs.iter().all(|&s| self.settles_at(ctx, stop, s, e, depth + 1))
+    }
+
     fn reaches_within(&self, ctx: &SeseCtx, from: usize, target: usize, stop: &HashSet<usize>) -> bool {
         if from == target {
             return true;
@@ -830,6 +1047,43 @@ impl<'a> Structurer<'a> {
                         }
                     }
                 }
+                // A `break L` out of a deep switch frequently compiles to a
+                // dedicated `goto TAIL` stub: the member-boundary exit is the
+                // stub, and the REAL continuation (the block the stub jumps
+                // to) sits two levels out — invisible to body_stop (case
+                // walks flow through the stub into the tail and consume it)
+                // and to natural_follow (the stub is consumed, preds==header,
+                // filtered). See through pure-jump stubs so exits name the
+                // semantic destination (jdk26 Pattern.sequence: break-LOOP
+                // stubs `goto 609` → the `if (head == null) return end; ..
+                // return head;` tail — 缺少返回语句).
+                {
+                    let mut extended: Vec<usize> = Vec::new();
+                    for &x in exits.iter() {
+                        let mut cur_x = x;
+                        let mut guard = 0;
+                        while matches!(self.results[cur_x].term, crate::builder::Term::Goto)
+                            && self.results[cur_x].stmts.is_empty()
+                            && self.cfg.blocks[cur_x].succ.len() == 1
+                            && guard < 8
+                        {
+                            let n = self.cfg.blocks[cur_x].succ[0];
+                            if members.contains(&n)
+                                || !ctx.universe.contains(&n)
+                                || ctx.loop_stack.contains(&n)
+                                || ctx.loop_headers.contains(&n)
+                            {
+                                break;
+                            }
+                            cur_x = n;
+                            guard += 1;
+                        }
+                        if !extended.contains(&cur_x) {
+                            extended.push(cur_x);
+                        }
+                    }
+                    exits = extended;
+                }
                 exits.sort_by_key(|e| self.cfg.blocks[*e].start);
                 // natural_follow = the HEADER's own exits (the condition's
                 // fall-out): where straight-line flow continues after the
@@ -889,7 +1143,7 @@ impl<'a> Structurer<'a> {
                 for &m in members.iter() {
                     ctx.consumed.insert(m);
                 }
-                parts.push(Region::Loop { header, body: Box::new(body), members, exits: exits.clone() });
+                parts.push(Region::Loop { header, body: Box::new(body), members: members.clone(), exits: exits.clone() });
                 // Continue after the loop at the header's natural exit (if it
                 // is within this region's reach and not an enclosing stop).
                 // A consumed candidate whose preds are ALL the header can
@@ -902,6 +1156,40 @@ impl<'a> Structurer<'a> {
                 // `if (c) return X; else { loop }`) and keeps the loop-top
                 // consumed policy below.
                 let header_id = cur;
+                // Two-level loop exits: `break LOOP` often compiles to a
+                // dedicated `goto TAIL` stub, so the member-boundary exit
+                // is the STUB, not the real continuation. When a stub exit
+                // was consumed by the body walk (the switch case's Goto
+                // resolved against it) and chains forward — through further
+                // consumed single-succ stubs — to an unconsumed non-member
+                // block, THAT block is the true post-loop follow (jdk26
+                // Pattern.sequence: exits {goto-609 stubs, throw} all
+                // consumed, the `if (head == null) return end; .. return
+                // head;` tail stranded → 缺少返回语句).
+                let natural_follow: Vec<usize> = natural_follow
+                    .into_iter()
+                    .map(|x| {
+                        let mut cur_x = x;
+                        let mut guard = 0;
+                        while ctx.consumed.contains(&cur_x)
+                            && self.cfg.blocks[cur_x].succ.len() == 1
+                            && guard < 16
+                        {
+                            let n = self.cfg.blocks[cur_x].succ[0];
+                            if ctx.consumed.contains(&n)
+                                || stop.contains(&n)
+                                || members.contains(&n)
+                                || ctx.loop_stack.contains(&n)
+                                || ctx.loop_headers.contains(&n)
+                            {
+                                break;
+                            }
+                            cur_x = n;
+                            guard += 1;
+                        }
+                        cur_x
+                    })
+                    .collect::<Vec<_>>();
                 let natural_follow = natural_follow
                     .into_iter()
                     .filter(|f| {
@@ -1082,7 +1370,16 @@ impl<'a> Structurer<'a> {
                         // in `stop` (enclosing flow owns it) — still the
                         // logical follow for case `break` resolution (jdk11
                         // Calendar.createCalendar catch-copy switch).
-                        .or_else(|| self.switch_stop_confluence(cur, &ctx.universe, stop));
+                        .or_else(|| self.switch_stop_confluence(cur, &ctx.universe, stop))
+                        // Loop-tail epilogue: cases break the switch into a
+                        // shared tail that flows back to the header; the
+                        // forward resolvers refuse header-reaching paths
+                        // (jdk26 Pattern.sequence lost the epilogue and the
+                        // post-loop tail -> 缺少返回语句).
+                        .or_else(|| self.loop_tail_switch_follow(ctx, cur, stop));
+                    if std::env::var("JCDC_DBG_SWF").is_ok() {
+                        eprintln!("SWF-RESOLVED cur={} follow={:?}", cur, follow);
+                    }
                     let mut claimed = ctx.consumed.clone();
                     let sw = self.structure_switch(
                         cur,
