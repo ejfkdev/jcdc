@@ -694,13 +694,12 @@ impl<'a> Structurer<'a> {
     pub(crate) fn exc_retry_back_edge(&self, cur: usize, gi: usize) -> bool {
         let g = &self.groups[gi];
         self.cfg.exc_edges.iter().any(|e| {
-            e.to != cur
+            e.from == cur
+                && e.to != cur
                 && self.cfg.blocks[e.to].pred.is_empty()
-                && !self.cfg.blocks[e.to].succ.is_empty()
-                && self.cfg.blocks[e.to].succ.iter().all(|s| *s == cur)
+                && self.cfg.blocks[e.to].succ.len() == 1
+                && self.cfg.blocks[e.to].succ[0] == cur
                 && self.cfg.blocks[e.to].start >= g.end
-                && self.cfg.blocks[e.from].start >= g.start
-                && self.cfg.blocks[e.from].start < g.end
         })
     }
 
@@ -779,14 +778,18 @@ impl<'a> Structurer<'a> {
 /// terminator `t` that also has an incoming exc-handler back edge is a retry
 /// loop header. Callers pass the structurer for cfg access.
 fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
-    // A claimed terminator target that is the exception-handler back-edge
-    // destination of its own protected range: the retry-loop header shape
-    // (handler `goto t` where t is protected by the handler's own range).
+    // EXACT retry idiom only: t's protected range is caught by a handler
+    // with no normal preds whose sole out-edge returns to t (Future
+    // .exceptionNow: range (40,57) caught at 57, `goto 40`). Broader
+    // "any handler flows to t" shapes matched shared RETURN tails whose
+    // arrivals legitimately need the terminator copy (jdk26 Resolver
+    // 缺少返回语句 x2 regression).
     s.cfg.exc_edges.iter().any(|e| {
-        e.to != t
-            && s.cfg.blocks[e.to].succ.contains(&t)
-            && s.cfg.blocks[e.from].start >= s.cfg.blocks[t].start
-            && !s.cfg.blocks[e.to].pred.iter().any(|p| *p != e.to)
+        e.from == t
+            && e.to != t
+            && s.cfg.blocks[e.to].pred.is_empty()
+            && s.cfg.blocks[e.to].succ.len() == 1
+            && s.cfg.blocks[e.to].succ[0] == t
     }) && matches!(
         s.results[t].term,
         crate::builder::Term::Return(_) | crate::builder::Term::Throw(_)

@@ -510,11 +510,11 @@ impl<'a> Converter<'a> {
     /// unprotected — 未报告的异常错误 InterruptedException).
     fn is_retry_loop_header(&self, t: usize) -> bool {
         self.cfg.exc_edges.iter().any(|e| {
-            e.to != t
+            e.from == t
+                && e.to != t
                 && self.cfg.blocks[e.to].pred.is_empty()
-                && !self.cfg.blocks[e.to].succ.is_empty()
-                && self.cfg.blocks[e.to].succ.iter().all(|s| *s == t)
-                && self.cfg.blocks[e.from].start >= self.cfg.blocks[t].start
+                && self.cfg.blocks[e.to].succ.len() == 1
+                && self.cfg.blocks[e.to].succ[0] == t
         })
     }
 
