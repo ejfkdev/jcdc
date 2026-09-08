@@ -4143,8 +4143,14 @@ fn clinit_only_enum_init(pc: &PoolClass, pool: &ClassPool, ci: usize) -> bool {
     let Ok(Some(mb)) = decompile_method(pc, pool, ci) else { return false };
     let stmts = stmt_vec(&mb.body);
     // Only the enum-constant stores, `$VALUES`, and synthetic `$`-prefixed
-    // bookkeeping (e.g. `$assertionsDisabled`) may be hidden — the constant
-    // list already renders the first two and the assert field is re-derived.
+    // bookkeeping may be hidden — the constant list already renders the
+    // first two. `$assertionsDisabled` is NOT hideable: enums skip the
+    // static_inits fold, so its clinit store is the ONLY initializer of
+    // the rendered blank `static final` ASSERT_FIELD — hiding it left the
+    // field unassigned (jdk26 ProxyGenerator$PrimitiveTypeInfo:
+    // 可能尚未初始化变量$jcdcAssertionsDisabled). With hide=false the enum
+    // pipeline still strips the constant stores, so only the assert
+    // assignment remains and emits as a one-line static block.
     // Any OTHER static field assignment (jdk26 AccessFlag's `CLASS_FLAGS =
     // createDefinition(..)`, Location's `SET_* = ..`) has no other
     // initializer: hiding the clinit drops it and every read fails with
@@ -4160,7 +4166,9 @@ fn clinit_only_enum_init(pc: &PoolClass, pool: &ClassPool, ci: usize) -> bool {
         && stmts.iter().all(|s| match s {
             Stmt::ExprStmt(Expr::Assign { target, .. }) => match &**target {
                 Expr::Field { name, is_static: true, .. } => {
-                    name == "$VALUES" || name.starts_with('$') || const_names.contains(name)
+                    name == "$VALUES"
+                        || (name.starts_with('$') && name != "$assertionsDisabled")
+                        || const_names.contains(name)
                 }
                 _ => false,
             },
