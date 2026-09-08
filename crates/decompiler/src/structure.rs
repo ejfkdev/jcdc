@@ -520,6 +520,83 @@ pub struct Structurer<'a> {
 }
 
 impl<'a> Structurer<'a> {
+    /// Remove a trailing `Goto{target}` from a region (at any tail
+    /// position: end of a sequence, or the tail of an if/else branch).
+    /// A trailing `Goto{s}` also strips when `s` is a statement-free
+    /// Fallthrough/Goto chain into `target`: the body walk hops such
+    /// stubs via copy_walk (the stub is not in the body universe), and
+    /// the copy must go when the real continuation is the stripped
+    /// target — otherwise the post-try statement executes twice (jdk26
+    /// UntrustedCertificates clinit: `algorithm = getProperty` inside the
+    /// try AND after it — 可能已分配变量algorithm on the blank final).
+    fn strip_trailing_goto_to(&self, r: &mut Region, target: usize) {
+        self.strip_trailing_goto_chain(r, target, &mut HashSet::new())
+    }
+
+    fn strip_trailing_goto_chain(&self, r: &mut Region, target: usize, seen: &mut HashSet<usize>) {
+        match r {
+            Region::Goto { target: t } if *t == target => *r = Region::Empty,
+            Region::Goto { target: t } if self.is_stmt_free_chain_to(*t, target, seen) => {
+                *r = Region::Empty
+            }
+            Region::Seq(v) => {
+                if let Some(last) = v.last_mut() {
+                    self.strip_trailing_goto_chain(last, target, seen);
+                }
+                if matches!(v.last(), Some(Region::Empty)) {
+                    v.pop();
+                }
+            }
+            Region::If { then_r, else_r, .. } => {
+                self.strip_trailing_goto_chain(then_r, target, seen);
+                self.strip_trailing_goto_chain(else_r, target, seen);
+            }
+            _ => {}
+        }
+    }
+
+    /// True when `t` lies at/after the span end of one of the ACTIVE
+    /// groups: it is that group's post-try continuation, owned by the
+    /// enclosing walk (structure_try strips the trailing Goto and the
+    /// scope continues there). Copy-walking it from inside the body
+    /// duplicates the continuation statement (jdk26
+    /// UntrustedCertificates clinit: `algorithm = getProperty` inside the
+    /// try AND after it — 可能已分配变量algorithm on the blank final).
+    fn is_active_group_continuation(&self, t: usize, active: &[usize]) -> bool {
+        let ts = self.cfg.blocks[t].start;
+        active.iter().any(|&gi| {
+            ts >= self.groups[gi].end
+                && self.body_group.get(&t) != Some(&gi)
+                && !self.handler_group.contains_key(&t)
+        })
+    }
+
+    /// True when `from` reaches `to` through statement-free
+    /// Fallthrough/Goto blocks (pure jump stubs).
+    fn is_stmt_free_chain_to(&self, from: usize, to: usize, seen: &mut HashSet<usize>) -> bool {
+        let mut x = from;
+        for _ in 0..8 {
+            if x == to {
+                return true;
+            }
+            if !seen.insert(x) {
+                return false;
+            }
+            if !self.results[x].stmts.is_empty() {
+                return false;
+            }
+            if !matches!(self.results[x].term, Term::Fallthrough | Term::Goto) {
+                return false;
+            }
+            let succs = self.cfg.blocks[x].succ.clone();
+            if succs.len() != 1 {
+                return false;
+            }
+            x = succs[0];
+        }
+        false
+    }
+
     /// Strip a trailing handler `Goto{t}` that merges into the post-try
     /// flow: t starts at/after the group end and is not a handler head.
     fn strip_handler_exit_goto(&self, r: &mut Region, end_pc: u16) {
@@ -683,24 +760,6 @@ pub(crate) fn region_terminates_ex(
     }
 }
 
-fn strip_trailing_goto_to(r: &mut Region, target: usize) {
-    match r {
-        Region::Goto { target: t } if *t == target => *r = Region::Empty,
-        Region::Seq(v) => {
-            if let Some(last) = v.last_mut() {
-                strip_trailing_goto_to(last, target);
-            }
-            if matches!(v.last(), Some(Region::Empty)) {
-                v.pop();
-            }
-        }
-        Region::If { then_r, else_r, .. } => {
-            strip_trailing_goto_to(then_r, target);
-            strip_trailing_goto_to(else_r, target);
-        }
-        _ => {}
-    }
-}
 
 
 
@@ -1895,6 +1954,8 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             if self.is_terminator_block(t)
                                 && !stop.contains(&t)
                                 && !Self::ctx_is_loop_header(self, t)
+                                && !self.terminator_writes_final(t)
+                                && !self.is_active_group_continuation(t, active)
                             {
                                 // Shared terminator tail — but NOT a retry
                                 // loop header (a handler-entry `goto head`
@@ -1907,6 +1968,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             } else if !stop.contains(&t)
                                 && !self.loops_stack.contains(&t)
                                 && !Self::ctx_is_loop_header(self, t)
+                                && !self.is_active_group_continuation(t, active)
                             {
                                 match self.copy_walk(t, stop, active, cur) {
                                     Some(r) => parts.push(r),
@@ -3071,7 +3133,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         outer_universe, stop);
                 }
                 if let Some(c) = cont {
-                    strip_trailing_goto_to(&mut r, c);
+                    self.strip_trailing_goto_to(&mut r, c);
                 }
                 r
             }

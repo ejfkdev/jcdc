@@ -1268,7 +1268,52 @@ impl<'a> Structurer<'a> {
                     .copied()
                     .filter(|e| self.is_handler(*e))
                     .collect();
-                let body_done = region_terminates_ex(&body, self.results, &handler_exits);
+                // Mirrors conv's break resolutions: a Goto to a loop exit
+                // or to any block that cannot reach back to the header
+                // converts to `break` — the loop is escapable.
+                fn region_has_break_goto(r: &Region, s: &Structurer, header: usize, exits: &[usize]) -> bool {
+                    let esc = |t: usize| {
+                        t != header
+                            && (exits.contains(&t)
+                                || !crate::structure::can_reach_cfg(s.cfg, t, header, 4096))
+                    };
+                    match r {
+                        Region::Goto { target } => esc(*target),
+                        Region::Seq(v) => v.iter().any(|x| region_has_break_goto(x, s, header, exits)),
+                        Region::If { then_r, else_r, .. } => {
+                            region_has_break_goto(then_r, s, header, exits)
+                                || region_has_break_goto(else_r, s, header, exits)
+                        }
+                        Region::Loop { body, .. } => region_has_break_goto(body, s, header, exits),
+                        Region::Try { body, catches, .. } => {
+                            region_has_break_goto(body, s, header, exits)
+                                || catches
+                                    .iter()
+                                    .any(|(_, _, cr)| region_has_break_goto(cr, s, header, exits))
+                        }
+                        Region::Switch { cases, default, .. } => {
+                            cases.iter().any(|(_, cr)| region_has_break_goto(cr, s, header, exits))
+                                || default
+                                    .as_ref()
+                                    .map(|d| region_has_break_goto(d, s, header, exits))
+                                    .unwrap_or(false)
+                        }
+                        _ => false,
+                    }
+                }
+                // A `break` inside the body means the loop CAN complete
+                // normally: the post-loop follow is reachable through it
+                // and must still be structured. region_terminates_ex is
+                // Goto-blind (conservatively false for Goto parts), but a
+                // body that absorbed an exit-landing return tail
+                // (awaitTermination's `var7 = false; unlock; return var7;`
+                // return-false path became the in-body continuation of the
+                // header try) looks terminating while the state-test break
+                // escapes — suppressing natural_follow there stranded the
+                // return-true tail after the loop (缺少返回语句, jdk11/17
+                // ThreadPoolExecutor.awaitTermination).
+                let body_done = region_terminates_ex(&body, self.results, &handler_exits)
+                    && !region_has_break_goto(&body, self, header, &exits);
                 if is_header {
                     ctx.loop_headers.insert(header);
                 }
