@@ -2473,6 +2473,31 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             // `case 99` — 无法访问的语句 on the outer tail). A shared
             // return that IS the lexical follow keeps preds from the
             // sibling (terminator-excluded) case flows and stays elected.
+            // A candidate whose every flow-internal pred is a VALUE-STACK
+            // diamond arm (statement-free, one stack value out, single
+            // successor) is a folded-ternary merge INSIDE the case body,
+            // not the switch follow (jdk26 xml impl.Parser.xml: case
+            // 0xFEFF's `ch = val < 0 ? 0xFFFF : val` and `st = ch != '<'
+            // ? -1 : 1` diamonds — electing the first merge split the
+            // case body in half, the front fell through into `default`
+            // and the back half went unreachable after the all-continue
+            // switch — 无法访问的语句 x2 trees). In the single-flow
+            // branch every other case terminates, so the true follow is
+            // the flow's own exit; an interior diamond merge never is.
+            let diamond_merge = |c: usize, d: &HashMap<usize, u32>| -> bool {
+                let internal: Vec<usize> = self.cfg.blocks[c]
+                    .pred
+                    .iter()
+                    .copied()
+                    .filter(|p| d.contains_key(p))
+                    .collect();
+                !internal.is_empty()
+                    && internal.iter().all(|&p| {
+                        self.results[p].stmts.is_empty()
+                            && self.results[p].out_stack.len() == 1
+                            && self.cfg.blocks[p].succ.len() == 1
+                    })
+            };
             let private_terminator_merge = |c: usize, d: &HashMap<usize, u32>| -> bool {
                 if !matches!(self.results[c].term, Term::Return(_) | Term::Throw(_)) {
                     return false;
@@ -2496,6 +2521,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             for &cand in d.keys() {
                 if self.cfg.blocks[cand].pred.len() >= 2
                     && !in_nested_switch(cand, d)
+                    && !diamond_merge(cand, d)
                     && !private_terminator_merge(cand, d)
                     && best.map(|b| self.cfg.blocks[cand].start < self.cfg.blocks[b].start).unwrap_or(true)
                 {
