@@ -1443,6 +1443,20 @@ impl<'a> Structurer<'a> {
                                 && reach.contains(e)
                                 && !self.is_handler(*e)
                                 && *e != header_id
+                                // Continue-stub exits (statement-free jump
+                                // chains back into an enclosing loop) are
+                                // conditional break arms of the inner loop,
+                                // already resolved inside the body — walking
+                                // one as the continuation re-emits the jump
+                                // unconditionally (jdk11
+                                // FutureTask.removeWaiter `continue retry`
+                                // stubs became an unconditional continue
+                                // after the inner while — 无法访问的语句 on
+                                // the tail return, x3 trees).
+                                && !ctx.loop_stack.iter().any(|h| {
+                                    h != e
+                                        && self.is_stmt_free_chain_to_block(*e, *h)
+                                })
                         })
                         .collect();
                     cands.sort_by_key(|e| self.cfg.blocks[*e].start);
@@ -1453,7 +1467,31 @@ impl<'a> Structurer<'a> {
                         cur = f;
                         continue;
                     }
-                    None => break,
+                    None => {
+                        // An exit that is an ENCLOSING loop's barrier must
+                        // be materialized as a Goto (the labeled break of
+                        // the enclosing loop); silently ending the body
+                        // makes the inner loop's normal completion
+                        // re-enter the outer (jdk11
+                        // FutureTask.removeWaiter — see the walk-side
+                        // twin in structure.rs).
+                        if !body_done {
+                            let barrier_exit = exits
+                                .iter()
+                                .copied()
+                                .filter(|e| {
+                                    stop.contains(e)
+                                        && !ctx.loop_stack.contains(e)
+                                        && ctx.universe.contains(e)
+                                        && !self.is_handler(*e)
+                                })
+                                .min_by_key(|e| self.cfg.blocks[*e].start);
+                            if let Some(e) = barrier_exit {
+                                parts.push(Region::Goto { target: e });
+                            }
+                        }
+                        break;
+                    }
                 }
             }
 

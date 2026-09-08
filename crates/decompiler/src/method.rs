@@ -1811,6 +1811,7 @@ fn depth_of(known: &[(usize, Vec<Expr>)]) -> usize {
 /// Remove `break;` statements that are immediately followed by the end of
 /// their loop body (dead code, rejected by javac).
 fn prune_dead_breaks(s: &mut Stmt) {
+    let strippable = tail_break_strippable(s);
     match s {
         Stmt::Block(v) => {
             for x in v.iter_mut() {
@@ -1819,11 +1820,15 @@ fn prune_dead_breaks(s: &mut Stmt) {
         }
         Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
             prune_dead_breaks(body);
-            strip_tail_break(body);
+            if strippable {
+                strip_tail_break(body);
+            }
         }
         Stmt::For { body, .. } | Stmt::ForEach { body, .. } => {
             prune_dead_breaks(body);
-            strip_tail_break(body);
+            if strippable {
+                strip_tail_break(body);
+            }
         }
         Stmt::Labeled { body, .. } | Stmt::Synchronized { body, .. } => prune_dead_breaks(body),
         Stmt::If { then_stmt, else_stmt, .. } => {
@@ -2254,6 +2259,25 @@ fn strip_tail_break(body: &mut Stmt) {
     } else if matches!(body, Stmt::Break(None)) {
         *body = Stmt::Block(vec![]);
     }
+}
+
+/// True when stripping a tail `break;` from this loop body is safe: only
+/// for do-whiles and infinite loops, where the body end already leaves /
+/// re-iterates unconditionally. A tail break in a CONDITIONAL loop is the
+/// loop's normal-completion exit (an enclosing-loop barrier materialized
+/// by the structurer): popping it makes the conditional loop spin forever
+/// (jdk11 FutureTask.removeWaiter: the inner `while (q != null)`
+/// completion had to break the outer retry loop — stripped, the outer
+/// while(true) never completed and the tail `return` went unreachable).
+fn tail_break_strippable(s: &Stmt) -> bool {
+    // ONLY do-while: there the tail break is the rotation residue the
+    // strip was written for (the do-while condition already names the
+    // exit). In every other loop the tail break is the body's normal
+    // completion exit — e.g. an enclosing-loop barrier the structurer
+    // materialized after an inner loop (jdk11 FutureTask.removeWaiter:
+    // stripping it made the outer while(true) never complete and the
+    // tail return unreachable).
+    matches!(s, Stmt::DoWhile { .. })
 }
 
 /// Give catch variables their exception type when the LVT did not provide

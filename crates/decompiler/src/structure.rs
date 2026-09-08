@@ -1312,6 +1312,34 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                                 }
                             }
                         }
+                        // An exit that is an ENCLOSING loop's barrier (in
+                        // `stop`) must still be materialized as a Goto: it
+                        // converts to the labeled break of the enclosing
+                        // loop. Dropping it lets the enclosing loop body
+                        // end in an implicit continue — the normal
+                        // completion of the inner loop re-entered the
+                        // outer instead of leaving it (jdk11
+                        // FutureTask.removeWaiter spun forever; javac:
+                        // 无法访问的语句 on the tail return once the
+                        // continue-stub walks were filtered).
+                        if !body_done
+                            && parts
+                                .last()
+                                .map(|r| !matches!(r, Region::Goto { .. }))
+                                .unwrap_or(true)
+                        {
+                            if let Some(&e) = loop_exits
+                                .iter()
+                                .filter(|e| {
+                                    stop.contains(e)
+                                        && !self.loops_stack.contains(e)
+                                        && universe.contains(e)
+                                })
+                                .min_by_key(|e| self.cfg.blocks[**e].start)
+                            {
+                                parts.push(Region::Goto { target: e });
+                            }
+                        }
                         break;
                     }
                 }
@@ -2654,7 +2682,49 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         exits
             .into_iter()
             .filter(|e| universe.contains(e) && !stop.contains(e))
+            // An exit that is a statement-free jump chain back into an
+            // ENCLOSING loop is a `continue outer` stub — one of the inner
+            // loop's conditional break arms, already resolved to a break
+            // inside the body. Walking it as the straight-line continuation
+            // re-emits the jump unconditionally after the inner loop
+            // (jdk11 FutureTask.removeWaiter: the pred.thread/CAS-fail
+            // `continue retry` stubs became an unconditional `continue`
+            // after the inner while, the outer while(true) never completed
+            // and the tail `return` went unreachable — 无法访问的语句 x3
+            // trees). Real fall-out exits (post-loop code) are kept.
+            .filter(|e| {
+                !self.loops_stack.iter().any(|&h| {
+                    h != *e && self.is_stmt_free_chain_to_block(*e, h)
+                })
+            })
             .min_by_key(|e| self.cfg.blocks[*e].start)
+    }
+
+    /// True when `from` reaches `to` through statement-free
+    /// Fallthrough/Goto blocks (walk-side twin of the strip helper).
+    pub(crate) fn is_stmt_free_chain_to_block(&self, from: usize, to: usize) -> bool {
+        let mut x = from;
+        let mut seen: HashSet<usize> = HashSet::new();
+        for _ in 0..8 {
+            if x == to {
+                return true;
+            }
+            if !seen.insert(x) {
+                return false;
+            }
+            if !self.results[x].stmts.is_empty() {
+                return false;
+            }
+            if !matches!(self.results[x].term, Term::Fallthrough | Term::Goto) {
+                return false;
+            }
+            let succs = self.cfg.blocks[x].succ.clone();
+            if succs.len() != 1 {
+                return false;
+            }
+            x = succs[0];
+        }
+        false
     }
 
     fn structure_loop(
