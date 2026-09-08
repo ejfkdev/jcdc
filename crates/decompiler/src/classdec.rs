@@ -10630,6 +10630,169 @@ fn prune_witnessed_raw_sam_casts(e: &mut Expr, pool: &ClassPool) {
 /// class exposes same-name/same-arity overloads whose parameter at this
 /// position ERASES differently (true ambiguity potential); unique
 /// signatures keep the bare lambda and its target typing.
+/// Explicit `.<R>mapMulti` witness recovered from the lambda impl body.
+/// javac erases R in the indy's instantiatedMethodType, but the bare call
+/// infers R := Object and the chain terminal fails to convert (jdk26
+/// AbstractUnboundModel `List<Object>无法转换为List<Attribute<?>>`,
+/// BufferedCodeBuilder, BufferedMethodBuilder `Optional<Object>`). R is
+/// the static type of the value the body feeds to `sink.accept(..)` —
+/// exactly what the source witness names.
+fn mapmulti_witness_from_body(
+    cls: &str,
+    name: &str,
+    type_args: &[String],
+    args: &[Expr],
+    pool: &ClassPool,
+    pc: &PoolClass,
+) -> Option<Vec<String>> {
+    if !type_args.is_empty() || name != "mapMulti" || cls != "java/util/stream/Stream" {
+        return None;
+    }
+    let Expr::Lambda(l) = args.first()? else { return None };
+    if l.kind == crate::expr::LambdaKind::MethodRef {
+        return None;
+    }
+    let dpc_owned;
+    let dpc: &PoolClass = if l.impl_owner == pc.internal_name {
+        pc
+    } else {
+        dpc_owned = pool.get(l.impl_owner.as_str())?;
+        &dpc_owned
+    };
+    let mi = dpc.find_own_method(&l.impl_name, &l.impl_desc.to_string())?;
+    let mb = decompile_method(dpc, pool, mi).ok()??;
+    // BiConsumer<T, Consumer<R>>: the sink is the LAST impl param
+    // (params are [captures..., e, sink]).
+    let sink = mb
+        .vt
+        .vars
+        .iter()
+        .rev()
+        .find(|v| v.is_param && v.name != "this")?
+        .id;
+    fn scan_e(e: &Expr, sink: u32, out: &mut Option<TypeRef>) {
+        if out.is_some() {
+            return;
+        }
+        if let Expr::Method { name, owner, args, .. } = e {
+            if name == "accept" && args.len() == 1 {
+                if let Some(Expr::Local { var, .. }) = owner.as_deref() {
+                    if *var == sink {
+                        *out = Some(args[0].type_ref());
+                        return;
+                    }
+                }
+            }
+        }
+        match e {
+            Expr::Method { owner, args, .. } => {
+                if let Some(o) = owner {
+                    scan_e(o, sink, out);
+                }
+                args.iter().for_each(|a| scan_e(a, sink, out));
+            }
+            Expr::Cast { e: i, .. } => scan_e(i, sink, out),
+            Expr::Cond { c, t, f } => {
+                scan_e(c, sink, out);
+                scan_e(t, sink, out);
+                scan_e(f, sink, out);
+            }
+            Expr::Bin { l, r, .. } => {
+                scan_e(l, sink, out);
+                scan_e(r, sink, out);
+            }
+            Expr::Lambda(l2) => l2.captures.iter().for_each(|c| scan_e(c, sink, out)),
+            _ => {}
+        }
+    }
+    fn scan_s(s: &Stmt, sink: u32, out: &mut Option<TypeRef>) {
+        if out.is_some() {
+            return;
+        }
+        match s {
+            Stmt::Block(v) => v.iter().for_each(|x| scan_s(x, sink, out)),
+            Stmt::ExprStmt(e) => scan_e(e, sink, out),
+            Stmt::LocalDef { init: Some(e), .. } => scan_e(e, sink, out),
+            Stmt::Return(Some(e)) | Stmt::Throw(e) => scan_e(e, sink, out),
+            Stmt::If { cond, then_stmt, else_stmt, .. } => {
+                scan_e(cond, sink, out);
+                scan_s(then_stmt, sink, out);
+                if let Some(x) = else_stmt {
+                    scan_s(x, sink, out);
+                }
+            }
+            Stmt::While { cond, body, .. } | Stmt::DoWhile { body, cond, .. } => {
+                scan_e(cond, sink, out);
+                scan_s(body, sink, out);
+            }
+            Stmt::For { init, cond, update, body, .. } => {
+                init.iter().for_each(|i| scan_s(i, sink, out));
+                if let Some(c) = cond {
+                    scan_e(c, sink, out);
+                }
+                update.iter().for_each(|u| scan_e(u, sink, out));
+                scan_s(body, sink, out);
+            }
+            Stmt::ForEach { .. } => {}
+            Stmt::Try { body, catches, finally, .. } => {
+                scan_s(body, sink, out);
+                for c in catches {
+                    scan_s(&c.body, sink, out);
+                }
+                if let Some(f) = finally {
+                    scan_s(f, sink, out);
+                }
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases {
+                    c.body.iter().for_each(|x| scan_s(x, sink, out));
+                }
+                if let Some(d) = default {
+                    scan_s(d, sink, out);
+                }
+            }
+            Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => scan_s(body, sink, out),
+            _ => {}
+        }
+    }
+    let mut got: Option<TypeRef> = None;
+    scan_s(&mb.body, sink, &mut got);
+    let g = match got? {
+        TypeRef::G(g) => g,
+        TypeRef::J(jt) => {
+            fn jt_to_g(jt: &jcdc_jvm::JavaType) -> jcdc_jvm::GenericType {
+                match jt {
+                    jcdc_jvm::JavaType::Object(n) => {
+                        let (pkg, simple) = match n.rfind('/') {
+                            Some(i) => (n[..i].to_string(), n[i + 1..].to_string()),
+                            None => (String::new(), n.clone()),
+                        };
+                        jcdc_jvm::GenericType::Class(jcdc_jvm::ClassSig {
+                            package: pkg,
+                            parts: vec![jcdc_jvm::ClassSigPart { name: simple, args: Vec::new() }],
+                        })
+                    }
+                    jcdc_jvm::JavaType::Array(i) => {
+                        jcdc_jvm::GenericType::Array(Box::new(jt_to_g(i)))
+                    }
+                    _ => return jcdc_jvm::GenericType::TypeVar(String::new()),
+                }
+            }
+            let g = jt_to_g(&jt);
+            if matches!(g, jcdc_jvm::GenericType::TypeVar(_)) {
+                return None;
+            }
+            g
+        }
+    };
+    let s = g.to_java();
+    // Captured wildcards are not denotable in a source witness.
+    if s.is_empty() || s.contains("CAP#") || s.contains("capture") {
+        return None;
+    }
+    Some(vec![s])
+}
+
 fn witness_ambiguous_lambda_args(e: &mut Expr, pool: &ClassPool, pc: &PoolClass) {
     let (cls, name, desc) = match &*e {
         Expr::Method { cls, name, desc, .. } => (cls.clone(), name.clone(), desc.clone()),
@@ -13008,6 +13171,14 @@ pub(crate) fn cast_wildcard_call_args(
                             pending_ta = Some(w);
                             break;
                         }
+                    }
+                }
+                if pending_ta.is_none() {
+                    if let Some(w) = mapmulti_witness_from_body(cls, name, type_args, args, pool, pc) {
+                        if std::env::var("JCDC_DBG_WIT").is_ok() {
+                            eprintln!("MMWIT {}.{} -> {:?}", cls, name, w);
+                        }
+                        pending_ta = Some(w);
                     }
                 }
             }
