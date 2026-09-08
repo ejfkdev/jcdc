@@ -2027,17 +2027,44 @@ fn switch_terminates_with(
     // from case i-1), does it necessarily terminate? A case ending in `break`
     // exits the switch normally (false); one ending in return/throw terminates
     // (true); one that falls through inherits the next case's status.
+    /// True when the statement can complete normally WITHOUT a break/
+    /// return/throw/continue — i.e. control really falls through to the
+    /// next case label. An if whose arms all break (`if (v != 0) break;
+    /// else { v = 2; break; }`) does NOT fall through, but it does not
+    /// terminate either — the old shape match treated it as fallthrough
+    /// and inherited the terminating default, so the whole switch counted
+    /// as abrupt and prune_unreachable deleted the post-switch
+    /// `return value;` (jdk26 CalendarDataUtility
+    /// CalendarWeekParameterGetter.getObject: 缺少返回语句).
+    fn last_falls_through(s: &Stmt) -> bool {
+        match s {
+            Stmt::Break(_) | Stmt::Continue(_) | Stmt::Return(_) | Stmt::Throw(_) => false,
+            Stmt::Block(v) => v.last().map(last_falls_through).unwrap_or(true),
+            Stmt::If { then_stmt, else_stmt, .. } => match else_stmt {
+                Some(e) => last_falls_through(then_stmt) || last_falls_through(e),
+                None => true,
+            },
+            Stmt::While { cond, body } | Stmt::DoWhile { body, cond }
+                if matches!(cond, Expr::Const(ConstVal::Int(1)))
+                    && !contains_break_stmt(body) =>
+            {
+                false
+            }
+            Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => {
+                last_falls_through(body)
+            }
+            _ => true,
+        }
+    }
     let n = cases.len();
     let mut t = vec![false; n + 1];
     t[n] = true; // falling off the last case reaches the default, which terminates
     for i in (0..n).rev() {
         let body = &cases[i].body;
         t[i] = match body.last() {
-            // `break` exits the switch normally → this path does not terminate.
-            Some(Stmt::Break(_)) => false,
-            Some(last) if stmt_terminates_with(last, no_break) => true,
-            // Falls through to the next case (or the default for the last).
-            _ => t[i + 1],
+            Some(last) if last_falls_through(last) => t[i + 1],
+            Some(last) => stmt_terminates_with(last, no_break),
+            None => t[i + 1],
         };
     }
     // The switch completes abruptly only if EVERY case entry terminates. If any

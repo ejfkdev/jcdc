@@ -504,6 +504,11 @@ pub struct Structurer<'a> {
     /// `cache = archivedCache; return;` copied into a branch =
     /// "variable cache might already have been assigned").
     pub final_fields: std::collections::HashSet<String>,
+    /// Groups whose structure_try is currently on the stack: the
+    /// group_here fallback must not re-fire a group inside its OWN body
+    /// walk (structure_try passes `nested` — which excludes the group —
+    /// as the body's active, so the primary find already declines there).
+    structuring_groups: std::cell::RefCell<Vec<usize>>,
 }
 
 impl<'a> Structurer<'a> {
@@ -750,7 +755,7 @@ impl<'a> Structurer<'a> {
         for (&merge, (root, _vis)) in &fold_regions {
             fold_root_to_merge.insert(*root, merge);
         }
-        Structurer { cfg, results, groups, body_group, handler_group, diamond_merges, fold_regions, fold_root_to_merge, copied_tails: HashSet::new(), loops_stack: Vec::new(), sese_loop_headers: std::collections::HashSet::new(), walk_depth: 0, final_fields: HashSet::new() }
+        Structurer { cfg, results, groups, body_group, handler_group, diamond_merges, fold_regions, fold_root_to_merge, copied_tails: HashSet::new(), loops_stack: Vec::new(), sese_loop_headers: std::collections::HashSet::new(), walk_depth: 0, final_fields: HashSet::new(), structuring_groups: std::cell::RefCell::new(Vec::new()) }
     }
 
     /// Immediate post-dominator of `entry` within `universe`. Delegates to the
@@ -895,6 +900,22 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         for &b in universe {
             if let Some(&gi) = self.body_group.get(&b) {
                 let g = &self.groups[gi];
+                // Expand to the full span ONLY when the scope holds the
+                // group's START block: a walk rooted mid-group (a
+                // handler-restricted arm at a single continuation block,
+                // jdk11 getInputStream0's RT-catch arm -> block 33) must
+                // not balloon to the whole enclosing span — it dragged the
+                // entire method body into the catch with the handler's
+                // (nested-less) group visibility, emitting the reflection
+                // try's call bare (未报告的异常错误NoSuchFieldException).
+                let holds_start = self
+                    .cfg
+                    .blocks
+                    .iter()
+                    .any(|nb| nb.start == g.start && universe.contains(&nb.id));
+                if !holds_start {
+                    continue;
+                }
                 for nb in &self.cfg.blocks {
                     if !nb.ins.is_empty()
                         && nb.start >= g.start
@@ -1084,7 +1105,39 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         && self.groups[gi].end >= b.end
                         && !self.handler_group.contains_key(&cur)
                 })
-                .copied();
+                .copied()
+                .or_else(|| {
+                    // A group starting at `cur` that `active` does not
+                    // carry: under SESE only OUTERMOST groups are active at
+                    // the top level, and handler-arm scopes inherit the
+                    // handler's (span-limited) visibility — a nested group
+                    // reached there was emitted BARE, losing its try
+                    // (jdk11 HttpURLConnection.getInputStream0: the RT-catch
+                    // arm re-walked the continuation and the reflection
+                    // try/catch(IllegalAccessException|NoSuchFieldException)
+                    // vanished — 未报告的异常错误). Carve it out unless an
+                    // ACTIVE group strictly enclosing `cur` owns the
+                    // carve-out (the intact enclosing body walk case).
+                    let covered_by_active = self.groups.iter().enumerate().any(|(oj, og)| {
+                        active.contains(&oj)
+                            && og.start <= b.start
+                            && og.end > b.start
+                            && !(og.start == b.start && og.end >= b.end)
+                    });
+                    if covered_by_active || self.handler_group.contains_key(&cur) {
+                        return None;
+                    }
+                    self.groups
+                        .iter()
+                        .enumerate()
+                        .filter(|(gi, g)| {
+                            g.start == b.start
+                                && g.end >= b.end
+                                && !self.structuring_groups.borrow().contains(gi)
+                        })
+                        .max_by_key(|(_, g)| g.end)
+                        .map(|(gi, _)| gi)
+                });
             // The group starts at a LOOP HEADER whose back edge lies
             // OUTSIDE the protected span (`for (;;) { try { ... } catch
             // { ... } ...retry... }` — jdk26 ClassValue.getFromHashMap):
@@ -2774,6 +2827,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         stop: &HashSet<usize>,
     ) -> Region {
         let g = self.groups[gi].clone();
+        self.structuring_groups.borrow_mut().push(gi);
         let nested: Vec<usize> = (0..self.groups.len())
             .filter(|&j| j != gi && self.groups[j].start >= g.start && self.groups[j].end <= g.end)
             .collect();
@@ -3086,6 +3140,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             self.strip_handler_exit_goto(&mut r, g.end);
             catches.push((tys.clone(), *hb, Box::new(r)));
         }
+        self.structuring_groups.borrow_mut().retain(|&x| x != gi);
         Region::Try { group_idx: gi, body: Box::new(body), catches }
     }
 }
