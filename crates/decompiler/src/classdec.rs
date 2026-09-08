@@ -6556,9 +6556,36 @@ fn strip_erasure_casts_generic_ret(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodS
                     // nothing downstream would restore this cast.
                     let diamond_arg_call = matches!(&**inner, Expr::Method { args, .. }
                         if args_have_generic_new(args, pool));
+                    // A generic call whose Signature return is a bare
+                    // METHOD typevar erases to Object, so javac emits a
+                    // real checkcast to the target's erasure (Stream
+                    // .collect: ()Object + checkcast Set). In the return
+                    // position the source needs NO cast: the return type
+                    // is the inference target and drives R (jdk26
+                    // ReferencedKeyMap.entrySet — keeping the synthesized
+                    // (Set<Entry<K,V>>) cast pins the chain at
+                    // Set<SimpleEntry<K,V>>: invariant 无法转换; the real
+                    // source is the bare chain).
+                    let generic_ret_object = matches!(&**inner, Expr::Method { desc, .. }
+                        if desc.ret == jcdc_jvm::JavaType::Object("java/lang/Object".to_string()))
+                        && is_generic_call(inner, pool)
+                        && matches!(inner.type_ref(), TypeRef::J(jcdc_jvm::JavaType::Object(n))
+                            if n == "java/lang/Object")
+                        && {
+                            let want_cls = match ty {
+                                TypeRef::G(jcdc_jvm::GenericType::Class(cs)) => {
+                                    Some(crate::method::classsig_internal(cs))
+                                }
+                                TypeRef::J(jcdc_jvm::JavaType::Object(n)) => Some(n.clone()),
+                                _ => None,
+                            };
+                            matches!(ret_er, jcdc_jvm::JavaType::Object(rn)
+                                if want_cls.as_deref() == Some(rn.as_str()))
+                        };
                     let droppable = !diamond_arg_call
                         && ((matches!(inner.type_ref(), TypeRef::G(_)) && erasure_only)
                             || (is_generic_call(inner, pool) && erasure_only)
+                            || generic_ret_object
                             || matches!(&**inner, Expr::Method { name, owner: Some(o), .. }
                                 if name == "clone" && matches!(o.type_ref(), TypeRef::G(_))));
                     if droppable {
@@ -12909,6 +12936,15 @@ pub(crate) fn cast_wildcard_call_args(
         // to exactly `? extends X` against an actual whose type is exactly
         // X. (`? super X` formals accept X fine — capture yields a supertype.)
         let broken = msig.args.iter().zip(args.iter()).any(|(formal, actual)| {
+            // A `null` literal converts to EVERY reference type including
+            // captures — it never breaks (jdk26 VectorSupport
+            // libraryUnaryOp `defaultImpl.apply(v, null)` against
+            // UnaryOperation<V,?> needed NO owner cast; treating null as
+            // a plain-Object actual synthesized (UnaryOperation<V,Object>)
+            // — 类型参数Object不在类型变量M的范围内 ×4).
+            if matches!(actual, Expr::Const(crate::expr::ConstVal::Null)) {
+                return false;
+            }
             let subst = subst_g(formal, &class_params, &last.args);
             match (&subst, actual.type_ref()) {
                 (
@@ -12935,20 +12971,30 @@ pub(crate) fn cast_wildcard_call_args(
             let Some(lp) = fixed.parts.last_mut() else {
                 return;
             };
-            for a in lp.args.iter_mut() {
+            for (pi, a) in lp.args.iter_mut().enumerate() {
                 match std::mem::replace(a, G::Primitive('V')) {
                     G::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
                     | G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => *a = *t,
                     // Unbounded: Object is the only always-legal slot type
                     // (input position accepts any actual; the erased return
-                    // flows through the source's own result cast).
+                    // flows through the source's own result cast) — unless
+                    // the class parameter is BOUNDED (M extends
+                    // VectorMask<?>): Object would violate the bound
+                    // (类型参数Object不在类型变量M的范围内), so substitute
+                    // the bound itself.
                     G::Wildcard(jcdc_jvm::WildcardBound::Any) => {
-                        *a = G::Class(jcdc_jvm::ClassSig {
-                            package: "java/lang".to_string(),
-                            parts: vec![jcdc_jvm::ClassSigPart {
-                                name: "Object".to_string(),
-                                args: Vec::new(),
-                            }],
+                        let bound = class_params
+                            .get(pi)
+                            .and_then(|p| p.class_bound.clone())
+                            .filter(|b| !matches!(b, G::TypeVar(_)));
+                        *a = bound.unwrap_or_else(|| {
+                            G::Class(jcdc_jvm::ClassSig {
+                                package: "java/lang".to_string(),
+                                parts: vec![jcdc_jvm::ClassSigPart {
+                                    name: "Object".to_string(),
+                                    args: Vec::new(),
+                                }],
+                            })
                         })
                     }
                     other => *a = other,

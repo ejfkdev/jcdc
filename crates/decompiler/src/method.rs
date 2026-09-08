@@ -1898,7 +1898,13 @@ fn prune_unreachable(s: &mut Stmt) {
         Stmt::ForEach { body, .. } => prune_unreachable(body),
         Stmt::Switch { cases, default, .. } => {
             for c in cases {
-                if let Some(pos) = c.body.iter().position(is_terminator_stmt) {
+                // `stmt_terminates`, not just the flat Return/Throw/Break
+                // check: a case body ending in `while (true) { .. return .. }`
+                // (no break anywhere) cannot complete normally, and javac
+                // rejects the shared-tail return copy after it as
+                // 无法访问的语句 (jdk26 DateTimeTextProvider getIterator
+                // cases 2/7).
+                if let Some(pos) = c.body.iter().position(stmt_terminates) {
                     // `break` at case end is idiomatic; keep it, drop what follows
                     c.body.truncate(pos + 1);
                 }

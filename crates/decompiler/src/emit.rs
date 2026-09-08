@@ -512,18 +512,22 @@ impl<'a> Printer<'a> {
                         // restored to `case T v when guard:` (jdk26
                         // DecimalFormat — duplicate type-pattern labels are
                         // "此 case 标签由前一个 case 标签支配" without it).
-                        for l in &c.raw_labels {
-                            let mut line = format!("case {} when ", l);
-                            let mut gtxt = String::new();
-                            self.expr(g, 1, &mut gtxt);
-                            line.push_str(&gtxt);
-                            line.push(':');
-                            self.line(&line);
-                        }
-                    } else {
-                        for l in &c.raw_labels {
-                            self.line(&format!("case {}:", l));
-                        }
+                        let mut gtxt = String::new();
+                        self.expr(g, 1, &mut gtxt);
+                        let joined = c
+                            .raw_labels
+                            .iter()
+                            .map(|l| format!("{} when {}", l, gtxt))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        self.line(&format!("case {}:", joined));
+                    } else if !c.raw_labels.is_empty() {
+                        // Pattern labels of one arm MUST be comma-joined:
+                        // stacked `case P1 x:` / `case P2 y:` lines are a
+                        // fall-through between patterns ("从模式贯穿非法",
+                        // jdk26 ParserVerifier `case OfConstant _,
+                        // OfClass _ -> 2`).
+                        self.line(&format!("case {}:", c.raw_labels.join(", ")));
                     }
                     for l in &c.labels {
                         self.line(&format!("case {}:", l));
@@ -2759,11 +2763,35 @@ impl<'a> Printer<'a> {
             }
         }
         let dotted = internal.replace('/', ".");
+        // A simple type name shadowed by an in-scope VARIABLE (a field of
+        // this class or a method local) cannot qualify a static access:
+        // javac resolves the leading name as the variable first
+        // (无法取消引用int — jdk26 VerificationType declares
+        // `private static final int Integer` and the source spells
+        // java.lang.Integer.toHexString in full). Keep the fully-qualified
+        // form whenever the leading segment collides.
+        let shadowed = |first: &str| {
+            self.pc
+                .cf
+                .fields
+                .iter()
+                .any(|f| self.pc.utf8(f.name_index) == Some(first))
+                || self.vt.vars.iter().any(|v| v.name == first)
+        };
         if internal.starts_with("java/lang/") && !internal[10..].contains('/') {
-            return internal[10..].replace('$', ".");
+            let simple = internal[10..].replace('$', ".");
+            let first = simple.split('.').next().unwrap_or(simple.as_str());
+            if !shadowed(first) {
+                return simple;
+            }
+            return dotted.replace('$', ".");
         }
         if pkg_of(internal) == pkg_of(&self.pc.internal_name) {
-            return internal.rsplit('/').next().unwrap_or(internal).replace('$', ".");
+            let simple = internal.rsplit('/').next().unwrap_or(internal).replace('$', ".");
+            let first = simple.split('.').next().unwrap_or(simple.as_str());
+            if !shadowed(first) {
+                return simple;
+            }
         }
         dotted.replace('$', ".")
     }
