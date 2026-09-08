@@ -1038,6 +1038,13 @@ impl<'a> Structurer<'a> {
                 // break-resolution set (a `break outer` from deep in the body
                 // targets one of these; resolve_goto maps a Goto to the
                 // OUTERMOST loop whose exits contain it -> labeled break).
+                // A SWITCH-dispatch header never has a condition fall-out:
+                // its out-of-loop target edges are per-case break stubs, so
+                // extending exits cannot degrade a while-cond
+                // classification (top-tested `while (i < n)` headers keep
+                // their raw exits — String.contentEquals).
+                let natural_follow_empty =
+                    matches!(self.results[cur].term, crate::builder::Term::Switch { .. });
                 let mut exits: Vec<usize> = Vec::new();
                 for &m in members.iter() {
                     for &s in &self.cfg.blocks[m].succ {
@@ -1047,17 +1054,23 @@ impl<'a> Structurer<'a> {
                         }
                     }
                 }
-                // A `break L` out of a deep switch frequently compiles to a
-                // dedicated `goto TAIL` stub: the member-boundary exit is the
-                // stub, and the REAL continuation (the block the stub jumps
-                // to) sits two levels out — invisible to body_stop (case
-                // walks flow through the stub into the tail and consume it)
-                // and to natural_follow (the stub is consumed, preds==header,
-                // filtered). See through pure-jump stubs so exits name the
-                // semantic destination (jdk26 Pattern.sequence: break-LOOP
-                // stubs `goto 609` → the `if (head == null) return end; ..
-                // return head;` tail — 缺少返回语句).
-                {
+                // Bottom-tested loops ONLY (for(;;) / restart shapes): a
+                // `break L` out of a deep switch compiles to a per-case
+                // empty `goto TAIL` stub, so the member-boundary exits are
+                // the stubs and the REAL continuation sits one hop behind
+                // them — invisible to body_stop (the case region walks
+                // through the stub and consumes the tail) and to the
+                // post-loop continuation (stubs are consumed with
+                // preds==header and filtered). See through pure-jump stubs
+                // so exits name the semantic destination (jdk26
+                // Pattern.sequence: `goto 609` stubs → the `if (head ==
+                // null) return end; .. return head;` tail —
+                // 缺少返回语句). Top-tested loops (String.contentEquals
+                // `while (i < n)`) keep the raw exits: their header
+                // fall-out exit drives the while-cond classification and
+                // extending it degraded the loop to `while (true)` and
+                // lost the post-loop return.
+                if natural_follow_empty {
                     let mut extended: Vec<usize> = Vec::new();
                     for &x in exits.iter() {
                         let mut cur_x = x;
@@ -1166,30 +1179,50 @@ impl<'a> Structurer<'a> {
                 // Pattern.sequence: exits {goto-609 stubs, throw} all
                 // consumed, the `if (head == null) return end; .. return
                 // head;` tail stranded → 缺少返回语句).
-                let natural_follow: Vec<usize> = natural_follow
-                    .into_iter()
-                    .map(|x| {
-                        let mut cur_x = x;
-                        let mut guard = 0;
-                        while ctx.consumed.contains(&cur_x)
-                            && self.cfg.blocks[cur_x].succ.len() == 1
-                            && guard < 16
-                        {
-                            let n = self.cfg.blocks[cur_x].succ[0];
-                            if ctx.consumed.contains(&n)
-                                || stop.contains(&n)
-                                || members.contains(&n)
-                                || ctx.loop_stack.contains(&n)
-                                || ctx.loop_headers.contains(&n)
+                // Gate: ONLY when every candidate exit was consumed by the
+                // body walk — the deep-switch break-stub shape (Pattern
+                // .sequence: all exits are per-case `goto TAIL` stubs the
+                // case regions absorbed, and the shared TAIL behind them is
+                // the true continuation). A normal loop leaves its header
+                // fall-out unconsumed; chain-walking it anyway degraded
+                // String.contentEquals's `while (i < n)` classification and
+                // dropped the post-loop `return true`.
+                let all_consumed = !natural_follow.is_empty()
+                    && natural_follow.iter().all(|f| ctx.consumed.contains(f));
+                if std::env::var("JCDC_DBG_SESE").is_ok() && all_consumed {
+                    eprintln!("CHAINWALK header={} nf={:?} succs={:?} cons49={:?}", header_id,
+                        natural_follow,
+                        natural_follow.iter().map(|f| self.cfg.blocks[*f].succ.clone()).collect::<Vec<_>>(),
+                        natural_follow.iter().map(|f| ctx.consumed.contains(f)).collect::<Vec<_>>());
+                }
+                let natural_follow: Vec<usize> = if all_consumed {
+                    natural_follow
+                        .into_iter()
+                        .map(|x| {
+                            let mut cur_x = x;
+                            let mut guard = 0;
+                            while ctx.consumed.contains(&cur_x)
+                                && self.cfg.blocks[cur_x].succ.len() == 1
+                                && guard < 16
                             {
-                                break;
+                                let n = self.cfg.blocks[cur_x].succ[0];
+                                if ctx.consumed.contains(&n)
+                                    || stop.contains(&n)
+                                    || members.contains(&n)
+                                    || ctx.loop_stack.contains(&n)
+                                    || ctx.loop_headers.contains(&n)
+                                {
+                                    break;
+                                }
+                                cur_x = n;
+                                guard += 1;
                             }
-                            cur_x = n;
-                            guard += 1;
-                        }
-                        cur_x
-                    })
-                    .collect::<Vec<_>>();
+                            cur_x
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    natural_follow
+                };
                 let natural_follow = natural_follow
                     .into_iter()
                     .filter(|f| {
@@ -1200,6 +1233,11 @@ impl<'a> Structurer<'a> {
                                 .all(|&p| p == header_id)
                     })
                     .collect::<Vec<_>>();
+                if std::env::var("JCDC_DBG_SESE").is_ok() {
+                    eprintln!("LOOPFOLLOW header={} exits={:?} natural_follow={:?} consumed_nf={:?}",
+                        header_id, exits, natural_follow,
+                        natural_follow.iter().map(|f| ctx.consumed.contains(f)).collect::<Vec<_>>());
+                }
                 match natural_follow.first().copied() {
                     // No `!consumed` gate: a follow already consumed by a
                     // sibling branch (the shared single-return block after
