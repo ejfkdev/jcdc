@@ -36,6 +36,10 @@ struct SeseCtx {
     vx: usize,
     /// loop headers (back-edge targets that dominate the source).
     loop_headers: HashSet<usize>,
+    /// loop headers whose back edge is EXCEPTION-mediated (the retry jump
+    /// originates in handler flow, invisible to normal dominance at the
+    /// group-yield check).
+    exc_retry_headers: HashSet<usize>,
     /// header -> natural-loop member set.
     loop_members: HashMap<usize, HashSet<usize>>,
     /// blocks consumed (structured exactly once) across the whole method.
@@ -97,10 +101,55 @@ impl<'a> Structurer<'a> {
             if !self.cfg.blocks[c].pred.is_empty() {
                 continue; // normally reachable: real dominators apply
             }
-            for &h in &self.cfg.blocks[c].succ {
-                if h != c && universe.contains(&h) && idom.dominates(h, e.from) {
-                    loop_headers.insert(h);
-                    exc_back_sources.entry(h).or_default().push(c);
+            // Handler-flow closure: blocks whose normal preds all stay
+            // within the handler flow. The retry back edge may originate
+            // deeper than the handler entry (`catch { if (rem > 0)
+            // sleep(..); rem = ..; if (rem > 0) goto head; }` — jdk11
+            // Process.waitFor: the back edge sits at the while-test two
+            // hops down; the direct-succ scan missed it, the retry loop
+            // never structured, and the back-edge arrival copy_walked the
+            // try head into 5 nested duplicate tries with the final
+            // `return false` lost — 缺少返回语句). Blocks with a normal pred
+            // from OUTSIDE the handler flow (shared merges) stop the
+            // closure; they belong to the enclosing flow.
+            let mut hf: HashSet<usize> = HashSet::new();
+            hf.insert(c);
+            {
+                let mut q: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+                q.push_back(c);
+                while let Some(b) = q.pop_front() {
+                    for &s in &self.cfg.blocks[b].succ {
+                        if hf.contains(&s)
+                            || !universe.contains(&s)
+                            || self.handler_group.contains_key(&s)
+                        {
+                            continue;
+                        }
+                        if self.cfg.blocks[s]
+                            .pred
+                            .iter()
+                            .all(|p| hf.contains(p) || self.handler_group.contains_key(p))
+                        {
+                            hf.insert(s);
+                            q.push_back(s);
+                        }
+                    }
+                }
+            }
+            for &b in hf.iter() {
+                for &h in &self.cfg.blocks[b].succ {
+                    if hf.contains(&h) {
+                        continue;
+                    }
+                    if universe.contains(&h) && idom.dominates(h, e.from) {
+                        loop_headers.insert(h);
+                        let srcs = exc_back_sources.entry(h).or_default();
+                        for &m in hf.iter() {
+                            if !srcs.contains(&m) {
+                                srcs.push(m);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -185,6 +234,7 @@ impl<'a> Structurer<'a> {
             idom,
             ipdom,
             vx,
+            exc_retry_headers: exc_back_sources.keys().copied().collect(),
             loop_headers,
             loop_members,
             consumed: HashSet::new(),
@@ -949,12 +999,13 @@ impl<'a> Structurer<'a> {
                 // its back edge is INSIDE the protected span.
                 let group_here = group_here.filter(|&gi| {
                     !ctx.loop_headers.contains(&cur)
-                        || !self.cfg.blocks[cur].pred.iter().any(|&p| {
-                            p != cur
-                                && ctx.idom.dominates(cur, p)
-                                && (self.cfg.blocks[p].end <= self.groups[gi].start
-                                    || self.cfg.blocks[p].start >= self.groups[gi].end)
-                        })
+                        || (!ctx.exc_retry_headers.contains(&cur)
+                            && !self.cfg.blocks[cur].pred.iter().any(|&p| {
+                                p != cur
+                                    && ctx.idom.dominates(cur, p)
+                                    && (self.cfg.blocks[p].end <= self.groups[gi].start
+                                        || self.cfg.blocks[p].start >= self.groups[gi].end)
+                            }))
                 });
                 if let Some(gi) = group_here {
                     let outer_universe = ctx.universe.clone();
