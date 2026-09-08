@@ -366,6 +366,23 @@ impl<'a> Converter<'a> {
                                 } else {
                                     Stmt::Block(cv)
                                 }
+                            } else if self
+                                .loops
+                                .iter()
+                                .any(|l| l.exits.contains(&t) || l.header == t)
+                                && (self.goto_is_last || self.if_follows.contains(&t))
+                            {
+                                // The target is an ENCLOSING LOOP's exit:
+                                // inside a loop body, falling out of an if
+                                // continues the LOOP — the if-follow
+                                // elision would silently drop the jump
+                                // (jdk11 ObjectInputStream.readSerialData's
+                                // finally-copy retry loop lost its `break`,
+                                // the finally's while(true) never completed
+                                // normally, and the tail went unreachable —
+                                // 无法访问的语句 x2 trees). Materialize the
+                                // break (innermost enclosing loop).
+                                Stmt::Break(None)
                             } else if self.goto_is_last
                                 || self.if_follows.contains(&t)
                                 || self.reaches_copy_tail(t)

@@ -7896,9 +7896,51 @@ fn strip_inflight_throws(s: &mut Stmt, _inflight: &std::collections::HashSet<u32
             v.retain(|x| !is_inflight_throw(x));
         }
         Stmt::If { then_stmt, else_stmt, .. } => {
-            strip_inflight_throws(then_stmt, _inflight);
+            // An in-flight rethrow AS a whole branch becomes an empty
+            // block (rotate/cleanup collapse it afterwards).
+            if is_inflight_throw(then_stmt) {
+                *then_stmt = Box::new(Stmt::Block(vec![]));
+            } else {
+                strip_inflight_throws(then_stmt, _inflight);
+            }
             if let Some(e) = else_stmt {
-                strip_inflight_throws(e, _inflight);
+                if is_inflight_throw(e) {
+                    *e = Box::new(Stmt::Block(vec![]));
+                } else {
+                    strip_inflight_throws(e, _inflight);
+                }
+            }
+        }
+        // The finally duplication nests: javac's ThreadDeath-retry
+        // scaffolding wraps the cleanup in try/catch/loop copies, and the
+        // in-flight `throw t` rethrows sit INSIDE those (jdk26
+        // ForkJoinWorkerThread.run: `catch (Throwable e5) { .. throw e4; }
+        // finally { deregisterWorker }` — 未报告的异常错误Throwable x2).
+        Stmt::Try { body, catches, finally, .. }
+        | Stmt::TryWithResources { body, catches, finally, .. } => {
+            strip_inflight_throws(body, _inflight);
+            for c in catches.iter_mut() {
+                strip_inflight_throws(&mut c.body, _inflight);
+            }
+            if let Some(f) = finally {
+                strip_inflight_throws(f, _inflight);
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::ForEach { body, .. }
+        | Stmt::Labeled { body, .. }
+        | Stmt::Synchronized { body, .. } => strip_inflight_throws(body, _inflight),
+        Stmt::For { init, body, .. } => {
+            init.iter_mut().for_each(|x| strip_inflight_throws(x, _inflight));
+            strip_inflight_throws(body, _inflight);
+        }
+        Stmt::Switch { cases, default, .. } => {
+            for c in cases {
+                c.body.iter_mut().for_each(|x| strip_inflight_throws(x, _inflight));
+            }
+            if let Some(d) = default {
+                strip_inflight_throws(d, _inflight);
             }
         }
         _ => {}
