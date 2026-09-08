@@ -1925,7 +1925,7 @@ fn contains_break_stmt(s: &Stmt) -> bool {
     }
 }
 
-fn stmt_terminates(s: &Stmt) -> bool {
+pub(crate) fn stmt_terminates(s: &Stmt) -> bool {
     match s {
         Stmt::Return(_) | Stmt::Throw(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
         Stmt::Block(v) => v.last().map(stmt_terminates).unwrap_or(false),

@@ -9017,23 +9017,16 @@ fn restore_one_switch(
                 // is illegal ("贯穿到模式非法", jdk26 ParserVerifier x34).
                 // Every labelled case (and the default) must end in a
                 // jump; when structuring lost the break, re-append it.
+                // Delegates to the canonical completion analyzer: it
+                // covers the JLS 14.21 infinite-loop rule (a
+                // `while (true)`/`for (;;)` body with no break never
+                // completes normally — jdk26 TypeClass.groupByEightBytes'
+                // SequenceLayout case is exactly that loop ending in
+                // `return`; the appended `break;` landed unreachable —
+                // 无法访问的语句), exhaustive switches, and try shapes
+                // the old local match missed.
                 fn case_terminates(st: &Stmt) -> bool {
-                    match st {
-                        Stmt::Return(_) | Stmt::Throw(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
-                        Stmt::Block(v) => v.last().map(case_terminates).unwrap_or(false),
-                        Stmt::If { then_stmt, else_stmt: Some(e), .. } => {
-                            case_terminates(then_stmt) && case_terminates(e)
-                        }
-                        Stmt::Labeled { body, .. } | Stmt::Synchronized { body, .. } => {
-                            case_terminates(body)
-                        }
-                        Stmt::Try { body, finally, .. }
-                        | Stmt::TryWithResources { body, finally, .. } => match finally {
-                            Some(f) => case_terminates(f),
-                            None => case_terminates(body),
-                        },
-                        _ => false,
-                    }
+                    crate::method::stmt_terminates(st)
                 }
                 for cgroup in cases.iter_mut() {
                     if cgroup.raw_labels.is_empty() && cgroup.string_labels.is_empty() {
