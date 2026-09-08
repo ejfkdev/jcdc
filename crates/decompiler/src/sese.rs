@@ -179,6 +179,7 @@ impl<'a> Structurer<'a> {
                 })
             })
             .collect();
+        self.sese_loop_headers = loop_headers.clone();
         let mut ctx = SeseCtx {
             universe,
             idom,

@@ -484,6 +484,12 @@ pub struct Structurer<'a> {
     pub copied_tails: HashSet<usize>,
     /// Headers of loops currently being structured (nesting barriers).
     pub loops_stack: Vec<usize>,
+    /// Loop headers detected at the SESE method level (including
+    /// exception-edge back edges from no-normal-pred retry handlers).
+    /// Walk-based sub-builders consult this so a retry `goto header`
+    /// keeps loop precedence and resolves to `continue` (jdk26
+    /// Future.exceptionNow).
+    pub sese_loop_headers: std::collections::HashSet<usize>,
     /// Current `walk` recursion depth (hang guard for pathological methods
     /// whose shared-tail / branch decomposition does not converge).
     walk_depth: usize,
@@ -662,7 +668,7 @@ impl<'a> Structurer<'a> {
         for (&merge, (root, _vis)) in &fold_regions {
             fold_root_to_merge.insert(*root, merge);
         }
-        Structurer { cfg, results, groups, body_group, handler_group, diamond_merges, fold_regions, fold_root_to_merge, copied_tails: HashSet::new(), loops_stack: Vec::new(), walk_depth: 0, final_fields: HashSet::new() }
+        Structurer { cfg, results, groups, body_group, handler_group, diamond_merges, fold_regions, fold_root_to_merge, copied_tails: HashSet::new(), loops_stack: Vec::new(), sese_loop_headers: std::collections::HashSet::new(), walk_depth: 0, final_fields: HashSet::new() }
     }
 
     /// Immediate post-dominator of `entry` within `universe`. Delegates to the
@@ -674,6 +680,30 @@ impl<'a> Structurer<'a> {
 
     /// True if `b` is an exception-handler head; such blocks must only be
     /// entered through their Try region, never through the normal flow.
+    /// True when one of the handlers protecting `cur` is a retry
+    /// trampoline: a handler with NO normal preds whose only out-edge
+    /// returns to `cur`, sitting at/after the group's span end (outside
+    /// the protected range). The normal-pred back-edge scan misses it
+    /// (the edge INTO the handler is exceptional), so the group-vs-loop
+    /// precedence wrongly lets the try carve out the header and the retry
+    /// `goto` inlines as an unprotected copy of the body (jdk26
+    /// Future.exceptionNow: `catch (InterruptedException e) { interrupted
+    /// = true; get(); throw ..; }` — 未报告的异常错误 InterruptedException;
+    /// the source is `while (true) { try { get(); .. } catch (IE) {
+    /// interrupted = true; } }`).
+    pub(crate) fn exc_retry_back_edge(&self, cur: usize, gi: usize) -> bool {
+        let g = &self.groups[gi];
+        self.cfg.exc_edges.iter().any(|e| {
+            e.to != cur
+                && self.cfg.blocks[e.to].pred.is_empty()
+                && !self.cfg.blocks[e.to].succ.is_empty()
+                && self.cfg.blocks[e.to].succ.iter().all(|s| *s == cur)
+                && self.cfg.blocks[e.to].start >= g.end
+                && self.cfg.blocks[e.from].start >= g.start
+                && self.cfg.blocks[e.from].start < g.end
+        })
+    }
+
     pub(crate) fn is_handler(&self, b: usize) -> bool {
         self.handler_group.contains_key(&b)
     }
@@ -740,6 +770,28 @@ impl<'a> Structurer<'a> {
             })
         })
     }
+
+/// Is `t` the header of a natural loop containing a back edge from `cur`-side
+/// flow? Approximation used by the walk's back-edge arm: `t` dominates the
+/// edge source (the arm's entry condition) AND some predecessor path of the
+/// current region loops — but the simple, robust signal here is: the Goto arm
+/// only runs when `dom.dominates(t, cur)` already held (see caller), so a
+/// terminator `t` that also has an incoming exc-handler back edge is a retry
+/// loop header. Callers pass the structurer for cfg access.
+fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
+    // A claimed terminator target that is the exception-handler back-edge
+    // destination of its own protected range: the retry-loop header shape
+    // (handler `goto t` where t is protected by the handler's own range).
+    s.cfg.exc_edges.iter().any(|e| {
+        e.to != t
+            && s.cfg.blocks[e.to].succ.contains(&t)
+            && s.cfg.blocks[e.from].start >= s.cfg.blocks[t].start
+            && !s.cfg.blocks[e.to].pred.iter().any(|p| *p != e.to)
+    }) && matches!(
+        s.results[t].term,
+        crate::builder::Term::Return(_) | crate::builder::Term::Throw(_)
+    )
+}
 
     fn sub_scope(
         &self,
@@ -900,6 +952,17 @@ impl<'a> Structurer<'a> {
                     } else {
                         parts.push(Region::Goto { target: cur });
                     }
+                } else if self.loops_stack.contains(&cur)
+                    || self.sese_loop_headers.contains(&cur)
+                {
+                    // An EMPTY region arriving at an enclosing loop header
+                    // IS the back edge (jdk26 Future.exceptionNow's
+                    // `catch (InterruptedException e) { interrupted =
+                    // true; }` retry — the handler's only out-edge is
+                    // `goto head`): emit the Goto so conversion resolves
+                    // it to `continue`. Dropping it lets the handler fall
+                    // out of the try silently.
+                    parts.push(Region::Goto { target: cur });
                 }
                 break;
             }
@@ -944,7 +1007,8 @@ impl<'a> Structurer<'a> {
             // edge is INSIDE the protected span.
             let group_here = group_here.filter(|&gi| {
                 entry_preclaimed
-                    || !self.is_loop_header(cur, universe, &dom)
+                    || !(self.is_loop_header(cur, universe, &dom)
+                        || self.sese_loop_headers.contains(&cur))
                     || !self.cfg.blocks[cur].pred.iter().any(|&p| {
                         p != cur
                             && dom.dominates(cur, p)
@@ -1554,9 +1618,23 @@ impl<'a> Structurer<'a> {
                             // Back edge into an already-structured block:
                             // emit statements + goto (→ continue/break).
                             parts.push(Region::Basic { block: cur });
-                            if self.is_terminator_block(t) && !stop.contains(&t) {
+                            if self.is_terminator_block(t)
+                                && !stop.contains(&t)
+                                && !self.loops_stack.contains(&t)
+                                && !Self::ctx_is_loop_header(self, t)
+                            {
+                                // A shared TERMINATOR tail (return/throw) is
+                                // copied at each arrival — but NOT when the
+                                // target is a LOOP HEADER: the back edge is
+                                // a `continue`, and copying a header whose
+                                // body ends in a throw inlines the body into
+                                // the handler unprotected (jdk26 Future
+                                // .exceptionNow: the InterruptedException
+                                // retry `goto 40` copied `get(); throw ISE`
+                                // into the catch — 未报告的异常错误
+                                // InterruptedException).
                                 parts.push(Region::CopyStmts { block: t });
-                            } else if !stop.contains(&t) && !self.loops_stack.contains(&t) {
+                            } else if !stop.contains(&t) && !self.loops_stack.contains(&t) && !Self::ctx_is_loop_header(self, t) {
                                 match self.copy_walk(t, stop, active, cur) {
                                     Some(r) => parts.push(r),
                                     None => parts.push(Region::Goto { target: t }),
@@ -1571,9 +1649,27 @@ impl<'a> Structurer<'a> {
                                 eprintln!("GOTO-FALL cur={} t={} univ={} stop={} claimed={} entry={}", cur, t, universe.contains(&t), stop.contains(&t), claimed.contains(&t), entry);
                             }
                             parts.push(Region::Basic { block: cur });
-                            if self.is_terminator_block(t) && !stop.contains(&t) {
+                            if std::env::var("JCDC_DBG_GOTO").is_ok() {
+                                eprintln!("GFALL-ARM cur={} t={} term={} stop={} loophdr={}",
+                                    cur, t, self.is_terminator_block(t), stop.contains(&t),
+                                    Self::ctx_is_loop_header(self, t));
+                            }
+                            if self.is_terminator_block(t)
+                                && !stop.contains(&t)
+                                && !Self::ctx_is_loop_header(self, t)
+                            {
+                                // Shared terminator tail — but NOT a retry
+                                // loop header (a handler-entry `goto head`
+                                // re-executes the protected body; copying a
+                                // throw-terminated header inlines it
+                                // unprotected: jdk26 Future.exceptionNow
+                                // catch(IE) got `get(); throw ISE` —
+                                // 未报告的异常错误 InterruptedException).
                                 parts.push(Region::CopyStmts { block: t });
-                            } else if !stop.contains(&t) && !self.loops_stack.contains(&t) {
+                            } else if !stop.contains(&t)
+                                && !self.loops_stack.contains(&t)
+                                && !Self::ctx_is_loop_header(self, t)
+                            {
                                 match self.copy_walk(t, stop, active, cur) {
                                     Some(r) => parts.push(r),
                                     None => parts.push(Region::Goto { target: t }),

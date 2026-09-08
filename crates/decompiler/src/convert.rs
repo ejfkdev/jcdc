@@ -353,7 +353,8 @@ impl<'a> Converter<'a> {
                             let term_copy = matches!(
                                 self.results[t].term,
                                 Term::Return(_) | Term::Throw(_)
-                            ) && !self.stmts_write_final(&self.results[t].stmts);
+                            ) && !self.stmts_write_final(&self.results[t].stmts)
+                            && !self.is_retry_loop_header(t);
                             if term_copy {
                                 let mut cv = self.results[t].stmts.clone();
                                 match &self.results[t].term {
@@ -500,6 +501,23 @@ impl<'a> Converter<'a> {
     /// (or the end of a chain of statement-free blocks starting at `t`) is
     /// a copied shared tail or an open if-follow that the enclosing flow
     /// will emit next anyway.
+    /// True when `t` is the head of a javac retry loop: some exception
+    /// handler protecting `t` has no normal preds and flows straight back
+    /// to `t` (`catch (InterruptedException e) { ..; goto head }`). A Goto
+    /// to such a header re-executes the protected body — inlining the
+    /// body's terminator as a "shared tail copy" drops it out of its try
+    /// (jdk26 Future.exceptionNow: the IE catch got `get(); throw ISE`
+    /// unprotected — 未报告的异常错误 InterruptedException).
+    fn is_retry_loop_header(&self, t: usize) -> bool {
+        self.cfg.exc_edges.iter().any(|e| {
+            e.to != t
+                && self.cfg.blocks[e.to].pred.is_empty()
+                && !self.cfg.blocks[e.to].succ.is_empty()
+                && self.cfg.blocks[e.to].succ.iter().all(|s| *s == t)
+                && self.cfg.blocks[e.from].start >= self.cfg.blocks[t].start
+        })
+    }
+
     fn reaches_copy_tail(&self, t: usize) -> bool {
         let mut x = t;
         for _ in 0..8 {
