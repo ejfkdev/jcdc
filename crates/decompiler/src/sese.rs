@@ -521,6 +521,11 @@ impl<'a> Structurer<'a> {
         let mut last_via_goto = false;
         loop {
             guard += 1;
+            if std::env::var("JCDC_DBG_GOTO").is_ok() {
+                eprintln!("SESETOP entry={} cur={} parts={} reach={} stop={} consumed={} last_via_goto={}",
+                    entry, cur, parts.len(), reach.contains(&cur), stop.contains(&cur),
+                    ctx.consumed.contains(&cur), last_via_goto);
+            }
             if deep || guard > ctx.universe.len() * 4 + 64 {
                 break;
             }
@@ -1091,6 +1096,11 @@ impl<'a> Structurer<'a> {
                     );
                     ctx.consumed = claimed;
                     parts.push(sw);
+                    if std::env::var("JCDC_DBG_GOTO").is_ok() {
+                        eprintln!("SWCONT cur={} follow={:?} in_reach={:?} in_stop={:?} consumed={:?}",
+                            cur, follow, follow.map(|f| reach.contains(&f)),
+                            follow.map(|f| stop.contains(&f)), ctx.consumed);
+                    }
                     match follow {
                         Some(f) if reach.contains(&f) => {
                             cur = f;

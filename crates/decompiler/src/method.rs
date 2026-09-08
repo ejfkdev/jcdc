@@ -390,12 +390,27 @@ pub fn decompile_method(
         .with_copied_tails(copied_tails)
         .with_final_fields(final_fields);
     let mut body = converter.convert(region);
+    if let Ok(want) = std::env::var("JCDC_DBG_BODY") {
+        if pc.method_name(m_idx) == Some(want.as_str()) {
+            eprintln!("BODY-CONVERT: {:#?}", body);
+        }
+    }
+    macro_rules! dbg_body {
+        ($tag:expr) => {
+            if let Ok(want) = std::env::var("JCDC_DBG_BODY") {
+                if pc.method_name(m_idx) == Some(want.as_str()) {
+                    eprintln!("BODY[{}]: {:#?}", $tag, body);
+                }
+            }
+        };
+    }
 
     // Post-passes.
     resolve_catch_vars(&mut vt, &mut body);
     assign_catch_names(&mut vt, &mut body);
     cleanup(&mut body);
     reconstruct_synchronized(&mut body);
+    dbg_body!("post-cleanup1");
     strip_monitors_in_sync(&mut body);
     drop_monitor_stores(&mut body, &vt);
     strip_selftype_checkcasts(&mut body, pool);
@@ -416,6 +431,7 @@ pub fn decompile_method(
     fold_this_stack_vars(&mut body, &vt, &stack_vars);
     hoist_stack_vars(&mut body, &stack_vars);
     cleanup(&mut body);
+    dbg_body!("post-stackvars");
     let numeric_ret = matches!(
         desc.ret,
         jcdc_jvm::JavaType::Byte
@@ -428,13 +444,16 @@ pub fn decompile_method(
     );
     booleanize_deep_stmt_r(&mut body, numeric_ret, &desc.ret);
     cleanup(&mut body);
+    dbg_body!("post-booleanize");
     rotate_empty_then(&mut body);
     cleanup(&mut body);
     // Type inference for synthetic (no-LVT) variables, then fix the embedded
     // types in Local expressions.
     let ret_ty = desc.ret.clone();
     infer_var_types(&mut vt, &mut body, &ret_ty, pc);
+    dbg_body!("post-infer");
     prune_dead_synth_stores(&mut body, &vt);
+    dbg_body!("post-prune-dead");
     cast_generic_locals(&vt, pool, pc, &mut body);
     cast_object_returns(&mut body, &ret_ty);
     cast_narrowing_assigns(&vt, &mut body);
@@ -457,6 +476,7 @@ pub fn decompile_method(
     disambiguate_nested_locals(&mut vt, &body);
     prune_unreachable(&mut body);
     cleanup(&mut body);
+    dbg_body!("post-unreachable");
 
     if !errors.is_empty() {
         let n = errors.len();
@@ -1735,9 +1755,64 @@ fn stmt_terminates(s: &Stmt) -> bool {
 /// `break` exits the switch normally, so the switch does NOT terminate.
 /// Without this, a trailing `return`/`throw` after an all-returning switch is
 /// kept and javac rejects it as unreachable.
+/// `stmt_terminates` parameterized: with `no_break`, `break`/`continue`
+/// count as NORMAL completion of the enclosing switch/loop rather than
+/// abrupt termination. `switch_terminates_with` needs this: a case body
+/// `if (c) { ..; break; } else { ..; break; }` exits the switch normally,
+/// but plain `stmt_terminates` read the nested breaks as terminating, the
+/// whole switch read as abrupt, and `prune_unreachable` truncated the
+/// post-switch tail (MemberName.asNormalOriginal lost its merge-var
+/// comparison, clone and both returns → "missing return statement").
+fn stmt_terminates_with(s: &Stmt, no_break: bool) -> bool {
+    match s {
+        Stmt::Return(_) | Stmt::Throw(_) => true,
+        Stmt::Break(_) | Stmt::Continue(_) => !no_break,
+        Stmt::Block(v) => v.last().map(|x| stmt_terminates_with(x, no_break)).unwrap_or(false),
+        Stmt::If { then_stmt, else_stmt: Some(e), .. } => {
+            stmt_terminates_with(then_stmt, no_break) && stmt_terminates_with(e, no_break)
+        }
+        Stmt::Switch { cases, default, .. } => {
+            switch_terminates_with(cases, default.as_deref(), no_break)
+        }
+        Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => {
+            stmt_terminates_with(body, no_break)
+        }
+        Stmt::While { cond, body } | Stmt::DoWhile { body, cond }
+            if matches!(cond, Expr::Const(ConstVal::Int(1))) && !contains_break_stmt(body) =>
+        {
+            true
+        }
+        Stmt::For { cond, body, .. }
+            if match cond {
+                None => true,
+                Some(c) => matches!(c, Expr::Const(ConstVal::Int(1))),
+            } && !contains_break_stmt(body)
+        => {
+            true
+        }
+        Stmt::Try { body, catches, .. } => {
+            stmt_terminates_with(body, no_break)
+                && catches.iter().all(|c| stmt_terminates_with(&c.body, no_break))
+        }
+        _ => false,
+    }
+}
+
 fn switch_terminates(cases: &[crate::stmt::CaseGroup], default: Option<&Stmt>) -> bool {
+    switch_terminates_with(cases, default, false)
+}
+
+fn switch_terminates_with(
+    cases: &[crate::stmt::CaseGroup],
+    default: Option<&Stmt>,
+    outer_no_break: bool,
+) -> bool {
+    // A `break` inside THIS switch's cases exits it normally, so case-level
+    // analysis always treats break as non-terminating (no_break = true).
+    let no_break = true;
+    let _ = outer_no_break;
     let Some(def) = default else { return false };
-    if !stmt_terminates(def) {
+    if !stmt_terminates_with(def, no_break) {
         return false;
     }
     // t[i]: once control has entered case i (via its label OR fall-through
@@ -1752,7 +1827,7 @@ fn switch_terminates(cases: &[crate::stmt::CaseGroup], default: Option<&Stmt>) -
         t[i] = match body.last() {
             // `break` exits the switch normally → this path does not terminate.
             Some(Stmt::Break(_)) => false,
-            Some(last) if stmt_terminates(last) => true,
+            Some(last) if stmt_terminates_with(last, no_break) => true,
             // Falls through to the next case (or the default for the last).
             _ => t[i + 1],
         };
