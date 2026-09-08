@@ -2753,7 +2753,16 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             // (exits/natural_follow lose it) and strands `interrupt();
             // return result;` (缺少返回语句). Preds may be body blocks,
             // this group's handler heads, or handler-flow-only blocks
-            // (the pending-rethrow copy shapes).
+            // (the pending-rethrow copy shapes). Do NOT gate on
+            // !stop.contains(cb): a shared return tail that is ALSO an
+            // enclosing loop's exit must still absorb when its preds are
+            // all group flow — refusing left ReflectionFactory
+            // .getReplaceResolveForSerialization's copied inner-try
+            // return as a Goto that resolved to `break` (the
+            // IllegalAccessException catch lost its throwing call).
+            // Future's exit block is ruled out by the pred test alone
+            // (its succs continue past the group, so it is not a
+            // terminator).
             let hf_own = self.handler_flow_only(gi);
             let pred_in_group_flow = |p: &usize| {
                 self.body_group.get(p) == Some(&gi)
@@ -2765,7 +2774,6 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                 && self.is_terminator_block(cb)
                 && self.results[cb].stmts.is_empty()
                 && !self.handler_group.contains_key(&cb)
-                && !stop.contains(&cb)
                 && !self.cfg.blocks[cb].pred.is_empty()
                 && self.cfg.blocks[cb].pred.iter().all(pred_in_group_flow)
             {
