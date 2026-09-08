@@ -1160,7 +1160,15 @@ impl<'a> Printer<'a> {
                         out.push_str(name);
                     }
                 } else if *is_static {
-                    if cls != &self.pc.internal_name {
+                    // A same-class static read prints bare — unless a local
+                    // of this method shadows the field name: javac resolves
+                    // the bare name as the LOCAL (jdk17 Socket.setImpl's
+                    // `SocketImplFactory factory = factory;` self-reference
+                    // — 可能尚未初始化变量factory x2 sites). Qualify with the
+                    // class name to reach the field.
+                    let shadowed_by_local = cls == &self.pc.internal_name
+                        && self.vt.vars.iter().any(|v| v.name == name);
+                    if cls != &self.pc.internal_name || shadowed_by_local {
                         out.push_str(&self.shorten(cls));
                         out.push('.');
                     }

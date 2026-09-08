@@ -13116,11 +13116,23 @@ pub(crate) fn fold_restart_guards(s: &mut Stmt) {
         if c.raw_labels.len() != 1 || c.guard.is_some() {
             return;
         }
-        // Split: optional leading binding LocalDef, then the guard If as the
-        // LAST statement of the group.
+        // Split: optional leading binding (LocalDef, or a plain Assign when
+        // the binding local was hoisted to the method top because the
+        // post-loop break-landing tail references it — jdk26
+        // NumberFormat.format's `bi`), then the guard If as the LAST
+        // statement of the group.
+        fn is_binding(st: &Stmt) -> bool {
+            match st {
+                Stmt::LocalDef { .. } => true,
+                Stmt::ExprStmt(Expr::Assign { target, value, op: crate::expr::AssignOp::Plain }) => {
+                    matches!(&**target, Expr::Local { .. }) && matches!(&**value, Expr::Cast { .. })
+                }
+                _ => false,
+            }
+        }
         let (bind_idx, if_idx) = match c.body.len() {
             n if n >= 1 && matches!(c.body[n - 1], Stmt::If { .. }) => {
-                let b = if n >= 2 && matches!(c.body[n - 2], Stmt::LocalDef { .. }) {
+                let b = if n >= 2 && is_binding(&c.body[n - 2]) {
                     Some(n - 2)
                 } else {
                     None
@@ -13144,11 +13156,20 @@ pub(crate) fn fold_restart_guards(s: &mut Stmt) {
             if bi + 1 != if_idx {
                 return;
             }
-            let Stmt::LocalDef { var, init: Some(init), .. } = &c.body[bi] else { return };
+            let (var, init) = match &c.body[bi] {
+                Stmt::LocalDef { var, init: Some(init), .. } => (*var, init),
+                Stmt::ExprStmt(Expr::Assign { target, value, .. }) => {
+                    match (&**target, &**value) {
+                        (Expr::Local { var, .. }, v) => (*var, v),
+                        _ => return,
+                    }
+                }
+                _ => return,
+            };
             if !matches!(init, Expr::Cast { .. }) {
                 return;
             }
-            replace_local(&mut guard, *var, init);
+            replace_local(&mut guard, var, init);
         }
         c.guard = Some(guard);
         // Body becomes the guard-pass branch (minus the binding def and the

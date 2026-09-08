@@ -1091,7 +1091,16 @@ impl<'a> Structurer<'a> {
                         // shared return/throw is the method tail the finally
                         // copy jumps to — the normal (try-completes) path
                         // must still return it (nestedTry's lost return).
-                        if self.handler_group.contains_key(&nb.id) && !is_term {
+                        // THIS group's own handler is never that shared
+                        // tail: its catch region already absorbed it, and
+                        // re-walking it duplicated the handler as top-level
+                        // statements after the try (jdk11
+                        // ThreadedSeedGenerator.run: `Exception e = null;
+                        // throw new InternalError(.., e);` after the
+                        // catch-that-throws — 无法访问的语句).
+                        if self.handler_group.contains_key(&nb.id)
+                            && (!is_term || self.handler_group.get(&nb.id) == Some(&gi))
+                        {
                             continue;
                         }
                         if ctx.consumed.contains(&nb.id) && !is_term {
@@ -1353,7 +1362,7 @@ impl<'a> Structurer<'a> {
                         _ => Region::Seq(parts),
                     };
                 }
-                match natural_follow.first().copied() {
+                let follow_pick = match natural_follow.first().copied() {
                     // No `!consumed` gate: a follow already consumed by a
                     // sibling branch (the shared single-return block after
                     // `if (c) return X; else { loop }`, Class.methodToString)
@@ -1363,11 +1372,40 @@ impl<'a> Structurer<'a> {
                     // Goto. Gating on !consumed silently dropped the else
                     // path's return (missing-return compile error; walk
                     // keeps the tail).
-                    Some(f) if !stop.contains(&f) && reach.contains(&f) => {
+                    Some(f) if !stop.contains(&f) && reach.contains(&f) => Some(f),
+                    _ => None,
+                };
+                let follow_pick = follow_pick.or_else(|| {
+                    // Stranded break landing: an exit some in-body
+                    // `break L` targeted but neither the body nor any
+                    // follow consumed (a guarded-pattern case body sits
+                    // outside the switch dispatch — jdk26
+                    // NumberFormat.format's `case BigInteger bi when
+                    // bi.bitLength() < 64` break-L1 landed on nothing:
+                    // natural_follow was empty and the bi.longValue()
+                    // body block was never structured — 缺少返回语句 x2
+                    // methods).
+                    let mut cands: Vec<usize> = exits
+                        .iter()
+                        .copied()
+                        .filter(|e| {
+                            !ctx.consumed.contains(e)
+                                && !stop.contains(e)
+                                && ctx.universe.contains(e)
+                                && reach.contains(e)
+                                && !self.is_handler(*e)
+                                && *e != header_id
+                        })
+                        .collect();
+                    cands.sort_by_key(|e| self.cfg.blocks[*e].start);
+                    cands.first().copied()
+                });
+                match follow_pick {
+                    Some(f) => {
                         cur = f;
                         continue;
                     }
-                    _ => break,
+                    None => break,
                 }
             }
 
