@@ -2795,6 +2795,7 @@ fn emit_method_with(
                 cast_wildcard_call_args(&mut body, pool, pc, &mb.vt, &caller_params);
                 witness_methodref_localdef_calls(&mut body, &mb.vt, pool, pc, &caller_params);
                 pin_underdetermined_return_diamonds(&mut body, msig.as_ref(), pool);
+                upgrade_raw_receiver_casts(&mut body, pool, pc, &caller_params);
                 if static_ban {
                     CAST_BANNED_TVARS.with(|b| b.borrow_mut().clear());
                 }
@@ -2914,6 +2915,8 @@ fn emit_method_with(
             // conditionals at Object: "Object无法转换为A").
             cast_pruned_delegation_typevar_args(&mut body, pc, mi);
             add_throw_witnesses(&mut body, msig.as_ref(), pool);
+            rethrow_typevar_witness(&mut body, msig.as_ref(), pool);
+            upgrade_raw_receiver_casts(&mut body, pool, pc, &caller_params);
             strip_erasure_casts_generic_ret(&mut body, msig.as_ref(), pool);
             witness_generic_returns(&mut body, msig.as_ref(), pool, pc);
             push_witness_into_branches(&mut body, msig.as_ref(), pool, pc);
@@ -9934,6 +9937,298 @@ pub(crate) fn is_subtype_of(pool: &ClassPool, ty: &jcdc_jvm::JavaType, target: &
 /// — inference in throw position falls back to the bound and would fail
 /// the enclosing throws clause. Also retypes erasure casts on thrown
 /// values to the declared throws type variable (`throw (X) e`).
+/// Upgrade a RAW receiver cast to a generic class to the parameterization
+/// made of the same-named in-scope typevars: a raw receiver makes the
+/// whole member chain raw, and a lambda parameter over it infers Object
+/// (jdk26/sj17 MemoryCache.cleanUp: `((QueueCacheEntry) entry).getQueue()
+/// .removeIf(e -> !e.isValid(time))` — 找不到符号 isValid on e:Object; the
+/// source cast QueueCacheEntry<K,V>).
+fn upgrade_raw_receiver_casts(
+    s: &mut Stmt,
+    pool: &ClassPool,
+    pc: &PoolClass,
+    caller_params: &[jcdc_jvm::TypeParam],
+) {
+    let mut scope: Vec<String> = caller_params.iter().map(|p| p.name.clone()).collect();
+    {
+        let mut name = pc.internal_name.clone();
+        loop {
+            if let Some(cp) = pool.get(&name) {
+                for t in class_typevar_names(&cp) {
+                    if !scope.contains(&t) {
+                        scope.push(t);
+                    }
+                }
+            }
+            match name.rfind('$') {
+                Some(i) if i > 0 => name.truncate(i),
+                _ => break,
+            }
+        }
+    }
+    if scope.is_empty() {
+        return;
+    }
+    fn upgraded_ty(c: &str, pool: &ClassPool, scope: &[String]) -> Option<TypeRef> {
+        let cp = pool.get(c)?;
+        let params = class_typevar_names(&cp);
+        if params.is_empty() || !params.iter().all(|p| scope.contains(p)) {
+            return None;
+        }
+        let (pkg, simple) = match c.rfind('/') {
+            Some(i) => (c[..i].to_string(), c[i + 1..].to_string()),
+            None => (String::new(), c.to_string()),
+        };
+        Some(TypeRef::G(jcdc_jvm::GenericType::Class(jcdc_jvm::ClassSig {
+            package: pkg,
+            parts: vec![jcdc_jvm::ClassSigPart {
+                name: simple.replace('$', "."),
+                args: params
+                    .iter()
+                    .map(|p| jcdc_jvm::GenericType::TypeVar(p.clone()))
+                    .collect(),
+            }],
+        })))
+    }
+    fn fix_e(e: &mut Expr, pool: &ClassPool, scope: &[String]) {
+        match e {
+            Expr::Method { owner, args, .. } => {
+                if let Some(o) = owner {
+                    if let Expr::Cast { ty, .. } = &mut **o {
+                        if let TypeRef::J(jcdc_jvm::JavaType::Object(c)) = ty {
+                            if let Some(g) = upgraded_ty(c, pool, scope) {
+                                *ty = g;
+                            }
+                        }
+                    }
+                    fix_e(o, pool, scope);
+                }
+                args.iter_mut().for_each(|a| fix_e(a, pool, scope));
+            }
+            Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+                args.iter_mut().for_each(|a| fix_e(a, pool, scope));
+            }
+            Expr::Field { owner: Some(o), .. } => fix_e(o, pool, scope),
+            Expr::ArrayIndex { array, index } => {
+                fix_e(array, pool, scope);
+                fix_e(index, pool, scope);
+            }
+            Expr::Cast { e: x, .. }
+            | Expr::Un { e: x, .. }
+            | Expr::InstanceOf { e: x, .. }
+            | Expr::PreIncDec { e: x, .. }
+            | Expr::PostIncDec { e: x, .. } => fix_e(x, pool, scope),
+            Expr::Cond { c, t, f } => {
+                fix_e(c, pool, scope);
+                fix_e(t, pool, scope);
+                fix_e(f, pool, scope);
+            }
+            Expr::Bin { l, r, .. } | Expr::Assign { target: l, value: r, .. } => {
+                fix_e(l, pool, scope);
+                fix_e(r, pool, scope);
+            }
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter_mut().for_each(|d| fix_e(d, pool, scope));
+                if let Some(vals) = init {
+                    vals.iter_mut().for_each(|v| fix_e(v, pool, scope));
+                }
+            }
+            Expr::Lambda(l) => l.captures.iter_mut().for_each(|c| fix_e(c, pool, scope)),
+            _ => {}
+        }
+    }
+    fn rec(s: &mut Stmt, pool: &ClassPool, scope: &[String]) {
+        match s {
+            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, pool, scope)),
+            Stmt::ExprStmt(e) => fix_e(e, pool, scope),
+            Stmt::LocalDef { init: Some(e), .. } => fix_e(e, pool, scope),
+            Stmt::Return(Some(e)) | Stmt::Throw(e) => fix_e(e, pool, scope),
+            Stmt::If { cond, then_stmt, else_stmt, .. } => {
+                fix_e(cond, pool, scope);
+                rec(then_stmt, pool, scope);
+                if let Some(x) = else_stmt {
+                    rec(x, pool, scope);
+                }
+            }
+            Stmt::While { cond, body, .. } | Stmt::DoWhile { body, cond, .. } => {
+                fix_e(cond, pool, scope);
+                rec(body, pool, scope);
+            }
+            Stmt::For { init, cond, update, body, .. } => {
+                init.iter_mut().for_each(|i| rec(i, pool, scope));
+                if let Some(c) = cond {
+                    fix_e(c, pool, scope);
+                }
+                update.iter_mut().for_each(|u| fix_e(u, pool, scope));
+                rec(body, pool, scope);
+            }
+            Stmt::ForEach { iterable, body, .. } => {
+                fix_e(iterable, pool, scope);
+                rec(body, pool, scope);
+            }
+            Stmt::Try { body, catches, finally, .. }
+            | Stmt::TryWithResources { body, catches, finally, .. } => {
+                rec(body, pool, scope);
+                for c in catches {
+                    rec(&mut c.body, pool, scope);
+                }
+                if let Some(f) = finally {
+                    rec(f, pool, scope);
+                }
+            }
+            Stmt::Switch { selector, cases, default, .. } => {
+                fix_e(selector, pool, scope);
+                for c in cases {
+                    c.body.iter_mut().for_each(|x| rec(x, pool, scope));
+                }
+                if let Some(d) = default {
+                    rec(d, pool, scope);
+                }
+            }
+            Stmt::Synchronized { lock, body } => {
+                fix_e(lock, pool, scope);
+                rec(body, pool, scope);
+            }
+            Stmt::Labeled { body, .. } => rec(body, pool, scope),
+            _ => {}
+        }
+    }
+    rec(s, pool, &scope);
+}
+
+/// Restore the source's sneaky-throw cast: `E cce = (E) x; throw cce;`
+/// (jdk26 String.encodeWithEncoder catches CharacterCodingException and
+/// rethrows through its own method typevar `throws E`). The `(E)` cast
+/// erases to a checkcast at E's BOUND and the redundant-upcast strip
+/// removes it, leaving `throw x;` — a checked exception beyond the
+/// `throws E` declaration (未报告的异常错误CharacterCodingException).
+/// Rewrap the thrown expression when the method throws a METHOD typevar
+/// and the thrown static type is a checked exception.
+fn rethrow_typevar_witness(
+    s: &mut Stmt,
+    msig: Option<&jcdc_jvm::MethodSignature>,
+    pool: &ClassPool,
+) {
+    let Some(sig) = msig else { return };
+    if sig.throws.is_empty() {
+        return;
+    }
+    let tvs: Vec<String> = sig
+        .throws
+        .iter()
+        .filter_map(|t| match t {
+            jcdc_jvm::GenericType::TypeVar(n)
+                if sig.params.iter().any(|p| &p.name == n) =>
+            {
+                Some(n.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    if std::env::var("JCDC_DBG_THROW").is_ok() {
+        eprintln!("RETHROW throws={:?} tvs={:?}", sig.throws, tvs);
+    }
+    if tvs.is_empty() {
+        return;
+    }
+    // The typevar's bound erasure (E extends Exception -> Exception); a
+    // thrown type under it — or the handler-typed java/lang/Throwable —
+    // needs the sneaky `(E)` rewrap. Unchecked types throw bare legally.
+    let bound_er: String = sig
+        .params
+        .iter()
+        .find(|p| p.name == tvs[0])
+        .and_then(|p| {
+            p.class_bound
+                .clone()
+                .or_else(|| p.interface_bounds.first().cloned())
+        })
+        .map(|b| TypeRef::G(b).erased())
+        .and_then(|j| match j {
+            jcdc_jvm::JavaType::Object(n) => Some(n),
+            _ => None,
+        })
+        .unwrap_or_else(|| "java/lang/Object".to_string());
+    fn needs_sneaky(ty: &TypeRef, pool: &ClassPool, bound_er: &str) -> bool {
+        let TypeRef::J(jcdc_jvm::JavaType::Object(n)) = ty else {
+            return false;
+        };
+        if is_subtype_of(pool, &jcdc_jvm::JavaType::Object(n.clone()), "java/lang/RuntimeException")
+            || is_subtype_of(pool, &jcdc_jvm::JavaType::Object(n.clone()), "java/lang/Error")
+        {
+            return false;
+        }
+        n == "java/lang/Throwable"
+            || is_subtype_of(pool, &jcdc_jvm::JavaType::Object(n.clone()), bound_er)
+    }
+    fn rec(s: &mut Stmt, tvs: &[String], pool: &ClassPool, bound_er: &str) {
+        match s {
+            Stmt::Throw(e) => {
+                if matches!(e, Expr::Cast { .. }) {
+                    return;
+                }
+                if !needs_sneaky(&e.type_ref(), pool, bound_er) {
+                    return;
+                }
+                let inner = std::mem::replace(e, Expr::This);
+                *e = Expr::Cast {
+                    ty: TypeRef::G(jcdc_jvm::GenericType::TypeVar(tvs[0].clone())),
+                    e: Box::new(inner),
+                };
+            }
+            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, tvs, pool, bound_er)),
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                rec(then_stmt, tvs, pool, bound_er);
+                if let Some(x) = else_stmt {
+                    rec(x, tvs, pool, bound_er);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::Labeled { body, .. }
+            | Stmt::Synchronized { body, .. } => rec(body, tvs, pool, bound_er),
+            Stmt::For { init, body, .. } => {
+                init.iter_mut().for_each(|x| rec(x, tvs, pool, bound_er));
+                rec(body, tvs, pool, bound_er);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases {
+                    c.body.iter_mut().for_each(|x| rec(x, tvs, pool, bound_er));
+                }
+                if let Some(d) = default {
+                    rec(d, tvs, pool, bound_er);
+                }
+            }
+            Stmt::Try { body, catches, finally, .. } => {
+                rec(body, tvs, pool, bound_er);
+                for c in catches {
+                    rec(&mut c.body, tvs, pool, bound_er);
+                }
+                if let Some(f) = finally {
+                    rec(f, tvs, pool, bound_er);
+                }
+            }
+            Stmt::TryWithResources { body, catches, finally, .. } => {
+                rec(body, tvs, pool, bound_er);
+                for c in catches {
+                    rec(&mut c.body, tvs, pool, bound_er);
+                }
+                if let Some(f) = finally {
+                    rec(f, tvs, pool, bound_er);
+                }
+            }
+            Stmt::ExprStmt(e) => {
+                // A lambda body's throw belongs to the SAM, not this
+                // method's throws clause — do not descend into lambdas.
+                let _ = e;
+            }
+            _ => {}
+        }
+    }
+    rec(s, &tvs, pool, &bound_er);
+}
+
 fn add_throw_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, pool: &ClassPool) {
     let Some(sig) = msig else { return };
     if sig.params.is_empty() {
