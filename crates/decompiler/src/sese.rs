@@ -960,7 +960,7 @@ impl<'a> Structurer<'a> {
                     let outer_universe = ctx.universe.clone();
                     let mut claimed = ctx.consumed.clone();
                     let try_region =
-                        self.structure_try(gi, &ctx.universe, &outer_universe, &mut claimed);
+                        self.structure_try(gi, &ctx.universe, &outer_universe, &mut claimed, stop);
                     ctx.consumed = claimed;
                     parts.push(try_region);
                     let gend = self.groups[gi].end;

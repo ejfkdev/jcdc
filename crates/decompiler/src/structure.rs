@@ -568,8 +568,24 @@ impl<'a> Structurer<'a> {
         hf
     }
 
-    /// First unclaimed non-handler block at or after `pc`.
-    fn continuation_after(&self, pc: u16, universe: &HashSet<usize>, claimed: &HashSet<usize>) -> Option<usize> {
+    /// First unclaimed non-handler block at or after `pc` that the outer
+    /// walk will actually continue at. `exclude` carries the enclosing
+    /// scope's barriers (loop exits, follows): a barrier block is never the
+    /// outer continuation (the post-Try `next` search skips stop blocks),
+    /// so naming one here would strip the try body's trailing `Goto` for a
+    /// continuation that never happens -- the jump silently vanishes and
+    /// the path falls into whatever the scope walks next (jdk17
+    /// ResourceBundle.loadBundle: the break stub `goto 323` at the
+    /// protected-span end was stripped because cont resolved to the stub
+    /// itself, a loop exit in stop; the break path then fell into the null
+    /// path's `continue` -- 无法访问的语句 on the real tail return).
+    fn continuation_after(
+        &self,
+        pc: u16,
+        universe: &HashSet<usize>,
+        claimed: &HashSet<usize>,
+        exclude: &HashSet<usize>,
+    ) -> Option<usize> {
         self.cfg
             .blocks
             .iter()
@@ -578,6 +594,7 @@ impl<'a> Structurer<'a> {
                     && universe.contains(&nb.id)
                     && !claimed.contains(&nb.id)
                     && !self.is_handler(nb.id)
+                    && !exclude.contains(&nb.id)
             })
             .map(|nb| nb.id)
     }
@@ -1062,7 +1079,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             });
             if let Some(gi) = group_here {
                 let outer_universe = universe.clone();
-                let try_region = self.structure_try(gi, universe, &outer_universe, claimed);
+                let try_region = self.structure_try(gi, universe, &outer_universe, claimed, stop);
                 parts.push(try_region);
                 let gend = self.groups[gi].end;
                 let hf_next = self.handler_flow_only(gi);
@@ -2622,6 +2639,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         universe: &HashSet<usize>,
         outer_universe: &HashSet<usize>,
         claimed: &mut HashSet<usize>,
+        stop: &HashSet<usize>,
     ) -> Region {
         let g = self.groups[gi].clone();
         let nested: Vec<usize> = (0..self.groups.len())
@@ -2671,7 +2689,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                 // Flow leaving the try body to the post-try continuation is
                 // natural fallthrough (the outer walk picks it up there).
                 let cont = self
-                    .continuation_after(g.end, outer_universe, claimed)
+                    .continuation_after(g.end, outer_universe, claimed, stop)
                     .filter(|c| !self.handler_flow_only(gi).contains(c));
                 if std::env::var("JCDC_DBG_IF").is_ok() {
                     eprintln!("try gi={} cont={:?} universe_has_blocks_after_end={}", gi, cont,
