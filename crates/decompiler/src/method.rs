@@ -4891,6 +4891,285 @@ fn rewrite_expr(e: &mut Expr, types: &[TypeRef]) {
 // Escaped variable hoisting
 // ---------------------------------------------------------------------------
 
+/// True when any decl/use of `var` appears in this subtree.
+fn mentions_var(s: &Stmt, var: u32) -> bool {
+    let mut d: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut u: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    collect_decl_use(s, &mut d, &mut u);
+    d.contains(&var) || u.contains(&var)
+}
+
+/// True when a lambda's capture list references `v` anywhere in this
+/// statement tree (the loop-decl-slot gate: a lambda-captured local
+/// assigned inside a loop must be declared per-iteration to stay
+/// effectively final — jdk17 Loader.initRemotePackageMap's `other`).
+fn captured_by_lambda(s: &Stmt, v: u32) -> bool {
+    fn refs(e: &Expr, v: u32) -> bool {
+        match e {
+            Expr::Local { var, .. } => *var == v,
+            Expr::Method { owner, args, .. } => {
+                owner.as_deref().map(|o| refs(o, v)).unwrap_or(false)
+                    || args.iter().any(|a| refs(a, v))
+            }
+            Expr::Field { owner: Some(o), .. } => refs(o, v),
+            Expr::Bin { l, r, .. } | Expr::Assign { target: l, value: r, .. } => {
+                refs(l, v) || refs(r, v)
+            }
+            Expr::Cond { c, t, f } => refs(c, v) || refs(t, v) || refs(f, v),
+            Expr::Un { e: x, .. }
+            | Expr::Cast { e: x, .. }
+            | Expr::InstanceOf { e: x, .. }
+            | Expr::PreIncDec { e: x, .. }
+            | Expr::PostIncDec { e: x, .. } => refs(x, v),
+            Expr::ArrayIndex { array, index } => refs(array, v) || refs(index, v),
+            Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+                args.iter().any(|a| refs(a, v))
+            }
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter().any(|d| refs(d, v))
+                    || init
+                        .as_ref()
+                        .map(|vals| vals.iter().any(|x| refs(x, v)))
+                        .unwrap_or(false)
+            }
+            Expr::StringConcat(parts) => parts.iter().any(|pp| match pp {
+                crate::expr::ConcatPart::Str(x) => refs(x, v),
+                _ => false,
+            }),
+            Expr::Lambda(l) => l.captures.iter().any(|a| refs(a, v)),
+            Expr::Invokedynamic { args, .. } => args.iter().any(|a| refs(a, v)),
+            _ => false,
+        }
+    }
+    fn ex(e: &Expr, v: u32) -> bool {
+        match e {
+            Expr::Lambda(l) => l.captures.iter().any(|a| refs(a, v)),
+            Expr::Method { owner, args, .. } => {
+                owner.as_deref().map(|o| ex(o, v)).unwrap_or(false)
+                    || args.iter().any(|a| ex(a, v))
+            }
+            Expr::Field { owner: Some(o), .. } => ex(o, v),
+            Expr::Bin { l, r, .. } | Expr::Assign { target: l, value: r, .. } => {
+                ex(l, v) || ex(r, v)
+            }
+            Expr::Cond { c, t, f } => ex(c, v) || ex(t, v) || ex(f, v),
+            Expr::Un { e: x, .. }
+            | Expr::Cast { e: x, .. }
+            | Expr::InstanceOf { e: x, .. }
+            | Expr::PreIncDec { e: x, .. }
+            | Expr::PostIncDec { e: x, .. } => ex(x, v),
+            Expr::ArrayIndex { array, index } => ex(array, v) || ex(index, v),
+            Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+                args.iter().any(|a| ex(a, v))
+            }
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter().any(|d| ex(d, v))
+                    || init
+                        .as_ref()
+                        .map(|vals| vals.iter().any(|x| ex(x, v)))
+                        .unwrap_or(false)
+            }
+            Expr::StringConcat(parts) => parts.iter().any(|pp| match pp {
+                crate::expr::ConcatPart::Str(x) => ex(x, v),
+                _ => false,
+            }),
+            Expr::Invokedynamic { args, .. } => args.iter().any(|a| ex(a, v)),
+            _ => false,
+        }
+    }
+    fn st(s: &Stmt, v: u32) -> bool {
+        match s {
+            Stmt::Block(x) => x.iter().any(|i| st(i, v)),
+            Stmt::ExprStmt(e) => ex(e, v),
+            Stmt::LocalDef { init: Some(e), .. } => ex(e, v),
+            Stmt::Return(Some(e)) | Stmt::Throw(e) => ex(e, v),
+            Stmt::If { cond, then_stmt, else_stmt } => {
+                ex(cond, v)
+                    || st(then_stmt, v)
+                    || else_stmt.as_deref().map(|e2| st(e2, v)).unwrap_or(false)
+            }
+            Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => ex(cond, v) || st(body, v),
+            Stmt::For { init, cond, update, body } => {
+                init.iter().any(|i| st(i, v))
+                    || cond.as_ref().map(|c| ex(c, v)).unwrap_or(false)
+                    || update.iter().any(|u| ex(u, v))
+                    || st(body, v)
+            }
+            Stmt::ForEach { iterable, body, .. } => ex(iterable, v) || st(body, v),
+            Stmt::Switch { selector, cases, default, .. } => {
+                ex(selector, v)
+                    || cases.iter().any(|c| c.body.iter().any(|b| st(b, v)))
+                    || default.as_deref().map(|d| st(d, v)).unwrap_or(false)
+            }
+            Stmt::Try { body, catches, finally } => {
+                st(body, v)
+                    || catches.iter().any(|c| st(&c.body, v))
+                    || finally.as_deref().map(|f| st(f, v)).unwrap_or(false)
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter().any(|r| st(r, v))
+                    || st(body, v)
+                    || catches.iter().any(|c| st(&c.body, v))
+                    || finally.as_deref().map(|f| st(f, v)).unwrap_or(false)
+            }
+            Stmt::Synchronized { lock, body } => ex(lock, v) || st(body, v),
+            Stmt::Labeled { body, .. } => st(body, v),
+            Stmt::Assert { cond, msg } => {
+                ex(cond, v) || msg.as_ref().map(|m| ex(m, v)).unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+    st(s, v)
+}
+
+/// Path step to a child subtree (for the loop-decl-slot search).
+#[derive(Clone, Copy)]
+enum SlotStep {
+    LoopBody,
+    VecChild(usize),
+    TryBody,
+    Catch(usize),
+    Finally,
+    Then,
+    Else,
+    WrapperBody,
+}
+
+/// Immutable search: path from `s` to the innermost LOOP BODY that hosts
+/// all mentions of `var` (all mentions assumed inside `s`). A loop body
+/// gives per-iteration variable freshness — required for captured locals
+/// assigned inside the loop to stay effectively final.
+fn find_loop_decl_path(s: &Stmt, var: u32) -> Option<Vec<SlotStep>> {
+    match s {
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::ForEach { body, .. } => {
+            if !mentions_var(body, var) {
+                return None;
+            }
+            let mut p = vec![SlotStep::LoopBody];
+            match find_loop_decl_path(body, var) {
+                Some(mut d) => {
+                    p.append(&mut d);
+                    Some(p)
+                }
+                None => Some(p),
+            }
+        }
+        Stmt::Block(v) => {
+            let hits: Vec<usize> = v
+                .iter()
+                .enumerate()
+                .filter(|(_, x)| mentions_var(x, var))
+                .map(|(i, _)| i)
+                .collect();
+            if hits.len() != 1 {
+                return None;
+            }
+            let i = hits[0];
+            let mut p = find_loop_decl_path(&v[i], var)?;
+            p.insert(0, SlotStep::VecChild(i));
+            Some(p)
+        }
+        Stmt::Try { body, catches, finally }
+        | Stmt::TryWithResources { body, catches, finally, .. } => {
+            let mut hits: Vec<(SlotStep, &Stmt)> = Vec::new();
+            if mentions_var(body, var) {
+                hits.push((SlotStep::TryBody, body));
+            }
+            for (i, c) in catches.iter().enumerate() {
+                if mentions_var(&c.body, var) {
+                    hits.push((SlotStep::Catch(i), &c.body));
+                }
+            }
+            if let Some(f) = finally {
+                if mentions_var(f, var) {
+                    hits.push((SlotStep::Finally, f));
+                }
+            }
+            if hits.len() != 1 {
+                return None;
+            }
+            let (step, sub) = hits.into_iter().next().unwrap();
+            let mut p = find_loop_decl_path(sub, var)?;
+            p.insert(0, step);
+            Some(p)
+        }
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            let t = mentions_var(then_stmt, var);
+            let e = else_stmt.as_deref().map(|x| mentions_var(x, var)).unwrap_or(false);
+            let (step, sub) = match (t, e) {
+                (true, false) => (SlotStep::Then, &**then_stmt),
+                (false, true) => (SlotStep::Else, else_stmt.as_deref().unwrap()),
+                _ => return None,
+            };
+            let mut p = find_loop_decl_path(sub, var)?;
+            p.insert(0, step);
+            Some(p)
+        }
+        Stmt::Labeled { body, .. } | Stmt::Synchronized { body, .. } => {
+            if !mentions_var(body, var) {
+                return None;
+            }
+            let mut p = find_loop_decl_path(body, var)?;
+            p.insert(0, SlotStep::WrapperBody);
+            Some(p)
+        }
+        _ => None,
+    }
+}
+
+/// Mutable follow of a path produced by `find_loop_decl_path`.
+fn follow_slot_path<'a>(s: &'a mut Stmt, path: &[SlotStep]) -> &'a mut Stmt {
+    let mut cur = s;
+    for step in path {
+        cur = match step {
+            SlotStep::LoopBody | SlotStep::WrapperBody => match cur {
+                Stmt::While { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::For { body, .. }
+                | Stmt::ForEach { body, .. }
+                | Stmt::Labeled { body, .. }
+                | Stmt::Synchronized { body, .. } => body,
+                _ => unreachable!("path/shape mismatch (loop/wrapper)"),
+            },
+            SlotStep::VecChild(i) => match cur {
+                Stmt::Block(v) => &mut v[*i],
+                _ => unreachable!("path/shape mismatch (vec)"),
+            },
+            SlotStep::TryBody => match cur {
+                Stmt::Try { body, .. } | Stmt::TryWithResources { body, .. } => body,
+                _ => unreachable!("path/shape mismatch (try)"),
+            },
+            SlotStep::Catch(i) => match cur {
+                Stmt::Try { catches, .. } | Stmt::TryWithResources { catches, .. } => {
+                    &mut catches[*i].body
+                }
+                _ => unreachable!("path/shape mismatch (catch)"),
+            },
+            SlotStep::Finally => match cur {
+                Stmt::Try { finally, .. } | Stmt::TryWithResources { finally, .. } => {
+                    finally.as_mut().expect("path/shape mismatch (finally)")
+                }
+                _ => unreachable!("path/shape mismatch (finally)"),
+            },
+            SlotStep::Then => match cur {
+                Stmt::If { then_stmt, .. } => then_stmt,
+                _ => unreachable!("path/shape mismatch (then)"),
+            },
+            SlotStep::Else => match cur {
+                Stmt::If { else_stmt, .. } => {
+                    else_stmt.as_mut().expect("path/shape mismatch (else)")
+                }
+                _ => unreachable!("path/shape mismatch (else)"),
+            },
+        };
+    }
+    cur
+}
+
 /// If a variable is declared inside a nested scope (try/if/loop body) but
 /// referenced after that scope closes, move its declaration to the method
 /// top and demote the inner declaration to an assignment.
@@ -4915,7 +5194,50 @@ fn hoist_escaped_vars(body: &mut Stmt, vt: &VarTable) {
     if escaped.is_empty() {
         return;
     }
+    // A captured var whose EVERY mention lives inside one loop body must
+    // be declared at that loop body's top, not at method top: a blank
+    // method-scope decl assigned inside the loop is assigned once per
+    // iteration — NOT effectively final — and the anon/lambda capture
+    // goes illegal (从内部类引用的本地变量必须是最终变量或实际上的最终
+    // 变量 — jdk17 URLClassPath$JarLoader.getResource: `url` is defined
+    // in the try inside the do-while and read after the try in the same
+    // iteration; method-top hoisting broke the doPrivileged anon's
+    // capture). Loop-body-top keeps a fresh blank per iteration — the
+    // source shape.
+    // Paths are computed BEFORE demote_defs (which rewrites LocalDefs in
+    // place, preserving block indices), applied AFTER it so the inserted
+    // blank decl is not itself demoted.
+    let mut loop_paths: Vec<(u32, Vec<SlotStep>)> = Vec::new();
+    for var in escaped.iter().copied().collect::<Vec<_>>() {
+        if !captured_by_anon(body, var) && !captured_by_lambda(body, var) {
+            continue;
+        }
+        if let Some(path) = find_loop_decl_path(body, var) {
+            loop_paths.push((var, path));
+        }
+    }
     demote_defs(body, &escaped, vt);
+    let mut loop_declared: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for (var, path) in loop_paths {
+        let slot = follow_slot_path(body, &path);
+        if let Stmt::Block(items) = slot {
+            items.insert(
+                0,
+                Stmt::LocalDef { var, init: None, is_final: false, force_type: true },
+            );
+        } else {
+            let old = std::mem::replace(slot, Stmt::Block(vec![]));
+            *slot = Stmt::Block(vec![
+                Stmt::LocalDef { var, init: None, is_final: false, force_type: true },
+                old,
+            ]);
+        }
+        loop_declared.insert(var);
+    }
+    escaped.retain(|v| !loop_declared.contains(v));
+    if escaped.is_empty() {
+        return;
+    }
     let mut decls: Vec<Stmt> = {
         let mut v: Vec<u32> = escaped.into_iter().collect();
         v.sort_unstable();

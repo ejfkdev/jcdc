@@ -130,7 +130,7 @@ impl<'a> Converter<'a> {
         Converter {
             cfg,
             results,
-            groups: crate::structure::group_exceptions(cfg),
+            groups: crate::structure::group_exceptions_with(cfg, Some(results)),
             dom,
             cur_block: usize::MAX,
             loops: Vec::new(),

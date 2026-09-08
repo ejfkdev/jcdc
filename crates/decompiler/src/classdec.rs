@@ -7714,6 +7714,12 @@ pub(crate) fn fix_lambda_captures(
                 count_s(body, assigns);
             }
             Stmt::Labeled { body, .. } => count_s(body, assigns),
+            Stmt::Assert { cond, msg } => {
+                count_e(cond, assigns);
+                if let Some(m) = msg {
+                    count_e(m, assigns);
+                }
+            }
             _ => {}
         }
     }
@@ -7738,6 +7744,14 @@ pub(crate) fn fix_lambda_captures(
         defs: &mut Vec<Stmt>,
     ) {
         if let Expr::Lambda(l) = e {
+            if std::env::var("JCDC_DBG_LAMPSNAP").is_ok() {
+                eprintln!(
+                    "LAMPSNAP-ENTRY impl={} desc={} found={}",
+                    l.impl_name,
+                    l.impl_desc,
+                    pc.find_own_method(&l.impl_name, &l.impl_desc.to_string()).is_some()
+                );
+            }
             if let Some(mi) = pc.find_own_method(&l.impl_name, &l.impl_desc.to_string()) {
                 if let Ok(Some(mb)) = decompile_method(pc, pool, mi) {
                     // Local classes instantiated INSIDE the lambda body
@@ -7897,7 +7911,37 @@ pub(crate) fn fix_lambda_captures(
                     // left the lambda body reading the non-effectively-
                     // final OUTER kl and shifted every snapshot onto the
                     // next param — 从lambda表达式引用的本地变量 x2).
-                    let cap_off = if l.impl_is_static { 0 } else { 1 };
+                    // The receiver capture rides captures[0] ONLY when the
+                    // impl actually has one: derive the offset from the
+                    // counts instead of the static flag — jdk17
+                    // Loader.initRemotePackageMap's impl was flagged
+                    // non-static with a single capture (`other`), and the
+                    // blind skip(1) dropped it, leaving the lambda
+                    // capturing the non-effectively-final hoisted local
+                    // (从lambda 表达式引用的本地变量必须是最终变量).
+                    let cap_off = l.captures.len().saturating_sub(n_cap).min(1);
+                    if std::env::var("JCDC_DBG_LAMPSNAP").is_ok() {
+                        let caps: Vec<String> = l
+                            .captures
+                            .iter()
+                            .map(|c| match c {
+                                Expr::Local { var, .. } => {
+                                    format!("L{}(multi={})", var, multi.contains(var))
+                                }
+                                other => format!("{:?}", std::mem::discriminant(other)),
+                            })
+                            .collect();
+                        eprintln!(
+                            "LAMPSNAP impl={} static={} sam_n={} n_cap={} cap_off={} caps={:?} params={:?}",
+                            l.impl_name,
+                            l.impl_is_static,
+                            sam_n,
+                            n_cap,
+                            cap_off,
+                            caps,
+                            impl_params.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>()
+                        );
+                    }
                     for (k, cap) in l.captures.iter().enumerate().skip(cap_off).take(n_cap) {
                         if let Expr::Local { var: ovid, .. } = cap {
                             if multi.contains(ovid) {
@@ -8015,6 +8059,23 @@ pub(crate) fn fix_lambda_captures(
             Stmt::LocalDef { init: Some(e), .. } => leaf!(e),
             Stmt::Return(Some(e)) => leaf!(e),
             Stmt::Throw(e) => leaf!(e),
+            // The assert-desugar lambda lives in the condition: a
+            // captured multi-assigned local needs its snapshot here too
+            // (jdk17 Proxy.defaultMethodHandle's BooleanSupplier assert
+            // captured the hoisted `dmh = null` + try-assigned local —
+            // 从lambda 表达式引用的本地变量必须是最终变量).
+            Stmt::Assert { cond, msg } => {
+                let mut defs: Vec<Stmt> = Vec::new();
+                lambda_snaps(cond, vt, pc, pool, fam, multi, counter, &mut defs);
+                if let Some(m) = msg {
+                    lambda_snaps(m, vt, pc, pool, fam, multi, counter, &mut defs);
+                }
+                if !defs.is_empty() {
+                    let old = std::mem::replace(s, Stmt::Block(vec![]));
+                    defs.push(old);
+                    *s = Stmt::Block(defs);
+                }
+            }
             Stmt::If { cond, then_stmt, else_stmt } => {
                 let mut defs: Vec<Stmt> = Vec::new();
                 lambda_snaps(cond, vt, pc, pool, fam, multi, counter, &mut defs);
@@ -8981,6 +9042,18 @@ fn restore_one_switch(
                     if !cgroup.body.last().map(case_terminates).unwrap_or(false) {
                         cgroup.body.push(Stmt::Break(None));
                     }
+                }
+                // Exhaustiveness: structure_switch drops the default
+                // region when the default target IS the switch follow
+                // (right for value switches — default just falls out).
+                // A PATTERN switch over a sealed hierarchy must stay
+                // exhaustive or javac rejects it (并非所有可能的输入值都
+                // 包含在 switch 语句中 — jdk26 ParserVerifier
+                // .verifyAttributes: default -> {} compiled to a jump to
+                // the trailing return, the emitted switch lost its
+                // default). Restore an empty `default: break;`.
+                if default.is_none() {
+                    *default = Some(Box::new(Stmt::Block(vec![Stmt::Break(None)])));
                 }
                 if let Some(d) = default {
                     if !case_terminates(d) {

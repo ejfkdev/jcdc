@@ -355,6 +355,86 @@ pub struct TryGroup {
 }
 
 pub fn group_exceptions(cfg: &Cfg) -> Vec<TryGroup> {
+    group_exceptions_with(cfg, None)
+}
+
+/// True when any expression in these statements calls
+/// `Throwable.addSuppressed` — the fingerprint of try-with-resources
+/// close scaffolding.
+fn stmts_mention_addsuppressed(stmts: &[crate::stmt::Stmt]) -> bool {
+    fn ex(e: &crate::expr::Expr) -> bool {
+        use crate::expr::Expr as E;
+        match e {
+            E::Method { name, owner, args, .. } => {
+                name == "addSuppressed"
+                    || owner.as_deref().map(ex).unwrap_or(false)
+                    || args.iter().any(ex)
+            }
+            E::Field { owner: Some(o), .. } => ex(o),
+            E::Bin { l, r, .. } | E::Assign { target: l, value: r, .. } => ex(l) || ex(r),
+            E::Cond { c, t, f } => ex(c) || ex(t) || ex(f),
+            E::Un { e: x, .. }
+            | E::Cast { e: x, .. }
+            | E::InstanceOf { e: x, .. }
+            | E::PreIncDec { e: x, .. }
+            | E::PostIncDec { e: x, .. } => ex(x),
+            E::ArrayIndex { array, index } => ex(array) || ex(index),
+            E::New { args, .. } | E::AnonNew { args, .. } => args.iter().any(ex),
+            E::NewArray { dims, init, .. } => {
+                dims.iter().any(ex)
+                    || init.as_ref().map(|v| v.iter().any(ex)).unwrap_or(false)
+            }
+            E::StringConcat(parts) => parts
+                .iter()
+                .any(|pp| matches!(pp, crate::expr::ConcatPart::Str(x) if ex(x))),
+            E::Invokedynamic { args, .. } => args.iter().any(ex),
+            E::Lambda(l) => l.captures.iter().any(ex),
+            _ => false,
+        }
+    }
+    fn st(s: &crate::stmt::Stmt) -> bool {
+        use crate::stmt::Stmt as S;
+        match s {
+            S::Block(v) => v.iter().any(st),
+            S::ExprStmt(e) => ex(e),
+            S::LocalDef { init: Some(e), .. } => ex(e),
+            S::Return(e) => e.as_ref().map(ex).unwrap_or(false),
+            S::Throw(e) => ex(e),
+            S::If { cond, then_stmt, else_stmt } => {
+                ex(cond)
+                    || st(then_stmt)
+                    || else_stmt.as_deref().map(st).unwrap_or(false)
+            }
+            S::While { cond, body } | S::DoWhile { body, cond } => ex(cond) || st(body),
+            S::For { init, cond, update, body } => {
+                init.iter().any(st)
+                    || cond.as_ref().map(ex).unwrap_or(false)
+                    || update.iter().any(ex)
+                    || st(body)
+            }
+            S::ForEach { iterable, body, .. } => ex(iterable) || st(body),
+            S::Switch { selector, cases, default, .. } => {
+                ex(selector)
+                    || cases.iter().any(|c| c.body.iter().any(st))
+                    || default.as_deref().map(st).unwrap_or(false)
+            }
+            S::Try { body, catches, finally } | S::TryWithResources { body, catches, finally, .. } => {
+                st(body)
+                    || catches.iter().any(|c| st(&c.body))
+                    || finally.as_deref().map(st).unwrap_or(false)
+            }
+            S::Synchronized { lock, body } => ex(lock) || st(body),
+            S::Labeled { body, .. } => st(body),
+            S::Assert { cond, msg } => {
+                ex(cond) || msg.as_ref().map(ex).unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+    stmts.iter().any(st)
+}
+
+pub fn group_exceptions_with(cfg: &Cfg, results: Option<&Vec<crate::builder::BlockResult>>) -> Vec<TryGroup> {
     let mut groups: Vec<TryGroup> = Vec::new();
     for (ri, r) in cfg.exc_ranges.iter().enumerate() {
         if let Some(g) = groups.iter_mut().find(|g| g.start == r.start && g.end == r.end) {
@@ -394,7 +474,62 @@ pub fn group_exceptions(cfg: &Cfg) -> Vec<TryGroup> {
                     continue;
                 }
                 if groups[b].start > groups[a].end.saturating_add(4) {
-                    continue;
+                    // Same-handler ranges separated by MORE than 4 bytes
+                    // still belong to one try when every block strictly
+                    // between them is a terminator (no normal succ):
+                    // those are the handler's own inline finally copies
+                    // (`unlock; return false`) that javac excludes from
+                    // the protected ranges (jdk17 LinkedBlockingQueue
+                    // .offer(E,long,TimeUnit): ranges (37,59)+(67,122)
+                    // split around the 8-byte return-false copy — the
+                    // unmerged first range made the try body {3,4,5},
+                    // cutting the wait loop's backedge block out of the
+                    // body universe; the loop exit got inlined as an
+                    // if-arm inside the loop and the post-loop return
+                    // was stranded in it — 缺少返回语句 x2 methods).
+                    // The gap must not swallow ANOTHER group's handler:
+                    // TWR nesting (try(a){try(b){..}}) puts the inner
+                    // handler entry exactly at the seam between the outer
+                    // resource's split ranges (feat Exceptions
+                    // .tryWithResources2: outer ranges (10,56)+(62,78)
+                    // share handler 78, and 62 is the inner group's
+                    // handler — merging collapsed the nested TWR into one
+                    // span with an empty catch(Throwable), 缺少返回语句
+                    // across the whole features battery). A foreign
+                    // handler INSIDE the gap fails the same way.
+                    let own_handlers: Vec<u16> =
+                        groups[a].handlers.iter().map(|(h, _)| *h).collect();
+                    let seam_clear_of_foreign_handlers =
+                        !cfg.exc_ranges.iter().any(|r| {
+                            !own_handlers.contains(&r.handler)
+                                && r.handler > groups[a].end
+                                && r.handler <= groups[b].start
+                        });
+                    // The gap blocks themselves must be pure terminator
+                    // flow (the handler's inline finally copies —
+                    // `unlock; return false`) with no TWR close
+                    // scaffolding (addSuppressed calls indicate resource
+                    // copies whose removal from the exception topology
+                    // misplaces the closes).
+                    let gap_terminator_only = seam_clear_of_foreign_handlers
+                        && cfg
+                            .blocks
+                            .iter()
+                            .filter(|bl| !bl.ins.is_empty())
+                            .filter(|bl| {
+                                bl.start >= groups[a].end && bl.end <= groups[b].start
+                            })
+                            .all(|bl| {
+                                bl.succ.is_empty()
+                                    && results
+                                        .map(|rs| {
+                                            !stmts_mention_addsuppressed(&rs[bl.id].stmts)
+                                        })
+                                        .unwrap_or(true)
+                            });
+                    if !gap_terminator_only {
+                        continue;
+                    }
                 }
                 if groups[a].handlers.iter().any(|(h, _)| *h == groups[b].start) {
                     continue;
@@ -857,7 +992,7 @@ impl<'a> Structurer<'a> {
         diamond_merges: std::collections::HashSet<usize>,
         fold_regions: HashMap<usize, (usize, HashSet<usize>)>,
     ) -> Structurer<'a> {
-        let groups = group_exceptions(cfg);
+        let groups = group_exceptions_with(cfg, Some(results));
         let mut body_group = HashMap::new();
         let mut handler_group = HashMap::new();
         // Groups are sorted outer-first (start asc, end desc); later
