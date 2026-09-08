@@ -964,7 +964,22 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         // even if their predecessors are outside: their flow is carved out
         // by the Try region and continues at the group's end.
         let mut eff = universe.clone();
-        for &b in universe {
+        // The walk root itself seeds the group expansion even when it lies
+        // OUTSIDE the passed universe: a protected branch target from a
+        // smaller group's body walk (jdk11 SocketChannelImpl.finishConnect's
+        // `if (!isConnected())` then-arm — block pc 39 belongs to the
+        // readLock/writeLock finally groups (39..174)/(39..167)/(46..105)
+        // but the If sits inside group (14..23), whose body universe is
+        // {2,3}; owner_scope then filtered everything and the expansion
+        // loop had nothing to key off) got sub = {from} alone — the arm
+        // emitted Goto{pc 46} and the ENTIRE connect-retry body (loop,
+        // endFinishConnect, return true) vanished, leaving the
+        // catch(IOException) try body unable to throw (不能抛出异常错误) and
+        // the blocking/connected locals dangling. The holds_start guard
+        // still blocks mid-group roots from ballooning (getInputStream0).
+        eff.insert(from);
+        let seed = eff.clone();
+        for &b in &seed {
             if let Some(&gi) = self.body_group.get(&b) {
                 let g = &self.groups[gi];
                 // Expand to the full span ONLY when the scope holds the
@@ -979,7 +994,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                     .cfg
                     .blocks
                     .iter()
-                    .any(|nb| nb.start == g.start && universe.contains(&nb.id));
+                    .any(|nb| nb.start == g.start && seed.contains(&nb.id));
                 if !holds_start {
                     continue;
                 }
@@ -2032,6 +2047,36 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             if std::env::var("JCDC_DBG_IF").is_ok() {
                                 eprintln!("GOTO-FT cur={} n={} univ={} stop={} claimed={} entry={}", cur, n, universe.contains(&n), stop.contains(&n), claimed.contains(&n), entry);
                             }
+                            // Shared-tail arrival: `n` is CLAIMED (hence
+                            // out of this walk's universe — sub_scope
+                            // retains unclaimed blocks only). A bare Goto
+                            // here is elided at conversion as the walk's
+                            // last part (goto_is_last), silently severing
+                            // this path's flow into the shared tail (jdk26
+                            // DatagramChannelImpl.innerJoin's IPv4 arm:
+                            // `key = new Type4(..)` fell off the method
+                            // without the `registry.add(key); return key;`
+                            // copy — 缺少返回语句 x2 trees). Per-arrival
+                            // copies are exactly the bytecode semantics:
+                            // a claimed terminator inlines as CopyStmts
+                            // (the walk's GOTO-CLAIMED discipline),
+                            // anything else copy_walks when its flow does
+                            // not circle back (copy_walk's own guard).
+                            if claimed.contains(&n)
+                                && !stop.contains(&n)
+                                && !self.loops_stack.contains(&n)
+                                && !self.is_handler(n)
+                                && !self.terminator_writes_final(n)
+                            {
+                                if self.is_terminator_block(n) {
+                                    parts.push(Region::CopyStmts { block: n });
+                                    break;
+                                }
+                                if let Some(r) = self.copy_walk(n, stop, active, cur) {
+                                    parts.push(r);
+                                    break;
+                                }
+                            }
                             parts.push(Region::Goto { target: n });
                             break;
                         }
@@ -2493,6 +2538,40 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         }
         if std::env::var("JCDC_DBG_ABSORB").is_ok() {
             eprintln!("absorb ACCEPT blk={} claimed={}", blk, claimed.contains(&blk));
+        }
+        // The unwalkable successor is an already-CLAIMED terminator this
+        // arm's normal walk would inline-copy (the shared
+        // `registry.add(key); return key;` tail): absorbing blk ends the
+        // arm AT blk and the path to the tail is silently severed — the
+        // enclosing walk breaks at the if with follow=None and the method
+        // falls off without a return on this path (jdk26
+        // DatagramChannelImpl.innerJoin's IPv4 arm lost the tail after
+        // `key = new Type4(..)` — 缺少返回语句 x2 trees). Refuse: the
+        // normal walk branch emits Basic{blk} and, arriving at the
+        // claimed terminator, CopyStmts/copy_walk — per-arrival copies
+        // are exactly the bytecode semantics.
+        {
+            let succ = self.cfg.blocks[blk].succ[0];
+            if claimed.contains(&succ)
+                && !bstop.contains(&succ)
+                && !self.loops_stack.contains(&succ)
+            {
+                // The walk's claimed-arrival handling would inline this
+                // successor (CopyStmts for a shared terminator, copy_walk
+                // otherwise); absorption must yield to it. A
+                // final-writing terminator stays absorbed — copying it
+                // would double-assign the blank final (the
+                // UntrustedCertificates discipline).
+                if !self.terminator_writes_final(succ) {
+                    if dbg_absorb {
+                        eprintln!(
+                            "absorb REJECT blk={} succ={} claimed inline-copy tail",
+                            blk, succ
+                        );
+                    }
+                    return None;
+                }
+            }
         }
         // Shared pure blocks (reached from several branches) get their
         // statements duplicated into each branch — exactly the bytecode

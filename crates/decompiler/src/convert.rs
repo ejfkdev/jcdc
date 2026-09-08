@@ -693,7 +693,32 @@ impl<'a> Converter<'a> {
                                     r: Box::new(negate(cb.clone())),
                                     ty: None,
                                 };
-                                let body = Stmt::Block(self.results[taken].stmts.clone());
+                                // The body is the converted region
+                                // remainder, NOT the taken block's raw
+                                // statements: when `taken` is wrapped in
+                                // regions (a try/catch group around the
+                                // body call), the raw-stmt body silently
+                                // drops them (jdk11 SocketChannelImpl
+                                // .implCloseSelectableChannel: the
+                                // wait()-loop's try/catch(Interrupted
+                                // Exception) region vanished — bare
+                                // wait() — 未报告的异常错误). The
+                                // leading guard If is the condition being
+                                // folded here; strip it and keep the rest.
+                                let mut parts = stmt_to_vec(body_stmt);
+                                if matches!(parts.first(), Some(Stmt::If { .. })) {
+                                    parts.remove(0);
+                                }
+                                let body = if parts.is_empty() {
+                                    Stmt::Block(self.results[taken].stmts.clone())
+                                } else {
+                                    let rest = if parts.len() == 1 {
+                                        parts.pop().unwrap()
+                                    } else {
+                                        Stmt::Block(parts)
+                                    };
+                                    strip_trailing_continue(rest)
+                                };
                                 if std::env::var("JCDC_DBG_LOOP").is_ok() {
                                     eprintln!(
                                         "CLASSIFY-CONDCHAIN header={} B={} body={} exits={:?}",
