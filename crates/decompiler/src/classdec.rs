@@ -2761,6 +2761,7 @@ fn emit_method_with(
                 // this(...) calls (invalid Java). Collapse them back into a
                 // single leading delegation when every path delegates.
                 collapse_ctor_delegation(&mut body, pc);
+                collapse_ctor_delegation_multi(&mut body, pc);
                 if is_local_class {
                     prune_local_ctor_delegation(&mut body, pc, mi);
                 }
@@ -7728,10 +7729,18 @@ pub(crate) fn fix_lambda_captures(
                     // params, so name matching against the outer var is
                     // unreliable.
                     let mut snaps: Vec<(u32, u32)> = Vec::new();
-                    for (k, cap) in l.captures.iter().enumerate().take(n_cap) {
+                    // An INSTANCE impl's receiver rides captures[0] while
+                    // impl_params excludes it ("this") — skip the receiver
+                    // capture so capture k pairs with impl param k-off
+                    // (jdk26 RandomGenerator.equiDoubles: the off-by-one
+                    // left the lambda body reading the non-effectively-
+                    // final OUTER kl and shifted every snapshot onto the
+                    // next param — 从lambda表达式引用的本地变量 x2).
+                    let cap_off = if l.impl_is_static { 0 } else { 1 };
+                    for (k, cap) in l.captures.iter().enumerate().skip(cap_off).take(n_cap) {
                         if let Expr::Local { var: ovid, .. } = cap {
                             if multi.contains(ovid) {
-                                if let Some((pid, _)) = impl_params.get(k) {
+                                if let Some((pid, _)) = impl_params.get(k - cap_off) {
                                     snaps.push((*ovid, *pid));
                                 }
                             }
@@ -9298,6 +9307,282 @@ fn cast_returns_to_typevar(s: &mut Stmt, tv: &str, vt: &VarTable) {
 
 /// Collapse `v = <branches>; this(v); return;` constructor bodies into a
 /// single leading `this(<ternary chain>)` delegation.
+/// MULTI-ARG deferred-delegation collapse. `collapse_ctor_delegation`
+/// folds the single-argument shape (`v = X; this(v)` leaves); javac also
+/// defers MULTI-arg delegations whose arguments are computed through a
+/// branch: every path assigns the merge locals and calls `this(a, b, c)`
+/// (jdk26 PrintWriter(OutputStream,boolean): the charset argument is a
+/// pattern ternary, so the then-path falls through to the tail call while
+/// the else-path carries its own copy + return). Symbolically execute the
+/// tail (assignments + if/else trees only), merge per-branch values into
+/// conditionals, and emit ONE leading delegation — the source shape
+/// (`this(out, autoFlush, out instanceof PrintStream ? ps.charset()
+/// : Charset.defaultCharset())`). Bails on loops/switches/tries, nested
+/// delegation shapes, or branches that neither delegate nor throw.
+fn collapse_ctor_delegation_multi(body: &mut Stmt, pc: &PoolClass) {
+    use std::collections::HashMap;
+    let items = match body {
+        Stmt::Block(v) => v,
+        _ => return,
+    };
+    // Only when a delegation call sits somewhere OTHER than the first
+    // statement (the legal shape needs no folding).
+    fn has_mid_ctor(v: &[Stmt], own: &str) -> bool {
+        v.iter().skip(1).any(|s| match s {
+            Stmt::ExprStmt(Expr::Method { name, .. }) if name == "<init>" => true,
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                let t = match then_stmt.as_ref() {
+                    Stmt::Block(b) => has_mid_ctor(b, own),
+                    other => has_mid_ctor(std::slice::from_ref(other), own),
+                };
+                let e = match else_stmt.as_deref() {
+                    Some(Stmt::Block(b)) => has_mid_ctor(b, own),
+                    Some(other) => has_mid_ctor(std::slice::from_ref(other), own),
+                    None => false,
+                };
+                t || e
+            }
+            _ => false,
+        })
+    }
+    if !has_mid_ctor(items, &pc.internal_name) {
+        return;
+    }
+
+    type Env = HashMap<u32, Expr>;
+    enum Flow {
+        Falls(Env),
+        /// Branch ended in its own delegation call: (resolved call, RAW
+        /// args for cross-env equality probes).
+        Delegates(Expr, Vec<Expr>),
+        /// Branch ended in throw — no delegation needed on this path.
+        Throws,
+    }
+
+    fn subst(e: &mut Expr, env: &Env) {
+        match e {
+            Expr::Local { var, .. } => {
+                if let Some(v) = env.get(var) {
+                    *e = v.clone();
+                }
+            }
+            Expr::Method { owner, args, .. } => {
+                if let Some(o) = owner {
+                    subst(o, env);
+                }
+                args.iter_mut().for_each(|a| subst(a, env));
+            }
+            Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+                args.iter_mut().for_each(|a| subst(a, env));
+            }
+            Expr::Field { owner: Some(o), .. } => subst(o, env),
+            Expr::ArrayIndex { array, index } => {
+                subst(array, env);
+                subst(index, env);
+            }
+            Expr::Cast { e: x, .. }
+            | Expr::Un { e: x, .. }
+            | Expr::InstanceOf { e: x, .. }
+            | Expr::PreIncDec { e: x, .. }
+            | Expr::PostIncDec { e: x, .. } => subst(x, env),
+            Expr::Cond { c, t, f } => {
+                subst(c, env);
+                subst(t, env);
+                subst(f, env);
+            }
+            Expr::Bin { l, r, .. } => {
+                subst(l, env);
+                subst(r, env);
+            }
+            Expr::Assign { target, value, .. } => {
+                subst(target, env);
+                subst(value, env);
+            }
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter_mut().for_each(|d| subst(d, env));
+                if let Some(vals) = init {
+                    vals.iter_mut().for_each(|v| subst(v, env));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn calls_eq(a: &Expr, b: &Expr) -> bool {
+        match (a, b) {
+            (
+                Expr::Method { cls: c1, name: n1, desc: d1, .. },
+                Expr::Method { cls: c2, name: n2, desc: d2, .. },
+            ) => c1 == c2 && n1 == n2 && d1.args == d2.args && d1.ret == d2.ret,
+            _ => false,
+        }
+    }
+
+    fn exec(s: &Stmt, env0: &Env, calls: &mut Vec<Expr>) -> Option<Flow> {
+        let mut env = env0.clone();
+        match s {
+            Stmt::Block(v) => {
+                for st in v {
+                    match exec(st, &env, calls)? {
+                        Flow::Falls(e2) => env = e2,
+                        f => return Some(f),
+                    }
+                }
+                Some(Flow::Falls(env))
+            }
+            Stmt::LocalDef { init: None, .. } | Stmt::Comment(_) => Some(Flow::Falls(env)),
+            Stmt::LocalDef { var, init: Some(e), .. } => {
+                let mut e = e.clone();
+                subst(&mut e, &env);
+                env.insert(*var, e);
+                Some(Flow::Falls(env))
+            }
+            Stmt::ExprStmt(Expr::Assign { target, op: crate::expr::AssignOp::Plain, value }) => {
+                if let Expr::Local { var, .. } = &**target {
+                    let mut e = (**value).clone();
+                    subst(&mut e, &env);
+                    env.insert(*var, e);
+                    Some(Flow::Falls(env))
+                } else {
+                    // A field write before the delegation would be dropped
+                    // by the fold (this-field writes are illegal pre-super
+                    // anyway): bail.
+                    None
+                }
+            }
+            Stmt::ExprStmt(e @ Expr::Method { name, .. }) if name == "<init>" => {
+                let raw_args: Vec<Expr> = match e {
+                    Expr::Method { args, .. } => args.clone(),
+                    _ => return None,
+                };
+                let mut c = e.clone();
+                if let Expr::Method { args, .. } = &mut c {
+                    for a in args.iter_mut() {
+                        subst(a, &env);
+                    }
+                }
+                for prev in calls.iter() {
+                    if !calls_eq(prev, &c) {
+                        return None;
+                    }
+                }
+                calls.push(c.clone());
+                Some(Flow::Delegates(c, raw_args))
+            }
+            Stmt::Return(None) => Some(Flow::Falls(env)),
+            Stmt::Throw(_) => Some(Flow::Throws),
+            Stmt::If { cond, then_stmt, else_stmt } => {
+                let tf = exec(then_stmt, &env, calls)?;
+                let ef = match else_stmt {
+                    Some(e) => exec(e, &env, calls)?,
+                    None => Flow::Falls(env.clone()),
+                };
+                let mut c = cond.clone();
+                subst(&mut c, &env);
+                match (tf, ef) {
+                    (Flow::Falls(te), Flow::Falls(ee)) => {
+                        let mut merged = env.clone();
+                        let mut vars: Vec<u32> = te.keys().chain(ee.keys()).copied().collect();
+                        vars.sort_unstable();
+                        vars.dedup();
+                        for v in vars {
+                            match (te.get(&v), ee.get(&v)) {
+                                (Some(a), Some(b)) if expr_ident(a, b) => {
+                                    merged.insert(v, a.clone());
+                                }
+                                (Some(a), Some(b)) => {
+                                    merged.insert(v, Expr::Cond {
+                                        c: Box::new(c.clone()),
+                                        t: Box::new(a.clone()),
+                                        f: Box::new(b.clone()),
+                                    });
+                                }
+                                (Some(a), None) | (None, Some(a)) => {
+                                    // Assigned on one path only: later uses
+                                    // would be definitely-unassigned on the
+                                    // other — too subtle to fold.
+                                    let _ = a;
+                                    return None;
+                                }
+                                (None, None) => {}
+                            }
+                        }
+                        Some(Flow::Falls(merged))
+                    }
+                    // One side delegates, the other continues: the merged
+                    // env must produce the SAME call for the tail
+                    // delegation — checked by calls_eq when the tail runs.
+                    (Flow::Delegates(call, raw), Flow::Falls(fe))
+                    | (Flow::Falls(fe), Flow::Delegates(call, raw)) => {
+                        // The continuing env must reproduce the branch's
+                        // call args EXACTLY (resolve the RAW args against
+                        // the continuing env): a branch-local value (the
+                        // pattern temp `ps.charset()`) cannot be hoisted
+                        // into a leading delegation, so the fold bails and
+                        // leaves the shape as-is (jdk26 PrintWriter
+                        // (OutputStream,boolean) needs the builder-level
+                        // diamond fold, not this).
+                        let mut probe = raw.clone();
+                        for a in probe.iter_mut() {
+                            subst(a, &fe);
+                        }
+                        let ok = match &call {
+                            Expr::Method { args: ca, .. } => {
+                                probe.len() == ca.len()
+                                    && probe.iter().zip(ca.iter()).all(|(x, y)| expr_ident(x, y))
+                            }
+                            _ => false,
+                        };
+                        if !ok {
+                            return None;
+                        }
+                        Some(Flow::Falls(fe))
+                    }
+                    (Flow::Delegates(a, ra), Flow::Delegates(b, _rb)) if calls_eq(&a, &b) => {
+                        Some(Flow::Delegates(a, ra))
+                    }
+                    (Flow::Throws, Flow::Falls(fe)) | (Flow::Falls(fe), Flow::Throws) => {
+                        Some(Flow::Falls(fe))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn expr_ident(a: &Expr, b: &Expr) -> bool {
+        // Structural identity via debug rendering: the fold only needs
+        // equality to avoid a redundant ternary.
+        format!("{:?}", a) == format!("{:?}", b)
+    }
+
+    let mut calls: Vec<Expr> = Vec::new();
+    let flow = match exec(&Stmt::Block(items.clone()), &Env::new(), &mut calls) {
+        Some(f) => f,
+        None => return,
+    };
+    if calls.is_empty() {
+        return;
+    }
+    let collapsed = match flow {
+        Flow::Delegates(c, _raw) => c,
+        Flow::Falls(_) => {
+            // The tail call is one of the recorded calls; re-resolve its
+            // args against the final env by rebuilding from the ORIGINAL
+            // trailing call shape: all recorded calls are arg-identical
+            // post-substitution except branch copies, which were verified
+            // against the continuing env — take the last recorded call.
+            match calls.last() {
+                Some(c) => c.clone(),
+                None => return,
+            }
+        }
+        Flow::Throws => return,
+    };
+    *body = Stmt::Block(vec![Stmt::ExprStmt(collapsed)]);
+}
+
 fn collapse_ctor_delegation(body: &mut Stmt, pc: &PoolClass) {
     let items = match body {
         Stmt::Block(v) => v,

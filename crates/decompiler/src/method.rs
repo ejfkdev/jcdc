@@ -424,7 +424,10 @@ pub fn decompile_method(
         .with_final_fields(final_fields);
     let mut body = converter.convert(region);
     if let Ok(want) = std::env::var("JCDC_DBG_BODY") {
-        if pc.method_name(m_idx) == Some(want.as_str()) {
+        if pc.method_name(m_idx) == Some(want.as_str())
+            || (want == "<init>" && pc.method_name(m_idx) == Some("<init>")
+                && desc_str.contains(&std::env::var("JCDC_DBG_BODY_DESC").unwrap_or_default()))
+        {
             eprintln!("BODY-CONVERT: {:#?}", body);
         }
     }
