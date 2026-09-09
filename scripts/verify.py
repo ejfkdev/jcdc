@@ -60,22 +60,34 @@ def _extract_platform(feature):
 
 def jcdc_cp(feature):
     # Platform classes for the decompiler's reference lookups (generic
-    # signature instantiation, sealed-supertype checks). For 9+ the ERA
-    # jimage is required: JDK8's rt.jar answers with pre-9 semantics
-    # (IllegalFormatException is sealed since 17; against the stale rt.jar
-    # copy the decompiler dropped `non-sealed` from its subclasses and the
-    # recompile died with 需要密封、非密封或最终修饰符). java.base first —
-    # pool dir sources are first-wins, and family classes (added before
-    # the cp) still take priority over everything.
+    # signature instantiation, sealed-supertype checks). Must be ERA-
+    # correct: JDK8's rt.jar answers with pre-9 semantics (jdk19+
+    # IllegalFormatException is sealed; against the stale copy the
+    # decompiler dropped `non-sealed` and the recompile died with
+    # 需要密封、非密封或最终修饰符). For 9+ the era jimage; for 8 rt.jar IS the
+    # era jar; for 6/7 the era JDK's own platform jar — EnumSet
+    # readResolve's erased `(E)e` cast witness needs Collection.add(E)'s
+    # Signature resolvable, and the super chain (AbstractSet→…→Collection)
+    # lives only in the platform jar. The old "no cp for 6/7" rule
+    # guarded against JDK8-era nested classes leaking into families
+    # (DeqSpliterator); an era jar contains exactly the classes the era
+    # sources compiled against, so there is nothing to leak. Family
+    # classes (added first) still take priority: pool dir sources are
+    # first-wins and dirs precede jars in lookup.
     if feature >= 9:
         base = _extract_platform(feature)
         if base is not None:
             return [str(base)]
-    if RT_JAR and feature >= 8:
-        # rt.jar carries JDK8-era class families; for jdk6/7 corpora its
-        # nested classes would leak into the decompiled family
-        # (e.g. DeqSpliterator).
+    if feature == 8 and RT_JAR:
         return [str(RT_JAR)]
+    home = jdk_home(feature)
+    if home is not None:
+        for c in (home / "jre" / "lib" / "rt.jar",
+                  home / "lib" / "rt.jar",
+                  home / "Classes" / "classes.jar",
+                  home.parent / "Classes" / "classes.jar"):
+            if c.exists():
+                return [str(c)]
     return []
 LOCAL_JDK = Path("/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home")
 
