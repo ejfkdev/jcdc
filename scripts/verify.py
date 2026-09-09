@@ -36,10 +36,45 @@ JCDC = ROOT / "target" / "release" / "jcdc"
 RT_JAR = next(iter(sorted((ROOT / "corpus" / "jdks" / "jdk8").glob("*/Home/jre/lib/rt.jar"))), None)
 
 
+def _extract_platform(feature):
+    """Extract the era JDK's lib/modules jimage once per release into
+    WORK/platform/jdkN; return the java.base class dir or None."""
+    cache = WORK / "platform" / f"jdk{feature}"
+    base = cache / "java.base"
+    if base.is_dir():
+        return base
+    home = jdk_home(feature)
+    modules = home / "lib" / "modules" if home else None
+    if modules is None or not modules.exists():
+        return None
+    cache.mkdir(parents=True, exist_ok=True)
+    for tool in (LOCAL_JDK / "bin" / "jimage", home / "bin" / "jimage"):
+        if not tool.exists():
+            continue
+        run([str(tool), "extract", "--dir", str(cache), str(modules)],
+            timeout=900)
+        if base.is_dir():
+            return base
+    return None
+
+
 def jcdc_cp(feature):
-    # rt.jar carries JDK8-era class families; for jdk6/7 corpora its nested
-    # classes would leak into the decompiled family (e.g. DeqSpliterator).
+    # Platform classes for the decompiler's reference lookups (generic
+    # signature instantiation, sealed-supertype checks). For 9+ the ERA
+    # jimage is required: JDK8's rt.jar answers with pre-9 semantics
+    # (IllegalFormatException is sealed since 17; against the stale rt.jar
+    # copy the decompiler dropped `non-sealed` from its subclasses and the
+    # recompile died with 需要密封、非密封或最终修饰符). java.base first —
+    # pool dir sources are first-wins, and family classes (added before
+    # the cp) still take priority over everything.
+    if feature >= 9:
+        base = _extract_platform(feature)
+        if base is not None:
+            return [str(base)]
     if RT_JAR and feature >= 8:
+        # rt.jar carries JDK8-era class families; for jdk6/7 corpora its
+        # nested classes would leak into the decompiled family
+        # (e.g. DeqSpliterator).
         return [str(RT_JAR)]
     return []
 LOCAL_JDK = Path("/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home")

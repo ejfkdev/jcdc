@@ -224,7 +224,13 @@ impl ClassPool {
             if primary {
                 st.primary.extend(index.keys().cloned());
             }
-            st.dir_index.extend(index);
+            // First source wins (javac classpath semantics): the primary
+            // family dir is added before reference classpath dirs, so a
+            // stale platform copy must never mask the freshly compiled
+            // family class.
+            for (k, v) in index {
+                st.dir_index.entry(k).or_insert(v);
+            }
         } else if is_zip(path) {
             let mut index = HashMap::new();
             index_jar(path, &mut index);
