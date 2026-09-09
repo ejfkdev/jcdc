@@ -2950,7 +2950,7 @@ fn emit_method_with(
                 &caller_params,
                 acc.contains(MethodAccessFlags::STATIC),
             );
-            strip_erasure_casts_generic_ret(&mut body, msig.as_ref(), pool);
+            strip_erasure_casts_generic_ret(&mut body, msig.as_ref(), pool, &mb.vt);
             witness_generic_returns(&mut body, msig.as_ref(), pool, pc);
             push_witness_into_branches(&mut body, msig.as_ref(), pool, pc);
             witness_comparison_operands(&mut body, msig.as_ref(), pool);
@@ -6734,17 +6734,22 @@ fn generic_ret_ish(g: &jcdc_jvm::GenericType) -> bool {
 /// generic array receiver — a poly expression typed by the return target),
 /// drop the erasure cast: the bare expression compiles exactly like the
 /// original source did.
-fn strip_erasure_casts_generic_ret(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, pool: &ClassPool) {
+fn strip_erasure_casts_generic_ret(
+    s: &mut Stmt,
+    msig: Option<&jcdc_jvm::MethodSignature>,
+    pool: &ClassPool,
+    vt: &crate::varalloc::VarTable,
+) {
     let Some(sig) = msig else { return };
     if !generic_ret_ish(&sig.ret) {
         return;
     }
     let ret_er = TypeRef::G(sig.ret.clone()).erased();
-    fn fix(e: &mut Expr, ret_er: &jcdc_jvm::JavaType, pool: &ClassPool) {
+    fn fix(e: &mut Expr, ret_er: &jcdc_jvm::JavaType, pool: &ClassPool, vt: &crate::varalloc::VarTable) {
         match e {
             Expr::Cond { t, f, .. } => {
-                fix(t, ret_er, pool);
-                fix(f, ret_er, pool);
+                fix(t, ret_er, pool, vt);
+                fix(f, ret_er, pool, vt);
             }
             Expr::Cast { ty, e: inner } => {
                 if &ty.erased() == ret_er {
@@ -6780,7 +6785,26 @@ fn strip_erasure_casts_generic_ret(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodS
                     // dies 推论变量 CR 具有不兼容的上限 — the source carries
                     // this.<NodeBuilder<R>,Node<R>>evaluate). Keep the cast;
                     // the RKM shape needs a chain witness instead (TODO).
+                    // A field read through a WILDCARD-parameterized owner
+                    // has a CAPTURE type in javac (e.value with
+                    // e: Entry<?,?> is CAP#1, not the declared V): the
+                    // synthesized `(V)` cast is the only bridge and must
+                    // survive (Hashtable.get walk-path CAP#1无法转换为V x3
+                    // trees). The VarTable type is authoritative for the
+                    // owner local — the embedded Local ty can be the
+                    // erasure.
+                    let capture_owner_field = if let Expr::Field { owner: Some(o), .. } = &**inner {
+                        let oty = match &**o {
+                            Expr::Local { var, .. } => vt.var(*var).ty.clone(),
+                            Expr::Cast { ty, .. } => ty.clone(),
+                            other => other.type_ref(),
+                        };
+                        matches!(&oty, TypeRef::G(g) if g_has_wildcard(g))
+                    } else {
+                        false
+                    };
                     let droppable = !diamond_arg_call
+                        && !capture_owner_field
                         && ((matches!(inner.type_ref(), TypeRef::G(_)) && erasure_only)
                             || (is_generic_call(inner, pool) && erasure_only)
                             || matches!(&**inner, Expr::Method { name, owner: Some(o), .. }
@@ -6791,53 +6815,53 @@ fn strip_erasure_casts_generic_ret(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodS
                         return;
                     }
                 }
-                fix(inner, ret_er, pool);
+                fix(inner, ret_er, pool, vt);
             }
             _ => {}
         }
     }
-    fn rec(s: &mut Stmt, ret_er: &jcdc_jvm::JavaType, pool: &ClassPool) {
+    fn rec(s: &mut Stmt, ret_er: &jcdc_jvm::JavaType, pool: &ClassPool, vt: &crate::varalloc::VarTable) {
         match s {
-            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, ret_er, pool)),
-            Stmt::Return(Some(e)) => fix(e, ret_er, pool),
+            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, ret_er, pool, vt)),
+            Stmt::Return(Some(e)) => fix(e, ret_er, pool, vt),
             Stmt::If { then_stmt, else_stmt, .. } => {
-                rec(then_stmt, ret_er, pool);
+                rec(then_stmt, ret_er, pool, vt);
                 if let Some(x) = else_stmt {
-                    rec(x, ret_er, pool);
+                    rec(x, ret_er, pool, vt);
                 }
             }
             Stmt::While { body, .. }
             | Stmt::DoWhile { body, .. }
             | Stmt::ForEach { body, .. }
             | Stmt::Labeled { body, .. }
-            | Stmt::Synchronized { body, .. } => rec(body, ret_er, pool),
+            | Stmt::Synchronized { body, .. } => rec(body, ret_er, pool, vt),
             Stmt::For { init, body, .. } => {
-                init.iter_mut().for_each(|i| rec(i, ret_er, pool));
-                rec(body, ret_er, pool);
+                init.iter_mut().for_each(|i| rec(i, ret_er, pool, vt));
+                rec(body, ret_er, pool, vt);
             }
             Stmt::Switch { cases, default, .. } => {
                 for c in cases.iter_mut() {
                     for st in c.body.iter_mut() {
-                        rec(st, ret_er, pool);
+                        rec(st, ret_er, pool, vt);
                     }
                 }
                 if let Some(d) = default {
-                    rec(d, ret_er, pool);
+                    rec(d, ret_er, pool, vt);
                 }
             }
             Stmt::Try { body, catches, finally } => {
-                rec(body, ret_er, pool);
+                rec(body, ret_er, pool, vt);
                 for c in catches.iter_mut() {
-                    rec(&mut c.body, ret_er, pool);
+                    rec(&mut c.body, ret_er, pool, vt);
                 }
                 if let Some(f) = finally {
-                    rec(f, ret_er, pool);
+                    rec(f, ret_er, pool, vt);
                 }
             }
             _ => {}
         }
     }
-    rec(s, &ret_er, pool);
+    rec(s, &ret_er, pool, vt);
 }
 
 pub(crate) fn is_generic_call(a: &Expr, pool: &ClassPool) -> bool {
@@ -9602,9 +9626,21 @@ fn cast_returns_to_typevar(s: &mut Stmt, tv: &str, vt: &VarTable) {
     // A field read through a wildcard-parameterized receiver (`e.value`
     // where e: Entry<?,?>) has a CAPTURE type, not the method's own type
     // variable — even when the names collide. It always needs the cast.
-    fn capture_field(e: &Expr) -> bool {
+    fn capture_field(e: &Expr, vt: &crate::varalloc::VarTable) -> bool {
         if let Expr::Field { owner: Some(o), .. } = e {
-            if let TypeRef::G(jcdc_jvm::GenericType::Class(cs)) = o.type_ref() {
+            // The VarTable type is authoritative for locals (the embedded
+            // Local ty can be the erasure while the decl/print carries the
+            // wildcard parameterization — Hashtable.get's `e.value` with
+            // e: Entry<?,?> skipped its (V) cast: capture_field saw the
+            // erased owner and the declared field typevar V matched the
+            // target, rendering bare `return e.value` = CAP#1无法转换为V
+            // x3 walk-path trees). Cast owners use the cast's target type.
+            let oty = match &**o {
+                Expr::Local { var, .. } => vt.var(*var).ty.clone(),
+                Expr::Cast { ty, .. } => ty.clone(),
+                other => other.type_ref(),
+            };
+            if let TypeRef::G(jcdc_jvm::GenericType::Class(cs)) = oty {
                 return cs.parts.iter().any(|p| {
                     p.args
                         .iter()
@@ -9614,12 +9650,12 @@ fn cast_returns_to_typevar(s: &mut Stmt, tv: &str, vt: &VarTable) {
         }
         false
     }
-    fn fix(e: &mut Expr, target: &TypeRef, tv: &str) {
+    fn fix(e: &mut Expr, target: &TypeRef, tv: &str, vt: &crate::varalloc::VarTable) {
         if matches!(e, Expr::Const(crate::expr::ConstVal::Null)) {
             return;
         }
         let already = match e.type_ref() {
-            TypeRef::G(jcdc_jvm::GenericType::TypeVar(n)) => n == tv && !capture_field(e),
+            TypeRef::G(jcdc_jvm::GenericType::TypeVar(n)) => n == tv && !capture_field(e, vt),
             _ => false,
         };
         if !already {
@@ -9629,14 +9665,14 @@ fn cast_returns_to_typevar(s: &mut Stmt, tv: &str, vt: &VarTable) {
     }
     match s {
         Stmt::Block(v) => v.iter_mut().for_each(|x| cast_returns_to_typevar(x, tv, vt)),
-        Stmt::Return(Some(e)) => fix(e, &target, tv),
+        Stmt::Return(Some(e)) => fix(e, &target, tv, vt),
         Stmt::LocalDef { var, init: Some(e), .. } => {
             let is_tv = match &vt.var(*var).ty {
                 TypeRef::G(jcdc_jvm::GenericType::TypeVar(n)) => n == tv,
                 _ => false,
             };
             if is_tv {
-                fix(e, &target, tv);
+                fix(e, &target, tv, vt);
             }
         }
         Stmt::ExprStmt(Expr::Assign { target: t, value, .. }) => {
@@ -9645,7 +9681,7 @@ fn cast_returns_to_typevar(s: &mut Stmt, tv: &str, vt: &VarTable) {
                 _ => false,
             };
             if is_tv {
-                fix(value, &target, tv);
+                fix(value, &target, tv, vt);
             }
         }
         Stmt::If { then_stmt, else_stmt, .. } => {
