@@ -374,29 +374,23 @@ def verify_corpus(features, limit, keep=False):
             return ("\n".join(errs) if errs else text)[:limit]
 
         for f in srcs:
-            p = run(javac + ["-nowarn", "-g", "-encoding", "UTF-8"] + release_args + patch_args +
+            # -implicit:none: with --patch-module (9+) javac would
+            # otherwise IMPLICITLY compile every dependency from the era
+            # source tree into orig (a whole java.base per family — 30x
+            # redundant work, and any poisoned decompiled dependency
+            # failed all 30 families: jdk9/jdk10 scored 0/30). orig then
+            # holds exactly this source file's classes — INCLUDING
+            # sibling top-level classes (AbstractList.java also defines
+            # SubList/RandomAccessSubList — a Stem-prefix filter dropped
+            # them: 找不到符号 SubList).
+            p = run(javac + ["-nowarn", "-g", "-encoding", "UTF-8", "-implicit:none"] + release_args + patch_args +
                     ["-d", str(fdir / "orig"), str(f)], timeout=120)
             if p.returncode != 0:
                 continue
             stats["compiled"] += 1
             stem = f.stem
-            # Restrict the family to this source's own classes. For 9+
-            # the --patch-module source tree makes javac IMPLICITLY
-            # compile every dependency into orig (a whole java.base per
-            # family — 30x redundant work and one poisoned decompiled
-            # dependency fails all 30 families: jdk9/10 scored 0/30 on
-            # AbstractChronology errors while compiling "AbstractCollection").
-            fam_dir = fdir / "fam"
-            shutil.rmtree(fam_dir, ignore_errors=True)
-            n_fam = 0
-            for c in (fdir / "orig").rglob("*.class"):
-                cs = c.stem
-                if cs == stem or cs.startswith(stem + "$"):
-                    dst = fam_dir / c.relative_to(fdir / "orig")
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(c, dst)
-                    n_fam += 1
-            if n_fam == 0:
+            fam_dir = fdir / "orig"
+            if not any(fam_dir.rglob("*.class")):
                 _cleanup_family()
                 continue
             # decompile the produced class family
