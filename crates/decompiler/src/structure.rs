@@ -603,6 +603,91 @@ pub enum Region {
     Empty,
 }
 
+impl Region {
+    /// Top-level parts of this region (the Seq's elements, or the region
+    /// itself as a single part).
+    fn iter_parts(&self) -> &[Region] {
+        match self {
+            Region::Seq(v) => v.as_slice(),
+            _ => std::slice::from_ref(self),
+        }
+    }
+
+    /// True when ANY flow path leaving this region does so via a Goto to
+    /// a target other than `taken` — i.e. the path BYPASSES the parked
+    /// follow block `taken` and would fall into the parked sibling
+    /// statements at render time instead of reaching its real target.
+    /// Regions ending without a Goto (Basic/CopyStmts/Empty/Loop/Try
+    /// fallout) leave the arm by natural fallthrough INTO the parked
+    /// chain — exactly the empty-arm contract, no bypass.
+    fn bypasses_exempt(
+        r: &Region,
+        taken: usize,
+        exempt: &std::collections::HashSet<usize>,
+    ) -> bool {
+        match r {
+            Region::Goto { target } => *target != taken && !exempt.contains(target),
+            Region::Seq(v) => v
+                .last()
+                .map(|l| Region::bypasses_exempt(l, taken, exempt))
+                .unwrap_or(false),
+            Region::If { then_r, else_r, .. } => {
+                Region::bypasses_exempt(then_r, taken, exempt)
+                    || Region::bypasses_exempt(else_r, taken, exempt)
+            }
+            Region::Try { body, catches, .. } => {
+                Region::bypasses_exempt(body, taken, exempt)
+                    || catches
+                        .iter()
+                        .any(|(_, _, h)| Region::bypasses_exempt(h, taken, exempt))
+            }
+            _ => false,
+        }
+    }
+
+    /// Collect loop headers/exits and Switch follows embedded in a region
+    /// tree: Gotos targeting them resolve to continue/break statements at
+    /// conversion — jumps that never fall through, so they are not
+    /// parked-chain bypasses (completing after them would emit
+    /// unreachable code).
+    fn jump_targets(r: &Region, out: &mut std::collections::HashSet<usize>) {
+        match r {
+            Region::Loop { header, body, exits, .. } => {
+                out.insert(*header);
+                out.extend(exits.iter().copied());
+                Region::jump_targets(body, out);
+            }
+            Region::Switch { cases, default, follow, .. } => {
+                if let Some(f) = follow {
+                    out.insert(*f);
+                }
+                for (_, cr) in cases {
+                    Region::jump_targets(cr, out);
+                }
+                if let Some(d) = default {
+                    Region::jump_targets(d, out);
+                }
+            }
+            Region::Seq(v) => {
+                for x in v {
+                    Region::jump_targets(x, out);
+                }
+            }
+            Region::If { then_r, else_r, .. } => {
+                Region::jump_targets(then_r, out);
+                Region::jump_targets(else_r, out);
+            }
+            Region::Try { body, catches, .. } => {
+                Region::jump_targets(body, out);
+                for (_, _, h) in catches {
+                    Region::jump_targets(h, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub struct Structurer<'a> {
     pub cfg: &'a Cfg,
     pub results: &'a Vec<BlockResult>,
@@ -2146,6 +2231,285 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         }
                     } else if let Some(absorbed) = self.absorb_pure(fall, universe, &bstop, claimed, active) {
                         absorbed
+                    } else if Some(taken) == follow
+                        && !stop.contains(&taken)
+                        && universe.contains(&taken)
+                        && !claimed.contains(&taken)
+                        && !self.is_terminator_block(taken)
+                        && !self.results[taken].stmts.is_empty()
+                        && !self.loops_stack.contains(&taken)
+                        && !(self.is_handler(taken) && active.is_empty())
+                        && !bstop.contains(&fall)
+                        && !claimed.contains(&fall)
+                        && universe.contains(&fall)
+                        && !(self.is_handler(fall) && active.is_empty())
+                    {
+                        // PARKED-ELSE COMPLETION (the systemic empty-arm
+                        // family): `taken` is the If's follow AND a
+                        // statement-bearing in-universe block — the
+                        // if-else-if chain shape javac emits for a shared
+                        // else body (`if (t1) goto B; if (t2) goto B; A;
+                        // goto M; B: ...; M: ...`). The then-arm renders
+                        // Region::Empty (correct: it falls into B's
+                        // statements parked after the chain), but the ELSE
+                        // arm's flow continues PAST B — its terminal
+                        // Goto{M} is elided at conversion (goto_is_last)
+                        // and the arm falls INTO the parked B statements:
+                        // double execution on the else path and B skipped
+                        // on its real predecessors' path (jdk17
+                        // JarFile.getBytes: the readNBytes A-arm ran
+                        // straight into readAllBytes; Pattern.clazz's
+                        // Bound arm, DatagramChannelImpl.receive,
+                        // SocketChannelImpl, HttpURLConnection carry the
+                        // same latent shape). Complete the else arm with
+                        // its OWN copy of the parked chain — exactly what
+                        // the GOTO-FT/GOTO-CLAIMED shared-tail arrivals
+                        // already do for claimed targets: per-arrival
+                        // copies are the bytecode semantics.
+                        let branch_universe = self.owner_scope(fall, universe);
+                        let mut sub = self.sub_scope(fall, &branch_universe, &bstop, claimed);
+                        self.restrict_handler_branch(&mut sub, entry);
+                        let arm = self.walk(fall, &sub, &bstop, active, claimed, false);
+                        // BYPASS DISCRIMINATOR: completion is needed only
+                        // when some arm path's terminal flow skips the
+                        // parked follow (a trailing Goto targeting
+                        // something other than `taken`, at any nesting
+                        // depth — JarFile's A-arm ends at Goto{epilogue
+                        // 11}, not the parked B 6). Exempt targets are
+                        // TRUE JUMPS, never fallthrough bypasses: loop
+                        // headers/exits and switch follows embedded in
+                        // the arm (resolve to continue/break), the
+                        // enclosing loops_stack and case_arm_ctx
+                        // follows, and this scope's barriers (bstop —
+                        // enclosing loop exits resolve to break at
+                        // conversion; Files.walkFileTree's TERMINATE
+                        // arm ends at Goto{loop-exit} and inverted when
+                        // wrongly completed). NOT exempt: an active
+                        // group's post-try continuation when the parked
+                        // follow's statements still sit between the arm
+                        // and it at render time (JarFile's b11 — the
+                        // owner emits the follow chain BEFORE the cont,
+                        // so the bare fallthrough would cross the parked
+                        // B statements). The ordinary empty-then `if`
+                        // (every arm path flows into the follow
+                        // naturally) needs no copy — completing it would
+                        // duplicate the tail through every such if in
+                        // the corpus (25-class matrix churn).
+                        let mut jump_exempt: HashSet<usize> = HashSet::new();
+                        Region::jump_targets(&arm, &mut jump_exempt);
+                        jump_exempt.extend(self.loops_stack.iter().copied());
+                        jump_exempt.extend(
+                            self.case_arm_ctx.iter().filter_map(|c| c.1),
+                        );
+                        jump_exempt.extend(bstop.iter().copied());
+                        let bypass = Region::bypasses_exempt(&arm, taken, &jump_exempt);
+                        // The parked chain: statement blocks flowing from
+                        // `taken` up to the blocks this arm already copied
+                        // (their per-arrival copies render inside the arm;
+                        // the sibling emits the rest).
+                        let mut chain: HashSet<usize> = HashSet::new();
+                        if bypass {
+                            let mut b = taken;
+                            for _ in 0..64 {
+                                if chain.contains(&b)
+                                    || b == cur
+                                    // bstop holds the follow == the chain
+                                    // head itself; only deeper barriers
+                                    // (loop exits) end the chain.
+                                    || (b != taken && bstop.contains(&b))
+                                    || self.loops_stack.contains(&b)
+                                    || self.is_handler(b)
+                                    || claimed.contains(&b)
+                                    || self.terminator_writes_final(b)
+                                {
+                                    break;
+                                }
+                                if arm.iter_parts().iter().any(|p| region_head_block(p) == b) {
+                                    break;
+                                }
+                                let term = self.results[b].term.clone();
+                                let stmts_ok = !self.results[b].stmts.is_empty()
+                                    || matches!(term, Term::Fallthrough | Term::Goto);
+                                if !stmts_ok {
+                                    break;
+                                }
+                                chain.insert(b);
+                                match term {
+                                    Term::Fallthrough | Term::Goto
+                                        if self.cfg.blocks[b].succ.len() == 1 =>
+                                    {
+                                        b = self.cfg.blocks[b].succ[0];
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        }
+                        if chain.is_empty() {
+                            if std::env::var("JCDC_DBG_IF").is_ok() {
+                                eprintln!("PARKCHAIN cur={} chain=EMPTY arm={}", cur, region_shape(&arm));
+                            }
+                            arm
+                        } else {
+                            // The chain walk must stay a SIMPLE tail
+                            // reproduction: universe = chain + forward
+                            // flow closure under the FULL parent
+                            // barriers (stop ∪ bstop minus the chain
+                            // itself, plus every enclosing loop header —
+                            // back edges into open loops belong to the
+                            // loop's own structuring, never to an arm
+                            // copy: huc getInputStream0's follow 41
+                            // flows around the auth retry loop and the
+                            // unbarriered closure restructured
+                            // Loop(41)+5 regions inside the else arm).
+                            let mut cu: HashSet<usize> = chain.clone();
+                            {
+                                let mut q: Vec<usize> = chain.iter().copied().collect();
+                                let mut seen: HashSet<usize> = chain.clone();
+                                while let Some(b) = q.pop() {
+                                    for &s2 in &self.cfg.blocks[b].succ {
+                                        if bstop.contains(&s2)
+                                            || stop.contains(&s2)
+                                            || self.loops_stack.contains(&s2)
+                                        {
+                                            continue;
+                                        }
+                                        if seen.insert(s2) {
+                                            cu.insert(s2);
+                                            q.push(s2);
+                                        }
+                                    }
+                                }
+                            }
+                            let mut cstop: HashSet<usize> = bstop.union(stop).copied().collect();
+                            cstop.extend(self.loops_stack.iter().copied());
+                            cstop.retain(|x| !chain.contains(x));
+                            // SCRATCH claimed set: a rejected completion
+                            // must leave no claims behind (an abandoned
+                            // exploratory walk claiming the follow would
+                            // degrade the parent's parked-sibling arrival
+                            // to a bare elided Goto — the very statement
+                            // loss the completion exists to prevent).
+                            // copied_tails must roll back too: conversion's
+                            // reaches_copy_tail elides RawGotos targeting
+                            // copy-walked tails, and the exploratory walk's
+                            // copy_walks poisoned that set for the parent's
+                            // own (identical-shape) walk.
+                            let saved_claims = claimed.clone();
+                            let mut scratch = claimed.clone();
+                            let saved_tails = self.copied_tails.clone();
+                            let saved_groups = self.structuring_groups.borrow().clone();
+                            let saved_loops = self.loops_stack.clone();
+                            let saved_switch_depth = self.switch_depth;
+                            let saved_case_ctx = self.case_arm_ctx.clone();
+                            let saved_walk_depth = self.walk_depth;
+                            let taken_r = self.walk(taken, &cu, &cstop, active, &mut scratch, false);
+                            if std::env::var("JCDC_DBG_IF").is_ok() {
+                                eprintln!(
+                                    "PARKCHAIN cur={} chain={:?} cu={} cstop={:?} taken_r={}",
+                                    cur, chain, cu.len(), cstop, region_shape(&taken_r)
+                                );
+                            }
+                            // Accept only SIMPLE completions (linear
+                            // blocks, copied tails, elision-safe gotos,
+                            // plain if-diamonds). A Loop/Try/Switch in
+                            // the result means the parked flow is
+                            // structural territory the PARENT walk must
+                            // own — back off and keep the historical
+                            // shape (adding a copy anyway lost huc's
+                            // serverAuthentication.addToCache: the arm
+                            // claimed the follow, the parent's arrival
+                            // degraded to a bare elided Goto).
+                            fn simple_completion(r: &Region) -> bool {
+                                match r {
+                                    Region::Basic { .. }
+                                    | Region::CopyStmts { .. }
+                                    | Region::Empty
+                                    | Region::Goto { .. } => true,
+                                    Region::Seq(v) => v.iter().all(simple_completion),
+                                    Region::If { then_r, else_r, .. } => {
+                                        simple_completion(then_r)
+                                            && simple_completion(else_r)
+                                    }
+                                    _ => false,
+                                }
+                            }
+                            // CONTINUATION COHERENCE: the chain copy's
+                            // own walk must end where the bypassing arm
+                            // path jumps (its continuation walk starts at
+                            // the bypass target). When they diverge (huc
+                            // getInputStream0: bypass Goto{117} but the
+                            // parked 109-chain continues into the auth
+                            // retry loop territory), splicing the copy
+                            // into the arm flips conv's goto_is_last for
+                            // the arm's internal gotos (a nested elided
+                            // Goto{108} materialized as Continue) and
+                            // prune_unreachable then ate the tail copy
+                            // (serverAuthentication.addToCache lost).
+                            let coherent = {
+                                fn chain_cont(r: &Region) -> Option<usize> {
+                                    match r {
+                                        Region::Goto { target } => Some(*target),
+                                        Region::Seq(v) => v.last().and_then(chain_cont),
+                                        _ => None,
+                                    }
+                                }
+                                fn bypass_targets(r: &Region, out: &mut Vec<usize>) {
+                                    match r {
+                                        Region::Goto { target } => out.push(*target),
+                                        Region::Seq(v) => {
+                                            if let Some(l) = v.last() { bypass_targets(l, out); }
+                                        }
+                                        Region::If { then_r, else_r, .. } => {
+                                            bypass_targets(then_r, out);
+                                            bypass_targets(else_r, out);
+                                        }
+                                        Region::Try { body, catches, .. } => {
+                                            bypass_targets(body, out);
+                                            for (_, _, h) in catches { bypass_targets(h, out); }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                let mut bts = Vec::new();
+                                bypass_targets(&arm, &mut bts);
+                                // A copy ending in a Goto to somewhere
+                                // OTHER than the bypass target re-routes
+                                // the path away from the arm's real
+                                // continuation (huc). A copy with NO
+                                // trailing Goto (it ends inside a
+                                // terminator or a full tail walk past
+                                // the target — JarFile's chain flows
+                                // through b11 into the close/return
+                                // epilogue) preserves it.
+                                match chain_cont(&taken_r) {
+                                    Some(c) => bts.iter().all(|t| *t == c),
+                                    None => true,
+                                }
+                            };
+                            if matches!(taken_r, Region::Empty)
+                                || !simple_completion(&taken_r)
+                                || !coherent
+                            {
+                                // Full state rollback: the exploratory walk
+                                // mutates Structurer state beyond `claimed`
+                                // (copied_tails feeds conversion's
+                                // reaches_copy_tail elision; the group/loop/
+                                // switch stacks feed scope decisions) — huc
+                                // getInputStream0 lost addToCache with only
+                                // claimed+tails restored.
+                                self.copied_tails = saved_tails;
+                                *claimed = saved_claims;
+                                *self.structuring_groups.borrow_mut() = saved_groups;
+                                self.loops_stack = saved_loops;
+                                self.switch_depth = saved_switch_depth;
+                                self.case_arm_ctx = saved_case_ctx;
+                                self.walk_depth = saved_walk_depth;
+                                arm
+                            } else {
+                                claimed.extend(scratch.iter().copied());
+                                Region::Seq(vec![arm, taken_r])
+                            }
+                        }
                     } else if universe.contains(&fall)
                         && !bstop.contains(&fall)
                         && !claimed.contains(&fall)
