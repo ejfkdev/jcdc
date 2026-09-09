@@ -806,22 +806,84 @@ impl<'a> Structurer<'a> {
     /// render that jump as the matching break/continue (conversion
     /// resolves against the enclosing loop stack; a cascade reaching an
     /// UNENCLOSED header falls back to the bare break).
-    fn materialize_content_exits(
+    pub(crate) fn materialize_content_exits(
         &mut self,
         body: &mut Region,
         header: usize,
         exits: &[usize],
         members: &HashSet<usize>,
         natural: &HashSet<usize>,
-        ctx: &SeseCtx,
+        ctx_universe: &HashSet<usize>,
+        ctx_loop_stack: &[usize],
+        ctx_loop_headers: &HashSet<usize>,
+        ctx_top_groups: &[usize],
+        outer_stop: &HashSet<usize>,
+        reach: &HashSet<usize>,
+        consumed: &HashSet<usize>,
+        natural_follow_empty: bool,
     ) {
         if MATEXIT_DISABLED.with(|d| d.get()) {
             return;
         }
         let mut barriers: HashSet<usize> = exits.iter().copied().collect();
         barriers.extend(members.iter().copied());
-        barriers.extend(ctx.loop_stack.iter().copied());
-        barriers.extend(ctx.loop_headers.iter().copied());
+        barriers.extend(ctx_loop_stack.iter().copied());
+        barriers.extend(ctx_loop_headers.iter().copied());
+        // PARENT-CONTINUATION fold: replicate the post-loop follow_pick's
+        // minimal candidate (lowest-start unconsumed in-reach exit) — when
+        // natural_follow is empty the parent continues at THAT exit and
+        // renders its flow once; materializing it double-renders the
+        // territory (ois readSerialData e=45: the cleanup-continuation
+        // copy re-bound catch identities downstream, markException(null)).
+        let mut natural: HashSet<usize> = natural.iter().copied().collect();
+        if natural_follow_empty {
+            // Full follow_pick replication (incl. the continue-stub
+            // filter): the parent's post-loop continuation is exactly
+            // this block, parent-rendered once — never materialize it.
+            let claim_cands: HashSet<usize> = exits
+                .iter()
+                .copied()
+                .filter(|e| {
+                    !consumed.contains(e)
+                        && !outer_stop.contains(e)
+                        && ctx_universe.contains(e)
+                        && reach.contains(e)
+                        && !self.is_handler(*e)
+                        && *e != header
+                })
+                .collect();
+            let mut cands: Vec<usize> = exits
+                .iter()
+                .copied()
+                .filter(|e| {
+                    !consumed.contains(e)
+                        && !outer_stop.contains(e)
+                        && ctx_universe.contains(e)
+                        && reach.contains(e)
+                        && !self.is_handler(*e)
+                        && *e != header
+                        && !ctx_loop_stack.iter().any(|h| {
+                            h != e
+                                && self.is_stmt_free_chain_to_block(*e, *h)
+                                && !self.stub_chain_claims_continuation(
+                                    *e,
+                                    *h,
+                                    &claim_cands,
+                                )
+                        })
+                })
+                .collect();
+            cands.sort_by_key(|x| self.cfg.blocks[*x].start);
+            if let Some(f) = cands.first() {
+                natural.insert(*f);
+            }
+        }
+        let natural = &natural;
+        if std::env::var("JCDC_DBG_SESE").is_ok() {
+            let mut nv: Vec<usize> = natural.iter().copied().collect();
+            nv.sort_unstable();
+            eprintln!("MXNAT header={} exits={:?} natural={:?}", header, exits, nv);
+        }
         // Baseline conversion of the un-spliced body: the trial
         // pathology scan compares against it (a splice that introduces a
         // NEW Stmt::Labeled changed classify_loop's rotation — the
@@ -844,8 +906,8 @@ impl<'a> Structurer<'a> {
             }
             if members.contains(&e)
                 || natural.contains(&e)
-                || ctx.loop_stack.contains(&e)
-                || ctx.loop_headers.contains(&e)
+                || ctx_loop_stack.contains(&e)
+                || ctx_loop_headers.contains(&e)
                 || self.is_terminator_block(e)
                 || !self.exit_has_content(e, &barriers)
             {
@@ -854,6 +916,33 @@ impl<'a> Structurer<'a> {
             let mut cstop = barriers.clone();
             cstop.remove(&e);
             cstop.extend(natural.iter().copied());
+            // The NATURAL CONTINUATION'S forward closure is parent-
+            // rendered territory: a cascade may not swallow it (ois
+            // readSerialData e=45's tu dragged in the post-loop blocks
+            // 50-57 — double-rendered flow re-bound catch identities
+            // downstream, markException(ex=null)). Barriers for the
+            // closure: exits, enclosing headers, members — the closure
+            // must not wrap around the loop.
+            {
+                let mut cl_bar: HashSet<usize> = exits.iter().copied().collect();
+                cl_bar.extend(members.iter().copied());
+                cl_bar.extend(ctx_loop_stack.iter().copied());
+                cl_bar.extend(ctx_loop_headers.iter().copied());
+                let mut cl: HashSet<usize> = HashSet::new();
+                let mut cq: Vec<usize> = natural.iter().copied().collect();
+                while let Some(b) = cq.pop() {
+                    if !cl.insert(b) {
+                        continue;
+                    }
+                    for &n2 in &self.cfg.blocks[b].succ {
+                        if !cl_bar.contains(&n2) {
+                            cq.push(n2);
+                        }
+                    }
+                }
+                cstop.extend(cl.iter().copied());
+                cstop.remove(&e);
+            }
             // ORPHANED exits only: E must NOT be forward-reachable from
             // any natural exit's flow. When it is, the parent renders that
             // flow after the Loop (ordinary continuation or finally-copy
@@ -866,11 +955,55 @@ impl<'a> Structurer<'a> {
             // restarts the outer loop) and TempFileHelper's
             // `hasPermissions = true` block (flow joins the post-loop
             // continuation only THROUGH the shared break stub).
-            let orphaned = !natural.contains(&e)
-                && !natural.iter().any(|&n0| {
-                    crate::structure::can_reach_cfg(self.cfg, n0, e, 4096)
-                });
+            // Barriered forward reachability: the RAW can_reach wraps
+            // around the loop through the restart backedge and makes
+            // every exit "reachable" from every natural (cleanQueue 6→
+            // 24→0→1→…→11) — barriers are the other exits, members and
+            // enclosing headers.
+            let orphaned = !natural.contains(&e) && {
+                let mut seen_o: HashSet<usize> = HashSet::new();
+                let mut qo: Vec<usize> = natural.iter().copied().collect();
+                for x in &qo {
+                    seen_o.insert(*x);
+                }
+                let mut found = false;
+                while let Some(b) = qo.pop() {
+                    for &n2 in &self.cfg.blocks[b].succ {
+                        if n2 == e {
+                            found = true;
+                            break;
+                        }
+                        if barriers.contains(&n2) || n2 == header {
+                            continue;
+                        }
+                        if seen_o.insert(n2) {
+                            qo.push(n2);
+                        }
+                    }
+                    if found {
+                        break;
+                    }
+                }
+                !found
+            };
             if !orphaned {
+                continue;
+            }
+            // SHARED-PRED gate: an exit that shares a normal-flow
+            // predecessor with a loop member is a SIBLING CONTINUATION
+            // branch (b24 flows to BOTH the member b25 and the exit 45 —
+            // ois readSerialData's finally-cleanup fork), not an orphaned
+            // break target: the outer region renders that territory once,
+            // and copying it double-renders the flow (catch identities
+            // rebound downstream: markException(ex=null)). cleanQueue's
+            // CAS exit (preds all members), Bits' epilogue (pred = its
+            // own test) and tfh/FJP/CHM restorations have no shared pred.
+            let shared_pred = self.cfg.blocks[e].pred.iter().any(|&p| {
+                p != header
+                    && !members.contains(&p)
+                    && self.cfg.blocks[p].succ.len() >= 2
+            });
+            if shared_pred {
                 continue;
             }
             // UPDATE-BLOCK gate: an exit whose forward flow (barred by the
@@ -970,7 +1103,7 @@ impl<'a> Structurer<'a> {
             // arm-local; the arm-internal trailing gotos still elide via
             // goto_is_last inside the copy.
             let saved_tails = self.copied_tails.clone();
-            let r = self.walk(e, &tu, &wstop, &ctx.top_groups, &mut fresh, true);
+            let r = self.walk(e, &tu, &wstop, &ctx_top_groups, &mut fresh, true);
             self.copied_tails = saved_tails;
             if matches!(r, Region::Empty) {
                 continue;
@@ -989,8 +1122,8 @@ impl<'a> Structurer<'a> {
                         || cstop.contains(&n)
                         || exits.contains(&n)
                         || natural.contains(&n)
-                        || ctx.loop_stack.contains(&n)
-                        || ctx.loop_headers.contains(&n)
+                        || ctx_loop_stack.contains(&n)
+                        || ctx_loop_headers.contains(&n)
                 })
             });
             if !self_contained {
@@ -1054,32 +1187,122 @@ impl<'a> Structurer<'a> {
             //     markException(ex=null) semantic corruption).
             // Clean → commit the splice; pathology → roll back this exit
             // (the clone is dropped; nothing outside was mutated).
-            let trial = {
-                let mut tb = body.clone();
-                Self::splice_exit_copies(&mut tb, e, &r);
-                tb
+            // Two-tier site policy validated by trial conversion: tier 1
+            // (loose) splices arm/tail Goto sites even under enclosing
+            // Seqs with live siblings (CHM putVal's addCount restoration
+            // lives on such an arm); tier 2 (strict) restricts to the
+            // true flow-end chain (Bits phase-1's catch-handler Goto{16}
+            // is followed by the handler's Goto{7} retry — splicing the
+            // terminating epilogue there strands it). Validate tier 1;
+            // on pathology fall back to tier 2 and re-validate; reject
+            // the exit only when both fail.
+            //
+            // A cascade whose every flow path already terminates
+            // (return/throw inlined via term_copy) takes NO trailing
+            // Goto{e} (the break would render after a return — dead);
+            // non-terminating cascades keep it so the break binding
+            // survives. In-loop normalization: when the loop's natural
+            // continuation is itself a barrier (backedge stub / outer
+            // header / exit), re-append Goto{e} so the fall-out arm
+            // re-iterates explicitly like the golden `continue`.
+            let mut replacement = if self.region_all_paths_terminate(&r) {
+                r.clone()
+            } else {
+                Region::Seq(vec![r.clone(), Region::Goto { target: e }])
             };
-            let trial_stmt = {
+            let natural_is_barrier = natural
+                .iter()
+                .all(|&n0| exits.contains(&n0) || ctx_loop_stack.contains(&n0));
+            if natural_is_barrier
+                && self.region_all_paths_terminate(&r)
+                && !matches!(replacement, Region::Seq(_))
+            {
+                replacement =
+                    Region::Seq(vec![replacement, Region::Goto { target: e }]);
+            }
+            let convert_trial = |tb: Region| -> (Stmt, usize) {
                 let mut conv = crate::convert::Converter::new(self.cfg, self.results)
                     .with_copied_tails(self.copied_tails.clone())
                     .with_final_fields(self.final_fields.clone());
-                conv.convert(trial)
+                let st = conv.convert(tb);
+                let lab = Self::count_labeled(&st);
+                (st, lab)
             };
-            let trial_labeled = Self::count_labeled(&trial_stmt);
-            if Self::stmt_splice_pathology(&trial_stmt) || trial_labeled != base_labeled {
-                if std::env::var("JCDC_DBG_SESE").is_ok() {
-                    eprintln!(
-                        "MATEXIT-REJECT e={} pathology={} labels {}->{}",
-                        e,
-                        Self::stmt_splice_pathology(&trial_stmt),
-                        base_labeled,
-                        trial_labeled
-                    );
+            let trial1 = {
+                let mut tb = body.clone();
+                Self::splice_exit_copies_with(&mut tb, e, &replacement, false);
+                self.replace_empty_arms_for(&mut tb, e, &replacement);
+                tb
+            };
+            let (stmt1, lab1) = convert_trial(trial1);
+            let strict = if !Self::stmt_splice_pathology(&stmt1) && lab1 == base_labeled {
+                false
+            } else {
+                let trial2 = {
+                    let mut tb = body.clone();
+                    Self::splice_exit_copies_with(&mut tb, e, &replacement, true);
+                    self.replace_empty_arms_for(&mut tb, e, &replacement);
+                    tb
+                };
+                let (stmt2, lab2) = convert_trial(trial2);
+                if Self::stmt_splice_pathology(&stmt2) || lab2 != base_labeled {
+                    if std::env::var("JCDC_DBG_SESE").is_ok() {
+                        eprintln!("MATEXIT-REJECT e={} both tiers pathological", e);
+                    }
+                    continue;
                 }
-                continue;
+                true
+            };
+            if std::env::var("JCDC_DBG_SESE").is_ok() {
+                let mut tusize: Vec<usize> = tu.iter().copied().collect();
+                tusize.sort_unstable();
+                eprintln!("MATEXIT-ACCEPT e={} strict={} tu={:?}", e, strict, tusize);
+                for (gi, g) in self.groups.iter().enumerate() {
+                    let overlap: Vec<usize> = tusize.iter().copied().filter(|&b| {
+                        self.cfg.blocks[b].start >= g.start && self.cfg.blocks[b].start < g.end
+                    }).collect();
+                    if !overlap.is_empty() {
+                        eprintln!("MXGROUP gi={} span=({},{}) overlap={:?}", gi, g.start, g.end, overlap);
+                    }
+                }
+                let bg: Vec<usize> = tusize.iter().copied().filter(|b| self.body_group.contains_key(b)).collect();
+                let hg: Vec<usize> = tusize.iter().copied().filter(|b| self.handler_group.contains_key(b)).collect();
+                eprintln!("MXGH body_group={:?} handler_group={:?}", bg, hg);
             }
-            Self::splice_exit_copies(body, e, &r);
-            MATEXIT_FIRED.with(|f| f.set(true));
+            let h1 = Self::splice_exit_copies_with(body, e, &replacement, strict);
+            let h2 = self.replace_empty_arms_for(body, e, &replacement);
+            if h1 || h2 {
+                MATEXIT_FIRED.with(|f| f.set(true));
+            }
+        }
+    }
+
+    /// True when every flow path through the region ends at a
+    /// return/throw (Basic/CopyStmts of a terminator block, or a Goto
+    /// whose target term-copies inline). Empty arms fall through, so an
+    /// If only terminates when BOTH arms do; a Seq when its last element
+    /// does.
+    fn region_all_paths_terminate(&self, r: &Region) -> bool {
+        match r {
+            Region::Basic { block } | Region::CopyStmts { block } => {
+                self.is_terminator_block(*block)
+            }
+            Region::Goto { target } => self.is_terminator_block(*target),
+            Region::Seq(v) => v
+                .last()
+                .map(|x| self.region_all_paths_terminate(x))
+                .unwrap_or(false),
+            Region::If { then_r, else_r, .. } => {
+                self.region_all_paths_terminate(then_r)
+                    && self.region_all_paths_terminate(else_r)
+            }
+            Region::Try { body, catches, .. } => {
+                self.region_all_paths_terminate(body)
+                    && catches
+                        .iter()
+                        .all(|(_, _, h)| self.region_all_paths_terminate(h))
+            }
+            _ => false,
         }
     }
 
@@ -1241,6 +1464,13 @@ impl<'a> Structurer<'a> {
     }
 
     fn pathology_in(s: &Stmt, own: Option<&str>) -> bool {
+        fn stmt_is_empty(x: &Stmt) -> bool {
+            match x {
+                Stmt::Block(v) => v.iter().all(stmt_is_empty),
+                Stmt::Comment(_) => true,
+                _ => false,
+            }
+        }
         fn dup_catch(catches: &[crate::stmt::Catch]) -> bool {
             for i in 0..catches.len() {
                 for j in i + 1..catches.len() {
@@ -1258,7 +1488,14 @@ impl<'a> Structurer<'a> {
                         .iter()
                         .position(|x| Structurer::terminates_scoped(x, own))
                     {
-                        if pos + 1 < v.len() {
+                        // EMPTY trailing blocks are conversion placeholders
+                        // (elided gotos) that cleanup() removes before
+                        // render — javac never sees them. Only NON-EMPTY
+                        // stranded siblings are pathologies (the trial
+                        // scans raw converter output; Bits phase-1's
+                        // [terminating Try, Block([])] false positive
+                        // vetoed the splice).
+                        if v[pos + 1..].iter().any(|x| !stmt_is_empty(x)) {
                             return true;
                         }
                     }
@@ -1341,42 +1578,47 @@ impl<'a> Structurer<'a> {
         }
     }
 
-    /// Recurse into nested containers splicing only TAIL-position gotos
-    /// (never replaces a mid-Seq element itself).
-    fn descend_only(r: &mut Region, e: usize, cascade: &Region) -> bool {
+    /// Replace EMPTY If arms whose branch target is `e` with the
+    /// replacement region: the Bits phase-1 shape has NO Goto{e} site at
+    /// all — the COND's fall==follow==exit renders the success arm as
+    /// Region::Empty and the body falls out to the backedge (re-loop).
+    /// The empty arm IS the jump to e; materializing it restores the
+    /// golden `if (!call) continue; else { epilogue; }`.
+    fn replace_empty_arms_for(&self, r: &mut Region, e: usize, replacement: &Region) -> bool {
         match r {
-            Region::Seq(v) => {
+            Region::If { block, then_r, else_r, .. } => {
+                let succs = &self.cfg.blocks[*block].succ;
                 let mut hit = false;
-                let n = v.len();
-                for (i, x) in v.iter_mut().enumerate() {
-                    if i + 1 == n {
-                        hit |= Self::splice_exit_copies(x, e, cascade);
-                    } else {
-                        hit |= Self::descend_only(x, e, cascade);
-                    }
+                if matches!(**then_r, Region::Empty) && succs.get(1) == Some(&e) {
+                    *then_r = Box::new(replacement.clone());
+                    hit = true;
                 }
+                if matches!(**else_r, Region::Empty) && succs.first() == Some(&e) {
+                    *else_r = Box::new(replacement.clone());
+                    hit = true;
+                }
+                hit |= self.replace_empty_arms_for(then_r, e, replacement);
+                hit |= self.replace_empty_arms_for(else_r, e, replacement);
                 hit
             }
-            Region::If { then_r, else_r, .. } => {
-                let a = Self::splice_exit_copies(then_r, e, cascade);
-                let b = Self::splice_exit_copies(else_r, e, cascade);
-                a | b
-            }
+            Region::Seq(v) => v
+                .iter_mut()
+                .fold(false, |h, x| h | self.replace_empty_arms_for(x, e, replacement)),
             Region::Try { body, catches, .. } => {
-                let mut hit = Self::splice_exit_copies(body, e, cascade);
+                let mut hit = self.replace_empty_arms_for(body, e, replacement);
                 for (_, _, h) in catches.iter_mut() {
-                    hit |= Self::splice_exit_copies(h, e, cascade);
+                    hit |= self.replace_empty_arms_for(h, e, replacement);
                 }
                 hit
             }
-            Region::Loop { body, .. } => Self::splice_exit_copies(body, e, cascade),
+            Region::Loop { body, .. } => self.replace_empty_arms_for(body, e, replacement),
             Region::Switch { cases, default, .. } => {
                 let mut hit = false;
                 for (_, cr) in cases.iter_mut() {
-                    hit |= Self::splice_exit_copies(cr, e, cascade);
+                    hit |= self.replace_empty_arms_for(cr, e, replacement);
                 }
                 if let Some(d) = default {
-                    hit |= Self::splice_exit_copies(d, e, cascade);
+                    hit |= self.replace_empty_arms_for(d, e, replacement);
                 }
                 hit
             }
@@ -1384,53 +1626,66 @@ impl<'a> Structurer<'a> {
         }
     }
 
-    /// Replace every `Goto{e}` in the region tree with
-    /// `Seq[cascade-copy, Goto{e}]` (per-arrival copies; Region: Clone).
-    fn splice_exit_copies(r: &mut Region, e: usize, cascade: &Region) -> bool {
+    /// Replace `Goto{e}` sites in the region tree with `replacement`
+    /// (per-arrival copies; Region: Clone). `strict`: only sites on the
+    /// true flow-end chain (every enclosing Seq position is last) are
+    /// replaced; loose mode additionally replaces arm-internal sites
+    /// whose enclosing Seq has live siblings. A MID-Seq Goto leaf is
+    /// never replaced in either mode (live siblings follow it directly).
+    fn splice_exit_copies_with(
+        r: &mut Region,
+        e: usize,
+        replacement: &Region,
+        strict: bool,
+    ) -> bool {
         match r {
             Region::Goto { target } if *target == e => {
-                *r = Region::Seq(vec![cascade.clone(), Region::Goto { target: e }]);
+                *r = replacement.clone();
                 true
             }
             Region::Seq(v) => {
                 let mut hit = false;
                 let n = v.len();
                 for (i, x) in v.iter_mut().enumerate() {
-                    // A MID-Seq Goto{e} has live siblings after it (the
-                    // shared continuation other paths fall into);
-                    // splicing an abrupt-ending cascade there strands
-                    // them (jdk26 ConcurrentHashMap getTable 无法访问的
-                    // 语句). Only tail-position gotos are the arm-terminal
-                    // break shape the completion targets. Recursion into
-                    // the mid element still handles its nested tails.
-                    if i + 1 == n {
-                        hit |= Self::splice_exit_copies(x, e, cascade);
+                    let last = i + 1 == n;
+                    if matches!(x, Region::Goto { target } if *target == e) {
+                        if last {
+                            *x = replacement.clone();
+                            hit = true;
+                        }
                     } else {
-                        hit |= Self::descend_only(x, e, cascade);
+                        hit |= Self::splice_exit_copies_with(
+                            x,
+                            e,
+                            replacement,
+                            strict || !last,
+                        );
                     }
                 }
                 hit
             }
             Region::If { then_r, else_r, .. } => {
-                let a = Self::splice_exit_copies(then_r, e, cascade);
-                let b = Self::splice_exit_copies(else_r, e, cascade);
+                let a = Self::splice_exit_copies_with(then_r, e, replacement, strict);
+                let b = Self::splice_exit_copies_with(else_r, e, replacement, strict);
                 a | b
             }
             Region::Try { body, catches, .. } => {
-                let mut hit = Self::splice_exit_copies(body, e, cascade);
+                let mut hit = Self::splice_exit_copies_with(body, e, replacement, strict);
                 for (_, _, h) in catches.iter_mut() {
-                    hit |= Self::splice_exit_copies(h, e, cascade);
+                    hit |= Self::splice_exit_copies_with(h, e, replacement, strict);
                 }
                 hit
             }
-            Region::Loop { body, .. } => Self::splice_exit_copies(body, e, cascade),
+            Region::Loop { body, .. } => {
+                Self::splice_exit_copies_with(body, e, replacement, strict)
+            }
             Region::Switch { cases, default, .. } => {
                 let mut hit = false;
                 for (_, cr) in cases.iter_mut() {
-                    hit |= Self::splice_exit_copies(cr, e, cascade);
+                    hit |= Self::splice_exit_copies_with(cr, e, replacement, strict);
                 }
                 if let Some(d) = default {
-                    hit |= Self::splice_exit_copies(d, e, cascade);
+                    hit |= Self::splice_exit_copies_with(d, e, replacement, strict);
                 }
                 hit
             }
@@ -2132,7 +2387,21 @@ impl<'a> Structurer<'a> {
                     // continuation into a break arm (nf=[36], 缺少返回语句
                     // x2 trees).
                     natural.extend(natural_follow.iter().copied());
-                    self.materialize_content_exits(&mut body, header, &exits, &members, &natural, ctx);
+                    self.materialize_content_exits(
+                        &mut body,
+                        header,
+                        &exits,
+                        &members,
+                        &natural,
+                        &ctx.universe,
+                        &ctx.loop_stack,
+                        &ctx.loop_headers,
+                        &ctx.top_groups,
+                        stop,
+                        &reach,
+                        &ctx.consumed,
+                        natural_follow.is_empty(),
+                    );
                 }
                 parts.push(Region::Loop { header, body: Box::new(body), members: members.clone(), exits: exits.clone() });
                 // Continue after the loop at the header's natural exit (if it

@@ -4185,9 +4185,43 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         }
         claimed.insert(header);
         self.loops_stack.push(header);
-        let body = self.walk(header, &members, &inner_stop, active, claimed, true);
+        let mut body = self.walk(header, &members, &inner_stop, active, claimed, true);
         if std::env::var("JCDC_DBG_LOOP").is_ok() {
             eprintln!("LOOP body region: {:#?}", body);
+        }
+        // Walk-side twin of the SESE loop-site call: orphaned
+        // statement-bearing exits materialized into the breaking arms
+        // (jdk26 java.nio.Bits.reserveMemory's phase-1 success path —
+        // `tryReserveOrClean` true falls to the interrupted-check +
+        // return epilogue (blocks 16-18) which the bare-break rendering
+        // dropped entirely: the success path RE-LOOPED, re-reserving
+        // memory forever; javac can't see it, the walk path structures
+        // this method, so the SESE-only pass never ran).
+        if std::env::var("JCDC_NO_MATEXIT").is_err() {
+            let natural: HashSet<usize> = self.cfg.blocks[header]
+                .succ
+                .iter()
+                .copied()
+                .filter(|x| !members.contains(x) && *x != header)
+                .collect();
+            let reach_all: HashSet<usize> =
+                (0..self.cfg.blocks.len()).collect();
+            let lh: HashSet<usize> = HashSet::new();
+            self.materialize_content_exits(
+                &mut body,
+                header,
+                &exits,
+                &members,
+                &natural,
+                &members,
+                &self.loops_stack.clone(),
+                &lh,
+                active,
+                stop,
+                &reach_all,
+                claimed,
+                false,
+            );
         }
         self.loops_stack.pop();
         claimed.extend(members.iter().copied());
