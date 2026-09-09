@@ -558,7 +558,7 @@ pub fn group_exceptions_with(cfg: &Cfg, results: Option<&Vec<crate::builder::Blo
 // Region tree
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Region {
     /// Statements of one basic block; terminal handled by the enclosing region.
     Basic { block: usize },
@@ -1526,7 +1526,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
     /// * `claimed`  — blocks consumed (in/out; pre-seed for loop bodies),
     /// * `allow_claimed_entry` — process `entry` even if already claimed
     ///   (loop headers are pre-claimed).
-    fn walk(
+    pub(crate) fn walk(
         &mut self,
         entry: usize,
         universe: &HashSet<usize>,
@@ -3234,6 +3234,39 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
     /// exits chain to UNCLAIMED continuations (the post-loop follow) and
     /// must stay jumps — inlining those rewrites breaks into returns and
     /// degrades while-cond loops (jdk26 ThreadPoolExecutor regression).
+    /// True when a loop-exit target heads real CONTENT: a statement or a
+    /// branch cascade, not a statement-free stub chain into a barrier
+    /// (loop header / another exit / out of scope). Breaking to a stub
+    /// exit loses nothing (Pattern.clazz's switch-case goto stubs must
+    /// stay bare breaks). Breaking to a content exit drops its whole
+    /// flow: jdk17 AQS.cleanQueue's `q.status < 0` arm breaks to the
+    /// CAS-unlink cascade (casTail/casPrev/casNext/signalNext flowing to
+    /// the outer restart stub) and the bare break silently deleted the
+    /// phase (semantic, compile-clean).
+    pub(crate) fn exit_has_content(&self, e: usize, stop: &HashSet<usize>) -> bool {
+        let mut b = e;
+        for _ in 0..16 {
+            if !self.results[b].stmts.is_empty() {
+                return true;
+            }
+            match &self.results[b].term {
+                Term::Cond { .. } | Term::Switch { .. } => return true,
+                Term::Return(_) | Term::Throw(_) => return false,
+                Term::Fallthrough | Term::Goto
+                    if self.cfg.blocks[b].succ.len() == 1 =>
+                {
+                    let n = self.cfg.blocks[b].succ[0];
+                    if n == e || stop.contains(&n) || self.loops_stack.contains(&n) {
+                        return false;
+                    }
+                    b = n;
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
     fn stop_chain_to_claimed_terminator(&self, cur: usize, claimed: &HashSet<usize>) -> bool {
         let mut x = cur;
         for _ in 0..8 {
@@ -3535,7 +3568,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
 
     /// True when the block ends in a return/throw (a shared terminator that
     /// can be safely duplicated at each arrival site).
-    fn is_terminator_block(&self, b: usize) -> bool {
+    pub(crate) fn is_terminator_block(&self, b: usize) -> bool {
         matches!(
             self.results[b].term,
             Term::Return(_) | Term::Throw(_)

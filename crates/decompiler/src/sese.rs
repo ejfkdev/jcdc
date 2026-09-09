@@ -27,6 +27,14 @@ use crate::structure::{
 };
 
 /// Per-method precomputation for the SESE decomposition.
+thread_local! {
+    /// Set when a matexit splice committed in the current method; read by
+    /// decompile_method's post-pipeline pathology retry.
+    pub static MATEXIT_FIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Method-local kill switch for the retry pass.
+    pub static MATEXIT_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 struct SeseCtx {
     universe: HashSet<usize>,
     idom: DomInfo,
@@ -780,6 +788,656 @@ impl<'a> Structurer<'a> {
     /// Region walk with an explicit scope (`reach`). Normally the scope is
     /// reachable_within(entry, stop); loop bodies pass the same set computed
     /// once at the loop site so nested walks/copies share one bound.
+    /// Loop-level materialization of statement-bearing exits (jdk17
+    /// AQS.cleanQueue's dropped CAS-unlink phase). Runs AFTER the loop
+    /// body region is fully built, so the body's claims/consumed history
+    /// is untouched — the arm-site copy experiment perturbed sibling
+    /// structuring mid-walk (cancelAcquire regressed, cleanQueue's
+    /// advance path was swallowed) and was reverted; this pass is pure
+    /// region-tree post-processing. Each exit E carrying statement/branch
+    /// CONTENT (exit_has_content; stub-chain exits like Pattern.clazz's
+    /// switch-case goto stubs are exempt and keep their bare breaks) gets
+    /// its cascade structured ONCE on a clean barriered scope (all exits
+    /// + loop members + enclosing headers), then every `Goto{E}` in the
+    /// body becomes `Seq[cascade-copy, Goto{E}]`: the break keeps its
+    /// conversion binding while the cascade runs before it — the golden
+    /// shape (CAS unlink executes, then break restarts the outer loop).
+    /// Cascades whose flow ends at another exit or an enclosing back edge
+    /// render that jump as the matching break/continue (conversion
+    /// resolves against the enclosing loop stack; a cascade reaching an
+    /// UNENCLOSED header falls back to the bare break).
+    fn materialize_content_exits(
+        &mut self,
+        body: &mut Region,
+        header: usize,
+        exits: &[usize],
+        members: &HashSet<usize>,
+        natural: &HashSet<usize>,
+        ctx: &SeseCtx,
+    ) {
+        if MATEXIT_DISABLED.with(|d| d.get()) {
+            return;
+        }
+        let mut barriers: HashSet<usize> = exits.iter().copied().collect();
+        barriers.extend(members.iter().copied());
+        barriers.extend(ctx.loop_stack.iter().copied());
+        barriers.extend(ctx.loop_headers.iter().copied());
+        // Baseline conversion of the un-spliced body: the trial
+        // pathology scan compares against it (a splice that introduces a
+        // NEW Stmt::Labeled changed classify_loop's rotation — the
+        // ObjectInputStream readSerialData corruption route: the L2
+        // re-rotation moved catch blocks across LVT ranges and varalloc
+        // rebound the catch identity, markException(ex=null)).
+        let base_labeled = {
+            let mut conv = crate::convert::Converter::new(self.cfg, self.results)
+                .with_copied_tails(self.copied_tails.clone())
+                .with_final_fields(self.final_fields.clone());
+            let base_stmt = conv.convert(body.clone());
+            Self::count_labeled(&base_stmt)
+        };
+        let skip_e: Option<usize> = std::env::var("JCDC_MATEXIT_SKIP")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        for &e in exits {
+            if Some(e) == skip_e {
+                continue;
+            }
+            if members.contains(&e)
+                || natural.contains(&e)
+                || ctx.loop_stack.contains(&e)
+                || ctx.loop_headers.contains(&e)
+                || self.is_terminator_block(e)
+                || !self.exit_has_content(e, &barriers)
+            {
+                continue;
+            }
+            let mut cstop = barriers.clone();
+            cstop.remove(&e);
+            cstop.extend(natural.iter().copied());
+            // ORPHANED exits only: E must NOT be forward-reachable from
+            // any natural exit's flow. When it is, the parent renders that
+            // flow after the Loop (ordinary continuation or finally-copy
+            // machinery) and the break lands into it — splicing a copy
+            // duplicated ObjectInputStream.readSerialData's finally-cleanup
+            // retry (3x catch(ThreadDeath ignored), 已在方法中定义了变量)
+            // and stranded ConcurrentHashMap.getTable tails (无法访问的语句).
+            // An orphaned E is rendered NOWHERE else: cleanQueue's CAS
+            // unlink phase (reachable only via member jumps, its flow
+            // restarts the outer loop) and TempFileHelper's
+            // `hasPermissions = true` block (flow joins the post-loop
+            // continuation only THROUGH the shared break stub).
+            let orphaned = !natural.contains(&e)
+                && !natural.iter().any(|&n0| {
+                    crate::structure::can_reach_cfg(self.cfg, n0, e, 4096)
+                });
+            if !orphaned {
+                continue;
+            }
+            // UPDATE-BLOCK gate: an exit whose forward flow (barred by the
+            // other exits, members, enclosing headers and the natural
+            // continuation) reaches THIS loop's header is the iteration
+            // update block — copying it into a jump arm inverts break into
+            // advance+continue (Pattern split's `break` became `++x2;
+            // offset += len; continue L3`). A genuine break exit receives
+            // member edges too (the cond's exit side) but never flows back
+            // to the header inside the barriers (cleanQueue's CAS exit
+            // restarts via the OUTER stub, TempFileHelper's joins the
+            // post-loop continuation).
+            let is_update = {
+                let mut bar: HashSet<usize> = barriers.clone();
+                bar.extend(natural.iter().copied());
+                bar.remove(&e);
+                let mut seen2: HashSet<usize> = HashSet::new();
+                let mut q2: Vec<usize> = vec![e];
+                seen2.insert(e);
+                let mut found = false;
+                while let Some(b) = q2.pop() {
+                    if self.cfg.blocks[b].succ.iter().any(|&n| n == header) {
+                        found = true;
+                        break;
+                    }
+                    for &n in &self.cfg.blocks[b].succ {
+                        if !bar.contains(&n) && seen2.insert(n) {
+                            q2.push(n);
+                        }
+                    }
+                }
+                found
+            };
+            if is_update {
+                continue;
+            }
+            // GROUP-TERRITORY gate: an exit whose flow lies inside any try
+            // group's protected span (or is a handler) belongs to the
+            // finally/catch machinery — copying it competes with the
+            // dedupe/catch-identity passes (ObjectInputStream
+            // .readSerialData: the e=4 micro-cascade copy re-bound the
+            // catch vars — `catch (ClassNotFoundException ignored)` +
+            // `ex = null` made markException receive NULL instead of the
+            // exception, and the triple `ignored` collided). cleanQueue
+            // and TempFileHelper have no groups over their cascades.
+            let in_group = self
+                .groups
+                .iter()
+                .any(|g| self.cfg.blocks[e].start >= g.start && self.cfg.blocks[e].start < g.end)
+                || self.body_group.contains_key(&e)
+                || self.handler_group.contains_key(&e);
+            if in_group {
+                continue;
+            }
+            let tu = crate::structure::reachable_within(self.cfg, e, &cstop);
+            if !tu.contains(&e) || tu.len() > 48 {
+                continue;
+            }
+            // HANDLER/THROW-TERRITORY gate: a cascade whose blocks
+            // include an exception-handler head or a throw site is
+            // finally/pending-rethrow machinery — copying it re-renders
+            // catch flow and the downstream naming passes rebind the
+            // catch identity (ois readSerialData e=24: the retry cascade
+            // copy turned `catch (ClassNotFoundException e1) {
+            // markException(passHandle, e1) }` into `catch (... ignored)
+            // { ex = null; markException(passHandle, ex) }` — NULL
+            // instead of the exception — plus a triple-`ignored`
+            // redefinition error; conversion-time trial checks cannot
+            // see it: the corruption happens in the post-convert
+            // varalloc/naming passes). Such exits keep the bare break.
+            // The e=4 single-Basic cascade (a genuine dropped
+            // `hasSpecialReadMethod = true` restoration, golden-verified)
+            // has neither handler heads nor throws and stays.
+            if tu.iter().any(|&b| {
+                self.handler_group.contains_key(&b)
+                    || matches!(self.results[b].term, Term::Throw(_))
+            }) {
+                continue;
+            }
+            let mut fresh: HashSet<usize> = HashSet::new();
+            // The walk's stop carries the OUTER barriers too (not just
+            // cstop): Goto regions targeting them resolve to
+            // break/continue at conversion instead of materializing
+            // foreign territory as RawGoto copies (the ois finally-cleanup
+            // duplication route).
+            let mut wstop: HashSet<usize> = cstop.clone();
+            wstop.extend(barriers.iter().copied());
+            wstop.extend(natural.iter().copied());
+            wstop.remove(&e);
+            // copied_tails isolation: the cascade walk's internal
+            // copy_walks register shared tails; leaking those into the
+            // method's set makes the PARENT's own gotos to them elide as
+            // reaches_copy_tail fallthrough — UnixPath.normalize lost its
+            // whole `while (i1 < count) ... return new UnixPath(..)`
+            // continuation (缺少返回语句 x2 trees) after an ACCEPTED splice.
+            // Restore unconditionally: the cascade's registrations are
+            // arm-local; the arm-internal trailing gotos still elide via
+            // goto_is_last inside the copy.
+            let saved_tails = self.copied_tails.clone();
+            let r = self.walk(e, &tu, &wstop, &ctx.top_groups, &mut fresh, true);
+            self.copied_tails = saved_tails;
+            if matches!(r, Region::Empty) {
+                continue;
+            }
+            // SELF-CONTAINED-FLOW gate: every successor of every cascade
+            // block must stay inside the cascade universe or land on a
+            // declared barrier (another exit, an enclosing header, the
+            // natural continuation). A flow escaping elsewhere (into a
+            // handler region or foreign territory) gets mangled by the
+            // copy's conversion context (ObjectInputStream readSerialData:
+            // the finally-cleanup retry copied as bare blocks re-bound
+            // catch identities — markException received a null `ex`).
+            let self_contained = tu.iter().all(|&b| {
+                self.cfg.blocks[b].succ.iter().all(|&n| {
+                    tu.contains(&n)
+                        || cstop.contains(&n)
+                        || exits.contains(&n)
+                        || natural.contains(&n)
+                        || ctx.loop_stack.contains(&n)
+                        || ctx.loop_headers.contains(&n)
+                })
+            });
+            if !self_contained {
+                continue;
+            }
+            // A cascade containing a Try cannot be spliced as a copy: the
+            // duplicated catch parameter collides with the original's
+            // scope (jdk11/17 ObjectInputStream.readSerialData 已在方法中
+            // 定义了变量 ignored — an inner catch may not redeclare an
+            // outer catch's variable). Renaming catch vars is a
+            // Stmt-level concern the region copy cannot express; those
+            // exits keep the bare break (pre-fix behavior).
+            if Self::region_contains_try(&r) {
+                continue;
+            }
+            if std::env::var("JCDC_DBG_SESE").is_ok() {
+                let txt = format!("{:?}", r);
+                eprintln!(
+                    "MATEXIT e={} tu={} r={}",
+                    e,
+                    tu.len(),
+                    &txt[..txt.len().min(300)]
+                );
+            }
+            // REDUNDANT BACKEDGE TRIM: a trailing Goto to THIS loop's own
+            // header is the fall-out-equivalent (the parent renders
+            // `continue` right after the loop anyway) — kept in the copy
+            // it makes the arm all-abrupt and strands that continue
+            // (ForkJoinPool awaitDone 无法访问的语句). Drop it; the arm
+            // then completes normally into the parent's backedge.
+            fn trim_backedge(r: &mut Region, header: usize) {
+                if let Region::Seq(v) = r {
+                    if matches!(v.last(), Some(Region::Goto { target }) if *target == header) {
+                        v.pop();
+                    }
+                    return;
+                }
+                if matches!(r, Region::Goto { target } if *target == header) {
+                    *r = Region::Empty;
+                }
+            }
+            let mut r = r;
+            trim_backedge(&mut r, header);
+            if matches!(r, Region::Empty) {
+                continue;
+            }
+            // CONVERSION-AWARE VALIDATION (the gate the region-level
+            // predicates could not express — two experiment rounds proved
+            // the harm classes arise at conversion/Stmt level): trial-
+            // splice into a CLONE, convert it in a throwaway Converter,
+            // and scan the Stmt tree for splice pathologies:
+            // (1) abrupt-stranding — a terminating statement followed by
+            //     siblings in the same block (the spliced cascade's inner
+            //     gotos resolved to break/continue at this site where the
+            //     ORIGINAL Goto{E} elided as fallthrough; jdk26
+            //     ConcurrentHashMap.getTable 无法访问的语句). prune_
+            //     unreachable would silently DELETE the stranded siblings.
+            // (2) duplicate catch exception types — the copy re-rendered
+            //     handler flow whose catch identity the naming passes
+            //     then rebind (jdk11 ObjectInputStream.readSerialData
+            //     markException(ex=null) semantic corruption).
+            // Clean → commit the splice; pathology → roll back this exit
+            // (the clone is dropped; nothing outside was mutated).
+            let trial = {
+                let mut tb = body.clone();
+                Self::splice_exit_copies(&mut tb, e, &r);
+                tb
+            };
+            let trial_stmt = {
+                let mut conv = crate::convert::Converter::new(self.cfg, self.results)
+                    .with_copied_tails(self.copied_tails.clone())
+                    .with_final_fields(self.final_fields.clone());
+                conv.convert(trial)
+            };
+            let trial_labeled = Self::count_labeled(&trial_stmt);
+            if Self::stmt_splice_pathology(&trial_stmt) || trial_labeled != base_labeled {
+                if std::env::var("JCDC_DBG_SESE").is_ok() {
+                    eprintln!(
+                        "MATEXIT-REJECT e={} pathology={} labels {}->{}",
+                        e,
+                        Self::stmt_splice_pathology(&trial_stmt),
+                        base_labeled,
+                        trial_labeled
+                    );
+                }
+                continue;
+            }
+            Self::splice_exit_copies(body, e, &r);
+            MATEXIT_FIRED.with(|f| f.set(true));
+        }
+    }
+
+    /// Count Stmt::Labeled nodes in a converted tree (rotation-shape
+    /// fingerprint for the trial comparison).
+    fn count_labeled(s: &Stmt) -> usize {
+        let mut n = match s {
+            Stmt::Labeled { .. } => 1,
+            _ => 0,
+        };
+        match s {
+            Stmt::Block(v) => {
+                for x in v {
+                    n += Self::count_labeled(x);
+                }
+            }
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                n += Self::count_labeled(then_stmt);
+                if let Some(e) = else_stmt {
+                    n += Self::count_labeled(e);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::Labeled { body, .. }
+            | Stmt::Synchronized { body, .. } => n += Self::count_labeled(body),
+            Stmt::For { init, body, .. } => {
+                for x in init {
+                    n += Self::count_labeled(x);
+                }
+                n += Self::count_labeled(body);
+            }
+            Stmt::Try { body, catches, finally, .. } => {
+                n += Self::count_labeled(body);
+                for c in catches {
+                    n += Self::count_labeled(&c.body);
+                }
+                if let Some(f) = finally {
+                    n += Self::count_labeled(f);
+                }
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases {
+                    for x in &c.body {
+                        n += Self::count_labeled(x);
+                    }
+                }
+                if let Some(d) = default {
+                    n += Self::count_labeled(d);
+                }
+            }
+            _ => {}
+        }
+        n
+    }
+
+    /// Scan a converted Stmt tree for splice pathologies (see
+    /// materialize_content_exits). Conservative: any hit rolls the exit
+    /// back to the bare-break shape.
+    pub(crate) fn stmt_splice_pathology(s: &Stmt) -> bool {
+        Self::pathology_in(s, None)
+    }
+
+    /// Label-aware JLS-14.21 termination for the pathology scanner:
+    /// `break L1` targeting an OUTER labeled loop escapes an inner
+    /// `while (true)` WITHOUT letting it complete normally — only
+    /// Break(None) or a break carrying THIS loop's own label does.
+    /// stmt_terminates's any-labeled-break conservatism (correct for
+    /// prune_unreachable's deletion side) false-negatived the
+    /// ForwardingNode.find strand (无法访问的语句 x3 trees: the spliced
+    /// cascade made the inner while(true) body all-abrupt, the outer
+    /// break-through left the loop non-completing, and the parent's next
+    /// sibling was unreachable).
+    fn terminates_scoped(s: &Stmt, own: Option<&str>) -> bool {
+        fn is_true_expr(c: &crate::expr::Expr) -> bool {
+            matches!(c, crate::expr::Expr::Const(crate::expr::ConstVal::Int(1)))
+        }
+        fn deep_own_break(s: &Stmt, own: Option<&str>) -> bool {
+            match s {
+                Stmt::Break(None) => true,
+                Stmt::Break(Some(l)) => Some(l.as_str()) == own,
+                Stmt::Block(v) => v.iter().any(|x| deep_own_break(x, own)),
+                Stmt::If { then_stmt, else_stmt, .. } => {
+                    deep_own_break(then_stmt, own)
+                        || else_stmt
+                            .as_ref()
+                            .map(|e| deep_own_break(e, own))
+                            .unwrap_or(false)
+                }
+                Stmt::While { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::ForEach { body, .. }
+                | Stmt::For { body, .. }
+                | Stmt::Synchronized { body, .. }
+                | Stmt::Labeled { body, .. } => deep_own_break(body, own),
+                Stmt::Switch { cases, default, .. } => {
+                    cases
+                        .iter()
+                        .any(|c| c.body.iter().any(|x| deep_own_break(x, own)))
+                        || default
+                            .as_ref()
+                            .map(|d| deep_own_break(d, own))
+                            .unwrap_or(false)
+                }
+                Stmt::Try { body, catches, finally, .. } => {
+                    deep_own_break(body, own)
+                        || catches.iter().any(|c| deep_own_break(&c.body, own))
+                        || finally
+                            .as_ref()
+                            .map(|f| deep_own_break(f, own))
+                            .unwrap_or(false)
+                }
+                Stmt::TryWithResources { resources, body, catches, finally, .. } => {
+                    resources.iter().any(|r| deep_own_break(r, own))
+                        || deep_own_break(body, own)
+                        || catches.iter().any(|c| deep_own_break(&c.body, own))
+                        || finally
+                            .as_ref()
+                            .map(|f| deep_own_break(f, own))
+                            .unwrap_or(false)
+                }
+                _ => false,
+            }
+        }
+        match s {
+            Stmt::Return(_) | Stmt::Throw(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
+            Stmt::Block(v) => v
+                .last()
+                .map(|x| Structurer::terminates_scoped(x, own))
+                .unwrap_or(false),
+            Stmt::If { then_stmt, else_stmt: Some(e), .. } => {
+                Structurer::terminates_scoped(then_stmt, own)
+                    && Structurer::terminates_scoped(e, own)
+            }
+            Stmt::Synchronized { body, .. } => Structurer::terminates_scoped(body, own),
+            Stmt::Labeled { label, body } => Structurer::terminates_scoped(body, Some(label)),
+            Stmt::While { cond, body } | Stmt::DoWhile { body, cond }
+                if is_true_expr(cond) && !deep_own_break(body, own) =>
+            {
+                true
+            }
+            Stmt::For { cond, body, .. }
+                if match cond {
+                    None => true,
+                    Some(c) => is_true_expr(c),
+                } && !deep_own_break(body, own) =>
+            {
+                true
+            }
+            Stmt::Try { body, catches, .. } => {
+                Structurer::terminates_scoped(body, own)
+                    && catches
+                        .iter()
+                        .all(|c| Structurer::terminates_scoped(&c.body, own))
+            }
+            _ => false,
+        }
+    }
+
+    fn pathology_in(s: &Stmt, own: Option<&str>) -> bool {
+        fn dup_catch(catches: &[crate::stmt::Catch]) -> bool {
+            for i in 0..catches.len() {
+                for j in i + 1..catches.len() {
+                    if !catches[i].exc.is_empty() && catches[i].exc == catches[j].exc {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        match s {
+            Stmt::Block(v) => {
+                if v.len() > 1 {
+                    if let Some(pos) = v
+                        .iter()
+                        .position(|x| Structurer::terminates_scoped(x, own))
+                    {
+                        if pos + 1 < v.len() {
+                            return true;
+                        }
+                    }
+                }
+                v.iter().any(|x| Structurer::pathology_in(x, own))
+            }
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                Structurer::pathology_in(then_stmt, own)
+                    || else_stmt
+                        .as_ref()
+                        .map(|e| Structurer::pathology_in(e, own))
+                        .unwrap_or(false)
+            }
+            // Loop bodies bind unlabeled breaks to themselves: the
+            // enclosing label does NOT propagate in (an inner while(true)
+            // under `L1:` is still non-completing when its body breaks
+            // to L1 — the break escapes THROUGH it). Synchronized is
+            // transparent.
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::ForEach { body, .. } => Structurer::pathology_in(body, None),
+            Stmt::Synchronized { body, .. } => Structurer::pathology_in(body, own),
+            Stmt::For { init, body, .. } => {
+                init.iter().any(|x| Structurer::pathology_in(x, own))
+                    || Structurer::pathology_in(body, None)
+            }
+            Stmt::Labeled { label, body } => Structurer::pathology_in(body, Some(label)),
+            Stmt::Try { body, catches, finally, .. } => {
+                dup_catch(catches)
+                    || Structurer::pathology_in(body, own)
+                    || catches
+                        .iter()
+                        .any(|c| Structurer::pathology_in(&c.body, own))
+                    || finally
+                        .as_ref()
+                        .map(|f| Structurer::pathology_in(f, own))
+                        .unwrap_or(false)
+            }
+            Stmt::TryWithResources { body, catches, finally, .. } => {
+                dup_catch(catches)
+                    || Structurer::pathology_in(body, own)
+                    || catches
+                        .iter()
+                        .any(|c| Structurer::pathology_in(&c.body, own))
+                    || finally
+                        .as_ref()
+                        .map(|f| Structurer::pathology_in(f, own))
+                        .unwrap_or(false)
+            }
+            Stmt::Switch { cases, default, .. } => {
+                cases
+                    .iter()
+                    .any(|c| c.body.iter().any(|x| Structurer::pathology_in(x, own)))
+                    || default
+                        .as_ref()
+                        .map(|d| Structurer::pathology_in(d, own))
+                        .unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+
+    /// True when the region tree contains any Try.
+    fn region_contains_try(r: &Region) -> bool {
+        match r {
+            Region::Try { .. } => true,
+            Region::Seq(v) => v.iter().any(Self::region_contains_try),
+            Region::If { then_r, else_r, .. } => {
+                Self::region_contains_try(then_r) || Self::region_contains_try(else_r)
+            }
+            Region::Loop { body, .. } => Self::region_contains_try(body),
+            Region::Switch { cases, default, .. } => {
+                cases.iter().any(|(_, cr)| Self::region_contains_try(cr))
+                    || default
+                        .as_ref()
+                        .map(|d| Self::region_contains_try(d))
+                        .unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+
+    /// Recurse into nested containers splicing only TAIL-position gotos
+    /// (never replaces a mid-Seq element itself).
+    fn descend_only(r: &mut Region, e: usize, cascade: &Region) -> bool {
+        match r {
+            Region::Seq(v) => {
+                let mut hit = false;
+                let n = v.len();
+                for (i, x) in v.iter_mut().enumerate() {
+                    if i + 1 == n {
+                        hit |= Self::splice_exit_copies(x, e, cascade);
+                    } else {
+                        hit |= Self::descend_only(x, e, cascade);
+                    }
+                }
+                hit
+            }
+            Region::If { then_r, else_r, .. } => {
+                let a = Self::splice_exit_copies(then_r, e, cascade);
+                let b = Self::splice_exit_copies(else_r, e, cascade);
+                a | b
+            }
+            Region::Try { body, catches, .. } => {
+                let mut hit = Self::splice_exit_copies(body, e, cascade);
+                for (_, _, h) in catches.iter_mut() {
+                    hit |= Self::splice_exit_copies(h, e, cascade);
+                }
+                hit
+            }
+            Region::Loop { body, .. } => Self::splice_exit_copies(body, e, cascade),
+            Region::Switch { cases, default, .. } => {
+                let mut hit = false;
+                for (_, cr) in cases.iter_mut() {
+                    hit |= Self::splice_exit_copies(cr, e, cascade);
+                }
+                if let Some(d) = default {
+                    hit |= Self::splice_exit_copies(d, e, cascade);
+                }
+                hit
+            }
+            _ => false,
+        }
+    }
+
+    /// Replace every `Goto{e}` in the region tree with
+    /// `Seq[cascade-copy, Goto{e}]` (per-arrival copies; Region: Clone).
+    fn splice_exit_copies(r: &mut Region, e: usize, cascade: &Region) -> bool {
+        match r {
+            Region::Goto { target } if *target == e => {
+                *r = Region::Seq(vec![cascade.clone(), Region::Goto { target: e }]);
+                true
+            }
+            Region::Seq(v) => {
+                let mut hit = false;
+                let n = v.len();
+                for (i, x) in v.iter_mut().enumerate() {
+                    // A MID-Seq Goto{e} has live siblings after it (the
+                    // shared continuation other paths fall into);
+                    // splicing an abrupt-ending cascade there strands
+                    // them (jdk26 ConcurrentHashMap getTable 无法访问的
+                    // 语句). Only tail-position gotos are the arm-terminal
+                    // break shape the completion targets. Recursion into
+                    // the mid element still handles its nested tails.
+                    if i + 1 == n {
+                        hit |= Self::splice_exit_copies(x, e, cascade);
+                    } else {
+                        hit |= Self::descend_only(x, e, cascade);
+                    }
+                }
+                hit
+            }
+            Region::If { then_r, else_r, .. } => {
+                let a = Self::splice_exit_copies(then_r, e, cascade);
+                let b = Self::splice_exit_copies(else_r, e, cascade);
+                a | b
+            }
+            Region::Try { body, catches, .. } => {
+                let mut hit = Self::splice_exit_copies(body, e, cascade);
+                for (_, _, h) in catches.iter_mut() {
+                    hit |= Self::splice_exit_copies(h, e, cascade);
+                }
+                hit
+            }
+            Region::Loop { body, .. } => Self::splice_exit_copies(body, e, cascade),
+            Region::Switch { cases, default, .. } => {
+                let mut hit = false;
+                for (_, cr) in cases.iter_mut() {
+                    hit |= Self::splice_exit_copies(cr, e, cascade);
+                }
+                if let Some(d) = default {
+                    hit |= Self::splice_exit_copies(d, e, cascade);
+                }
+                hit
+            }
+            _ => false,
+        }
+    }
+
     fn sese_region_with_scope(
         &mut self,
         entry: usize,
@@ -1452,6 +2110,29 @@ impl<'a> Structurer<'a> {
                 }
                 for &m in members.iter() {
                     ctx.consumed.insert(m);
+                }
+                let mut body = body;
+                if std::env::var("JCDC_NO_MATEXIT").is_err() {
+                    // The header's own out-of-member successors are the
+                    // NATURAL exits (the while-cond fall-out / bottom-test
+                    // exit): the parent region renders them ONCE after the
+                    // Loop. Materializing them inside the body rotated
+                    // while-cond loops into while(true)+copied-break
+                    // (TempFileHelper/HttpURLConnection clinit churn).
+                    let mut natural: HashSet<usize> = self.cfg.blocks[header]
+                        .succ
+                        .iter()
+                        .copied()
+                        .filter(|x| !members.contains(x) && *x != header)
+                        .collect();
+                    // SESE's computed natural_follow is ALSO parent-owned
+                    // continuation (it may differ from the header's raw
+                    // succs — bottom-tested/exit-derived follows): splicing
+                    // it copied UnixPath.normalize's whole join-and-return
+                    // continuation into a break arm (nf=[36], 缺少返回语句
+                    // x2 trees).
+                    natural.extend(natural_follow.iter().copied());
+                    self.materialize_content_exits(&mut body, header, &exits, &members, &natural, ctx);
                 }
                 parts.push(Region::Loop { header, body: Box::new(body), members: members.clone(), exits: exits.clone() });
                 // Continue after the loop at the header's natural exit (if it

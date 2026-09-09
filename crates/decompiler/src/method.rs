@@ -49,6 +49,9 @@ pub fn decompile_method(
         }
     }
     let _dg = DepthGuard;
+    if d == 1 {
+        crate::sese::MATEXIT_FIRED.with(|f| f.set(false));
+    }
     if d > 64 {
         // Safety net: a self-referential method-ref cycle (impl body
         // contains a lambda whose impl is the method being decompiled)
@@ -683,6 +686,22 @@ pub fn decompile_method(
     if !errors.is_empty() {
         let n = errors.len();
         prepend_comment(&mut body, format!("$JCDC: {} block(s) failed to decompile", n));
+    }
+    // Post-pipeline safety net for the matexit splices: the conversion-
+    // time trial cannot see pathologies CREATED BY THE POST-CONVERT
+    // PASSES (classify_loop/rotate_empty_then rotations turning a spliced
+    // arm all-abrupt and stranding the parent's next sibling — jdk
+    // ConcurrentHashMap.getTable 无法访问的语句 x3 trees). When this method
+    // spliced an exit cascade and the final tree strands statements after
+    // a terminator, redo the method with matexit disabled (one retry; the
+    // disabled flag makes it terminate).
+    if crate::sese::MATEXIT_FIRED.with(|f| f.get())
+        && crate::structure::Structurer::stmt_splice_pathology(&body)
+    {
+        crate::sese::MATEXIT_DISABLED.with(|d| d.set(true));
+        let retry = decompile_method(pc, pool, m_idx);
+        crate::sese::MATEXIT_DISABLED.with(|d| d.set(false));
+        return retry;
     }
     Ok(Some(MethodBody { body, vt, desc }))
 }
