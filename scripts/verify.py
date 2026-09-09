@@ -356,6 +356,23 @@ def verify_corpus(features, limit, keep=False):
         stats = {"sources": len(srcs), "compiled": 0, "decompiled": 0,
                  "recompiled": 0, "methods_total": 0, "methods_equal": 0,
                  "fail_files": []}
+        def _cleanup_family():
+            # Per-family artifacts must be removed on EVERY exit path:
+            # a failed family's decompiled files otherwise poison every
+            # subsequent recompile (the jdk7 EnumSet failure cascaded
+            # into 13 phantom fails).
+            shutil.rmtree(fdir / "orig", ignore_errors=True)
+            shutil.rmtree(fdir / "fam", ignore_errors=True)
+            shutil.rmtree(fdir / "decomp", ignore_errors=True)
+            shutil.rmtree(fdir / "re", ignore_errors=True)
+            (fdir / "orig").mkdir(parents=True)
+
+        def _err_excerpt(stderr_bytes, limit=400):
+            text = stderr_bytes.decode("utf-8", "replace")
+            errs = [ln for ln in text.splitlines()
+                    if ("错误" in ln or "error" in ln.lower())]
+            return ("\n".join(errs) if errs else text)[:limit]
+
         for f in srcs:
             p = run(javac + ["-nowarn", "-g", "-encoding", "UTF-8"] + release_args + patch_args +
                     ["-d", str(fdir / "orig"), str(f)], timeout=120)
@@ -363,11 +380,31 @@ def verify_corpus(features, limit, keep=False):
                 continue
             stats["compiled"] += 1
             stem = f.stem
+            # Restrict the family to this source's own classes. For 9+
+            # the --patch-module source tree makes javac IMPLICITLY
+            # compile every dependency into orig (a whole java.base per
+            # family — 30x redundant work and one poisoned decompiled
+            # dependency fails all 30 families: jdk9/10 scored 0/30 on
+            # AbstractChronology errors while compiling "AbstractCollection").
+            fam_dir = fdir / "fam"
+            shutil.rmtree(fam_dir, ignore_errors=True)
+            n_fam = 0
+            for c in (fdir / "orig").rglob("*.class"):
+                cs = c.stem
+                if cs == stem or cs.startswith(stem + "$"):
+                    dst = fam_dir / c.relative_to(fdir / "orig")
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(c, dst)
+                    n_fam += 1
+            if n_fam == 0:
+                _cleanup_family()
+                continue
             # decompile the produced class family
             p = run([str(JCDC)] + (["-cp", ":".join(jcdc_cp(feature))] if jcdc_cp(feature) else []) +
-                    [str(fdir / "orig"), "-o", str(fdir / "decomp")], timeout=120)
+                    [str(fam_dir), "-o", str(fdir / "decomp")], timeout=120)
             if p.returncode != 0:
-                stats["fail_files"].append((stem, "decompile:" + p.stderr.decode("utf-8", "replace")[:200]))
+                stats["fail_files"].append((stem, "decompile:" + _err_excerpt(p.stderr, 200)))
+                _cleanup_family()
                 continue
             stats["decompiled"] += 1
             # recompile ALL decompiled files (families reference each other)
@@ -392,7 +429,8 @@ def verify_corpus(features, limit, keep=False):
             p = run(javac + ["-nowarn", "-g", "-encoding", "UTF-8"] + release_args + re_patch +
                     ["-d", str(fdir / "re")] + dfiles, timeout=300)
             if p.returncode != 0 and not (feature < 8 and any((fdir / "re").rglob("*.class"))):
-                stats["fail_files"].append((stem, "recompile:" + p.stderr.decode("utf-8", "replace")[:300]))
+                stats["fail_files"].append((stem, "recompile:" + _err_excerpt(p.stderr)))
+                _cleanup_family()
                 continue
             stats["recompiled"] += 1
             # Live progress: dump the partial stats after every family so a
@@ -404,8 +442,10 @@ def verify_corpus(features, limit, keep=False):
             except Exception:
                 pass
             # javap compare each original class file vs recompiled
-            for oc in sorted((fdir / "orig").rglob("*.class")):
-                rel = oc.relative_to(fdir / "orig")
+            # (family classes only — orig also holds javac's implicit
+            # dependency compilations for 9+).
+            for oc in sorted(fam_dir.rglob("*.class")):
+                rel = oc.relative_to(fam_dir)
                 rc = fdir / "re" / rel
                 if not rc.exists():
                     stats["fail_files"].append((str(rel), "missing recompiled class"))
@@ -422,10 +462,7 @@ def verify_corpus(features, limit, keep=False):
                         if len(stats["fail_files"]) < 40:
                             stats["fail_files"].append((f"{rel}:{sig}", "bytecode-diff"))
             # clean per-file artifacts so next file starts fresh
-            shutil.rmtree(fdir / "orig", ignore_errors=True)
-            shutil.rmtree(fdir / "decomp", ignore_errors=True)
-            shutil.rmtree(fdir / "re", ignore_errors=True)
-            (fdir / "orig").mkdir(parents=True)
+            _cleanup_family()
         if not keep:
             shutil.rmtree(fdir, ignore_errors=True)
         results[feature] = stats
