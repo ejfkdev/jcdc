@@ -26,6 +26,14 @@ pub struct Printer<'a> {
     /// Object bounds and then fails the cast — while the bare/raw form
     /// `(T) new X(args)` compiles (unchecked).
     suppress_diamond: bool,
+    /// True while rendering a conditional expression's branches. Pre-Java-8
+    /// (major < 52) conditionals are NOT poly expressions: a diamond branch
+    /// (`c ? new HashMap<>(..) : new LinkedHashMap<>(..)`) infers each side
+    /// standalone to <Object,Object> and fails the assignment target (jdk7
+    /// HashSet.readObject 不兼容的类型 — the golden source carried explicit
+    /// <E,Object> args). Diamond branches print RAW there instead:
+    /// unchecked but always compilable.
+    in_cond: bool,
     /// Instantiated SAM return type while rendering the Lambda directly
     /// inside a cast to a generic functional interface: the lambda body's
     /// returns may need `(R) value` witnesses (jdk17 Collectors
@@ -49,7 +57,7 @@ pub struct Printer<'a> {
 
 impl<'a> Printer<'a> {
     pub fn new(pc: &'a PoolClass, pool: &'a ClassPool, vt: &'a VarTable) -> Self {
-        Printer { pc, pool, vt, out: String::new(), indent: 0, lambda_depth: 0, ret_bool: false, suppress_poly_cast: false, suppress_diamond: false, lambda_sam_ret: None, ret_sam: None, ret_char: false, ret_byte: false, ret_short: false }
+        Printer { pc, pool, vt, out: String::new(), indent: 0, lambda_depth: 0, ret_bool: false, suppress_poly_cast: false, suppress_diamond: false, in_cond: false, lambda_sam_ret: None, ret_sam: None, ret_char: false, ret_byte: false, ret_short: false }
     }
 
     pub fn with_ret_bool(mut self, b: bool) -> Self {
@@ -268,9 +276,11 @@ impl<'a> Printer<'a> {
                 let force = force_consts || !matches!(&**c, Expr::Const(_));
                 self.expr(c, 3, out);
                 out.push_str(" ? ");
+                let prev = std::mem::replace(&mut self.in_cond, true);
                 self.expr_narrow_f(t, ty, force, out);
                 out.push_str(" : ");
                 self.expr_narrow_f(f, ty, force, out);
+                self.in_cond = prev;
             }
             // An int-typed local (typically a branch-merge stack temp)
             // under a byte/short target needs the explicit narrowing cast
@@ -307,9 +317,11 @@ impl<'a> Printer<'a> {
             Expr::Cond { c, t, f } => {
                 self.expr(c, 3, out);
                 out.push_str(" ? ");
+                let prev = std::mem::replace(&mut self.in_cond, true);
                 self.expr_narrow_arg(t, ty, out);
                 out.push_str(" : ");
                 self.expr_narrow_arg(f, ty, out);
+                self.in_cond = prev;
             }
             _ => self.expr(e, 1, out),
         }
@@ -324,9 +336,11 @@ impl<'a> Printer<'a> {
             Expr::Cond { c, t, f } => {
                 self.expr(c, 3, out);
                 out.push_str(" ? ");
+                let prev = std::mem::replace(&mut self.in_cond, true);
                 self.expr_char(t, out);
                 out.push_str(" : ");
                 self.expr_char(f, out);
+                self.in_cond = prev;
             }
             _ => self.expr(e, 1, out),
         }
@@ -831,6 +845,7 @@ impl<'a> Printer<'a> {
             ret_short: self.ret_short,
             suppress_poly_cast: self.suppress_poly_cast,
             suppress_diamond: self.suppress_diamond,
+            in_cond: self.in_cond,
             lambda_sam_ret: self.lambda_sam_ret.clone(),
             ret_sam: self.ret_sam.clone(),
         }
@@ -894,7 +909,16 @@ impl<'a> Printer<'a> {
                 });
                 let diamond: std::borrow::Cow<str> = match &explicit {
                     Some(x) => x.as_str().into(),
-                    None if no_diamond || args_wildcard => "".into(),
+                    // Pre-Java-8 conditional branches are not poly
+                    // expressions: the diamond cannot see the assignment
+                    // target through the `?:` and infers <Object,Object>
+                    // (jdk7 HashSet.readObject map-ternary 不兼容的类型).
+                    // Raw is unchecked but always compilable.
+                    None if no_diamond || args_wildcard
+                        || (self.in_cond && self.pc.cf.major_version < 52) =>
+                    {
+                        "".into()
+                    }
                     None => self.diamond_for(cls).into(),
                 };
                 let diamond = diamond.as_ref();
@@ -1588,9 +1612,11 @@ impl<'a> Printer<'a> {
             Expr::Cond { c, t, f } => {
                 self.expr(c, 3, out);
                 out.push_str(" ? ");
+                let prev = std::mem::replace(&mut self.in_cond, true);
                 self.expr(t, 2, out);
                 out.push_str(" : ");
                 self.expr(f, 2, out);
+                self.in_cond = prev;
             }
             Expr::Assign { target, op, value } => {
                 // The local's VarTable type is authoritative: booleanize
@@ -2363,6 +2389,11 @@ impl<'a> Printer<'a> {
                             ret_short: l.sam_desc.ret == jcdc_jvm::JavaType::Short,
                             suppress_poly_cast: false,
                             suppress_diamond: false,
+                            // A lambda body is a fresh expression context:
+                            // the enclosing conditional's pre-8 non-poly
+                            // rule does not propagate into it (the lambda
+                            // is a standalone method body).
+                            in_cond: false,
                             lambda_sam_ret: None,
                             ret_sam: None,
                         };

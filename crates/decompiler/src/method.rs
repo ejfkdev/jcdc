@@ -5304,8 +5304,18 @@ fn hoist_escaped_vars(body: &mut Stmt, vt: &VarTable) {
     // Paths are computed BEFORE demote_defs (which rewrites LocalDefs in
     // place, preserving block indices), applied AFTER it so the inserted
     // blank decl is not itself demoted.
+    //
+    // Deterministic iteration: `escaped` is a HashSet and each loop decl
+    // is insert(0)'d into its loop-body slot — random iteration order
+    // swapped sibling blank decls across runs (jdk11 module Resolver
+    // `requiresTransitive;`/`reads;` flip-flopped between two outputs on
+    // the SAME binary). Descending var-id iteration + head insertion
+    // yields ascending var-id layout, matching the method-top hoist's
+    // sort_unstable convention below.
     let mut loop_paths: Vec<(u32, Vec<SlotStep>)> = Vec::new();
-    for var in escaped.iter().copied().collect::<Vec<_>>() {
+    let mut esc_sorted: Vec<u32> = escaped.iter().copied().collect();
+    esc_sorted.sort_unstable_by(|a, b| b.cmp(a));
+    for var in esc_sorted {
         if !captured_by_anon(body, var) && !captured_by_lambda(body, var) {
             continue;
         }
