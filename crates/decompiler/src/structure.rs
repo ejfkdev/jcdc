@@ -1960,12 +1960,17 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         eprintln!("COND cur={} follow={:?}", cur, follow);
                     }
                     if std::env::var("JCDC_DBG_IF").is_ok() {
+                        // absorb_pure is &mut and CLAIMS the absorbed block
+                        // — calling it here for the printout pre-claimed the
+                        // taken arm and flipped the real decision below
+                        // (JarFile.getBytes rendered a different shape under
+                        // JCDC_DBG_IF than in production). Debug must be
+                        // pure observation.
                         eprintln!(
-                            "THENDECIDE cur={} taken={} fall={} follow={:?} stop_t={} stop_f={} term_t={} term_f={} univ_t={} claim_t={} absorb={}",
+                            "THENDECIDE cur={} taken={} fall={} follow={:?} stop_t={} stop_f={} term_t={} term_f={} univ_t={} claim_t={}",
                             cur, taken, fall, follow, stop.contains(&taken), stop.contains(&fall),
                             self.is_terminator_block(taken), self.is_terminator_block(fall),
-                            universe.contains(&taken), claimed.contains(&taken),
-                            self.absorb_pure(taken, universe, &bstop, claimed, active).is_some()
+                            universe.contains(&taken), claimed.contains(&taken)
                         );
                     }
                     let then_r = if Some(taken) == follow && !stop.contains(&taken) {
