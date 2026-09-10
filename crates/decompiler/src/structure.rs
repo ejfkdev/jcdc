@@ -1082,6 +1082,20 @@ fn active_filtered(active: &[usize], structured: &HashSet<usize>) -> Vec<usize> 
     active.iter().copied().filter(|g| !structured.contains(g)).collect()
 }
 
+/// True when the region's terminal edge is a Goto to one of the loop's
+/// own non-handler exits (a `break` onto live post-loop flow).
+fn region_ends_at_live_exit(r: &Region, exits: &[usize], st: &Structurer) -> bool {
+    let t = match r {
+        Region::Goto { target } => *target,
+        Region::Seq(v) => match v.last() {
+            Some(last) => return region_ends_at_live_exit(last, exits, st),
+            None => return false,
+        },
+        _ => return false,
+    };
+    exits.contains(&t) && !st.is_handler(t)
+}
+
 pub(crate) fn region_terminates(r: &Region, results: &[crate::builder::BlockResult]) -> bool {
     region_terminates_ex(r, results, &[])
 }
@@ -1987,6 +2001,18 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             .filter(|e| self.is_handler(*e))
                             .collect();
                         region_terminates_ex(body, self.results, &handler_exits)
+                            // A terminal Goto to the loop's OWN non-handler
+                            // exit converts to `break` (the exit binding
+                            // wins over term-copy inlining), and the break
+                            // lands on live post-loop flow — the body DOES
+                            // complete normally even when the exit block is
+                            // a shared return terminator (jdk11
+                            // KeyStore$Builder$2$1.run: break → the
+                            // `getCalled = true; return ks` tail; the
+                            // term-copy abrupt reading suppressed the
+                            // continuation and the CBH path fell off the
+                            // method — 缺少返回语句 x2 trees).
+                            && !region_ends_at_live_exit(body, exits, self)
                     }
                     _ => false,
                 };
