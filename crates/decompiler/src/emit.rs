@@ -3162,7 +3162,7 @@ fn truncate_dead_ends(s: &Stmt) -> Stmt {
 
 /// True when `s` is a `while (true)` (labeled or not) whose body holds
 /// no `break` binding to it — it can never complete normally.
-fn dead_end_infinite_while(s: &Stmt) -> bool {
+pub(crate) fn dead_end_infinite_while(s: &Stmt) -> bool {
     let (label, body, cond) = match s {
         Stmt::While { cond, body } => (None, body.as_ref(), cond),
         Stmt::Labeled { label, body } => match &**body {

@@ -3489,6 +3489,35 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                                 // body AND a missing return).
                                 || (self.groups[*og].start <= g.start
                                     && self.groups[*og].end >= g.end)
+                                // Blocks owned by a LATER sibling group
+                                // that the arm's own flow runs INTO are
+                                // not foreign territory either: the arm
+                                // walk structures that group when flow
+                                // arrives (structure_try fires at its
+                                // start). Filtering them severs the flow
+                                // mid-chain — every arrival at the
+                                // dropped block dangles as an
+                                // exits-resolved break (jdk11/17
+                                // SeedGenerator ThreadedSeedGenerator.run:
+                                // the spin arm's scope was rooted at the
+                                // thread-create try; the spin body's
+                                // `synchronized(this){}` monitorexit
+                                // block is owned by its own tiny sync
+                                // group starting INSIDE the spin loop, so
+                                // it was stripped — the latch increment
+                                // block past it left the spin's member
+                                // set, the body's back edge resolved to
+                                // `break`, and the 250ms entropy spin
+                                // rendered as `while (cond) { break; }`
+                                // with the latch lost). A later sibling
+                                // whose start the arm cannot reach stays
+                                // filtered (no arrival ever dangles).
+                                || (self.groups[*og].start >= g.end
+                                    && self.arm_flow_reaches(
+                                        b,
+                                        *og,
+                                        universe,
+                                    ))
                         }
                     })
                     .collect();
@@ -3501,6 +3530,52 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                 out
             }
         }
+    }
+
+    /// True when normal flow from `from` (within `universe`) reaches the
+    /// START block of `target_gi`: the arm walk will arrive there and
+    /// structure the group itself.
+    fn arm_flow_reaches(
+        &self,
+        from: usize,
+        target_gi: usize,
+        universe: &HashSet<usize>,
+    ) -> bool {
+        let gstart = self.groups[target_gi].start;
+        let mut start_blk: Option<usize> = None;
+        for nb in &self.cfg.blocks {
+            if nb.start == gstart {
+                start_blk = Some(nb.id);
+                break;
+            }
+        }
+        let Some(target) = start_blk else { return false };
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut q: VecDeque<usize> = VecDeque::new();
+        q.push_back(from);
+        seen.insert(from);
+        let mut guard = 0;
+        while let Some(b) = q.pop_front() {
+            guard += 1;
+            if guard > 1024 {
+                return false;
+            }
+            for &s in &self.cfg.blocks[b].succ {
+                if s == target {
+                    return true;
+                }
+                if seen.contains(&s) || !universe.contains(&s) {
+                    continue;
+                }
+                // Plain normal-flow BFS: handler blocks are unreachable
+                // here by construction (exception-only in-edges), and a
+                // kept-but-never-arrived block is harmless (the arm walk
+                // only structures what its flow reaches).
+                seen.insert(s);
+                q.push_back(s);
+            }
+        }
+        false
     }
 
     /// A sibling-group-owned block that is the normal-flow target of a
@@ -4649,18 +4724,23 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             q.push_back(header);
             while let Some(b) = q.pop_front() {
                 for &s in &self.cfg.blocks[b].succ {
+                    let dbg_lmem = std::env::var("JCDC_DBG_LMEM").is_ok();
                     if barriers.contains(&s) && s != header {
                         // enclosing loop header: never absorb it
+                        if dbg_lmem { eprintln!("LMEM h={} from={} s={} why=barrier", header, b, s); }
                         continue;
                     }
                     if s == header || !universe.contains(&s) || stop.contains(&s) {
+                        if dbg_lmem { eprintln!("LMEM h={} from={} s={} why=hdr{} univ{} stop{} hndlr={} succ={:?}", header, b, s, s == header, universe.contains(&s), stop.contains(&s), self.is_handler(s), self.cfg.blocks[s].succ); }
                         continue;
                     }
                     if !dom.dominates(header, s) {
+                        if dbg_lmem { eprintln!("LMEM h={} from={} s={} why=dom preds={:?}", header, b, s, self.cfg.blocks[s].pred); }
                         continue;
                     }
                     let reaches =
                         can_reach_cfg_barred(self.cfg, &exc_succ, s, header, &barriers, 8192);
+                    if dbg_lmem && !reaches { eprintln!("LMEM h={} from={} s={} reaches=false succ={:?}", header, b, s, self.cfg.blocks[s].succ); }
                     if !reaches {
                         // `s` cannot loop back on its own. It is the loop's
                         // exit merge when the header branches to it directly

@@ -1514,9 +1514,33 @@ impl<'a> Structurer<'a> {
                         // scans raw converter output; Bits phase-1's
                         // [terminating Try, Block([])] false positive
                         // vetoed the splice).
-                        if v[pos + 1..].iter().any(|x| !stmt_is_empty(x)) {
+                        //
+                        // EXCEPT when the terminator is an emit-level
+                        // dead-end while(true): Printer::into_string runs
+                        // truncate_dead_ends over the FINAL tree and
+                        // strips everything after it, so javac never sees
+                        // those siblings either — flagging them vetoed the
+                        // matexit shape whose break-cascade arms carry the
+                        // loop's real exits (jdk26 ConcurrentLinkedQueue
+                        // .poll: the restart Continue(None) after the
+                        // dead-end inner traversal forced the retry, whose
+                        // matexit-OFF shape drops the cas-success p==h
+                        // `return item` exit — the polled item was
+                        // dequeued but never returned).
+                        let scan_len =
+                            if crate::emit::dead_end_infinite_while(&v[pos]) {
+                                pos + 1
+                            } else {
+                                v.len()
+                            };
+                        if v[pos + 1..scan_len].iter().any(|x| !stmt_is_empty(x)) {
                             return true;
                         }
+                        // Truncated siblings are invisible to javac — their
+                        // interiors cannot be pathologies either.
+                        return v[..scan_len]
+                            .iter()
+                            .any(|x| Structurer::pathology_in(x, own));
                     }
                 }
                 v.iter().any(|x| Structurer::pathology_in(x, own))
