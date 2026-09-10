@@ -1193,7 +1193,45 @@ impl<'a> Printer<'a> {
                     // class name to reach the field.
                     let shadowed_by_local = cls == &self.pc.internal_name
                         && self.vt.vars.iter().any(|v| v.name == name);
-                    if cls != &self.pc.internal_name || shadowed_by_local {
+                    // ENCLOSING-class static fields read from a nested
+                    // class print bare too (lexical scope) — and MUST when
+                    // the class name itself is shadowed by a member of the
+                    // same name: jdk26 HPKE$Impl reads the outer
+                    // `byte[] HPKE`/PSK_ID_HASH/SECRET/EXP/KEY constants;
+                    // `HPKE.PSK_ID_HASH` resolves the qualifier as the
+                    // byte[] FIELD (variables obscure type names in
+                    // expression names) — 找不到符号 变量 PSK_ID_HASH x6.
+                    let enclosing_static = cls != &self.pc.internal_name
+                        && self
+                            .pc
+                            .internal_name
+                            .starts_with(&format!("{}$", cls))
+                        && !self.vt.vars.iter().any(|v| v.name == name)
+                        && {
+                            let mut cur = self.pc.internal_name.clone();
+                            let mut shadow = false;
+                            while cur != *cls {
+                                if let Some(cpc) = self.pool.get(&cur) {
+                                    if cpc
+                                        .cf
+                                        .fields
+                                        .iter()
+                                        .any(|f| cpc.utf8(f.name_index) == Some(name))
+                                    {
+                                        shadow = true;
+                                        break;
+                                    }
+                                }
+                                match cur.rfind('$') {
+                                    Some(i) => cur.truncate(i),
+                                    None => break,
+                                }
+                            }
+                            !shadow
+                        };
+                    if !enclosing_static
+                        && (cls != &self.pc.internal_name || shadowed_by_local)
+                    {
                         out.push_str(&self.shorten(cls));
                         out.push('.');
                     }

@@ -2477,6 +2477,156 @@ fn emit_method(
     emit_method_with(pc, pool, fam, mi, out, indent, &HashMap::new())
 }
 
+/// Print-time repair: a call whose owner was CAST to a parameterized type
+/// late in the pipeline (raw (Comparable) upgraded to (Comparable<T>) by a
+/// post-fix_expr witness pass) never went through apply_param_casts with
+/// the instantiated formals — an Object-typed actual at a typevar formal
+/// then prints bare and fails conversion (jdk11 PriorityQueue
+/// .siftDownComparable: `((Comparable<T>) c).compareTo(es[right])` —
+/// Object无法转换为T; the source carries `(T) c`; same shape in
+/// PriorityBlockingQueue). Wrap such actuals in the typevar cast when the
+/// typevar is denotable at the site and the actual erases to plain Object.
+fn late_typevar_arg_casts(
+    s: &mut Stmt,
+    pc: &PoolClass,
+    pool: &ClassPool,
+    msig: Option<&jcdc_jvm::MethodSignature>,
+) {
+    let mut denotable: std::collections::HashSet<String> =
+        class_typevar_names(pc).into_iter().collect();
+    if let Some(sig) = msig {
+        for p in &sig.params {
+            denotable.insert(p.name.clone());
+        }
+    }
+    if denotable.is_empty() {
+        return;
+    }
+    fn fix(
+        e: &mut Expr,
+        pool: &ClassPool,
+        pc: &PoolClass,
+        denotable: &std::collections::HashSet<String>,
+    ) {
+        let mut inst: Option<(String, Vec<jcdc_jvm::GenericType>)> = None;
+        if let Expr::Method { name, desc, owner: Some(o), .. } = e {
+            if let Expr::Cast { ty: TypeRef::G(jcdc_jvm::GenericType::Class(cs)), .. } = o.as_ref()
+            {
+                if cs.parts.last().map(|p| !p.args.is_empty()).unwrap_or(false) {
+                    inst = Some((
+                        crate::method::classsig_internal(cs),
+                        cs.parts.last().map(|p| p.args.clone()).unwrap_or_default(),
+                    ));
+                    let _ = (name, desc);
+                }
+            }
+        }
+        if let Some((decl, inst_args)) = inst {
+            let want_desc = match e {
+                Expr::Method { desc, .. } => format!(
+                    "({}){}",
+                    desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+                    desc.ret.to_descriptor()
+                ),
+                _ => String::new(),
+            };
+            if let Some(dpc) = pool.get(&decl) {
+                if let Some(mi) = (0..dpc.cf.methods.len()).find(|&i| {
+                    dpc.method_name(i) == match e {
+                        Expr::Method { name, .. } => Some(name.as_str()),
+                        _ => None,
+                    } && dpc.method_desc(i) == Some(want_desc.as_str())
+                }) {
+                    if let Some(msig) = method_signature_of(&dpc, mi) {
+                        if let Some(csig) = dpc.class_attr("Signature").and_then(|b| {
+                            if b.len() >= 2 {
+                                dpc.utf8(u16::from_be_bytes([b[0], b[1]]))
+                                    .and_then(|x| parse_class_signature(x))
+                            } else {
+                                None
+                            }
+                        }) {
+                            if csig.params.len() == inst_args.len() && msig.args.len() > 0 {
+                                if let Expr::Method { args, .. } = e {
+                                    if args.len() == msig.args.len() {
+                                        for (a, formal) in args.iter_mut().zip(msig.args.iter()) {
+                                            let f = crate::method::subst_typevars(
+                                                formal,
+                                                &csig.params,
+                                                &inst_args,
+                                            );
+                                            if let jcdc_jvm::GenericType::TypeVar(tn) = &f {
+                                                if denotable.contains(tn)
+                                                    && !matches!(a, Expr::Cast { .. })
+                                                    && matches!(
+                                                        a.type_ref().erased(),
+                                                        jcdc_jvm::JavaType::Object(_)
+                                                    )
+                                                {
+                                                    let inner =
+                                                        std::mem::replace(a, Expr::This);
+                                                    *a = Expr::Cast {
+                                                        ty: TypeRef::G(
+                                                            jcdc_jvm::GenericType::TypeVar(
+                                                                tn.clone(),
+                                                            ),
+                                                        ),
+                                                        e: Box::new(inner),
+                                                    };
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let f: fn(&mut Expr, &ClassPool, &PoolClass, &std::collections::HashSet<String>) = fix;
+        let _ = f;
+        walk_expr_children_simple(e, pool, pc, denotable);
+    }
+    fn walk_expr_children_simple(
+        e: &mut Expr,
+        pool: &ClassPool,
+        pc: &PoolClass,
+        denotable: &std::collections::HashSet<String>,
+    ) {
+        match e {
+            Expr::Method { owner, args, .. } => {
+                if let Some(o) = owner {
+                    fix(o, pool, pc, denotable);
+                }
+                args.iter_mut().for_each(|a| fix(a, pool, pc, denotable));
+            }
+            Expr::Cast { e: i, .. } | Expr::Un { e: i, .. } => fix(i, pool, pc, denotable),
+            Expr::Bin { l, r, .. } => {
+                fix(l, pool, pc, denotable);
+                fix(r, pool, pc, denotable);
+            }
+            Expr::Cond { c, t, f } => {
+                fix(c, pool, pc, denotable);
+                fix(t, pool, pc, denotable);
+                fix(f, pool, pc, denotable);
+            }
+            Expr::Assign { target, value, .. } => {
+                fix(target, pool, pc, denotable);
+                fix(value, pool, pc, denotable);
+            }
+            Expr::ArrayIndex { array, index } => {
+                fix(array, pool, pc, denotable);
+                fix(index, pool, pc, denotable);
+            }
+            Expr::New { args, .. } => args.iter_mut().for_each(|a| fix(a, pool, pc, denotable)),
+            Expr::Field { owner: Some(o), .. } => fix(o, pool, pc, denotable),
+            _ => {}
+        }
+    }
+    walk_stmt_exprs(s, pool, pc, &mut |e, p2, c2| fix(e, p2, c2, &denotable));
+}
+
 fn emit_method_with(
     pc: &PoolClass,
     pool: &ClassPool,
@@ -3117,6 +3267,7 @@ fn emit_method_with(
             // Last moment before printing: labels can be dropped by any
             // earlier reshaping pass, leaving undefined-label breaks.
             crate::method::demote_undefined_label_jumps(&mut body);
+            late_typevar_arg_casts(&mut body, pc, pool, msig.as_ref());
             let text = Printer::new(pc, pool, &mb.vt)
                 .with_indent(indent + 1)
                 .with_ret_bool(ret_bool)
@@ -6925,8 +7076,21 @@ fn strip_erasure_casts_generic_ret(
                         && !capture_owner_field
                         && ((matches!(inner.type_ref(), TypeRef::G(_)) && erasure_only)
                             || (is_generic_call(inner, pool) && erasure_only)
-                            || matches!(&**inner, Expr::Method { name, owner: Some(o), .. }
-                                if name == "clone" && matches!(o.type_ref(), TypeRef::G(_))));
+                            // The clone exemption applies ONLY to a
+                            // COVARIANT clone (descriptor returns the
+                            // owner type, so the cast is our synthesis):
+                            // Object.clone() overrides returning Object
+                            // (LinkedList/ArrayList) carry a REAL
+                            // checkcast the source needs (jdk11/17/26
+                            // ResolverConfigurationImpl.searchlist:
+                            // `(List<String>) searchlist.clone()`
+                            // stripped to a bare Object return —
+                            // Object无法转换为List<String> x2 x3 trees).
+                            || matches!(&**inner, Expr::Method { name, owner: Some(o), desc, .. }
+                                if name == "clone"
+                                    && matches!(o.type_ref(), TypeRef::G(_))
+                                    && !matches!(desc.ret, jcdc_jvm::JavaType::Object(ref n)
+                                        if n == "java/lang/Object")));
                     if droppable {
                         let v = std::mem::replace(&mut **inner, Expr::This);
                         *e = v;
