@@ -2028,8 +2028,24 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                     // branch stay natural fallthrough. Only treat it as the
                     // follow when BOTH branches land on it (the If truly
                     // merges there).
+                    // EXCEPTION — the terminator carries blank-final field
+                    // assignments: those must execute EXACTLY once on every
+                    // path, and every copy route (CopyStmts, term copy,
+                    // SWTAIL) refuses final-writers, so no arm can absorb
+                    // the tail. Nulling the follow lets the FIRST arm's
+                    // walk flow into the merge and claim it, and the
+                    // sibling arms fall off without the assignments
+                    // (jdk11 LocaleProviderAdapter clinit:
+                    // adapterPreference/NONEXISTENT_ADAPTER assigned only
+                    // in the typeList.isEmpty() arm; jdk26
+                    // ObjectInputFilter$Config clinit:
+                    // invalidFactoryMessage — 可能尚未初始化变量).
                     if let Some(p) = pd {
-                        if self.is_terminator_block(p) && p != taken && p != fall {
+                        if self.is_terminator_block(p)
+                            && p != taken
+                            && p != fall
+                            && !self.terminator_writes_final(p)
+                        {
                             pd = None;
                         }
                     }
