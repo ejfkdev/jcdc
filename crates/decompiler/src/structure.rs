@@ -1138,6 +1138,47 @@ pub(crate) fn region_terminates_ex(
     }
 }
 
+/// Can a rendered Switch region complete normally (flow out of its
+/// follow)? JLS 14.11: yes when the selector can match no case (no
+/// default region rendered), or when the default arm does not complete
+/// abruptly, or when any case arm does not (its `break` exits the
+/// switch). An arm whose terminal edge is `Goto{follow}` IS the break —
+/// normal completion — even when the follow block itself is a shared
+/// return/throw terminator (region_terminates would call that Goto
+/// abrupt: the term-copy inlining applies to gotos ACROSS scopes, not
+/// to a switch's own follow binding). region_terminates is `_ => false`
+/// for nested Switch, so those conservatively count as completing.
+fn switch_completes_normally(
+    r: &Region,
+    follow: usize,
+    results: &[crate::builder::BlockResult],
+) -> bool {
+    fn breaks_out(r: &Region, follow: usize) -> bool {
+        match r {
+            Region::Goto { target } => *target == follow,
+            Region::Seq(v) => v.last().map(|x| breaks_out(x, follow)).unwrap_or(false),
+            Region::Empty => true,
+            _ => false,
+        }
+    }
+    fn arm_abrupt(
+        r: &Region,
+        follow: usize,
+        results: &[crate::builder::BlockResult],
+    ) -> bool {
+        !breaks_out(r, follow) && region_terminates(r, results)
+    }
+    match r {
+        Region::Switch { cases, default, .. } => {
+            (match default.as_deref() {
+                None => true,
+                Some(d) => !arm_abrupt(d, follow, results),
+            }) || cases.iter().any(|(_, c)| !arm_abrupt(c, follow, results))
+        }
+        _ => !region_terminates(r, results),
+    }
+}
+
 
 
 
@@ -2882,6 +2923,41 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         }
                     }
                     self.switch_depth -= 1;
+                    // A follow already CLAIMED by a sibling arm (a shared
+                    // terminator tail copied there first) still binds this
+                    // switch's `break`s — but nothing after the switch
+                    // renders the tail, so a normally-completing switch
+                    // fell off the enclosing arm (jdk11 MethodTypeForm
+                    // .canonicalize: the Void.TYPE lookupswitch's default
+                    // `goto return-null` became `break` with the tail
+                    // claimed by the tableswitch arm — 缺少返回语句). Copy
+                    // the terminator at the confluence, mirroring the
+                    // GOTO-CLAIMED shared-tail rule. Only when the switch
+                    // can complete normally (JLS 14.11: an open default
+                    // route, a non-terminating default, or any
+                    // non-terminating case) — else the copy is unreachable
+                    // (无法访问的语句).
+                    if let Some(f) = follow {
+                        if std::env::var("JCDC_DBG_SWF").is_ok() {
+                            eprintln!("SWTAIL cur={} f={} claimed={} stop={} loops={} term={} loophdr={} finw={} completes={}",
+                                cur, f, claimed.contains(&f), stop.contains(&f),
+                                self.loops_stack.contains(&f), self.is_terminator_block(f),
+                                Self::ctx_is_loop_header(self, f), self.terminator_writes_final(f),
+                                switch_completes_normally(&sw, f, self.results));
+                        }
+                        if claimed.contains(&f)
+                            && !stop.contains(&f)
+                            && !self.loops_stack.contains(&f)
+                            && self.is_terminator_block(f)
+                            && !Self::ctx_is_loop_header(self, f)
+                            && !self.terminator_writes_final(f)
+                            && switch_completes_normally(&sw, f, self.results)
+                        {
+                            parts.push(sw);
+                            parts.push(Region::CopyStmts { block: f });
+                            break;
+                        }
+                    }
                     parts.push(sw);
                     match follow {
                         Some(f) if universe.contains(&f) && !stop.contains(&f) && !claimed.contains(&f) => {

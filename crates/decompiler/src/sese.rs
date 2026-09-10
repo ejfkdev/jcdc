@@ -183,7 +183,6 @@ impl<'a> Structurer<'a> {
             }
         }
         let exc_back_sources = self.precompute_exc_retry(&universe, &idom, &mut loop_headers);
-        let exc_retry_only: HashSet<usize> = exc_back_sources.keys().copied().collect();
         // Exception-edge predecessors: handler -> protected blocks. A protected
         // block reaches its handler only on a throw (an exception edge, not a
         // normal pred), so when the handler loops back to the header, the
