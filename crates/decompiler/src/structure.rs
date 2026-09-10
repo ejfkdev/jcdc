@@ -1491,14 +1491,52 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
     /// walk update block). The scope's dom root is excluded: its idom
     /// is itself too, and root->cur with cur reaching the root is just
     /// the enclosing scope's circulation.
-    fn closes_back_edge(&self, cur: usize, p: usize, dom: &DomInfo) -> bool {
+    fn closes_back_edge(
+        &self,
+        cur: usize,
+        p: usize,
+        dom: &DomInfo,
+        entry: usize,
+        use_exc: bool,
+    ) -> bool {
         if p == cur {
             return true;
         }
         if dom.dominates(cur, p) {
             return true;
         }
-        if dom.idom[p] == p && dom.idom[cur] != cur && p != dom.idom[cur] {
+        if !use_exc {
+            return false;
+        }
+        // Exclusions: `p == entry` is the scope root's forward edge
+        // (root→cur with cur reaching the root is the enclosing scope's
+        // circulation, not a loop at cur), and an exc-only `cur` that is
+        // not the root is a mid-cycle handler-flow member (jdk11
+        // Process.waitFor's sleep block — the genuine header sits two
+        // hops up). The root itself (cur == entry, idom[root]==root by
+        // construction) stays eligible: jdk26 Future.exceptionNow's
+        // finally-group body walk is rooted AT the retry header.
+        if dom.idom[p] == p && p != entry {
+            let root_walk = cur == entry;
+            if root_walk {
+                // A sub-scope root whose sentinel pred is the sub-scope's
+                // own branch head is an if-ARM walk: the head-to-root
+                // "cycle" runs out through the ENCLOSING loop's iterator
+                // (jdk11 FileDescriptor.closeAll: spurious
+                // while(true){addSuppressed;break} arm wrappers). The
+                // genuine root-walk retry header (jdk26
+                // Future.exceptionNow's finally-group body walk rooted AT
+                // the protected-span start) has its back-edge source as a
+                // DIRECT exception successor: require that exact edge.
+                if !self.cfg.exc_edges.iter().any(|e| e.from == cur && e.to == p)
+                {
+                    return false;
+                }
+            } else if dom.idom[cur] == cur {
+                // Exc-only mid-cycle member (jdk11 Process.waitFor's
+                // sleep block): the genuine header sits upstream.
+                return false;
+            }
             let mut xs: HashMap<usize, Vec<usize>> = HashMap::new();
             for e in &self.cfg.exc_edges {
                 xs.entry(e.from).or_default().push(e.to);
@@ -1513,6 +1551,8 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         cur: usize,
         universe: &HashSet<usize>,
         dom: &DomInfo,
+        entry: usize,
+        use_exc: bool,
     ) -> bool {
         // Enclosing-loop circulation artifact: a walk entry whose only
         // successor is an ENCLOSING loop header (a `st = -1; goto head`
@@ -1554,7 +1594,18 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             if p == cur {
                 return true;
             }
-            if universe.contains(&p) && self.closes_back_edge(cur, p, dom) {
+            // In-scope arrivals only: a pred outside this walk's
+            // universe belongs to a sibling region (a handler arm being
+            // structured by structure_try). Its back edge is the retry
+            // loop of the ENCLOSING scope — claiming it here wraps the
+            // protected block in a spurious inner while(true) whose
+            // header never lands in loops_stack when the handler arm
+            // walks, so the retry `goto head` lost its continue (jdk26
+            // Future.exceptionNow: catch(IE){interrupted=true} fell off
+            // the method — 缺少返回语句). The dominance branch never saw
+            // such preds either (out-of-universe preds have sentinel
+            // idoms); the exc-augmented branch must keep the same view.
+            if universe.contains(&p) && self.closes_back_edge(cur, p, dom, entry, use_exc) {
                 if single_enclosing_succ {
                     let x = self.cfg.blocks[cur].succ[0];
                     let mut barriers: HashSet<usize> = HashSet::new();
@@ -1856,12 +1907,27 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             // edge is INSIDE the protected span.
             let group_here = group_here.filter(|&gi| {
                 entry_preclaimed
-                    || !(self.is_loop_header(cur, universe, &dom)
-                        || self.sese_loop_headers.contains(&cur))
+                    || !(self.is_loop_header(cur, universe, &dom, entry, true)
+                        || self.sese_loop_headers.contains(&cur)
+                        // Exc-retry headers count too: the retry loop of
+                        // `for(;;){try{..}catch{.. goto head}}` wraps the
+                        // try even when the try's protected span starts
+                        // AT the header (jdk26 Future.exceptionNow: the
+                        // finally-group body walk must structure the loop
+                        // around the inner IE/EE try so the IE handler's
+                        // `goto head` resolves to `continue` against
+                        // loops_stack — without it the inner group won,
+                        // a degenerate while(true){get();throw} absorbed
+                        // the protected block, and catch(IE){interrupted
+                        // =true} fell off the method — 缺少返回语句).
+                        || self.sese_exc_retry_headers.contains(&cur))
                     || !self.cfg.blocks[cur].pred.iter().any(|&p| {
+                        // No universe filter: an exc-mediated retry back
+                        // edge's source is handler flow — carved OUT of
+                        // this body walk's universe by construction
+                        // (Future.exceptionNow's IE handler at pc 57).
                         p != cur
-                            && universe.contains(&p)
-                            && self.closes_back_edge(cur, p, &dom)
+                            && self.closes_back_edge(cur, p, &dom, entry, true)
                             && (self.cfg.blocks[p].end <= self.groups[gi].start
                                 || self.cfg.blocks[p].start >= self.groups[gi].end)
                     })
@@ -1903,7 +1969,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             // loop-exhausted `throw DateTimeException` lost —
             // 缺少返回语句 x3 trees).
             if !at_preclaimed_entry
-                && (self.is_loop_header(cur, universe, &dom)
+                && (self.is_loop_header(cur, universe, &dom, entry, true)
                     || self.sese_exc_retry_headers.contains(&cur))
             {
                 let loop_r = self.structure_loop(cur, universe, stop, active, claimed, &dom);

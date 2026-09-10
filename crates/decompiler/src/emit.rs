@@ -3175,118 +3175,58 @@ fn dead_end_infinite_while(s: &Stmt) -> bool {
         return false;
     }
     // JLS 14.14: `while (true)` completes normally iff its body holds a
-    // reachable break that EXITS it: an unlabeled break not captured by
-    // an inner breakable construct, OR a labeled break whose label is
-    // not introduced inside the body (it exits outward through the
-    // while — jdk11 ThreadPoolExecutor.addWorker's `break retry` keeps
-    // the statements after the inner for(;;) reachable; javac compiled
-    // that shape for years). A labeled break bound to an INNER label
-    // (Pattern.clazz's `break L4` at the loop bottom) exits only that
-    // inner construct and does NOT count.
-    let inner_labels = collect_labels(body);
-    !has_break_exiting(body, label, 0, &inner_labels)
+    // reachable break that exits IT: an unlabeled break not captured by
+    // an inner breakable construct, or `break L` where L is THIS loop's
+    // own label. A labeled break to any OTHER label — inner (Pattern
+    // .clazz's `break L4`) or OUTER (jdk11/26 ThreadPoolExecutor
+    // .addWorker's `break retry` inside the inner for(;;)) — completes
+    // the while ABRUPTLY: javac's flow model marks the statements after
+    // such a loop unreachable (the w26 `continue;` after the inner
+    // while(true) was a latent 无法访问的语句 masked by alphabetically
+    // earlier census errors).
+    !has_break_exiting(body, label, 0)
 }
 
-/// Every `Stmt::Labeled` name introduced inside `s`.
-fn collect_labels(s: &Stmt) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
-    collect_labels_into(s, &mut out);
-    out
-}
-
-fn collect_labels_into(s: &Stmt, out: &mut std::collections::HashSet<String>) {
-    match s {
-        Stmt::Labeled { label, body } => {
-            out.insert(label.clone());
-            collect_labels_into(body, out);
-        }
-        Stmt::Block(v) => v.iter().for_each(|x| collect_labels_into(x, out)),
-        Stmt::If { then_stmt, else_stmt, .. } => {
-            collect_labels_into(then_stmt, out);
-            if let Some(e) = else_stmt {
-                collect_labels_into(e, out);
-            }
-        }
-        Stmt::While { body, .. }
-        | Stmt::DoWhile { body, .. }
-        | Stmt::For { body, .. }
-        | Stmt::ForEach { body, .. }
-        | Stmt::Synchronized { body, .. } => collect_labels_into(body, out),
-        Stmt::Switch { cases, default, .. } => {
-            for c in cases {
-                c.body.iter().for_each(|x| collect_labels_into(x, out));
-            }
-            if let Some(d) = default {
-                collect_labels_into(d, out);
-            }
-        }
-        Stmt::Try { body, catches, finally }
-        | Stmt::TryWithResources { body, catches, finally, .. } => {
-            collect_labels_into(body, out);
-            for c in catches {
-                collect_labels_into(&c.body, out);
-            }
-            if let Some(f) = finally {
-                collect_labels_into(f, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Does `s` contain a reachable unlabeled `break` that binds to the
-/// enclosing loop? `depth` counts breakable constructs (loops/switches)
-/// entered since the loop body started: an unlabeled break binds to the
-/// innermost one, so it escapes the loop only at depth 0. Labeled
-/// breaks never complete a while(true) (JLS 14.14). Unstructured `Goto`
-/// remnants and opaque shapes count as escaping (conservative).
-fn has_break_exiting(
-    s: &Stmt,
-    lbl: Option<&str>,
-    depth: usize,
-    inner_labels: &std::collections::HashSet<String>,
-) -> bool {
+fn has_break_exiting(s: &Stmt, lbl: Option<&str>, depth: usize) -> bool {
     match s {
         Stmt::Break(None) => depth == 0,
-        // Exits the while unless the label binds to a construct
-        // introduced INSIDE the body.
-        Stmt::Break(Some(l)) => {
-            Some(l.as_str()) == lbl || !inner_labels.contains(l)
-        }
+        // Only this loop's OWN label completes it; any other labeled
+        // break exits abruptly (JLS 14.14/14.17).
+        Stmt::Break(Some(l)) => Some(l.as_str()) == lbl,
         Stmt::Continue(_) | Stmt::Return(_) | Stmt::Throw(_) => false,
         Stmt::Goto(_) => true,
-        Stmt::Block(v) => v.iter().any(|x| has_break_exiting(x, lbl, depth, inner_labels)),
+        Stmt::Block(v) => v.iter().any(|x| has_break_exiting(x, lbl, depth)),
         Stmt::If { then_stmt, else_stmt, .. } => {
-            has_break_exiting(then_stmt, lbl, depth, inner_labels)
+            has_break_exiting(then_stmt, lbl, depth)
                 || else_stmt
                     .as_deref()
-                    .map(|e| has_break_exiting(e, lbl, depth, inner_labels))
+                    .map(|e| has_break_exiting(e, lbl, depth))
                     .unwrap_or(false)
         }
         Stmt::While { body, .. }
         | Stmt::DoWhile { body, .. }
         | Stmt::For { body, .. }
-        | Stmt::ForEach { body, .. } => has_break_exiting(body, lbl, depth + 1, inner_labels),
+        | Stmt::ForEach { body, .. } => has_break_exiting(body, lbl, depth + 1),
         Stmt::Switch { cases, default, .. } => {
             cases
                 .iter()
-                .any(|c| c.body.iter().any(|x| has_break_exiting(x, lbl, depth + 1, inner_labels)))
+                .any(|c| c.body.iter().any(|x| has_break_exiting(x, lbl, depth + 1)))
                 || default
                     .as_deref()
-                    .map(|d| has_break_exiting(d, lbl, depth + 1, inner_labels))
+                    .map(|d| has_break_exiting(d, lbl, depth + 1))
                     .unwrap_or(false)
         }
         Stmt::Try { body, catches, finally }
         | Stmt::TryWithResources { body, catches, finally, .. } => {
-            has_break_exiting(body, lbl, depth, inner_labels)
-                || catches.iter().any(|c| has_break_exiting(&c.body, lbl, depth, inner_labels))
+            has_break_exiting(body, lbl, depth)
+                || catches.iter().any(|c| has_break_exiting(&c.body, lbl, depth))
                 || finally
                     .as_deref()
-                    .map(|f| has_break_exiting(f, lbl, depth, inner_labels))
+                    .map(|f| has_break_exiting(f, lbl, depth))
                     .unwrap_or(false)
         }
-        Stmt::Synchronized { body, .. } => has_break_exiting(body, lbl, depth, inner_labels),
-        Stmt::Labeled { body, .. } => has_break_exiting(body, lbl, depth, inner_labels),
+        Stmt::Synchronized { body, .. } => has_break_exiting(body, lbl, depth),
+        Stmt::Labeled { body, .. } => has_break_exiting(body, lbl, depth),
         // Plain leaf statements never contain a break.
         Stmt::ExprStmt(_)
         | Stmt::LocalDef { .. }
