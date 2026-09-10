@@ -579,6 +579,20 @@ pub fn decompile_class(pc: &PoolClass, pool: &ClassPool, opts: &ClassOptions) ->
     if pc.is_module() {
         return decompile_module_info(pc);
     }
+    // package-info.class carries ONLY the package declaration and its
+    // annotations — emitting it as a class (`abstract interface
+    // package-info`) is a syntax error on the hyphenated name (jdk26
+    // java/net/package-info: 需要<标识符>).
+    if pc.internal_name.ends_with("/package-info") || pc.internal_name == "package-info" {
+        let mut out = class_annotations(pc);
+        if let Some(slash) = pc.internal_name.rfind('/') {
+            out.push_str(&format!(
+                "package {};\n",
+                pc.internal_name[..slash].replace('/', ".")
+            ));
+        }
+        return Ok(out);
+    }
     // If this class is itself nested and its outer class is in the pool,
     // decompile from the outer root so the output is a valid compilation unit.
     if let Some(outer) = find_outer(pc, pool) {
@@ -4186,6 +4200,9 @@ pub const ASSERT_FIELD: &str = "$jcdcAssertionsDisabled";
 // ---------------------------------------------------------------------------
 
 pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: &Family, vt: &VarTable) {
+    if std::env::var("JCDC_DBG_ANON").is_ok() {
+        eprintln!("IA pc={} anon={:?} locals={:?} primary_n={}", pc.internal_name, fam.anonymous, fam.locals, pool.primary_names().len());
+    }
     if fam.anonymous.is_empty() && fam.locals.is_empty() {
         return;
     }
@@ -7112,9 +7129,13 @@ fn build_anon_new(
         sig_base.unwrap_or(TypeRef::J(JavaType::Object(n.to_string())))
     } else {
         let sup = apc.super_name()?.to_string();
-        if sup == "java/lang/Object" {
-            return None;
-        }
+        // An Object superclass is NOT a decline reason at this point:
+        // build_anon_new only runs at a real `new` site of a fam-classified
+        // anonymous class, and `new Object() { ... }` is a legal source
+        // anonymous (jdk11 java.util.Timer's threadReaper finalize hack —
+        // the decline left the marker fallback printing the illegal
+        // `new 1()`, 需要<标识符>). Synthetic Object-extenders without new
+        // sites (switch-map holders) never reach here.
         sig_base.unwrap_or(TypeRef::J(JavaType::Object(sup)))
     };
 
