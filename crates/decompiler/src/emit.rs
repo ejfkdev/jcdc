@@ -2782,6 +2782,15 @@ impl<'a> Printer<'a> {
         if internal.is_empty() {
             return String::new();
         }
+        // Literal-$ top-level class (in pool, no InnerClasses nesting
+        // evidence): the $ is part of the SOURCE name (jextract-generated
+        // errno_h$shared) — never dot it into a nested qualifier.
+        let keep_dollar = internal.contains('$')
+            && self
+                .pool
+                .get(internal)
+                .map(|pc| crate::classdec::find_outer(&pc, self.pool).is_none())
+                .unwrap_or(false);
         // Anonymous class types (all-digit last segment) have no source
         // name: print the base interface/superclass instead.
         if let Some(last) = internal.rsplit('$').next() {
@@ -2803,7 +2812,8 @@ impl<'a> Printer<'a> {
         }
         // Local classes are emitted with their simple source name.
         if let Some(last) = internal.rsplit('$').next() {
-            if !last.is_empty()
+            if !keep_dollar
+                && !last.is_empty()
                 && !last.chars().all(|c| c.is_ascii_digit())
                 && internal.contains('$')
             {
@@ -2851,7 +2861,11 @@ impl<'a> Printer<'a> {
                 || self.vt.vars.iter().any(|v| v.name == first)
         };
         if internal.starts_with("java/lang/") && !internal[10..].contains('/') {
-            let simple = internal[10..].replace('$', ".");
+            let simple = if keep_dollar {
+                internal[10..].to_string()
+            } else {
+                internal[10..].replace('$', ".")
+            };
             let first = simple.split('.').next().unwrap_or(simple.as_str());
             if !shadowed(first) {
                 return simple;
@@ -2859,13 +2873,21 @@ impl<'a> Printer<'a> {
             return dotted.replace('$', ".");
         }
         if pkg_of(internal) == pkg_of(&self.pc.internal_name) {
-            let simple = internal.rsplit('/').next().unwrap_or(internal).replace('$', ".");
+            let simple = if keep_dollar {
+                internal.rsplit('/').next().unwrap_or(internal).to_string()
+            } else {
+                internal.rsplit('/').next().unwrap_or(internal).replace('$', ".")
+            };
             let first = simple.split('.').next().unwrap_or(simple.as_str());
             if !shadowed(first) {
                 return simple;
             }
         }
-        dotted.replace('$', ".")
+        if keep_dollar {
+            dotted
+        } else {
+            dotted.replace('$', ".")
+        }
     }
 
     pub fn type_name(&self, ty: &TypeRef) -> String {
@@ -2891,6 +2913,36 @@ impl<'a> Printer<'a> {
         match g {
             GenericType::Primitive(c) => prim_name(*c).to_string(),
             GenericType::Class(cs) => {
+                // The signature parser splits a literal-$ top-level name
+                // (jextract-generated errno_h$shared) into nested-looking
+                // parts [errno_h, shared]; rejoin and, when the pool
+                // proves the class is NOT nested, render the binary name
+                // through shorten (same-package simple form keeps the $).
+                if cs.parts.len() > 1
+                    && cs.parts.iter().skip(1).all(|p| p.args.is_empty())
+                {
+                    let joined = cs
+                        .parts
+                        .iter()
+                        .map(|p| p.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("$");
+                    let full = if cs.package.is_empty() {
+                        joined
+                    } else {
+                        format!("{}/{}", cs.package, joined)
+                    };
+                    let literal = self
+                        .pool
+                        .get(&full)
+                        .map(|pc| {
+                            crate::classdec::find_outer(&pc, self.pool).is_none()
+                        })
+                        .unwrap_or(false);
+                    if literal {
+                        return self.shorten(&full);
+                    }
+                }
                 let mut s = String::new();
                 if !cs.package.is_empty() {
                     let full = format!("{}/{}", cs.package, cs.parts.first().map(|p| p.name.as_str()).unwrap_or(""));

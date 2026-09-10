@@ -471,6 +471,17 @@ impl Expr {
                 let p = op.precedence();
                 p < outer_prec || (is_right && p == outer_prec)
             }
+            // String concat is an additive-level expression: as a method
+            // receiver or cast operand it MUST parenthesize, or a call
+            // textually binds to the last operand (jdk11
+            // SSLSessionContextImpl.getKey: `(hostname + ":" + port)
+            // .toLowerCase(..)` rendered as .. + port.toLowerCase(..) —
+            // 无法取消引用int; SSLTrafficKeyDerivation's ("tls13 "+label)
+            // .getBytes lost to byte[] — String无法转换为byte[]).
+            Expr::StringConcat(_) => {
+                let p = BinOp::Add.precedence();
+                p < outer_prec || (is_right && p == outer_prec)
+            }
             Expr::InstanceOf { .. } => outer_prec > 10,
             Expr::Cond { .. } => outer_prec > 2,
             Expr::Assign { .. } | Expr::PreIncDec { .. } | Expr::PostIncDec { .. } => outer_prec > 1,

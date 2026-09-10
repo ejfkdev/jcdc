@@ -678,7 +678,7 @@ pub fn decompile_method(
     prune_post_loop_label_breaks(&mut body);
     demote_undefined_label_jumps(&mut body);
     cleanup(&mut body);
-    disambiguate_nested_locals(&mut vt, &body);
+    disambiguate_nested_locals(&mut vt, &mut body);
     prune_unreachable(&mut body);
     cleanup(&mut body);
     dbg_body!("post-unreachable");
@@ -9008,7 +9008,25 @@ pub(crate) fn prune_post_loop_label_breaks(s: &mut Stmt) {
     }
 }
 
-fn disambiguate_nested_locals(vt: &mut VarTable, body: &Stmt) {
+fn disambiguate_nested_locals(vt: &mut VarTable, body: &mut Stmt) {
+    // A try-with-resources resource is a FRESH local: when its var id was
+    // already declared in an enclosing scope (varalloc hoisted a
+    // blank `X x = null;` to the method top because other arms' stores
+    // precede their decls, and the LVT merged every same-slot range into
+    // ONE var), re-printing the same name inside the resource list is
+    // illegal — Java forbids a local re-declaring any name visible in the
+    // enclosing method scope (jdk17 keytool Main.doCommands: 48x 已在
+    // 方法中定义了变量 inStream; sibling-arm reuse is fine and untouched —
+    // only still-open enclosing scopes trigger the split). Split the
+    // resource onto a fresh var id BEFORE the rename walk: the resource
+    // keeps the LVT name, the enclosing var (and all its bare-assign
+    // uses) keeps its hoisted identity.
+    {
+        let mut scopes: Vec<std::collections::HashSet<u32>> =
+            vec![std::collections::HashSet::new()];
+        let mut next_id = vt.vars.len() as u32;
+        split_twr_redecls(vt, body, &mut scopes, &mut next_id);
+    }
     // var id -> current printed name
     let mut scopes: Vec<std::collections::HashMap<String, u32>> =
         vec![std::collections::HashMap::new()];
@@ -9020,6 +9038,118 @@ fn disambiguate_nested_locals(vt: &mut VarTable, body: &Stmt) {
     // decl then collided with var44's in a still-enclosing scope).
     let mut used: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     disambig_walk(vt, body, &mut scopes, &mut used);
+}
+
+fn split_twr_redecls(
+    vt: &mut VarTable,
+    s: &mut Stmt,
+    scopes: &mut Vec<std::collections::HashSet<u32>>,
+    next_id: &mut u32,
+) {
+    let enclosing_has = |scopes: &Vec<std::collections::HashSet<u32>>, var: u32| -> bool {
+        scopes[..scopes.len().saturating_sub(1)]
+            .iter()
+            .any(|sc| sc.contains(&var))
+    };
+    match s {
+        Stmt::Block(v) => {
+            scopes.push(std::collections::HashSet::new());
+            for x in v.iter_mut() {
+                split_twr_redecls(vt, x, scopes, next_id);
+            }
+            scopes.pop();
+        }
+        Stmt::LocalDef { var, .. } => {
+            if enclosing_has(scopes, *var) {
+                // Plain nested re-decl of the same var (not a resource):
+                // also illegal — split it too.
+                let v = *var as usize;
+                if v < vt.vars.len() {
+                    let mut ni = vt.vars[v].clone();
+                    ni.id = *next_id;
+                    *next_id += 1;
+                    let nid = ni.id;
+                    vt.vars.push(ni);
+                    *var = nid;
+                }
+            }
+            scopes.last_mut().unwrap().insert(*var);
+        }
+        Stmt::TryWithResources { resources, body, catches, finally } => {
+            scopes.push(std::collections::HashSet::new());
+            for res in resources.iter_mut() {
+                split_twr_redecls(vt, res, scopes, next_id);
+            }
+            split_twr_redecls(vt, body, scopes, next_id);
+            for c in catches.iter_mut() {
+                scopes.push(std::collections::HashSet::new());
+                if c.var != u32::MAX {
+                    scopes.last_mut().unwrap().insert(c.var);
+                }
+                split_twr_redecls(vt, &mut c.body, scopes, next_id);
+                scopes.pop();
+            }
+            if let Some(f) = finally {
+                split_twr_redecls(vt, f, scopes, next_id);
+            }
+            scopes.pop();
+        }
+        Stmt::Try { body, catches, finally } => {
+            split_twr_redecls(vt, body, scopes, next_id);
+            for c in catches.iter_mut() {
+                scopes.push(std::collections::HashSet::new());
+                if c.var != u32::MAX {
+                    scopes.last_mut().unwrap().insert(c.var);
+                }
+                split_twr_redecls(vt, &mut c.body, scopes, next_id);
+                scopes.pop();
+            }
+            if let Some(f) = finally {
+                split_twr_redecls(vt, f, scopes, next_id);
+            }
+        }
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            split_twr_redecls(vt, then_stmt, scopes, next_id);
+            if let Some(e) = else_stmt {
+                split_twr_redecls(vt, e, scopes, next_id);
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::Labeled { body, .. }
+        | Stmt::Synchronized { body, .. } => {
+            split_twr_redecls(vt, body, scopes, next_id);
+        }
+        Stmt::ForEach { var, body, .. } => {
+            scopes.push(std::collections::HashSet::new());
+            scopes.last_mut().unwrap().insert(*var);
+            split_twr_redecls(vt, body, scopes, next_id);
+            scopes.pop();
+        }
+        Stmt::For { init, body, .. } => {
+            scopes.push(std::collections::HashSet::new());
+            for i in init.iter_mut() {
+                split_twr_redecls(vt, i, scopes, next_id);
+            }
+            split_twr_redecls(vt, body, scopes, next_id);
+            scopes.pop();
+        }
+        Stmt::Switch { cases, default, .. } => {
+            for c in cases.iter_mut() {
+                scopes.push(std::collections::HashSet::new());
+                for x in c.body.iter_mut() {
+                    split_twr_redecls(vt, x, scopes, next_id);
+                }
+                scopes.pop();
+            }
+            if let Some(d) = default {
+                scopes.push(std::collections::HashSet::new());
+                split_twr_redecls(vt, d, scopes, next_id);
+                scopes.pop();
+            }
+        }
+        _ => {}
+    }
 }
 
 fn visible_name_owner(scopes: &[std::collections::HashMap<String, u32>], name: &str) -> Option<u32> {

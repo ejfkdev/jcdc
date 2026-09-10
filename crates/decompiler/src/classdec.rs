@@ -97,6 +97,13 @@ impl Family {
             }
             let rest = &name[prefix.len()..];
             let Some(pc) = pool.get(&name) else { continue };
+            // Literal-$ top-level siblings (jextract-generated FFI headers)
+            // match the name prefix but are NOT family members: without
+            // InnerClasses evidence they would be emitted inside the root
+            // (errno_h$shared nested into errno_h → 循环继承).
+            if !has_inner_class_evidence(&pc, &root, pool) {
+                continue;
+            }
             let (kind, simple, access) = classify_nested(&name, rest, &pc);
             match kind {
                 NestedKind::Lambda => {
@@ -610,16 +617,42 @@ pub fn decompile_class(pc: &PoolClass, pool: &ClassPool, opts: &ClassOptions) ->
 }
 
 /// Nearest existing outer class by `$` splitting (None for top-level).
+/// A `$` in the name is only nesting evidence when the InnerClasses
+/// attributes back it: the JDK's jextract-style generated FFI headers
+/// declare LITERAL-$ top-level siblings (jdk26 errno_h$shared is its own
+/// compilation unit, `class errno_h extends errno_h$shared` — treating
+/// shared as nested rendered a self-extending cycle plus illegal statics
+/// in an inner class, 循环继承 + 此处不允许使用修饰符static).
 pub fn find_outer(pc: &PoolClass, pool: &ClassPool) -> Option<String> {
     let name = &pc.internal_name;
     let mut cut = name.as_str();
     while let Some(d) = cut.rfind('$') {
         cut = &cut[..d];
-        if pool.get(cut).is_some() {
+        if pool.get(cut).is_some() && has_inner_class_evidence(pc, cut, pool) {
             return Some(cut.to_string());
         }
     }
     None
+}
+
+/// True when the InnerClasses attributes record `pc` as a nested class:
+/// either pc's own attribute carries a self entry (anonymous entries have
+/// inner_name 0, locals outer 0 — any self entry counts) or the candidate
+/// outer's attribute lists pc. Classes compiled without any nesting keep
+/// only REFERENCED classes in their attribute (errno_h$shared lists
+/// ValueLayout$OfInt etc. but never itself).
+fn has_inner_class_evidence(pc: &PoolClass, outer: &str, pool: &ClassPool) -> bool {
+    let lists = |c: &PoolClass, target: &str| -> bool {
+        let Some(bytes) = c.class_attr("InnerClasses") else { return false };
+        let Some(attr) = parse_inner_classes(bytes) else { return false };
+        attr.classes.iter().any(|e| {
+            c.class_name(e.inner_class_info_index)
+                .map(|n| n == target)
+                .unwrap_or(false)
+        })
+    };
+    lists(pc, &pc.internal_name)
+        || pool.get(outer).map(|o| lists(&o, &pc.internal_name)).unwrap_or(false)
 }
 
 /// True if this class will be emitted inside another compilation unit.
@@ -628,13 +661,18 @@ pub fn is_nested_in_family(pc: &PoolClass, pool: &ClassPool) -> bool {
 }
 
 /// Name-based variant: True if a `$`-prefix of this internal name exists in
-/// the pool (so the class is emitted inside that outer class).
+/// the pool AND the InnerClasses attributes record the nesting (a
+/// literal-$ top-level sibling like jdk26 errno_h$shared has a pool
+/// prefix but no evidence — it must stay its own compilation unit).
 pub fn is_nested_in_pool(internal_name: &str, pool: &ClassPool) -> bool {
     let mut cut = internal_name;
     while let Some(d) = cut.rfind('$') {
         cut = &cut[..d];
         if pool.get(cut).is_some() {
-            return true;
+            match pool.get(internal_name) {
+                Some(pc) => return has_inner_class_evidence(&pc, cut, pool),
+                None => return true,
+            }
         }
     }
     false
@@ -863,7 +901,7 @@ fn emit_class(
         .nested
         .get(&internal)
         .map(|n| n.simple.clone())
-        .unwrap_or_else(|| simple_name(&internal));
+        .unwrap_or_else(|| source_simple_name(pc, pool));
 
     let class_sig = pc.class_attr("Signature").and_then(|b| {
         if b.len() >= 2 {
@@ -1027,6 +1065,18 @@ fn emit_class(
     // hidden, recover instance-field initializers from that constructor.
     let inner_ctor_inits: HashMap<String, Expr> = if !is_root
         && class_has_this0(pc)
+        // Mirror the emission skip's SOLE-CTOR condition exactly: the
+        // recovered initializers are only legal when the trivial ctor is
+        // actually HIDDEN (sole ctor). With sibling ctors the trivial one
+        // stays visible (Inet6AddressHolder rule) and recovering its
+        // field stores double-assigns every field it touches — illegal
+        // for finals (jdk17 Authenticator$MacImpl: field decls rendered
+        // `= MacAlg.M_NULL` / `= null` AND the visible no-arg ctor
+        // re-assigned them, 无法为 final 变量分配值 x2 fields x3 trees).
+        && (0..pc.cf.methods.len())
+            .filter(|&mi| pc.method_name(mi) == Some("<init>"))
+            .count()
+            == 1
         && (0..pc.cf.methods.len()).any(|mi| {
             pc.method_name(mi) == Some("<init>") && is_trivial_inner_ctor(pc, pool, mi)
         })
@@ -1563,6 +1613,20 @@ fn collect_lambda_methods(pc: &PoolClass) -> HashSet<usize> {
         }
     }
     set
+}
+
+/// Source-level simple name of a class: nested classes take their
+/// InnerClasses-derived simple name; a literal-$ top-level class (jextract
+/// FFI headers, errno_h$shared) keeps the FULL $-bearing last segment —
+/// its constructor name must match the class header exactly (方法声明无效
+/// 需要返回类型 when the ctor printed `shared()` in `class errno_h$shared`).
+fn source_simple_name(pc: &PoolClass, pool: &ClassPool) -> String {
+    let internal = &pc.internal_name;
+    let last = internal.rsplit('/').next().unwrap_or(internal);
+    if last.contains('$') && find_outer(pc, pool).is_none() {
+        return last.to_string();
+    }
+    simple_name(internal)
 }
 
 fn simple_name(internal: &str) -> String {
@@ -2579,7 +2643,7 @@ fn emit_method_with(
     } else {
         // Anonymous class constructors take the base type's name; LOCAL
         // classes ($1Splitr) take their stripped source name.
-        let self_simple = simple_name(&pc.internal_name);
+        let self_simple = source_simple_name(pc, pool);
         let local_simple = fam
             .nested
             .get(&pc.internal_name)
@@ -2802,6 +2866,12 @@ fn emit_method_with(
             }
             if is_ctor && pc.is_enum() {
                 strip_enum_super(&mut body);
+                // Enum ctors need the const-final prune too: modern javac
+                // emits ConstantValue for INSTANCE finals with constant
+                // initializers, so the decl prints `= 16` while the ctor
+                // keeps javac's inlined putfield (jdk17/26 SSLCipher
+                // .tagSize — 无法为 final 变量 tagSize 分配值 x2 trees).
+                prune_const_final_ctor_assigns(&mut body, pc);
             } else if is_ctor {
                 if outer_super_param {
                     strip_outer_super_arg(&mut body, &mb.vt);
@@ -4053,10 +4123,24 @@ fn walk_enum_inits(s: &Stmt, map: &mut HashMap<String, EnumInit>, pc: &PoolClass
                             let d = pc.method_desc(mi)?;
                             let md = parse_method_descriptor(d)?;
                             if md.args.len() == args.len() {
-                                Some(md.args)
-                            } else {
-                                None
+                                return Some(md.args);
                             }
+                            // VARARGS ctor: the trailing array formal covers
+                            // every remaining argument (jdk17 CipherSuite
+                            // .KeyExchange(String,boolean,boolean,
+                            // NamedGroupSpec...) — the arity miss left the
+                            // boolean formals unmapped and isAnonymous
+                            // printed 0/1, int无法转换为boolean x5).
+                            if md.args.len() >= 2 && args.len() > md.args.len() {
+                                if let jcdc_jvm::JavaType::Array(elem) = md.args.last().unwrap() {
+                                    let mut p = md.args[..md.args.len() - 1].to_vec();
+                                    while p.len() < args.len() {
+                                        p.push((**elem).clone());
+                                    }
+                                    return Some(p);
+                                }
+                            }
+                            None
                         })
                         .max_by_key(|cand| {
                             use crate::expr::ConstVal as CV;
@@ -4091,6 +4175,23 @@ fn walk_enum_inits(s: &Stmt, map: &mut HashMap<String, EnumInit>, pc: &PoolClass
                                         if let Some(c) = char::from_u32(*n as u32) {
                                             return format!("'{}'", crate::emit::escape_char(c));
                                         }
+                                    }
+                                }
+                                // byte/short formals need the explicit cast:
+                                // method-invocation conversion never narrows,
+                                // not even constant expressions (jdk17
+                                // sun.security.ssl.Alert's enum constants
+                                // CLOSE_NOTIFY((byte)0,..) rendered bare and
+                                // every constant hit 从int转换到byte可能会有损失;
+                                // the source carries the casts).
+                                if let jcdc_jvm::JavaType::Byte = pt {
+                                    if let Expr::Const(crate::expr::ConstVal::Int(n)) = a {
+                                        return format!("(byte){}", n);
+                                    }
+                                }
+                                if let jcdc_jvm::JavaType::Short = pt {
+                                    if let Expr::Const(crate::expr::ConstVal::Int(n)) = a {
+                                        return format!("(short){}", n);
                                     }
                                 }
                             }
