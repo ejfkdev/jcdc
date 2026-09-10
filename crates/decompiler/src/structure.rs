@@ -2267,6 +2267,84 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         cur = m;
                         continue;
                     }
+                    // No ipdom, no appendix, no value diamond — but when
+                    // the fall side is a bare statement-free jump STUB
+                    // and the TAKEN arm's open flow crosses past the
+                    // stub into its target, that target is the real
+                    // follow: an if/ELSE pyramid dangles the taken arm's
+                    // fall-out inside the else arm's territory (jdk26
+                    // UnixFileSystemProvider.newDirectoryStream x3
+                    // trees: `catch (UnixException x) { ...;
+                    // x.rethrowAsIOException(dir); }` falls through
+                    // into the dfd1/SecureDirectoryStream tail owned by
+                    // the else arm — the catch fell off the if/else and
+                    // the method fell off its end — 缺少返回语句).
+                    // Scoped tight: stub-only fall sides (the sequential-
+                    // if shape javac emits: `if (c) goto join; goto T`
+                    // with T the dead stub target), non-terminator
+                    // target, and a taken-arm route to it that bypasses
+                    // the stub (barriers exclude the stub, the cond and
+                    // both branch heads, so the ONLY qualifying route
+                    // crosses over). Natural diamonds keep their ipdom
+                    // and never reach this branch.
+                    if follow.is_none() {
+                        let fall_is_stub = self.results[fall].stmts.is_empty()
+                            && matches!(self.results[fall].term, Term::Goto)
+                            && self.cfg.blocks[fall].succ.len() == 1;
+                        if fall_is_stub {
+                            let fh = self.cfg.blocks[fall].succ[0];
+                            // fh must not START a try group: the follow
+                            // continuation may be walked in a scope where
+                            // that (nested) group is not visible, and the
+                            // carve-out would be lost — jdk11
+                            // ReflectionFactory.getReplaceResolveFor-
+                            // Serialization's inner try{setAccessible;
+                            // unreflect}catch(IAE) dissolved into a bare
+                            // unreflect (未报告的异常错误 x3 trees).
+                            let fh_starts_group = self
+                                .groups
+                                .iter()
+                                .any(|g| g.start == self.cfg.blocks[fh].start);
+                            if fh != cur
+                                && fh != taken
+                                && !fh_starts_group
+                                && !stop.contains(&fh)
+                                && !claimed.contains(&fh)
+                                && !self.is_terminator_block(fh)
+                                && !self.is_handler(fh)
+                                && !self.loops_stack.contains(&fh)
+                            {
+                                let exc_succ: HashMap<usize, Vec<usize>> =
+                                    self.cfg.exc_edges.iter().fold(
+                                        HashMap::new(),
+                                        |mut m, e| {
+                                            m.entry(e.from).or_default().push(e.to);
+                                            m
+                                        },
+                                    );
+                                let mut barriers: HashSet<usize> = HashSet::new();
+                                barriers.insert(fh);
+                                barriers.insert(cur);
+                                barriers.insert(fall);
+                                barriers.insert(taken);
+                                for l in &self.loops_stack {
+                                    barriers.insert(*l);
+                                }
+                                barriers.extend(stop.iter().copied());
+                                if can_reach_cfg_barred(
+                                    self.cfg,
+                                    &exc_succ,
+                                    taken,
+                                    fh,
+                                    &barriers,
+                                    8192,
+                                ) {
+                                    follow = Some(fh);
+                                    bstop.insert(fh);
+                                }
+                            }
+                        }
+                    }
                     if std::env::var("JCDC_DBG_IF").is_ok() {
                         eprintln!("COND cur={} follow={:?}", cur, follow);
                     }
