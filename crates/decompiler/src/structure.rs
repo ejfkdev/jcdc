@@ -1122,6 +1122,32 @@ fn region_ends_at_live_exit(r: &Region, exits: &[usize], st: &Structurer) -> boo
     exits.contains(&t) && !st.is_handler(t)
 }
 
+/// True when the region tree contains a Basic/CopyStmts of `b` (a
+/// matexit-materialized exit cascade re-emits the exit block inside the
+/// body; the rotated-do-while rebuild must not duplicate it).
+fn region_mentions_block(r: &Region, b: usize) -> bool {
+    match r {
+        Region::Basic { block } | Region::CopyStmts { block } => *block == b,
+        Region::Seq(v) => v.iter().any(|x| region_mentions_block(x, b)),
+        Region::Loop { body, .. } => region_mentions_block(body, b),
+        Region::If { then_r, else_r, .. } => {
+            region_mentions_block(then_r, b) || region_mentions_block(else_r, b)
+        }
+        Region::Try { body, catches, .. } => {
+            region_mentions_block(body, b)
+                || catches.iter().any(|(_, _, r)| region_mentions_block(r, b))
+        }
+        Region::Switch { cases, default, .. } => {
+            cases.iter().any(|(_, c)| region_mentions_block(c, b))
+                || default
+                    .as_ref()
+                    .map(|d| region_mentions_block(d, b))
+                    .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn region_terminates(r: &Region, results: &[crate::builder::BlockResult]) -> bool {
     region_terminates_ex(r, results, &[])
 }
@@ -2057,6 +2083,51 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                     Region::Loop { exits, .. } => exits.clone(),
                     _ => Vec::new(),
                 };
+                // ROTATED DO-WHILE REBUILD: the loop's continuation is a
+                // BACKWARD exit — a claimed statement block BEFORE the
+                // header that this walk already emitted as the pre-loop
+                // part (parts tail = [Basic{n}, Loop]). javac rotated
+                // `do { <n stmts> while (c) {..} } while (c2);` into
+                // `<n stmts>; while(..){.. goto n ..}`: the in-body
+                // Goto{n} resolved against the inner exits as a `break`
+                // landing on the post-loop re-copy of n, which dead-ends
+                // off the method (jdk11/17 URLClassPath$JarLoader
+                // .getResource: the refetch-true back edge broke out,
+                // the do-top copy fell off the if — 缺少返回语句).
+                // Wrap [Basic{n}, Loop] into an OUTER for(;;) region
+                // headed at n: conversion's header-continue check
+                // (which precedes the exits-break check) then resolves
+                // every Goto{n} inside the body to a labeled continue
+                // of the outer loop, and classify_loop renders the
+                // Fallthrough-headed outer as while(true). Skip when a
+                // matexit cascade already materialized n inside the
+                // body (its copies would duplicate the outer Basic).
+                if let Some(n) = next {
+                    if claimed.contains(&n)
+                        && self.cfg.blocks[n].start < self.cfg.blocks[cur].start
+                        && !self.is_handler(n)
+                        && matches!(loop_r, Region::Loop { .. })
+                        && !region_mentions_block(&loop_r, n)
+                        && matches!(parts.last(), Some(Region::Basic { block }) if *block == n)
+                    {
+                        let do_top = parts.pop().unwrap();
+                        let mut members = match &loop_r {
+                            Region::Loop { members, .. } => members.clone(),
+                            _ => HashSet::new(),
+                        };
+                        members.insert(n);
+                        parts.push(Region::Loop {
+                            header: n,
+                            body: Box::new(Region::Seq(vec![do_top, loop_r])),
+                            members,
+                            exits: Vec::new(),
+                        });
+                        if std::env::var("JCDC_DBG_LOOP").is_ok() {
+                            eprintln!("ROTATION header={} do-top={}", cur, n);
+                        }
+                        break;
+                    }
+                }
                 parts.push(loop_r);
                 match next {
                     Some(n) => {
