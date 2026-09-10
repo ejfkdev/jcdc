@@ -4,7 +4,7 @@ use jcdc_jvm::{ClassPool, JavaType, PoolClass};
 
 use crate::expr::{BinOp, ConcatPart, ConstVal, Expr, LambdaKind, TypeRef, UnOp};
 use crate::method::MethodBody;
-use crate::stmt::Stmt;
+use crate::stmt::{CaseGroup, Catch, Stmt};
 use crate::varalloc::VarTable;
 
 pub struct Printer<'a> {
@@ -87,7 +87,8 @@ impl<'a> Printer<'a> {
     }
 
     pub fn into_string(mut self, body: &Stmt) -> String {
-        self.stmt(body);
+        let body = truncate_dead_ends(body);
+        self.stmt(&body);
         self.out
     }
 
@@ -3044,3 +3045,259 @@ pub fn format_float(v: f64, is_float: bool) -> String {
     // double literal. But "inf"/"nan" handled above.
     format!("{}{}", s, suffix)
 }
+
+
+// ---------------------------------------------------------------------------
+// Unreachable-code truncation (final statement tree)
+// ---------------------------------------------------------------------------
+
+/// Drop statements that follow a `while (true)` which cannot complete
+/// normally (no `break` in its body binds to it): javac rejects them as
+/// 无法访问的语句, and the structurers only emitted them as shared-tail
+/// copies whose real arrivals all render INSIDE the loop arms (jdk17/26
+/// Pattern.clazz's for(;;){switch}: case-93's `return prev/negate` tail
+/// landed after the never-completing loop). Runs on the FINAL tree (after
+/// switch restoration and goto resolution) so the break inventory is
+/// exactly what gets emitted; every unknown shape stays conservative
+/// (assumes the loop can complete).
+fn truncate_dead_ends(s: &Stmt) -> Stmt {
+    match s {
+        Stmt::Block(v) => {
+            let mut out: Vec<Stmt> = Vec::with_capacity(v.len());
+            for x in v {
+                if !out.is_empty() && dead_end_infinite_while(out.last().unwrap()) {
+                    if std::env::var("JCDC_DBG_GOTO").is_ok() {
+                        eprintln!(
+                            "DEADEND truncate {} unreachable stmt(s)",
+                            v.len() - out.len()
+                        );
+                    }
+                    break;
+                }
+                out.push(truncate_dead_ends(x));
+            }
+            Stmt::Block(out)
+        }
+        Stmt::If { cond, then_stmt, else_stmt } => Stmt::If {
+            cond: cond.clone(),
+            then_stmt: Box::new(truncate_dead_ends(then_stmt)),
+            else_stmt: else_stmt.as_deref().map(truncate_dead_ends).map(Box::new),
+        },
+        Stmt::While { cond, body } => Stmt::While {
+            cond: cond.clone(),
+            body: Box::new(truncate_dead_ends(body)),
+        },
+        Stmt::DoWhile { body, cond } => Stmt::DoWhile {
+            body: Box::new(truncate_dead_ends(body)),
+            cond: cond.clone(),
+        },
+        Stmt::For { init, cond, update, body } => Stmt::For {
+            init: init.iter().map(truncate_dead_ends).collect(),
+            cond: cond.clone(),
+            update: update.clone(),
+            body: Box::new(truncate_dead_ends(body)),
+        },
+        Stmt::ForEach { var, iterable, is_array, body } => Stmt::ForEach {
+            var: *var,
+            iterable: iterable.clone(),
+            is_array: *is_array,
+            body: Box::new(truncate_dead_ends(body)),
+        },
+        Stmt::Switch { selector, cases, default, on_string } => Stmt::Switch {
+            selector: selector.clone(),
+            cases: cases
+                .iter()
+                .map(|c| CaseGroup {
+                    labels: c.labels.clone(),
+                    string_labels: c.string_labels.clone(),
+                    enum_labels: c.enum_labels.clone(),
+                    raw_labels: c.raw_labels.clone(),
+                    guard: c.guard.clone(),
+                    body: c.body.iter().map(truncate_dead_ends).collect(),
+                })
+                .collect(),
+            default: default.as_deref().map(truncate_dead_ends).map(Box::new),
+            on_string: *on_string,
+        },
+        Stmt::Try { body, catches, finally } => Stmt::Try {
+            body: Box::new(truncate_dead_ends(body)),
+            catches: catches
+                .iter()
+                .map(|c| Catch {
+                    exc: c.exc.clone(),
+                    var: c.var,
+                    var_name: c.var_name.clone(),
+                    body: Box::new(truncate_dead_ends(&c.body)),
+                })
+                .collect(),
+            finally: finally.as_deref().map(truncate_dead_ends).map(Box::new),
+        },
+        Stmt::TryWithResources { resources, body, catches, finally } => {
+            Stmt::TryWithResources {
+                resources: resources.iter().map(truncate_dead_ends).collect(),
+                body: Box::new(truncate_dead_ends(body)),
+                catches: catches
+                    .iter()
+                    .map(|c| Catch {
+                        exc: c.exc.clone(),
+                        var: c.var,
+                        var_name: c.var_name.clone(),
+                        body: Box::new(truncate_dead_ends(&c.body)),
+                    })
+                    .collect(),
+                finally: finally.as_deref().map(truncate_dead_ends).map(Box::new),
+            }
+        }
+        Stmt::Synchronized { lock, body } => Stmt::Synchronized {
+            lock: lock.clone(),
+            body: Box::new(truncate_dead_ends(body)),
+        },
+        Stmt::Labeled { label, body } => Stmt::Labeled {
+            label: label.clone(),
+            body: Box::new(truncate_dead_ends(body)),
+        },
+        other => other.clone(),
+    }
+}
+
+/// True when `s` is a `while (true)` (labeled or not) whose body holds
+/// no `break` binding to it — it can never complete normally.
+fn dead_end_infinite_while(s: &Stmt) -> bool {
+    let (label, body, cond) = match s {
+        Stmt::While { cond, body } => (None, body.as_ref(), cond),
+        Stmt::Labeled { label, body } => match &**body {
+            Stmt::While { cond, body } => (Some(label.as_str()), body.as_ref(), cond),
+            _ => return false,
+        },
+        _ => return false,
+    };
+    if !matches!(cond, Expr::Const(ConstVal::Int(1))) {
+        return false;
+    }
+    // JLS 14.14: `while (true)` completes normally iff its body holds a
+    // reachable break that EXITS it: an unlabeled break not captured by
+    // an inner breakable construct, OR a labeled break whose label is
+    // not introduced inside the body (it exits outward through the
+    // while — jdk11 ThreadPoolExecutor.addWorker's `break retry` keeps
+    // the statements after the inner for(;;) reachable; javac compiled
+    // that shape for years). A labeled break bound to an INNER label
+    // (Pattern.clazz's `break L4` at the loop bottom) exits only that
+    // inner construct and does NOT count.
+    let inner_labels = collect_labels(body);
+    !has_break_exiting(body, label, 0, &inner_labels)
+}
+
+/// Every `Stmt::Labeled` name introduced inside `s`.
+fn collect_labels(s: &Stmt) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    collect_labels_into(s, &mut out);
+    out
+}
+
+fn collect_labels_into(s: &Stmt, out: &mut std::collections::HashSet<String>) {
+    match s {
+        Stmt::Labeled { label, body } => {
+            out.insert(label.clone());
+            collect_labels_into(body, out);
+        }
+        Stmt::Block(v) => v.iter().for_each(|x| collect_labels_into(x, out)),
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            collect_labels_into(then_stmt, out);
+            if let Some(e) = else_stmt {
+                collect_labels_into(e, out);
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::ForEach { body, .. }
+        | Stmt::Synchronized { body, .. } => collect_labels_into(body, out),
+        Stmt::Switch { cases, default, .. } => {
+            for c in cases {
+                c.body.iter().for_each(|x| collect_labels_into(x, out));
+            }
+            if let Some(d) = default {
+                collect_labels_into(d, out);
+            }
+        }
+        Stmt::Try { body, catches, finally }
+        | Stmt::TryWithResources { body, catches, finally, .. } => {
+            collect_labels_into(body, out);
+            for c in catches {
+                collect_labels_into(&c.body, out);
+            }
+            if let Some(f) = finally {
+                collect_labels_into(f, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Does `s` contain a reachable unlabeled `break` that binds to the
+/// enclosing loop? `depth` counts breakable constructs (loops/switches)
+/// entered since the loop body started: an unlabeled break binds to the
+/// innermost one, so it escapes the loop only at depth 0. Labeled
+/// breaks never complete a while(true) (JLS 14.14). Unstructured `Goto`
+/// remnants and opaque shapes count as escaping (conservative).
+fn has_break_exiting(
+    s: &Stmt,
+    lbl: Option<&str>,
+    depth: usize,
+    inner_labels: &std::collections::HashSet<String>,
+) -> bool {
+    match s {
+        Stmt::Break(None) => depth == 0,
+        // Exits the while unless the label binds to a construct
+        // introduced INSIDE the body.
+        Stmt::Break(Some(l)) => {
+            Some(l.as_str()) == lbl || !inner_labels.contains(l)
+        }
+        Stmt::Continue(_) | Stmt::Return(_) | Stmt::Throw(_) => false,
+        Stmt::Goto(_) => true,
+        Stmt::Block(v) => v.iter().any(|x| has_break_exiting(x, lbl, depth, inner_labels)),
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            has_break_exiting(then_stmt, lbl, depth, inner_labels)
+                || else_stmt
+                    .as_deref()
+                    .map(|e| has_break_exiting(e, lbl, depth, inner_labels))
+                    .unwrap_or(false)
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::ForEach { body, .. } => has_break_exiting(body, lbl, depth + 1, inner_labels),
+        Stmt::Switch { cases, default, .. } => {
+            cases
+                .iter()
+                .any(|c| c.body.iter().any(|x| has_break_exiting(x, lbl, depth + 1, inner_labels)))
+                || default
+                    .as_deref()
+                    .map(|d| has_break_exiting(d, lbl, depth + 1, inner_labels))
+                    .unwrap_or(false)
+        }
+        Stmt::Try { body, catches, finally }
+        | Stmt::TryWithResources { body, catches, finally, .. } => {
+            has_break_exiting(body, lbl, depth, inner_labels)
+                || catches.iter().any(|c| has_break_exiting(&c.body, lbl, depth, inner_labels))
+                || finally
+                    .as_deref()
+                    .map(|f| has_break_exiting(f, lbl, depth, inner_labels))
+                    .unwrap_or(false)
+        }
+        Stmt::Synchronized { body, .. } => has_break_exiting(body, lbl, depth, inner_labels),
+        Stmt::Labeled { body, .. } => has_break_exiting(body, lbl, depth, inner_labels),
+        // Plain leaf statements never contain a break.
+        Stmt::ExprStmt(_)
+        | Stmt::LocalDef { .. }
+        | Stmt::Assert { .. }
+        | Stmt::TernaryValue { .. }
+        | Stmt::MonitorEnter(_)
+        | Stmt::MonitorExit(_)
+        | Stmt::Comment(_) => false,
+        // Opaque shapes (raw labels, inline class decls, anything new):
+        // keep truncation off when an escape cannot be ruled out.
+        _ => true,
+    }
+}
+
