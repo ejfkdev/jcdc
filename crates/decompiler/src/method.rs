@@ -670,6 +670,7 @@ pub fn decompile_method(
         hoist_ctor_call_guards(&mut body);
         cleanup(&mut body);
     }
+    fold_dup_array_stores(&mut body);
     dedupe_declarations(&mut body);
     ensure_declared(&vt, &mut body);
     cleanup(&mut body);
@@ -6467,6 +6468,97 @@ fn wrap_num(numeric_parent: bool, b: crate::expr::Expr) -> crate::expr::Expr {
 /// = stack2` — int无法转换为boolean; PKCS12KeyStore `return var6_581`).
 /// Rewrite bare Local values to `v != 0`; constants and conditionals are
 /// booleanize/expr_bool territory already.
+/// A DUP'd array construction feeding both a store and an element-init
+/// renders the construction expression TWICE — once consumed by the
+/// field/local store, once as the element store's array target (an
+/// illegal assignment target AND a double allocation): jdk26 Exchanger's
+/// `(arena = new Slot[size])[0] = new Slot()` decompiled to
+/// `this.arena = new Slot[size]; new Slot[size][0] = new Slot();`
+/// (意外的类型 需要:变量). When consecutive siblings store a
+/// structurally-equal array value into a variable and then write an
+/// element of that same expression, rebind the element store's array to
+/// the variable.
+fn fold_dup_array_stores(s: &mut Stmt) {
+    use crate::expr::Expr;
+    match s {
+        Stmt::Block(v) => {
+            let mut k = 0;
+            while k + 1 < v.len() {
+                let pair = match (&v[k], &v[k + 1]) {
+                    (
+                        Stmt::ExprStmt(Expr::Assign { target, op: crate::expr::AssignOp::Plain, value, .. }),
+                        Stmt::ExprStmt(Expr::Assign { target: t2, op: crate::expr::AssignOp::Plain, .. }),
+                    ) => {
+                        match (target.as_ref(), t2.as_ref()) {
+                            (Expr::Field { .. } | Expr::Local { .. } | Expr::ArrayIndex { .. }, Expr::ArrayIndex { array, .. })
+                                if **array == **value =>
+                            {
+                                Some(target.clone())
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(t) = pair {
+                    if let Stmt::ExprStmt(Expr::Assign { target: t2, .. }) = &mut v[k + 1] {
+                        if let Expr::ArrayIndex { array, .. } = t2.as_mut() {
+                            *array = t;
+                        }
+                    }
+                    k += 2;
+                    continue;
+                }
+                k += 1;
+            }
+            v.iter_mut().for_each(fold_dup_array_stores);
+        }
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            fold_dup_array_stores(then_stmt);
+            if let Some(e) = else_stmt {
+                fold_dup_array_stores(e);
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::ForEach { body, .. }
+        | Stmt::Labeled { body, .. }
+        | Stmt::Synchronized { body, .. } => fold_dup_array_stores(body),
+        Stmt::For { init, body, .. } => {
+            init.iter_mut().for_each(fold_dup_array_stores);
+            fold_dup_array_stores(body);
+        }
+        Stmt::Switch { cases, default, .. } => {
+            for c in cases.iter_mut() {
+                c.body.iter_mut().for_each(fold_dup_array_stores);
+            }
+            if let Some(d) = default {
+                fold_dup_array_stores(d);
+            }
+        }
+        Stmt::Try { body, catches, finally } => {
+            fold_dup_array_stores(body);
+            for c in catches.iter_mut() {
+                fold_dup_array_stores(&mut c.body);
+            }
+            if let Some(f) = finally {
+                fold_dup_array_stores(f);
+            }
+        }
+        Stmt::TryWithResources { resources, body, catches, finally } => {
+            resources.iter_mut().for_each(fold_dup_array_stores);
+            fold_dup_array_stores(body);
+            for c in catches.iter_mut() {
+                fold_dup_array_stores(&mut c.body);
+            }
+            if let Some(f) = finally {
+                fold_dup_array_stores(f);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn fix_int_locals_at_bool_sites(s: &mut Stmt, ret: &jcdc_jvm::JavaType, vt: &VarTable) {
     use crate::expr::{BinOp, ConstVal, Expr};
     fn is_bool_ty(t: &TypeRef) -> bool {
