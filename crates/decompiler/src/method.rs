@@ -2137,6 +2137,31 @@ fn stmt_terminates_with(s: &Stmt, no_break: bool) -> bool {
     }
 }
 
+/// True when `s` holds a reachable PLAIN `break` in a position
+/// transparent to the enclosing switch (not captured by a nested
+/// loop/switch — breaks there bind to the inner construct; labeled
+/// breaks reach their own target, not the switch end).
+fn has_plain_break(s: &Stmt) -> bool {
+    match s {
+        Stmt::Break(None) => true,
+        Stmt::Block(v) => v.iter().any(has_plain_break),
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            has_plain_break(then_stmt)
+                || else_stmt.as_deref().map(has_plain_break).unwrap_or(false)
+        }
+        Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => {
+            has_plain_break(body)
+        }
+        Stmt::Try { body, catches, .. } => {
+            has_plain_break(body)
+                || catches.iter().any(|c| has_plain_break(&c.body))
+        }
+        // Breaks inside loops or nested switches belong to those
+        // constructs.
+        _ => false,
+    }
+}
+
 fn switch_terminates(cases: &[crate::stmt::CaseGroup], default: Option<&Stmt>) -> bool {
     switch_terminates_with(cases, default, false)
 }
@@ -2152,6 +2177,9 @@ fn switch_terminates_with(
     let _ = outer_no_break;
     let Some(def) = default else { return false };
     if !stmt_terminates_with(def, no_break) {
+        return false;
+    }
+    if has_plain_break(def) {
         return false;
     }
     // t[i]: once control has entered case i (via its label OR fall-through
@@ -2200,28 +2228,6 @@ fn switch_terminates_with(
                 // last statement is not abrupt (return/throw/break/
                 // continue — a LABELED break exits an OUTER construct, not
                 // this switch) and group i+1 completes normally.
-                fn has_plain_break(s: &Stmt) -> bool {
-                    match s {
-                        Stmt::Break(None) => true,
-                        Stmt::Block(v) => v.iter().any(has_plain_break),
-                        Stmt::If { then_stmt, else_stmt, .. } => {
-                            has_plain_break(then_stmt)
-                                || else_stmt.as_deref().map(has_plain_break).unwrap_or(false)
-                        }
-                        Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => {
-                            has_plain_break(body)
-                        }
-                        Stmt::Try { body, catches, .. } => {
-                            has_plain_break(body)
-                                || catches.iter().any(|c| has_plain_break(&c.body))
-                        }
-                        // Breaks inside loops or nested switches belong to
-                        // those constructs (labeled escapes are abrupt for
-                        // this switch but reach their own target, not the
-                        // switch end).
-                        _ => false,
-                    }
-                }
                 fn completes_normally(s: &Stmt) -> bool {
                     match s {
                         Stmt::Switch { cases, default, .. } => {
@@ -2270,6 +2276,20 @@ fn switch_terminates_with(
             Some(last) => stmt_terminates_with(last, no_break),
             None => t[i + 1],
         };
+        // A plain `break` ANYWHERE in the body (not just its last
+        // statement) exits the switch normally: the body may still end
+        // in a terminating copy of the shared tail while a mid-arm
+        // branch breaks out (jdk17 DirectMethodHandle
+        // .shouldBeInitialized: every case targets the tail, the arm
+        // inlined it ending in `return false`, and the isSamePackage
+        // paths' interior `break`s were invisible to the last-stmt
+        // scan — the switch read as abrupt, prune_unreachable deleted
+        // the post-switch ensureClassInitialized tail, and both the
+        // breaks and the fall-out landed at the method end —
+        // 缺少返回语句 + lost ensure-init).
+        if t[i] && body.iter().any(has_plain_break) {
+            t[i] = false;
+        }
     }
     // The switch completes abruptly only if EVERY case entry terminates. If any
     // case breaks (or falls through to one that breaks), control exits the
