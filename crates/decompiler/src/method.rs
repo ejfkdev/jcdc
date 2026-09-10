@@ -652,6 +652,10 @@ pub fn decompile_method(
     // types in Local expressions.
     let ret_ty = desc.ret.clone();
     infer_var_types(&mut vt, &mut body, &ret_ty, pc);
+    // After synthetic-var inference: stack-merge locals now carry their
+    // Int type in the VarTable (PKCS12KeyStore.isPasswordless'
+    // `return var6_581` under a boolean return).
+    fix_int_locals_at_bool_sites(&mut body, &desc.ret, &vt);
     dbg_body!("post-infer");
     prune_dead_synth_stores(&mut body, &vt);
     dbg_body!("post-prune-dead");
@@ -6454,6 +6458,107 @@ fn wrap_num(numeric_parent: bool, b: crate::expr::Expr) -> crate::expr::Expr {
         t: Box::new(Expr::Const(ConstVal::Int(1))),
         f: Box::new(Expr::Const(ConstVal::Int(0))),
     }
+}
+
+/// An int-typed stack-merge local reaching a BOOLEAN position (an assign
+/// to a boolean field/local, a boolean method's return, a boolean local
+/// decl): javac's flow merged iconst 0/1 branch values into one int slot
+/// and the source shape needs a boolean (CipherCore `this.requireReinit
+/// = stack2` — int无法转换为boolean; PKCS12KeyStore `return var6_581`).
+/// Rewrite bare Local values to `v != 0`; constants and conditionals are
+/// booleanize/expr_bool territory already.
+fn fix_int_locals_at_bool_sites(s: &mut Stmt, ret: &jcdc_jvm::JavaType, vt: &VarTable) {
+    use crate::expr::{BinOp, ConstVal, Expr};
+    fn is_bool_ty(t: &TypeRef) -> bool {
+        t.erased() == jcdc_jvm::JavaType::Boolean
+    }
+    fn wrap(v: &mut Expr) {
+        if let Expr::Local { .. } = v {
+            if v.type_ref().erased() == jcdc_jvm::JavaType::Int {
+                let inner = std::mem::replace(v, Expr::This);
+                *v = Expr::Bin {
+                    op: BinOp::Ne,
+                    l: Box::new(inner),
+                    r: Box::new(Expr::Const(ConstVal::Int(0))),
+                    ty: Some(TypeRef::J(jcdc_jvm::JavaType::Boolean)),
+                };
+            }
+        }
+    }
+    fn rec(s: &mut Stmt, ret: &jcdc_jvm::JavaType, vt: &VarTable) {
+        match s {
+            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, ret, vt)),
+            Stmt::ExprStmt(Expr::Assign { target, value, .. }) => {
+                let tb = match target.as_ref() {
+                    Expr::Field { ty, .. } => is_bool_ty(ty),
+                    Expr::Local { var, .. } => vt
+                        .vars
+                        .get(*var as usize)
+                        .map(|i| is_bool_ty(&i.ty))
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                if tb {
+                    wrap(value);
+                }
+            }
+            Stmt::LocalDef { var, init: Some(e), .. } => {
+                if vt
+                    .vars
+                    .get(*var as usize)
+                    .map(|i| is_bool_ty(&i.ty))
+                    .unwrap_or(false)
+                {
+                    wrap(e);
+                }
+            }
+            Stmt::Return(Some(e)) if matches!(ret, jcdc_jvm::JavaType::Boolean) => wrap(e),
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                rec(then_stmt, ret, vt);
+                if let Some(x) = else_stmt {
+                    rec(x, ret, vt);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::Labeled { body, .. }
+            | Stmt::Synchronized { body, .. } => rec(body, ret, vt),
+            Stmt::For { init, body, .. } => {
+                init.iter_mut().for_each(|i| rec(i, ret, vt));
+                rec(body, ret, vt);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    c.body.iter_mut().for_each(|x| rec(x, ret, vt));
+                }
+                if let Some(d) = default {
+                    rec(d, ret, vt);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                rec(body, ret, vt);
+                for c in catches.iter_mut() {
+                    rec(&mut c.body, ret, vt);
+                }
+                if let Some(f) = finally {
+                    rec(f, ret, vt);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter_mut().for_each(|r| rec(r, ret, vt));
+                rec(body, ret, vt);
+                for c in catches.iter_mut() {
+                    rec(&mut c.body, ret, vt);
+                }
+                if let Some(f) = finally {
+                    rec(f, ret, vt);
+                }
+            }
+            _ => {}
+        }
+    }
+    rec(s, ret, vt);
 }
 
 /// Fold an already-built condition's nested 0/1 int diamonds to boolean
