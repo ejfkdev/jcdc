@@ -69,37 +69,24 @@ struct SeseCtx {
 
 impl<'a> Structurer<'a> {
     /// Structure the whole method via SESE decomposition.
-    pub fn structure_method_sese(&mut self) -> Region {
-        let universe: HashSet<usize> = self
-            .cfg
-            .blocks
-            .iter()
-            .filter(|b| !b.ins.is_empty())
-            .map(|b| b.id)
-            .collect();
-        let idom = compute_dominators(self.cfg, &universe, self.cfg.entry);
-        let (vx, ipdom) = compute_postdominators(self.cfg, &universe);
-
-        // Natural loops from back edges (h dominates u => u->h is a back edge).
-        let mut loop_headers: HashSet<usize> = HashSet::new();
-        for &u in universe.iter() {
-            for &s in &self.cfg.blocks[u].succ {
-                if universe.contains(&s) && s != u && idom.dominates(s, u) {
-                    loop_headers.insert(s);
-                }
-                if s == u {
-                    loop_headers.insert(u); // self loop
-                }
-            }
-        }
-        // A catch-and-retry handler has NO normal-flow preds, so the
-        // dominator tree roots it and its `goto header` back edge is
-        // invisible (jdk11 ObjectStreamClass.getInheritableMethod:
-        // `while (defCl != null) { try { ..; break; } catch (NSME) {
-        // defCl = super; } }` unrolled into nested try copies on BOTH
-        // paths). Treat the handler as dominated via its protected
-        // block: handler -> h with h dominating the protected block is
-        // a back edge, and the handler joins the loop.
+    /// Catch-and-retry header detection shared by both structurizers.
+    /// A catch-and-retry handler has NO normal-flow preds, so the
+    /// dominator tree roots it and its `goto header` back edge is
+    /// invisible to natural-loop detection. Returns the per-header
+    /// handler-flow back-edge sources and (as a side effect) marks the
+    /// headers in `loop_headers` and `self.sese_exc_retry_headers`.
+    /// The WALK structurer consumes sese_exc_retry_headers (its
+    /// loop-structuring branch + single_enclosing_succ) — in walk-only
+    /// mode it was never computed, so exc-mediated retry loops unrolled
+    /// into nested try copies (jdk11/17 ObjectInputStream.auditSubclass
+    /// lost the retry loop and its tail return — 缺少返回语句 x2 trees;
+    /// SESE rendered it correctly).
+    pub(crate) fn precompute_exc_retry(
+        &mut self,
+        universe: &HashSet<usize>,
+        idom: &crate::structure::DomInfo,
+        loop_headers: &mut HashSet<usize>,
+    ) -> HashMap<usize, Vec<usize>> {
         let mut exc_back_sources: HashMap<usize, Vec<usize>> = HashMap::new();
         let mut exc_retry_only: HashSet<usize> = HashSet::new();
         for e in &self.cfg.exc_edges {
@@ -163,6 +150,40 @@ impl<'a> Structurer<'a> {
                 }
             }
         }
+        if std::env::var("JCDC_DBG_IF").is_ok() && !exc_retry_only.is_empty() {
+            let mut v: Vec<usize> = exc_retry_only.iter().copied().collect();
+            v.sort_unstable();
+            eprintln!("EXCRETRY headers={:?}", v);
+        }
+        self.sese_exc_retry_headers = exc_retry_only;
+        exc_back_sources
+    }
+
+    pub fn structure_method_sese(&mut self) -> Region {
+        let universe: HashSet<usize> = self
+            .cfg
+            .blocks
+            .iter()
+            .filter(|b| !b.ins.is_empty())
+            .map(|b| b.id)
+            .collect();
+        let idom = compute_dominators(self.cfg, &universe, self.cfg.entry);
+        let (vx, ipdom) = compute_postdominators(self.cfg, &universe);
+
+        // Natural loops from back edges (h dominates u => u->h is a back edge).
+        let mut loop_headers: HashSet<usize> = HashSet::new();
+        for &u in universe.iter() {
+            for &s in &self.cfg.blocks[u].succ {
+                if universe.contains(&s) && s != u && idom.dominates(s, u) {
+                    loop_headers.insert(s);
+                }
+                if s == u {
+                    loop_headers.insert(u); // self loop
+                }
+            }
+        }
+        let exc_back_sources = self.precompute_exc_retry(&universe, &idom, &mut loop_headers);
+        let exc_retry_only: HashSet<usize> = exc_back_sources.keys().copied().collect();
         // Exception-edge predecessors: handler -> protected blocks. A protected
         // block reaches its handler only on a throw (an exception edge, not a
         // normal pred), so when the handler loops back to the header, the
@@ -239,7 +260,6 @@ impl<'a> Structurer<'a> {
             })
             .collect();
         self.sese_loop_headers = loop_headers.clone();
-        self.sese_exc_retry_headers = exc_retry_only;
         let mut ctx = SeseCtx {
             universe,
             idom,

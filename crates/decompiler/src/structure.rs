@@ -1502,6 +1502,20 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             .map(|b| b.id)
             .collect();
 
+        // Exc-mediated retry headers must be known to the walk too: its
+        // loop-structuring branch and back-edge scans consult
+        // sese_exc_retry_headers, which only the SESE precompute used to
+        // fill — in walk-only mode catch-and-retry loops unrolled into
+        // nested try copies (ois auditSubclass 缺少返回语句 x2 trees).
+        // sese_loop_headers stays EMPTY here on purpose: feeding walk the
+        // full natural-header set regressed 6/6/6 (the 1969e0bb lesson —
+        // walk-side consumers must use the exc-only subset).
+        {
+            let idom = compute_dominators(self.cfg, &universe, self.cfg.entry);
+            let mut lh: HashSet<usize> = HashSet::new();
+            self.precompute_exc_retry(&universe, &idom, &mut lh);
+        }
+
         let top_groups: Vec<usize> = (0..self.groups.len())
             .filter(|gi| {
                 let g = &self.groups[*gi];
