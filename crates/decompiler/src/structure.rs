@@ -802,8 +802,34 @@ impl<'a> Structurer<'a> {
     /// duplicates the continuation statement (jdk26
     /// UntrustedCertificates clinit: `algorithm = getProperty` inside the
     /// try AND after it — 可能已分配变量algorithm on the blank final).
-    fn is_active_group_continuation(&self, t: usize, active: &[usize]) -> bool {
+    fn is_active_group_continuation(
+        &self,
+        cur: usize,
+        t: usize,
+        claimed: &HashSet<usize>,
+        active: &[usize],
+    ) -> bool {
         let ts = self.cfg.blocks[t].start;
+        // A CLAIMED block that STARTS another group's protected span,
+        // arrived at from OUTSIDE that span, is never a bare continuation:
+        // its group was already structured by a different arm, no walk
+        // will ever re-emit it, and the arrival must carry its own copy.
+        // Deferring to an unrelated active group's owner walk strands it
+        // when that owner's universe excludes it (jdk26
+        // StructuredTaskScopeImpl.join: the timeoutExpired else arm's
+        // arrival at the tail-try head deferred to the awaitAll group's
+        // continuation, whose arm universe lacked the tail — the
+        // `return joiner.result()` epilogue vanished from the else path,
+        // 缺少返回语句). UNCLAIMED group heads keep the old deferral:
+        // structure_try fires in whichever walk's universe holds them.
+        if let Some(&ogi) = self.body_group.get(&t) {
+            let g = &self.groups[ogi];
+            let cs = self.cfg.blocks[cur].start;
+            let cur_in_span = cs >= g.start && (cs as u32) < (g.end as u32);
+            if g.start == ts && claimed.contains(&t) && !cur_in_span {
+                return false;
+            }
+        }
         active.iter().any(|&gi| {
             ts >= self.groups[gi].end
                 && self.body_group.get(&t) != Some(&gi)
@@ -1946,6 +1972,12 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                                 || self.cfg.blocks[p].start >= self.groups[gi].end)
                     })
             });
+            if std::env::var("JCDC_DBG_GRP").is_ok() {
+                eprintln!("GRPDEC cur={} start={} end={} group_here={:?} active={:?} hg={} structuring={:?}",
+                    cur, b.start, b.end, group_here, active,
+                    self.handler_group.contains_key(&cur),
+                    self.structuring_groups.borrow().clone());
+            }
             if let Some(gi) = group_here {
                 let outer_universe = universe.clone();
                 let try_region = self.structure_try(gi, universe, &outer_universe, claimed, stop);
@@ -3226,11 +3258,6 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                                 eprintln!("GOTO-FALL cur={} t={} univ={} stop={} claimed={} entry={}", cur, t, universe.contains(&t), stop.contains(&t), claimed.contains(&t), entry);
                             }
                             parts.push(Region::Basic { block: cur });
-                            if std::env::var("JCDC_DBG_GOTO").is_ok() {
-                                eprintln!("GFALL-ARM cur={} t={} term={} stop={} loophdr={}",
-                                    cur, t, self.is_terminator_block(t), stop.contains(&t),
-                                    Self::ctx_is_loop_header(self, t));
-                            }
                             if self.is_terminator_block(t)
                                 && !stop.contains(&t)
                                 && !Self::ctx_is_loop_header(self, t)
@@ -3248,7 +3275,9 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                                 && !self.loops_stack.contains(&t)
                                 && !Self::ctx_is_loop_header(self, t)
                                 && !self.is_active_group_continuation(
+                                    cur,
                                     t,
+                                    claimed,
                                     &active_filtered(active, &structured_here),
                                 )
                             {
@@ -3366,7 +3395,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         match self.body_group.get(&b) {
             Some(gi) => {
                 let g = &self.groups[*gi];
-                universe
+                let mut out: HashSet<usize> = universe
                     .iter()
                     .copied()
                     .filter(|x| match self.body_group.get(x) {
@@ -3391,9 +3420,134 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                                     && self.groups[*og].end >= g.end)
                         }
                     })
-                    .collect()
+                    .collect();
+                self.expand_orphan_group_tails(&mut out, b);
+                out
             }
-            None => universe.clone(),
+            None => {
+                let mut out = universe.clone();
+                self.expand_orphan_group_tails(&mut out, b);
+                out
+            }
+        }
+    }
+
+    /// A sibling-group-owned block that is the normal-flow target of a
+    /// kept in-scope block, lies PAST every group active over that block,
+    /// and whose group has no owner in scope, is an ORPHAN TAIL: no walk
+    /// can ever structure it (the owner_scope filter strips it from every
+    /// arm universe, so every arrival dangles as an elided raw Goto).
+    /// Adopt it — with its whole group span and that group's own tail
+    /// closure — so the arriving arm walks and structures it (jdk26
+    /// StructuredTaskScopeImpl.join: both timeoutExpired arms ended in
+    /// Goto{tail}, the tail's `try { return joiner.result(); } catch
+    /// (Throwable e) { throw new FailedException(e); }` was owned by a
+    /// sibling group present in NO arm's scope — the epilogue vanished
+    /// from the render entirely, 缺少返回语句).
+    fn expand_orphan_group_tails(&self, out: &mut HashSet<usize>, from: usize) {
+        let structuring = self.structuring_groups.borrow().clone();
+        let mut frontier: Vec<usize> = vec![from];
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut guard = 0;
+        while let Some(b) = frontier.pop() {
+            guard += 1;
+            if guard > 512 || !seen.insert(b) {
+                continue;
+            }
+            if !out.contains(&b) {
+                continue;
+            }
+            for &t in &self.cfg.blocks[b].succ {
+                if out.contains(&t) {
+                    frontier.push(t);
+                    continue;
+                }
+                let Some(&ogi) = self.body_group.get(&t) else {
+                    continue;
+                };
+                let og = &self.groups[ogi];
+                // The owner group is STILL PENDING in this scope — its
+                // start block is held by `out` and structure_try has not
+                // consumed it yet: that walk structures the group when
+                // flow arrives and its post-try continuation emits the
+                // tail at the right level. Adopting it into an arm
+                // universe claims the shared tail early and the
+                // continuation search then finds it claimed (jdk17/26
+                // PrintStream.format x2 trees: the else arm adopted the
+                // synchronized group's monitorexit chain plus the
+                // post-try `return this`, cont resolved to None inside
+                // BOTH nested tries — 缺少返回语句 x2 methods). Groups
+                // already structured by an ancestor (STS join's tail
+                // try, structured by the sibling arm) keep adopting:
+                // their tail will never be emitted elsewhere.
+                let start_held = self
+                    .cfg
+                    .blocks
+                    .iter()
+                    .any(|nb| nb.start == og.start && out.contains(&nb.id));
+                if structuring.contains(&ogi) || start_held {
+                    continue;
+                }
+                // Past every group active over `b`: a target inside an
+                // active group's span is that group's own continuation —
+                // the owner walk handles it (ZipFile.getComment's
+                // enclosing-group tail; Module.loadModuleInfoClass's
+                // post-try cont) — never an orphan.
+                let inside_active = out.iter().any(|&x| {
+                    self.body_group.get(&x) == Some(&ogi)
+                        || self.handler_group.get(&x) == Some(&ogi)
+                });
+                if inside_active {
+                    continue;
+                }
+                if self.groups.iter().enumerate().any(|(gi, g)| {
+                    out.iter().any(|&x| self.body_group.get(&x) == Some(&gi))
+                        && g.start <= og.start
+                        && g.end >= og.end
+                }) {
+                    continue;
+                }
+                // Adopt the full span + handler heads (structure_try
+                // rebuilds handlers itself) + the group's own tail
+                // closure beyond the span end.
+                let mut adopt: Vec<usize> = self
+                    .cfg
+                    .blocks
+                    .iter()
+                    .filter(|nb| {
+                        !nb.ins.is_empty()
+                            && nb.start >= og.start
+                            && nb.end <= og.end.max(og.start + 1)
+                    })
+                    .map(|nb| nb.id)
+                    .collect();
+                for (&hb, &hg) in self.handler_group.iter() {
+                    if hg == ogi {
+                        adopt.push(hb);
+                    }
+                }
+                let mut x = og.end;
+                for _ in 0..8 {
+                    let Some(bid) = self.cfg.block_at(x) else { break };
+                    if self.body_group.contains_key(&bid) {
+                        break;
+                    }
+                    adopt.push(bid);
+                    let nxt = match self.results[bid].term {
+                        Term::Fallthrough | Term::Goto
+                            if self.cfg.blocks[bid].succ.len() == 1 =>
+                        {
+                            self.cfg.blocks[bid].succ[0]
+                        }
+                        _ => break,
+                    };
+                    x = self.cfg.blocks[nxt].start;
+                }
+                for id in adopt {
+                    out.insert(id);
+                    frontier.push(id);
+                }
+            }
         }
     }
 
