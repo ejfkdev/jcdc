@@ -15,6 +15,13 @@ pub struct Printer<'a> {
     indent: usize,
     /// Depth guard for recursive lambda printing.
     lambda_depth: usize,
+    /// Names visible in enclosing lambda/method scopes BEYOND self.vt,
+    /// accumulated down the lambda print chain: a nested lambda's locals
+    /// must not redeclare ANY of them (jdk26 PackageSnippets
+    /// .fooToBarUnrolled: the depth-2 codeBuilder lambda's foreach `i$`
+    /// collided with the METHOD-level `i$` — the depth-1 rename only
+    /// consulted depth-1's vt, 已在方法中定义了变量 i$).
+    outer_names: Vec<String>,
     /// True when the enclosing method returns boolean.
     pub ret_bool: bool,
     /// True while rendering the ROOT of an expression statement: a
@@ -57,7 +64,7 @@ pub struct Printer<'a> {
 
 impl<'a> Printer<'a> {
     pub fn new(pc: &'a PoolClass, pool: &'a ClassPool, vt: &'a VarTable) -> Self {
-        Printer { pc, pool, vt, out: String::new(), indent: 0, lambda_depth: 0, ret_bool: false, suppress_poly_cast: false, suppress_diamond: false, in_cond: false, lambda_sam_ret: None, ret_sam: None, ret_char: false, ret_byte: false, ret_short: false }
+        Printer { pc, pool, vt, out: String::new(), indent: 0, lambda_depth: 0, outer_names: Vec::new(), ret_bool: false, suppress_poly_cast: false, suppress_diamond: false, in_cond: false, lambda_sam_ret: None, ret_sam: None, ret_char: false, ret_byte: false, ret_short: false }
     }
 
     pub fn with_ret_bool(mut self, b: bool) -> Self {
@@ -840,6 +847,7 @@ impl<'a> Printer<'a> {
             out: String::new(),
             indent: 0,
             lambda_depth: self.lambda_depth,
+            outer_names: self.outer_names.clone(),
             ret_bool: self.ret_bool,
             ret_char: self.ret_char,
             ret_byte: self.ret_byte,
@@ -2479,12 +2487,14 @@ impl<'a> Printer<'a> {
                         // method-level twin is handled by
                         // disambiguate_lambda_locals.
                         {
-                            let outer_names: std::collections::HashSet<&str> = self
+                            let mut outer_names: std::collections::HashSet<&str> = self
                                 .vt
                                 .vars
                                 .iter()
                                 .map(|v| v.name.as_str())
                                 .collect();
+                            outer_names
+                                .extend(self.outer_names.iter().map(|n| n.as_str()));
                             let mut used: std::collections::HashSet<String> =
                                 vt.vars.iter().map(|v| v.name.clone()).collect();
                             for v in vt.vars.iter_mut() {
@@ -2513,6 +2523,11 @@ impl<'a> Printer<'a> {
                             out: String::new(),
                             indent: self.indent,
                             lambda_depth: self.lambda_depth + 1,
+                            outer_names: {
+                                let mut n = self.outer_names.clone();
+                                n.extend(self.vt.vars.iter().map(|v| v.name.clone()));
+                                n
+                            },
                             // The SAM's return type governs the impl
                             // body's renders: boolean SAMs must print
                             // `return true;` not the JVM-int `return 1;`

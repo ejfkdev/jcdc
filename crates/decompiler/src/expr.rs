@@ -410,7 +410,19 @@ impl Expr {
             Expr::Local { ty, .. } => ty.clone(),
             Expr::This => JavaType::Object("java/lang/Object".into()).into(),
             Expr::New { ty, .. } => ty.clone(),
-            Expr::NewArray { elem, .. } => JavaType::Array(Box::new(elem.erased())).into(),
+            // dims carries the lengths; `trailing_dims` counts EXTRA []
+            // levels beyond the element type (`new byte[][]{a,b,c}` =
+            // elem Byte + the init dimension + 1 trailing). type_ref
+            // dropped the trailing levels (ML_DSA_Impls.implGenerate-
+            // KeyPair: the byte[][] literal evidenced byte[] for the
+            // return-temp slot — byte[][]无法转换为byte[] x2 classes).
+            Expr::NewArray { elem, trailing_dims, .. } => {
+                let mut t = elem.erased();
+                for _ in 0..=(*trailing_dims as usize) {
+                    t = JavaType::Array(Box::new(t));
+                }
+                t.into()
+            }
             Expr::NewMultiArray { ty, .. } => ty.clone(),
             Expr::Field { ty, .. } => ty.clone(),
             Expr::Method { desc, .. } => desc.ret.clone().into(),
