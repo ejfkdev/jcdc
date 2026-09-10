@@ -1074,6 +1074,14 @@ impl<'a> Structurer<'a> {
 /// (return/throw): the region cannot complete normally, so a following
 /// continuation would be unreachable (javac: 无法访问的语句). Goto/Empty
 /// are conservative negatives (a Goto may resolve to a fallthrough).
+/// `active` minus the groups the current walk scope already structured.
+fn active_filtered(active: &[usize], structured: &HashSet<usize>) -> Vec<usize> {
+    if structured.is_empty() {
+        return active.to_vec();
+    }
+    active.iter().copied().filter(|g| !structured.contains(g)).collect()
+}
+
 pub(crate) fn region_terminates(r: &Region, results: &[crate::builder::BlockResult]) -> bool {
     region_terminates_ex(r, results, &[])
 }
@@ -1673,6 +1681,14 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         let mut cur = entry;
         let mut first = true;
         let mut guard = 0usize;
+        // Groups this scope has already structured: their continuations
+        // are OWNED by this walk from structure_try's `cont` step on —
+        // the active-group-continuation guards must no longer defer to
+        // an owner that IS this scope (jdk11/17 TimeZone.setDefaultZone:
+        // the post-try fall-out `goto tail` was elided as "the owner
+        // will emit it" and the shared `return tz` tail vanished from
+        // the try's normal path — 缺少返回语句 x2 trees).
+        let mut structured_here: HashSet<usize> = HashSet::new();
         let _ = &mut first;
         loop {
             guard += 1;
@@ -1854,6 +1870,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                 let outer_universe = universe.clone();
                 let try_region = self.structure_try(gi, universe, &outer_universe, claimed, stop);
                 parts.push(try_region);
+                structured_here.insert(gi);
                 let gend = self.groups[gi].end;
                 let hf_next = self.handler_flow_only(gi);
                 let next = self.cfg.blocks.iter().find(|nb| {
@@ -3060,7 +3077,10 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             } else if !stop.contains(&t)
                                 && !self.loops_stack.contains(&t)
                                 && !Self::ctx_is_loop_header(self, t)
-                                && !self.is_active_group_continuation(t, active)
+                                && !self.is_active_group_continuation(
+                                    t,
+                                    &active_filtered(active, &structured_here),
+                                )
                             {
                                 match self.copy_walk(t, stop, active, cur) {
                                     Some(r) => parts.push(r),
@@ -3128,8 +3148,12 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             // 未报告的异常错误Throwable x2 trees). The
                             // conversion's strip_trailing_goto(try_follow)
                             // renders the Goto as the natural fallthrough.
-                            let owned_cont =
-                                self.is_cont_of_active_group(n, stop, claimed, active);
+                            let owned_cont = self.is_cont_of_active_group(
+                                n,
+                                stop,
+                                claimed,
+                                &active_filtered(active, &structured_here),
+                            );
                             if claimed.contains(&n)
                                 && !owned_cont
                                 && !stop.contains(&n)
