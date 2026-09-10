@@ -2447,6 +2447,44 @@ impl<'a> Printer<'a> {
                                 }
                             }
                         }
+                        // A nested lambda body shares the ENCLOSING
+                        // lambda's scope rules: its own locals must not
+                        // redeclare names visible there (jdk26
+                        // MethodHandleProxies.createTemplate — the clb
+                        // lambda's foreach-desugared `i$`/`mi` collided
+                        // with the nested cob lambda's own `i$`/`mi`,
+                        // 已在方法中定义了变量 x2). Rename the inner
+                        // impl's non-param locals on collision; the
+                        // method-level twin is handled by
+                        // disambiguate_lambda_locals.
+                        {
+                            let outer_names: std::collections::HashSet<&str> = self
+                                .vt
+                                .vars
+                                .iter()
+                                .map(|v| v.name.as_str())
+                                .collect();
+                            let mut used: std::collections::HashSet<String> =
+                                vt.vars.iter().map(|v| v.name.clone()).collect();
+                            for v in vt.vars.iter_mut() {
+                                if v.is_param || !outer_names.contains(v.name.as_str()) {
+                                    continue;
+                                }
+                                let base = v.name.clone();
+                                let mut k = 1;
+                                loop {
+                                    let cand = format!("{}${}", base, k);
+                                    if !used.contains(&cand)
+                                        && !outer_names.contains(cand.as_str())
+                                    {
+                                        used.insert(cand.clone());
+                                        v.name = cand;
+                                        break;
+                                    }
+                                    k += 1;
+                                }
+                            }
+                        }
                         let mut sub = Printer {
                             pc: self.pc,
                             pool: self.pool,

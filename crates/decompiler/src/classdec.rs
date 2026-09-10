@@ -2636,6 +2636,7 @@ fn emit_method_with(
     indent: usize,
     captures: &HashMap<String, Expr>,
 ) -> anyhow::Result<()> {
+    PATTERN_CTR.with(|c| c.set(0));
     let depth = EMIT_DEPTH.with(|d| {
         let v = d.get() + 1;
         d.set(v);
@@ -9430,6 +9431,17 @@ pub fn restore_enum_switches(s: &mut Stmt, pc: &PoolClass, pool: &ClassPool) {
     }
 }
 
+thread_local! {
+    /// Monotonic pattern-binding name counter for the CURRENT method
+    /// emission (reset at emit_method_with entry). A per-switch counter
+    /// collided across nesting: jdk26 ClassRemapperImpl.mapSignature's
+    /// outer typeSwitch bound `ignored1` while the lambda-body switch's
+    /// fresh counter re-issued `ignored1` INSIDE the outer case block —
+    /// 已在方法中定义了变量 ignored1 (a lambda cannot redeclare an
+    /// enclosing pattern variable).
+    static PATTERN_CTR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn restore_one_switch(
     selector: &mut Expr,
     cases: &mut Vec<crate::stmt::CaseGroup>,
@@ -9446,7 +9458,7 @@ fn restore_one_switch(
             let _shorten = |c: &str| Printer::new(pc, pool, empty_vt()).shorten(c);
             let mut ok = true;
             let mut new_cases: Vec<(Vec<String>, Vec<String>)> = Vec::new(); // (raw, str)
-            let mut pat_ctr = 0usize;
+            let mut pat_ctr = PATTERN_CTR.with(|c| c.get());
             for cgroup in cases.iter() {
                 let mut raws = Vec::new();
                 let mut strs = Vec::new();
@@ -9482,6 +9494,7 @@ fn restore_one_switch(
                 }
                 new_cases.push((raws, strs));
             }
+            PATTERN_CTR.with(|c| c.set(pat_ctr));
             if ok {
                 for (cgroup, (raws, strs)) in cases.iter_mut().zip(new_cases) {
                     cgroup.raw_labels = raws;
