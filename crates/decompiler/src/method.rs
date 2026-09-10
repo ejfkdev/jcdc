@@ -6526,11 +6526,18 @@ fn booleanize_deep(e: &mut crate::expr::Expr) {
             // A branch holding a non-0/1 int makes this an arithmetic
             // ternary: the sibling `c ? 1 : 0` must not collapse to a
             // boolean (`x >= y ? x != y : -1` is ill-typed).
-            let sibling_numeric = |x: &Expr| -> bool {
+            fn sibling_numeric(x: &Expr) -> bool {
                 match x {
                     Expr::Const(ConstVal::Int(n)) => *n != 0 && *n != 1,
                     Expr::Const(ConstVal::Long(_)) => true,
-                    Expr::Cond { .. } | Expr::Un { .. } | Expr::InstanceOf { .. } => false,
+                    // A nested ternary arm is numeric when ITS branches
+                    // are: the enclosing conditional's type comes from
+                    // both arms' leaves, and folding a 0/1 sibling to
+                    // boolean strands an int-typed parent (jdk26 HPKE
+                    // `authKey()!=null ? (usePSK?3:2) : (usePSK?1:0)`
+                    // rendered `.. : usePSK` — INT#1无法转换为int).
+                    Expr::Cond { t, f, .. } => sibling_numeric(t) || sibling_numeric(f),
+                    Expr::Un { .. } | Expr::InstanceOf { .. } => false,
                     other => {
                         let e = other.type_ref().erased();
                         matches!(
@@ -6541,7 +6548,7 @@ fn booleanize_deep(e: &mut crate::expr::Expr) {
                         )
                     }
                 }
-            };
+            }
             let numeric_branches = sibling_numeric(t) || sibling_numeric(f);
             if numeric_branches {
                 NUMERIC_CTX.with(|n| n.set(n.get() + 1));

@@ -1370,8 +1370,44 @@ impl<'a> Printer<'a> {
                         }
                     } else if *is_static && (cls != &self.pc.internal_name || !type_args.is_empty())
                     {
-                        out.push_str(&self.shorten(cls));
-                        out.push('.');
+                        // A static member of an ENCLOSING class resolves
+                        // through lexical scope unqualified — and the
+                        // qualified form is a TRAP when a field/local is
+                        // named after the class: expression-name
+                        // resolution prefers variables, so jdk26
+                        // HPKE$Impl's `private static final byte[] HPKE`
+                        // hijacked `HPKE.usePSK(psk)` into a member
+                        // lookup on the array (找不到符号 方法
+                        // usePSK(SecretKey) 位置: 类型为byte[]的变量
+                        // HPKE). Keep the qualifier when an own or
+                        // intermediate class declares a same-named
+                        // method (real member shadowing) or when type
+                        // witnesses need an explicit receiver.
+                        let enclosing_static = type_args.is_empty()
+                            && self.pc.internal_name.starts_with(&format!("{}$", cls))
+                            && {
+                                let mut cur = self.pc.internal_name.clone();
+                                let mut shadow = false;
+                                while cur != *cls {
+                                    if let Some(cpc) = self.pool.get(&cur) {
+                                        if (0..cpc.cf.methods.len())
+                                            .any(|mi| cpc.method_name(mi) == Some(name.as_str()))
+                                        {
+                                            shadow = true;
+                                            break;
+                                        }
+                                    }
+                                    match cur.rfind('$') {
+                                        Some(i) => cur.truncate(i),
+                                        None => break,
+                                    }
+                                }
+                                !shadow
+                            };
+                        if !enclosing_static {
+                            out.push_str(&self.shorten(cls));
+                            out.push('.');
+                        }
                     } else if !type_args.is_empty() {
                         // Type witnesses require an explicit receiver.
                         out.push_str("this.");

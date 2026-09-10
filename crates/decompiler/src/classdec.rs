@@ -11758,6 +11758,18 @@ fn prune_witnessed_raw_sam_casts(e: &mut Expr, pool: &ClassPool) {
         // 引用不明确 errors across p11/sj17). Prune only when no sibling
         // can take the lambda (COWAL Reversed.toArray: the sibling
         // formal is T[], an array — never lambda-compatible).
+        // When the explicit witness exactly fills the CHOSEN method's own
+        // type parameters, a sibling whose method-typevar count differs
+        // cannot carry the witness and is not a viable overload: the
+        // raw SAM cast is then redundant AND poisonous for a method ref
+        // (raw Function's apply(Object) vs Service::getAlgorithm —
+        // 方法引用无效 + cascading 找不到符号 on the lambda param,
+        // sun.launcher.SecuritySettings' Comparator.<Service,String>
+        // comparing(..).<String>thenComparing(Service::getAlgorithm)
+        // x2 trees). doPrivileged keeps its veto: its witness never
+        // fits a method-typevar list (non-generic method), so the
+        // disambiguating raw cast stays.
+        let witness_fits_chosen = msig.params.len() == type_args.len();
         let sibling_sam = (0..dpc.cf.methods.len()).any(|oi| {
             if oi == mi || dpc.method_name(oi) != Some(name.as_str()) {
                 return false;
@@ -11767,6 +11779,13 @@ fn prune_witnessed_raw_sam_casts(e: &mut Expr, pool: &ClassPool) {
             };
             if od.args.len() != desc.args.len() {
                 return false;
+            }
+            if witness_fits_chosen {
+                if let Some(osig) = method_signature_of(&dpc, oi) {
+                    if osig.params.len() != type_args.len() {
+                        return false;
+                    }
+                }
             }
             match od.args.get(pos) {
                 Some(jcdc_jvm::JavaType::Object(n)) if n != raw_n => pool
