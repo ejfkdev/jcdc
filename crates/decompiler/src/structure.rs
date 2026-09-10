@@ -1456,6 +1456,22 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         || self.sese_loop_headers.contains(&x)
                         || self.sese_exc_retry_headers.contains(&x))
             };
+        // Exc-only-reachable preds (handlers and their downstream blocks)
+        // never get a normal-flow dominator: compute_dominators' RPO walks
+        // normal succ edges only, so such a block keeps the idom[p]==p
+        // sentinel and every dominates() query on it is false. When it
+        // carries a NORMAL edge back into `cur`, that is a genuine back
+        // edge of a catch-and-retry loop whose cycle runs through a throw
+        // (jdk11/17 ObjectInputStream$1.run: `for (cl = subcl; cl !=
+        // ObjectInputStream.class; cl = cl.getSuperclass())` — the update
+        // block's only inbound edge is try2's exception edge; walk missed
+        // the loop, copy_walk unrolled 5 nested copies and the tail
+        // `return TRUE` was lost — 缺少返回语句). Verify the cycle on the
+        // exc-augmented CFG (same view structure_loop's membership scan
+        // uses). The scope's dom root is excluded: idom[root]==root too,
+        // and root→cur with cur⇝root is just the enclosing loop's normal
+        // circulation, not a loop at `cur`.
+        let mut exc_succ: Option<HashMap<usize, Vec<usize>>> = None;
         for &p in &self.cfg.blocks[cur].pred {
             if p == cur {
                 return true;
@@ -1477,6 +1493,31 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                     }
                 }
                 return true;
+            }
+            // `cur` itself must be normal-flow reachable in this scope
+            // (non-sentinel idom): on an exc-augmented cycle every member
+            // sees every other member as reachable, and without this guard
+            // a handler-flow block mid-cycle (jdk11 Process.waitFor's
+            // `Thread.sleep` between the rem-test and the rem-update —
+            // the genuine header is the protected exitValue() block two
+            // hops up, owned by precompute_exc_retry) was flagged as a
+            // header too, wrapping the sleep in a spurious
+            // `while(true){..break}`.
+            if universe.contains(&p)
+                && dom.idom[p] == p
+                && dom.idom[cur] != cur
+                && p != dom.idom[cur]
+            {
+                let xs = exc_succ.get_or_insert_with(|| {
+                    let mut m: HashMap<usize, Vec<usize>> = HashMap::new();
+                    for e in &self.cfg.exc_edges {
+                        m.entry(e.from).or_default().push(e.to);
+                    }
+                    m
+                });
+                if can_reach_cfg_barred(self.cfg, xs, cur, p, &HashSet::new(), 8192) {
+                    return true;
+                }
             }
         }
         false
