@@ -1285,7 +1285,11 @@ fn emit_class(
             } else {
                 clinit_body.take()
             };
-            if let Some((body, vt)) = prepared {
+            if let Some((mut body, mut vt)) = prepared {
+                // The static initializer gets the same package-root local
+                // rename as methods (jdk11 JsseJce's `Provider sun`
+                // obscured sun.security.jca.ProviderList — 找不到符号).
+                rename_package_root_locals(&mut body, &mut vt, pc, pool);
                 let text = Printer::new(pc, pool, &vt).with_indent(indent + 1).into_string(&body);
                 if !text.trim().is_empty() {
                     out.push('\n');
@@ -3211,6 +3215,7 @@ fn emit_method_with(
             let names_before: HashMap<u32, String> =
                 mb.vt.vars.iter().map(|v| (v.id, v.name.clone())).collect();
             disambiguate_lambda_locals(pc, pool, &mut mb.vt, &mut body);
+            rename_package_root_locals(&mut body, &mut mb.vt, pc, pool);
             {
                 let renames: HashMap<String, String> = mb
                     .vt
@@ -15881,6 +15886,223 @@ fn method_signature_of(pc: &PoolClass, mi: usize) -> Option<jcdc_jvm::MethodSign
 /// shadowing ("已在方法 makeGraph 中定义了变量 m2", jdk11 module
 /// Resolver). Rename the OUTER local (all references follow the
 /// VarTable name) until no lambda-scope name collides.
+/// A local named after a package root (`Provider sun = ...` — jdk11
+/// JsseJce's static init) obscures every fully-qualified reference that
+/// starts with it: `sun.security.jca.ProviderList.newList(..)` inside the
+/// variable's scope resolves `sun` as the VARIABLE (找不到符号 变量
+/// security). jcdc renders class references fully qualified, so rename
+/// such locals (and their RawT snapshots) when the body actually
+/// references a class under that root.
+fn rename_package_root_locals(
+    body: &mut Stmt,
+    vt: &mut crate::varalloc::VarTable,
+    pc: &PoolClass,
+    pool: &ClassPool,
+) {
+    // Collect the package roots the body's class references use.
+    fn roots_in_expr(e: &Expr, out: &mut std::collections::HashSet<String>) {
+        fn cls_root(c: &str) -> Option<String> {
+            let r = c.split('/').next()?;
+            if r.is_empty() || c == r {
+                return None;
+            }
+            (!r.chars().next()?.is_ascii_digit()).then(|| r.to_string())
+        }
+        match e {
+            Expr::Method { cls, owner, args, .. } => {
+                if let Some(r) = cls_root(cls) {
+                    out.insert(r);
+                }
+                if let Some(o) = owner {
+                    roots_in_expr(o, out);
+                }
+                args.iter().for_each(|a| roots_in_expr(a, out));
+            }
+            Expr::Field { cls, owner, .. } => {
+                if let Some(r) = cls_root(cls) {
+                    out.insert(r);
+                }
+                if let Some(o) = owner {
+                    roots_in_expr(o, out);
+                }
+            }
+            Expr::New { cls, args, .. } => {
+                if let Some(r) = cls_root(cls) {
+                    out.insert(r);
+                }
+                args.iter().for_each(|a| roots_in_expr(a, out));
+            }
+            Expr::Cast { ty, e } => {
+                if let TypeRef::J(jcdc_jvm::JavaType::Object(n)) = ty {
+                    if let Some(r) = cls_root(n) {
+                        out.insert(r);
+                    }
+                }
+                if let TypeRef::G(jcdc_jvm::GenericType::Class(cs)) = ty {
+                    if !cs.package.is_empty() {
+                        if let Some(r) = cs.package.split('/').next() {
+                            out.insert(r.to_string());
+                        }
+                    }
+                }
+                roots_in_expr(e, out);
+            }
+            Expr::Bin { l, r, .. } => {
+                roots_in_expr(l, out);
+                roots_in_expr(r, out);
+            }
+            Expr::Cond { c, t, f } => {
+                roots_in_expr(c, out);
+                roots_in_expr(t, out);
+                roots_in_expr(f, out);
+            }
+            Expr::Un { e, .. } | Expr::InstanceOf { e, .. } => roots_in_expr(e, out),
+            Expr::Assign { target, value, .. } => {
+                roots_in_expr(target, out);
+                roots_in_expr(value, out);
+            }
+            Expr::ArrayIndex { array, index } => {
+                roots_in_expr(array, out);
+                roots_in_expr(index, out);
+            }
+            Expr::Const(crate::expr::ConstVal::ClassLit(t)) => {
+                if let TypeRef::J(jcdc_jvm::JavaType::Object(n)) = t {
+                    if let Some(r) = cls_root(n) {
+                        out.insert(r);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn roots_in_stmt(s: &Stmt, out: &mut std::collections::HashSet<String>) {
+        match s {
+            Stmt::Block(v) => v.iter().for_each(|x| roots_in_stmt(x, out)),
+            Stmt::ExprStmt(e) | Stmt::Return(Some(e)) | Stmt::Throw(e) => roots_in_expr(e, out),
+            Stmt::Return(None) => {}
+            Stmt::LocalDef { init, .. } => {
+                if let Some(e) = init {
+                    roots_in_expr(e, out);
+                }
+            }
+            Stmt::If { cond, then_stmt, else_stmt, .. } => {
+                roots_in_expr(cond, out);
+                roots_in_stmt(then_stmt, out);
+                if let Some(e) = else_stmt {
+                    roots_in_stmt(e, out);
+                }
+            }
+            Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+                roots_in_expr(cond, out);
+                roots_in_stmt(body, out);
+            }
+            Stmt::ForEach { iterable, body, .. } => {
+                roots_in_expr(iterable, out);
+                roots_in_stmt(body, out);
+            }
+            Stmt::For { init, cond, update, body } => {
+                init.iter().for_each(|i| roots_in_stmt(i, out));
+                if let Some(c) = cond {
+                    roots_in_expr(c, out);
+                }
+                update.iter().for_each(|u| roots_in_expr(u, out));
+                roots_in_stmt(body, out);
+            }
+            Stmt::Switch { selector, cases, default, .. } => {
+                roots_in_expr(selector, out);
+                for c in cases {
+                    c.body.iter().for_each(|x| roots_in_stmt(x, out));
+                }
+                if let Some(d) = default {
+                    roots_in_stmt(d, out);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                roots_in_stmt(body, out);
+                for c in catches {
+                    roots_in_stmt(&c.body, out);
+                }
+                if let Some(f) = finally {
+                    roots_in_stmt(f, out);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter().for_each(|r| roots_in_stmt(r, out));
+                roots_in_stmt(body, out);
+                for c in catches {
+                    roots_in_stmt(&c.body, out);
+                }
+                if let Some(f) = finally {
+                    roots_in_stmt(f, out);
+                }
+            }
+            Stmt::Synchronized { lock, body } => {
+                roots_in_expr(lock, out);
+                roots_in_stmt(body, out);
+            }
+            Stmt::Labeled { body, .. } => roots_in_stmt(body, out),
+            Stmt::Assert { cond, msg } => {
+                roots_in_expr(cond, out);
+                if let Some(m) = msg {
+                    roots_in_expr(m, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut roots: std::collections::HashSet<String> = std::collections::HashSet::new();
+    roots_in_stmt(body, &mut roots);
+    if roots.is_empty() {
+        return;
+    }
+    let mut renames: HashMap<String, String> = HashMap::new();
+    let mut used: std::collections::HashSet<String> =
+        vt.vars.iter().map(|v| v.name.clone()).collect();
+    for v in vt.vars.iter_mut() {
+        if !roots.contains(&v.name) {
+            continue;
+        }
+        let base = v.name.clone();
+        if renames.contains_key(&base) {
+            v.name = renames.get(&base).cloned().unwrap_or(base);
+            continue;
+        }
+        let mut k = 1;
+        let cand = loop {
+            let c = format!("{}${}", base, k);
+            if !used.contains(&c) && !roots.contains(&c) {
+                break c;
+            }
+            k += 1;
+        };
+        used.insert(cand.clone());
+        // Params keep their printed name at the signature level too —
+        // renaming the VarTable entry renames both consistently.
+        v.name = cand.clone();
+        renames.insert(base, cand);
+    }
+    if renames.is_empty() {
+        return;
+    }
+    // Frozen RawT texts (inlined anon/local bodies) captured the old
+    // names: rewrite exact matches like the lambda-disambiguation twin.
+    fn rewrite_rawt(
+        e: &mut Expr,
+        renames: &HashMap<String, String>,
+        pool: &ClassPool,
+        pc: &PoolClass,
+    ) {
+        if let Expr::RawT(text, _) = e {
+            if let Some(n) = renames.get(text.as_str()) {
+                *text = n.clone();
+            }
+        }
+        walk_expr_children(e, pool, pc, &mut |x, p2, c2| rewrite_rawt(x, renames, p2, c2));
+    }
+    walk_stmt_exprs(body, pool, pc, &mut |e, p2, c2| rewrite_rawt(e, &renames, p2, c2));
+    let _ = pool;
+}
+
 fn disambiguate_lambda_locals(
     pc: &PoolClass,
     pool: &ClassPool,
