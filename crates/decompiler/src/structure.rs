@@ -1471,6 +1471,35 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
 
     /// `cur` is a loop header if some in-universe, unclaimed predecessor has
     /// an edge back to `cur` and `cur` dominates it, or `cur` self-loops.
+    /// True when the normal edge `p -> cur` closes a cycle at `cur`:
+    /// either `cur` dominates `p` in the scope's normal-flow dominator
+    /// tree, or `p` is exception-only reachable (compute_dominators'
+    /// RPO walks normal succ edges only, so handler-flow blocks keep
+    /// the idom[p]==p sentinel) and `cur` reaches `p` over the
+    /// exc-augmented CFG — the catch-and-retry back edge (jdk11
+    /// AbstractClassLoaderValue.putIfAbsent: the Throwable handler's
+    /// `goto H` is the retry loop's only inbound edge to H besides the
+    /// pre-loop init; jdk11/17 ObjectInputStream$1.run's superclass
+    /// walk update block). The scope's dom root is excluded: its idom
+    /// is itself too, and root->cur with cur reaching the root is just
+    /// the enclosing scope's circulation.
+    fn closes_back_edge(&self, cur: usize, p: usize, dom: &DomInfo) -> bool {
+        if p == cur {
+            return true;
+        }
+        if dom.dominates(cur, p) {
+            return true;
+        }
+        if dom.idom[p] == p && dom.idom[cur] != cur && p != dom.idom[cur] {
+            let mut xs: HashMap<usize, Vec<usize>> = HashMap::new();
+            for e in &self.cfg.exc_edges {
+                xs.entry(e.from).or_default().push(e.to);
+            }
+            return can_reach_cfg_barred(self.cfg, &xs, cur, p, &HashSet::new(), 8192);
+        }
+        false
+    }
+
     fn is_loop_header(
         &self,
         cur: usize,
@@ -1517,7 +1546,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             if p == cur {
                 return true;
             }
-            if universe.contains(&p) && dom.dominates(cur, p) {
+            if universe.contains(&p) && self.closes_back_edge(cur, p, dom) {
                 if single_enclosing_succ {
                     let x = self.cfg.blocks[cur].succ[0];
                     let mut barriers: HashSet<usize> = HashSet::new();
@@ -1534,31 +1563,6 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                     }
                 }
                 return true;
-            }
-            // `cur` itself must be normal-flow reachable in this scope
-            // (non-sentinel idom): on an exc-augmented cycle every member
-            // sees every other member as reachable, and without this guard
-            // a handler-flow block mid-cycle (jdk11 Process.waitFor's
-            // `Thread.sleep` between the rem-test and the rem-update —
-            // the genuine header is the protected exitValue() block two
-            // hops up, owned by precompute_exc_retry) was flagged as a
-            // header too, wrapping the sleep in a spurious
-            // `while(true){..break}`.
-            if universe.contains(&p)
-                && dom.idom[p] == p
-                && dom.idom[cur] != cur
-                && p != dom.idom[cur]
-            {
-                let xs = exc_succ.get_or_insert_with(|| {
-                    let mut m: HashMap<usize, Vec<usize>> = HashMap::new();
-                    for e in &self.cfg.exc_edges {
-                        m.entry(e.from).or_default().push(e.to);
-                    }
-                    m
-                });
-                if can_reach_cfg_barred(self.cfg, xs, cur, p, &HashSet::new(), 8192) {
-                    return true;
-                }
             }
         }
         false
@@ -1840,7 +1844,8 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         || self.sese_loop_headers.contains(&cur))
                     || !self.cfg.blocks[cur].pred.iter().any(|&p| {
                         p != cur
-                            && dom.dominates(cur, p)
+                            && universe.contains(&p)
+                            && self.closes_back_edge(cur, p, &dom)
                             && (self.cfg.blocks[p].end <= self.groups[gi].start
                                 || self.cfg.blocks[p].start >= self.groups[gi].end)
                     })
