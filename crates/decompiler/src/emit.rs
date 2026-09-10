@@ -1211,16 +1211,22 @@ impl<'a> Printer<'a> {
                             let mut cur = self.pc.internal_name.clone();
                             let mut shadow = false;
                             while cur != *cls {
-                                if let Some(cpc) = self.pool.get(&cur) {
-                                    if cpc
-                                        .cf
-                                        .fields
-                                        .iter()
-                                        .any(|f| cpc.utf8(f.name_index) == Some(name))
-                                    {
-                                        shadow = true;
-                                        break;
+                                // Inherited fields shadow too (superclass
+                                // chain — see the method-side twin).
+                                let mut sup = Some(cur.clone());
+                                while let Some(c) = sup.take() {
+                                    if let Some(cpc) = self.pool.get(&c) {
+                                        if cpc.cf.fields.iter().any(|f| {
+                                            cpc.utf8(f.name_index) == Some(name)
+                                        }) {
+                                            shadow = true;
+                                            break;
+                                        }
+                                        sup = cpc.super_name().map(|s| s.to_string());
                                     }
+                                }
+                                if shadow {
+                                    break;
                                 }
                                 match cur.rfind('$') {
                                     Some(i) => cur.truncate(i),
@@ -1427,13 +1433,28 @@ impl<'a> Printer<'a> {
                                 let mut cur = self.pc.internal_name.clone();
                                 let mut shadow = false;
                                 while cur != *cls {
-                                    if let Some(cpc) = self.pool.get(&cur) {
-                                        if (0..cpc.cf.methods.len())
-                                            .any(|mi| cpc.method_name(mi) == Some(name.as_str()))
-                                        {
-                                            shadow = true;
-                                            break;
+                                    // Inherited members shadow too: the
+                                    // lexical member scope of a class
+                                    // includes its whole superclass chain
+                                    // (jdk26 GaloisCounterMode$GCMDecrypt
+                                    // extends GCMEngine, whose own
+                                    // implGCMCrypt(ByteBuffer,..) hijacks
+                                    // the bare 9-arg call to the OUTER
+                                    // static — 无法将方法应用到给定类型).
+                                    let mut sup = Some(cur.clone());
+                                    while let Some(c) = sup.take() {
+                                        if let Some(cpc) = self.pool.get(&c) {
+                                            if (0..cpc.cf.methods.len()).any(|mi| {
+                                                cpc.method_name(mi) == Some(name.as_str())
+                                            }) {
+                                                shadow = true;
+                                                break;
+                                            }
+                                            sup = cpc.super_name().map(|s| s.to_string());
                                         }
+                                    }
+                                    if shadow {
+                                        break;
                                     }
                                     match cur.rfind('$') {
                                         Some(i) => cur.truncate(i),

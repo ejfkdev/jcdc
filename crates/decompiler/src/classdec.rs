@@ -2495,6 +2495,7 @@ fn late_typevar_arg_casts(
     pc: &PoolClass,
     pool: &ClassPool,
     msig: Option<&jcdc_jvm::MethodSignature>,
+    vt: &crate::varalloc::VarTable,
 ) {
     let mut denotable: std::collections::HashSet<String> =
         class_typevar_names(pc).into_iter().collect();
@@ -2506,6 +2507,151 @@ fn late_typevar_arg_casts(
     if denotable.is_empty() {
         return;
     }
+    // A generic call under a PARAMETERIZED LocalDef target: bind the
+    // method's own typevars by unifying its Signature return with the
+    // declared type, then cast erased-Object actuals at those formals
+    // (jdk11/17/26 ConcurrentLinkedDeque.readObject's
+    // `Node<E> newNode = newNode(item)` — the (E) item cast leaves NO
+    // bytecode trace (erasure Object), and without it the diamond-free
+    // generic call dies 推论变量 E#1 具有不兼容的上限).
+    fn g_denotable(
+        g: &jcdc_jvm::GenericType,
+        den: &std::collections::HashSet<String>,
+    ) -> bool {
+        use jcdc_jvm::GenericType as G;
+        match g {
+            G::TypeVar(n) => den.contains(n),
+            G::Array(i) => g_denotable(i, den),
+            G::Class(cs) => cs.parts.iter().all(|p| p.args.iter().all(|a| g_denotable(a, den))),
+            G::Wildcard(jcdc_jvm::WildcardBound::Any) => true,
+            G::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
+            | G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => g_denotable(t, den),
+            _ => true,
+        }
+    }
+    fn pin_localdef(
+        init: &mut Expr,
+        var: u32,
+        vt: &crate::varalloc::VarTable,
+        pc: &PoolClass,
+        pool: &ClassPool,
+        denotable: &std::collections::HashSet<String>,
+    ) {
+        let Some(info) = vt.vars.get(var as usize) else { return };
+        let TypeRef::G(jcdc_jvm::GenericType::Class(tcs)) = &info.ty else { return };
+        if tcs.parts.last().map(|p| p.args.is_empty()).unwrap_or(true) {
+            return;
+        }
+        let Expr::Method { cls, name, desc, args, type_args, owner, .. } = init else { return };
+        if !type_args.is_empty() || cls != &pc.internal_name {
+            return;
+        }
+        if owner.as_ref().map(|o| !matches!(o.as_ref(), Expr::This)).unwrap_or(false) {
+            return;
+        }
+        let want_desc = format!(
+            "({}){}",
+            desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+            desc.ret.to_descriptor()
+        );
+        let Some(mi) = (0..pc.cf.methods.len()).find(|&i| {
+            pc.method_name(i) == Some(name.as_str())
+                && pc.method_desc(i) == Some(want_desc.as_str())
+        }) else {
+            return;
+        };
+        let Some(msig) = method_signature_of(pc, mi) else { return };
+        if msig.params.is_empty() || msig.args.len() != args.len() {
+            return;
+        }
+        let mut subst: Vec<(String, jcdc_jvm::GenericType)> = Vec::new();
+        unify_types(
+            &msig.ret,
+            &jcdc_jvm::GenericType::Class(tcs.clone()),
+            &mut subst,
+        );
+        if subst.is_empty() {
+            return;
+        }
+        for (a, formal) in args.iter_mut().zip(msig.args.iter()) {
+            let jcdc_jvm::GenericType::TypeVar(tn) = formal else { continue };
+            let Some(bound) = subst.iter().find(|(n, _)| n == tn).map(|(_, g)| g.clone()) else {
+                continue;
+            };
+            if !denotable.contains(tn) || !g_denotable(&bound, denotable) {
+                continue;
+            }
+            if matches!(a, Expr::Cast { .. }) {
+                continue;
+            }
+            if !matches!(a.type_ref().erased(), jcdc_jvm::JavaType::Object(_)) {
+                continue;
+            }
+            let inner = std::mem::replace(a, Expr::This);
+            *a = Expr::Cast { ty: TypeRef::G(bound), e: Box::new(inner) };
+        }
+    }
+    fn pin_stmt(
+        s: &mut Stmt,
+        vt: &crate::varalloc::VarTable,
+        pc: &PoolClass,
+        pool: &ClassPool,
+        denotable: &std::collections::HashSet<String>,
+    ) {
+        match s {
+            Stmt::Block(v) => {
+                v.iter_mut().for_each(|x| pin_stmt(x, vt, pc, pool, denotable))
+            }
+            Stmt::LocalDef { var, init: Some(init), .. } => {
+                pin_localdef(init, *var, vt, pc, pool, denotable)
+            }
+            Stmt::ExprStmt(_) | Stmt::Return(_) => {}
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                pin_stmt(then_stmt, vt, pc, pool, denotable);
+                if let Some(x) = else_stmt {
+                    pin_stmt(x, vt, pc, pool, denotable);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::Labeled { body, .. }
+            | Stmt::Synchronized { body, .. } => pin_stmt(body, vt, pc, pool, denotable),
+            Stmt::For { init, body, .. } => {
+                init.iter_mut().for_each(|i| pin_stmt(i, vt, pc, pool, denotable));
+                pin_stmt(body, vt, pc, pool, denotable);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    c.body.iter_mut().for_each(|x| pin_stmt(x, vt, pc, pool, denotable));
+                }
+                if let Some(d) = default {
+                    pin_stmt(d, vt, pc, pool, denotable);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                pin_stmt(body, vt, pc, pool, denotable);
+                for c in catches.iter_mut() {
+                    pin_stmt(&mut c.body, vt, pc, pool, denotable);
+                }
+                if let Some(f) = finally {
+                    pin_stmt(f, vt, pc, pool, denotable);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter_mut().for_each(|r| pin_stmt(r, vt, pc, pool, denotable));
+                pin_stmt(body, vt, pc, pool, denotable);
+                for c in catches.iter_mut() {
+                    pin_stmt(&mut c.body, vt, pc, pool, denotable);
+                }
+                if let Some(f) = finally {
+                    pin_stmt(f, vt, pc, pool, denotable);
+                }
+            }
+            _ => {}
+        }
+    }
+    pin_stmt(s, vt, pc, pool, &denotable);
     fn fix(
         e: &mut Expr,
         pool: &ClassPool,
@@ -3273,7 +3419,7 @@ fn emit_method_with(
             // Last moment before printing: labels can be dropped by any
             // earlier reshaping pass, leaving undefined-label breaks.
             crate::method::demote_undefined_label_jumps(&mut body);
-            late_typevar_arg_casts(&mut body, pc, pool, msig.as_ref());
+            late_typevar_arg_casts(&mut body, pc, pool, msig.as_ref(), &mb.vt);
             let text = Printer::new(pc, pool, &mb.vt)
                 .with_indent(indent + 1)
                 .with_ret_bool(ret_bool)
