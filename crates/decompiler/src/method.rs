@@ -699,7 +699,16 @@ pub fn decompile_method(
         && crate::structure::Structurer::stmt_splice_pathology(&body)
     {
         crate::sese::MATEXIT_DISABLED.with(|d| d.set(true));
+        // The retry must see FIRED=false: the flag is only reset at
+        // depth 1, and with matexit DISABLED the inner pass cannot
+        // re-set it — a stale TRUE plus a pathology the scanner also
+        // flags in the DISABLED shape re-armed this branch at every
+        // level (jdk26 ConcurrentLinkedQueue.poll recursed to the
+        // depth-64 bail, the method emitted as a comment stub —
+        // 缺少返回语句). One retry means one retry.
+        let fired_saved = crate::sese::MATEXIT_FIRED.with(|f| f.replace(false));
         let retry = decompile_method(pc, pool, m_idx);
+        crate::sese::MATEXIT_FIRED.with(|f| f.set(fired_saved));
         crate::sese::MATEXIT_DISABLED.with(|d| d.set(false));
         return retry;
     }
