@@ -627,6 +627,7 @@ pub fn decompile_method(
     cleanup(&mut body);
     dbg_body!("post-prune-rethrows");
     fix_empty_catchall(&mut body);
+    order_try_catches(&mut body, pool);
     cleanup(&mut body);
     let stack_vars = vt.stack_vars.clone();
     fold_this_stack_vars(&mut body, &vt, &stack_vars);
@@ -5884,6 +5885,128 @@ fn demote_defs(s: &mut Stmt, vars: &std::collections::HashSet<u32>, vt: &VarTabl
 /// catch. Pattern: Try whose last catch is catch-all ending with
 /// `throw <var>` → convert to `finally` and strip the trailing duplicate
 /// from the body and each typed catch.
+/// Reorder each try's catches so no catch is shadowed by an EARLIER
+/// broader one (javac: 已捕获到异常错误). The exception table lists
+/// handlers in bytecode-layout order; when javac splits an outer try
+/// around an inner try/catch (the handler-protection range gives the
+/// inner body's group both the inner and the outer handlers), the broad
+/// catch can precede its own subtypes (jdk26 KDF.chooseProvider:
+/// catch(Exception) before catch(InvalidAlgorithmParameterException) /
+/// catch(NoSuchAlgorithmException) — unreachable siblings ×2; the source
+/// nests the retry loop's catch(Exception) inside the outer IAPE/NSAE
+/// try, and for the body range the specific-first order IS the source
+/// dispatch semantics). Stable subtype-first insertion sort: a catch
+/// moves left only past catches it is a STRICT subtype of; unrelated or
+/// multi-catch entries keep table order.
+fn order_try_catches(s: &mut Stmt, pool: &ClassPool) {
+    fn single(exc: &[String]) -> Option<&str> {
+        if exc.len() == 1 {
+            Some(exc[0].as_str())
+        } else {
+            None
+        }
+    }
+    match s {
+        Stmt::Try { body, catches, finally }
+        | Stmt::TryWithResources { body, catches, finally, .. } => {
+            order_try_catches(body, pool);
+            for c in catches.iter_mut() {
+                order_try_catches(&mut c.body, pool);
+            }
+            if let Some(f) = finally {
+                order_try_catches(f, pool);
+            }
+            let mut i = 1;
+            while i < catches.len() {
+                let mut j = i;
+                while j > 0 {
+                    let moved = match (single(&catches[j].exc), single(&catches[j - 1].exc)) {
+                        (Some(cur), Some(prev)) => {
+                            cur != prev
+                                && crate::classdec::is_subtype_of(
+                                    pool,
+                                    &jcdc_jvm::JavaType::Object(cur.to_string()),
+                                    prev,
+                                )
+                        }
+                        _ => false,
+                    };
+                    if !moved {
+                        break;
+                    }
+                    catches.swap(j, j - 1);
+                    j -= 1;
+                }
+                i += 1;
+            }
+        }
+        Stmt::Block(v) => v.iter_mut().for_each(|x| order_try_catches(x, pool)),
+        Stmt::ExprStmt(e) => order_in_expr(e, pool),
+        Stmt::LocalDef { init: Some(e), .. } => order_in_expr(e, pool),
+        Stmt::Return(Some(e)) | Stmt::Throw(e) => order_in_expr(e, pool),
+        Stmt::If { cond, then_stmt, else_stmt } => {
+            order_in_expr(cond, pool);
+            order_try_catches(then_stmt, pool);
+            if let Some(x) = else_stmt {
+                order_try_catches(x, pool);
+            }
+        }
+        Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+            order_in_expr(cond, pool);
+            order_try_catches(body, pool);
+        }
+        Stmt::For { init, cond, update, body } => {
+            init.iter_mut().for_each(|x| order_try_catches(x, pool));
+            if let Some(c) = cond {
+                order_in_expr(c, pool);
+            }
+            update.iter_mut().for_each(|u| order_in_expr(u, pool));
+            order_try_catches(body, pool);
+        }
+        Stmt::ForEach { iterable, body, .. } => {
+            order_in_expr(iterable, pool);
+            order_try_catches(body, pool);
+        }
+        Stmt::Switch { cases, default, .. } => {
+            for c in cases.iter_mut() {
+                c.body.iter_mut().for_each(|st| order_try_catches(st, pool));
+            }
+            if let Some(d) = default {
+                order_try_catches(d, pool);
+            }
+        }
+        Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => {
+            order_try_catches(body, pool)
+        }
+        _ => {}
+    }
+}
+
+fn order_in_expr(e: &mut Expr, pool: &ClassPool) {
+    match e {
+        Expr::Method { owner, args, .. } => {
+            if let Some(o) = owner {
+                order_in_expr(o, pool);
+            }
+            args.iter_mut().for_each(|a| order_in_expr(a, pool));
+        }
+        Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+            args.iter_mut().for_each(|a| order_in_expr(a, pool))
+        }
+        Expr::Cast { e: i, .. } | Expr::Un { e: i, .. } => order_in_expr(i, pool),
+        Expr::Bin { l, r, .. } | Expr::Assign { target: l, value: r, .. } => {
+            order_in_expr(l, pool);
+            order_in_expr(r, pool);
+        }
+        Expr::Cond { c, t, f } => {
+            order_in_expr(c, pool);
+            order_in_expr(t, pool);
+            order_in_expr(f, pool);
+        }
+        _ => {}
+    }
+}
+
 fn dedupe_finally(s: &mut Stmt) {
     match s {
         Stmt::Try { body, catches, finally } => {
