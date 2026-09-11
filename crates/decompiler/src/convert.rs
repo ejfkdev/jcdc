@@ -1163,7 +1163,44 @@ fn extract_compound_do_while(body: &Stmt) -> Option<(Vec<Stmt>, Expr, Stmt)> {
             other => vec![other.clone()],
         }
     }
-    let stmts = flatten_seq(body);
+    let mut stmts = flatten_seq(body);
+    // Unnest the rendered if/else-if CHAIN spine: javac's bottom-tested
+    // `if (c1) continue; if (c2) continue; ... else exit;` disjunct run
+    // converts to ONE nested If whose else arms hold the remaining
+    // tests — opaque to the backwards scan below, which would fold only
+    // c1 and push the whole c2..cN chain out of the loop as the "exit"
+    // (jdk26 ML_DSA.signInternal: `do { expandMask.. } while
+    // (vectorNormBound(z,..));` with the c2/hint chain — and its
+    // continue/break — stranded after the loop, continue 在 loop 外部
+    // ×2). Splitting each continue-then If back into siblings restores
+    // the flat run; semantics are identical (the then arm is a bare
+    // continue with no fallthrough, and the LAST else is preserved as
+    // the final statement's else = the loop's exit route).
+    {
+        let mut flat: Vec<Stmt> = Vec::new();
+        for st in stmts.into_iter() {
+            let mut cur = st;
+            loop {
+                match cur {
+                    Stmt::If { cond, then_stmt, else_stmt: Some(e) }
+                        if is_continue_stmt(&then_stmt) =>
+                    {
+                        flat.push(Stmt::If {
+                            cond,
+                            then_stmt,
+                            else_stmt: None,
+                        });
+                        cur = *e;
+                    }
+                    other => {
+                        flat.push(other);
+                        break;
+                    }
+                }
+            }
+        }
+        stmts = flat;
+    }
     let n = stmts.len();
     if n < 2 {
         return None;
