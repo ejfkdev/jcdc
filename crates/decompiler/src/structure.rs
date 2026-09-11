@@ -3376,6 +3376,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             && !bstop.contains(&fall)
                             && !self.loops_stack.contains(&fall)
                             && !self.terminator_writes_final(fall)
+                            && !self.shared_tail_confluence(fall)
                         {
                             if let Some(r) = self.copy_walk(fall, &bstop, active, cur) {
                                 r
@@ -3813,6 +3814,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             } else if !stop.contains(&t)
                                 && !self.loops_stack.contains(&t)
                                 && !Self::ctx_is_loop_header(self, t)
+                                && !self.shared_tail_confluence(t)
                                 && !self.is_active_group_continuation(
                                     cur,
                                     t,
@@ -4628,6 +4630,22 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         let mut barriers = stop.clone();
         barriers.extend(self.loops_stack.iter().copied());
         barriers.insert(guard_against);
+        // Shared tail-confluence heads inside the closure become dynamic
+        // barriers: the copy stops before them and defers to the owner
+        // walk's canonical render (keytool doCommands' load epilogue was
+        // re-rendered by every password-section copy whose closure flowed
+        // into it — 12 inline survivors blew the 64K try-codegen limit).
+        // Skip the pre-pass when t is itself a terminator (legit shared
+        // return-tail copies never traverse a confluence head anyway).
+        if !self.is_terminator_block(t) {
+            let probe = reachable_within(self.cfg, t, &barriers);
+            let extra: Vec<usize> = probe
+                .iter()
+                .copied()
+                .filter(|&x| x != t && self.shared_tail_confluence(x))
+                .collect();
+            barriers.extend(extra);
+        }
         let tu = reachable_within(self.cfg, t, &barriers);
         if !tu.contains(&t) {
             return None;
@@ -4687,6 +4705,65 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             self.results[b].term,
             Term::Return(_) | Term::Throw(_)
         )
+    }
+
+    /// True when `b` reaches some method Return through normal edges
+    /// (bounded BFS): the block sits on a live route to the method end,
+    /// i.e. it heads a method-tail region rather than a self-contained
+    /// abrupt epilogue.
+    fn reaches_any_return(&self, b: usize) -> bool {
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut q: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        q.push_back(b);
+        let mut budget = 4096;
+        while let Some(x) = q.pop_front() {
+            if budget == 0 {
+                return false;
+            }
+            budget -= 1;
+            if !seen.insert(x) {
+                continue;
+            }
+            if matches!(self.results[x].term, Term::Return(_)) {
+                return true;
+            }
+            for &sx in &self.cfg.blocks[x].succ {
+                q.push_back(sx);
+            }
+        }
+        false
+    }
+
+    /// A SHARED TAIL CONFLUENCE: a many-pred normal merge head that sits
+    /// on a live route to the method's final return (jdk11/26 keytool
+    /// doCommands' keystore-load epilogue, block 376 `if (!token)` with
+    /// 28 preds: every password-section arm/handler exit jumps to it, and
+    /// the canonical owner walk renders it once after the dispatch
+    /// chain). Per-arrival COPY contexts must not swallow such a head in
+    /// their universe closures: each copy re-renders the whole ~92-line
+    /// epilogue (12 survivors inflated the method past javac's 64K
+    /// try-codegen limit — try 语句的代码过长 ×64/87). The copy's exit
+    /// Goto resolves at conversion like every deferred shared merge.
+    /// Terminator heads stay copyable (the established per-arrival shared
+    /// RETURN-tail discipline — small, no outgoing flow, nothing to
+    /// duplicate); handler heads and group-span starts are structural
+    /// territory, excluded; the high pred floor keeps ordinary merges
+    /// (loop selectors, small diamonds) out — copy-local merges have
+    /// their preds inside the closure and close normally.
+    fn shared_tail_confluence(&self, b: usize) -> bool {
+        if self.is_terminator_block(b) || self.is_handler(b) {
+            return false;
+        }
+        let bstart = self.cfg.blocks[b].start;
+        if self.groups.iter().any(|g| g.start == bstart) {
+            return false;
+        }
+        let normal_preds = self.cfg.blocks[b]
+            .pred
+            .iter()
+            .filter(|p| !self.is_handler(**p))
+            .count();
+        normal_preds >= 8 && self.reaches_any_return(b)
     }
 
     /// True when EVERY normal flow path out of `b` ends in a
