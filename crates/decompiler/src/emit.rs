@@ -2241,6 +2241,27 @@ impl<'a> Printer<'a> {
                                 &fam,
                                 &vt,
                             );
+                            // Lambda impl bodies decompiled HERE bypass
+                            // emit_method_with, so the capture-snapshot
+                            // pass never ran on them: an inner lambda
+                            // capturing a multi-assigned local of THIS
+                            // body rendered the raw name (jdk26
+                            // MethodHandleProxies.createTemplate's
+                            // withMethodBody/trying/catching lambdas
+                            // capture the loop-reassigned `mi` —
+                            // 从lambda表达式引用的本地变量必须是最终变量
+                            // ×6). fix_lambda_captures inserts the
+                            // `final T mi$capN = mi;` snapshots and
+                            // registers the renames on the inner
+                            // LambdaExprs before their own print-time
+                            // decompile picks them up.
+                            crate::classdec::fix_lambda_captures(
+                                &mut body,
+                                &mut vt,
+                                self.pc,
+                                self.pool,
+                                &fam,
+                            );
                         }
                         // Inner-class lambda impls read the synthetic
                         // outer field directly (`this.this$0.cp`): the

@@ -8209,153 +8209,193 @@ pub(crate) fn fix_lambda_captures(
     fam: &Family,
 ) {
     let mut assigns: HashMap<u32, usize> = HashMap::new();
-    fn count_e(e: &Expr, assigns: &mut HashMap<u32, usize>) {
+    fn count_e(
+        e: &Expr,
+        assigns: &mut HashMap<u32, usize>,
+        depth: usize,
+        loopmax: &mut HashMap<u32, usize>,
+    ) {
         match e {
             Expr::Assign { target, value, .. } => {
                 if let Expr::Local { var, .. } = &**target {
                     *assigns.entry(*var).or_insert(0) += 1;
+                    if depth > 0 {
+                        let m = loopmax.entry(*var).or_insert(0);
+                        *m = (*m).max(depth);
+                    }
                 }
-                count_e(value, assigns);
+                count_e(value, assigns, depth, loopmax);
             }
             Expr::PreIncDec { e: i, .. } | Expr::PostIncDec { e: i, .. } => {
                 if let Expr::Local { var, .. } = &**i {
                     *assigns.entry(*var).or_insert(0) += 1;
+                    if depth > 0 {
+                        let m = loopmax.entry(*var).or_insert(0);
+                        *m = (*m).max(depth);
+                    }
                 }
-                count_e(i, assigns);
+                count_e(i, assigns, depth, loopmax);
             }
             Expr::Method { owner, args, .. } => {
                 if let Some(o) = owner {
-                    count_e(o, assigns);
+                    count_e(o, assigns, depth, loopmax);
                 }
-                args.iter().for_each(|a| count_e(a, assigns));
+                args.iter().for_each(|a| count_e(a, assigns, depth, loopmax));
             }
             Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
-                args.iter().for_each(|a| count_e(a, assigns))
+                args.iter().for_each(|a| count_e(a, assigns, depth, loopmax))
             }
-            Expr::Field { owner: Some(o), .. } => count_e(o, assigns),
+            Expr::Field { owner: Some(o), .. } => count_e(o, assigns, depth, loopmax),
             Expr::ArrayIndex { array, index } => {
-                count_e(array, assigns);
-                count_e(index, assigns);
+                count_e(array, assigns, depth, loopmax);
+                count_e(index, assigns, depth, loopmax);
             }
-            Expr::Cast { e: i, .. } | Expr::InstanceOf { e: i, .. } | Expr::Un { e: i, .. } => count_e(i, assigns),
+            Expr::Cast { e: i, .. } | Expr::InstanceOf { e: i, .. } | Expr::Un { e: i, .. } => count_e(i, assigns, depth, loopmax),
             Expr::Bin { l, r, .. } => {
-                count_e(l, assigns);
-                count_e(r, assigns);
+                count_e(l, assigns, depth, loopmax);
+                count_e(r, assigns, depth, loopmax);
             }
             Expr::Cond { c, t, f } => {
-                count_e(c, assigns);
-                count_e(t, assigns);
-                count_e(f, assigns);
+                count_e(c, assigns, depth, loopmax);
+                count_e(t, assigns, depth, loopmax);
+                count_e(f, assigns, depth, loopmax);
             }
             Expr::NewArray { dims, init, .. } => {
-                dims.iter().for_each(|d| count_e(d, assigns));
+                dims.iter().for_each(|d| count_e(d, assigns, depth, loopmax));
                 if let Some(vals) = init {
-                    vals.iter().for_each(|v| count_e(v, assigns));
+                    vals.iter().for_each(|v| count_e(v, assigns, depth, loopmax));
                 }
             }
             Expr::StringConcat(parts) => parts.iter().for_each(|p| {
                 if let crate::expr::ConcatPart::Str(i) = p {
-                    count_e(i, assigns);
+                    count_e(i, assigns, depth, loopmax);
                 }
             }),
-            Expr::Lambda(l) => l.captures.iter().for_each(|c| count_e(c, assigns)),
-            Expr::Invokedynamic { args, .. } => args.iter().for_each(|a| count_e(a, assigns)),
+            Expr::Lambda(l) => l.captures.iter().for_each(|c| count_e(c, assigns, depth, loopmax)),
+            Expr::Invokedynamic { args, .. } => args.iter().for_each(|a| count_e(a, assigns, depth, loopmax)),
             _ => {}
         }
     }
-    fn count_s(st: &Stmt, assigns: &mut HashMap<u32, usize>) {
+    fn count_s(
+        st: &Stmt,
+        assigns: &mut HashMap<u32, usize>,
+        depth: usize,
+        loopmax: &mut HashMap<u32, usize>,
+        decl_at: &mut HashMap<u32, usize>,
+    ) {
         match st {
-            Stmt::Block(v) => v.iter().for_each(|x| count_s(x, assigns)),
-            Stmt::ExprStmt(e) => count_e(e, assigns),
+            Stmt::Block(v) => v.iter().for_each(|x| count_s(x, assigns, depth, loopmax, decl_at)),
+            Stmt::ExprStmt(e) => count_e(e, assigns, depth, loopmax),
             Stmt::LocalDef { var, init, .. } => {
+                decl_at.entry(*var).or_insert(depth);
                 if init.is_some() {
                     *assigns.entry(*var).or_insert(0) += 1;
                 }
                 if let Some(e) = init {
-                    count_e(e, assigns);
+                    count_e(e, assigns, depth, loopmax);
                 }
             }
             Stmt::Return(e) => {
                 if let Some(x) = e {
-                    count_e(x, assigns);
+                    count_e(x, assigns, depth, loopmax);
                 }
             }
-            Stmt::Throw(e) => count_e(e, assigns),
+            Stmt::Throw(e) => count_e(e, assigns, depth, loopmax),
             Stmt::If { cond, then_stmt, else_stmt } => {
-                count_e(cond, assigns);
-                count_s(then_stmt, assigns);
+                count_e(cond, assigns, depth, loopmax);
+                count_s(then_stmt, assigns, depth, loopmax, decl_at);
                 if let Some(x) = else_stmt {
-                    count_s(x, assigns);
+                    count_s(x, assigns, depth, loopmax, decl_at);
                 }
             }
             Stmt::While { cond, body } => {
-                count_e(cond, assigns);
-                count_s(body, assigns);
+                count_e(cond, assigns, depth, loopmax);
+                count_s(body, assigns, depth + 1, loopmax, decl_at);
             }
             Stmt::DoWhile { body, cond } => {
-                count_s(body, assigns);
-                count_e(cond, assigns);
+                count_s(body, assigns, depth + 1, loopmax, decl_at);
+                count_e(cond, assigns, depth, loopmax);
             }
             Stmt::For { init, cond, update, body } => {
-                init.iter().for_each(|i| count_s(i, assigns));
+                init.iter().for_each(|i| count_s(i, assigns, depth + 1, loopmax, decl_at));
                 if let Some(c) = cond {
-                    count_e(c, assigns);
+                    count_e(c, assigns, depth, loopmax);
                 }
-                update.iter().for_each(|u| count_e(u, assigns));
-                count_s(body, assigns);
+                update.iter().for_each(|u| count_e(u, assigns, depth + 1, loopmax));
+                count_s(body, assigns, depth + 1, loopmax, decl_at);
             }
-            Stmt::ForEach { iterable, body, .. } => {
-                count_e(iterable, assigns);
-                count_s(body, assigns);
+            Stmt::ForEach { var, iterable, body, .. } => {
+                decl_at.entry(*var).or_insert(depth + 1);
+                count_e(iterable, assigns, depth, loopmax);
+                count_s(body, assigns, depth + 1, loopmax, decl_at);
             }
             Stmt::Switch { selector, cases, default, .. } => {
-                count_e(selector, assigns);
+                count_e(selector, assigns, depth, loopmax);
                 for c in cases {
-                    c.body.iter().for_each(|st| count_s(st, assigns));
+                    c.body.iter().for_each(|st| count_s(st, assigns, depth, loopmax, decl_at));
                 }
                 if let Some(d) = default {
-                    count_s(d, assigns);
+                    count_s(d, assigns, depth, loopmax, decl_at);
                 }
             }
             Stmt::Try { body, catches, finally } => {
-                count_s(body, assigns);
+                count_s(body, assigns, depth, loopmax, decl_at);
                 for c in catches {
-                    count_s(&c.body, assigns);
+                    count_s(&c.body, assigns, depth, loopmax, decl_at);
                 }
                 if let Some(f) = finally {
-                    count_s(f, assigns);
+                    count_s(f, assigns, depth, loopmax, decl_at);
                 }
             }
             Stmt::TryWithResources { resources, body, catches, finally } => {
-                resources.iter().for_each(|r| count_s(r, assigns));
-                count_s(body, assigns);
+                resources.iter().for_each(|r| count_s(r, assigns, depth, loopmax, decl_at));
+                count_s(body, assigns, depth, loopmax, decl_at);
                 for c in catches {
-                    count_s(&c.body, assigns);
+                    count_s(&c.body, assigns, depth, loopmax, decl_at);
                 }
                 if let Some(f) = finally {
-                    count_s(f, assigns);
+                    count_s(f, assigns, depth, loopmax, decl_at);
                 }
             }
             Stmt::Synchronized { lock, body } => {
-                count_e(lock, assigns);
-                count_s(body, assigns);
+                count_e(lock, assigns, depth, loopmax);
+                count_s(body, assigns, depth, loopmax, decl_at);
             }
-            Stmt::Labeled { body, .. } => count_s(body, assigns),
+            Stmt::Labeled { body, .. } => count_s(body, assigns, depth, loopmax, decl_at),
             Stmt::Assert { cond, msg } => {
-                count_e(cond, assigns);
+                count_e(cond, assigns, depth, loopmax);
                 if let Some(m) = msg {
-                    count_e(m, assigns);
+                    count_e(m, assigns, depth, loopmax);
                 }
             }
             _ => {}
         }
     }
-    count_s(s, &mut assigns);
-    let multi: HashSet<u32> = assigns
+    let mut loopmax: HashMap<u32, usize> = HashMap::new();
+    let mut decl_at: HashMap<u32, usize> = HashMap::new();
+    count_s(s, &mut assigns, 0, &mut loopmax, &mut decl_at);
+    let mut multi: HashSet<u32> = assigns
         .iter()
         .filter(|(_, &n)| n >= 2)
         .map(|(&v, _)| v)
         .collect();
+    // A SINGLE assign statement inside a loop body also defeats
+    // effectively-final when the variable's declaration lives outside
+    // that loop: the loop re-executes the assign on the next iteration
+    // (javac: "might already be assigned" at the capture). jdk26
+    // MethodHandleProxies' second per-method loop assigns `mi =
+    // (MethodInfo) i$.next()` once per iteration while the withMethodBody
+    // lambdas capture mi — 从lambda表达式引用的本地变量必须是最终变量 ×6.
+    // A var declared INSIDE the loop body (fresh per iteration, e.g. the
+    // sibling loop's `MethodInfo mi$1 = ...` LocalDef) keeps its
+    // effectively-final status: only an assign DEEPER than the decl flags.
+    // Vars with no LocalDef at all are hoisted synthetics — treat them as
+    // declared at method top (depth 0), so any in-loop assign flags.
+    for (&v, &d) in loopmax.iter() {
+        if d > *decl_at.get(&v).unwrap_or(&0) {
+            multi.insert(v);
+        }
+    }
     if multi.is_empty() && fam.locals.is_empty() {
         return;
     }
