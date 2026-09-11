@@ -278,6 +278,7 @@ pub fn immediate_postdom(
     universe: &HashSet<usize>,
     entry: usize,
     group_owned: &HashSet<usize>,
+    stmt_counts: &[usize],
     body_group_of: &HashMap<usize, usize>,
     entry_group: Option<usize>,
     terminators: &HashSet<usize>,
@@ -338,6 +339,7 @@ pub fn immediate_postdom(
         .iter()
         .any(|&x| x == entry);
     let mut best: Option<(u32, usize)> = None;
+    let mut any_rejected = false;
     for (&cand, &d0) in dists[0].iter() {
         if cand == entry {
             continue;
@@ -378,47 +380,119 @@ pub fn immediate_postdom(
             // whose javac expansion overflowed (try 语句的代码过长 x93).
             let same_body = entry_group.is_some()
                 && body_group_of.get(&cand) == entry_group.as_ref();
+            let stmts_at_least_8 = stmt_counts.get(cand).copied().unwrap_or(0) >= 8;
+            // Reachability set below cand: the bypass probe must see the
+            // WHOLE downstream flow, not just cand's immediate succs —
+            // SSLConfiguration's clinit ternary scaffolding (cond ? a : b
+            // over blank-final assigns) re-converges several blocks below
+            // the taken target (head 7 -> arms 8/9 -> merge 12 -> next
+            // property 14): the fall arm's route 8 -> 13 -> 14 bypasses 9
+            // entirely, but 14 is not in succ(9) = {10, 11}, so the narrow
+            // probe kept 9 as the follow, the else walk nested property 3/4
+            // inside the client-default arm and duplicated the blank-final
+            // assigns (可能已分配/可能尚未初始化 x4 w26).
+            // Entry-barred reachability below cand: a loop wraparound
+            // re-entering the entry's own branch is NOT cand's tail
+            // territory (Legacy6 loops(): the inner-loop backedge cand 13
+            // reaches block 12 only via 13 -> 9 -> entry 10 -> 11 -> 12,
+            // and counting that confluence rejected the backedge block
+            // and spun the walk; SSLConfiguration's merge 14 stays
+            // visible — 9 -> 10 -> 12 -> 14 never crosses entry 7).
+            // Depth-capped (4 hops): the false-merge families are tight
+            // diamonds whose tail re-joins the sibling flow within a few
+            // blocks. Uncapped, a long if-chain's then-tail reaches the
+            // whole downstream method and EVERY chain COND rejects
+            // (jdk26 IndicConjunctBreak isExtend: 1300+ rejects, each
+            // re-routed follow re-walked the 4K-bytecode chain — the
+            // structurer spun at 100% CPU).
+            let mut cand_reach: HashSet<usize> = HashSet::new();
+            if std::env::var("JCDC_DBG_NOWIDE").is_err() {
+                let mut q: VecDeque<(usize, u32)> = VecDeque::new();
+                for &sx in &cfg.blocks[cand].succ {
+                    if sx != entry && cand_reach.insert(sx) {
+                        q.push_back((sx, 1));
+                    }
+                }
+                while let Some((b, db)) = q.pop_front() {
+                    if db >= 4 {
+                        continue;
+                    }
+                    for &nx in &cfg.blocks[b].succ {
+                        if nx != entry && cand_reach.insert(nx) {
+                            q.push_back((nx, db + 1));
+                        }
+                    }
+                }
+            } else {
+                cand_reach.extend(cfg.blocks[cand].succ.iter().copied());
+            }
             let bypass = !stmt_free
                 && !is_fall
                 && !same_body
                 && !group_owned.contains(&cand)
                 && succs.iter().any(|&s0| {
                     let mut seen: HashSet<usize> = HashSet::new();
-                    let mut q: VecDeque<usize> = VecDeque::new();
-                    q.push_back(s0);
+                    let mut q: VecDeque<(usize, bool)> = VecDeque::new();
+                    q.push_back((s0, false));
                     seen.insert(s0);
-                    while let Some(b) = q.pop_front() {
+                    while let Some((b, indep)) = q.pop_front() {
                         if b == cand {
                             continue;
                         }
+                        // b is an INDEPENDENT segment block when it is not
+                        // the sibling start itself and lies outside cand's
+                        // tail territory.
+                        let b_indep = indep
+                            || (b != s0 && !cand_reach.contains(&b));
                         for &nx in &cfg.blocks[b].succ {
                             if nx == cand || seen.contains(&nx) {
                                 continue;
                             }
-                            if cfg.blocks[cand].succ.contains(&nx) {
-                                // A bypass that lands on a RETURN/THROW
-                                // confluence is benign: the bypassing arm
-                                // renders the terminator inline and exits
-                                // BEFORE any parked copy of cand, so the
-                                // shared tail still executes exactly once
-                                // per arriving path (sun/reflect/annotation/
-                                // AnnotationType: both if_acmpeq guards jump
-                                // to the `retention = RUNTIME` tail, the
-                                // parse arm gotos the bare ctor Return —
-                                // rejecting it let arm 1 claim the tail and
-                                // left arm 2 empty, 可能尚未初始化变量retention
-                                // x3 trees; its parked HEAD shape compiles).
-                                // OCSPResponse's values[reason] arm flows on
-                                // into a live Goto-stub confluence and would
-                                // double-assign the parked tail — harmful.
-                                if !terminators.contains(&nx) || no_tcf {
+                            if cand_reach.contains(&nx) {
+                                // Large shared tails (>= 8 statements) skip
+                                // the independence requirement: deduping a
+                                // big epilogue is worth the re-route even
+                                // when the sibling steps straight into the
+                                // tail (keytool doCommands' 22-statement
+                                // TWR epilogues rejected from 18 switch
+                                // arms render the compact compilable 6K
+                                // shape; with the requirement they parked
+                                // per-arm copies and javac's TWR codegen
+                                // overflowed again, 64 errors). Small
+                                // statement tails keep the requirement
+                                // (IndicConjunctBreak's 3-statement chain
+                                // returns).
+                                // Re-entry into cand's tail counts as a
+                                // bypass only when the route brought its
+                                // own flow first (SSLConfiguration clinit:
+                                // the fall arm owns block 13 before
+                                // re-joining at the diamond merge 14 — the
+                                // nested-property shape double-assigned the
+                                // blank finals, 可能已分配/可能尚未初始化 x4
+                                // w26) AND the confluence is not a quiet
+                                // terminator (AnnotationType: a route dying
+                                // in its own return exits before any parked
+                                // copy of the shared tail — benign;
+                                // OCSPResponse: the values[reason] arm flows
+                                // on into a live Goto-stub confluence and
+                                // would double-assign — harmful). A sibling
+                                // that steps straight into cand's
+                                // continuation is the ordinary if-chain
+                                // merge (jdk26 IndicConjunctBreak isExtend:
+                                // counting those rejected all 1300+ chain
+                                // CONDs and spun the structurer at 100%
+                                // CPU).
+                                if (b_indep || stmts_at_least_8)
+                                    && (!terminators.contains(&nx) || no_tcf)
+                                {
                                     return true;
                                 }
                                 seen.insert(nx);
+                                q.push_back((nx, b_indep));
                                 continue;
                             }
                             seen.insert(nx);
-                            q.push_back(nx);
+                            q.push_back((nx, b_indep));
                         }
                     }
                     false
@@ -494,8 +568,25 @@ pub fn immediate_postdom(
                                 // route is live at that point.
                                 let dying = terminators.contains(&nx)
                                     || abrupt_only.contains(&nx);
+                                // A shared THROW keeps its rejection even
+                                // against a dying route: the valid path
+                                // that skips the throw must not find it
+                                // parked between the chain and its own
+                                // exit (DHKeyExchange clinit — the Goto
+                                // stub into the Return is abrupt-only, so
+                                // the dying guard would park the throw and
+                                // the valid key-size path would execute
+                                // it: 无法访问的语句 p11, silent wrong-throw
+                                // elsewhere).
+                                let throw_cand = cfg.blocks[cand]
+                                    .ins
+                                    .last()
+                                    .map(|i| {
+                                        i.op == jcdc_classfile::Opcode::Athrow
+                                    })
+                                    .unwrap_or(false);
                                 if !can_reach_cfg(cfg, nx, cand, 4096)
-                                    && (no_lr || !dying)
+                                    && (no_lr || !dying || throw_cand)
                                 {
                                     if std::env::var("JCDC_DBG_PDJ").is_ok() {
                                         eprintln!("PDJ-SKIP cand={} cand_pc={} cand_term={} s0={} s0_pc={} nx={} nx_pc={} nx_term={} no_lr={}",
@@ -519,6 +610,7 @@ pub fn immediate_postdom(
                         cfg.blocks[cand].ins.len());
                 }
                 rejected = true;
+                any_rejected = true;
             }
         }
         let mut total = d0;
@@ -542,6 +634,95 @@ pub fn immediate_postdom(
             if better {
                 best = Some((total, cand));
             }
+        }
+    }
+    // Re-score when a candidate was rejected: the plain BFS lets one
+    // branch's paths run THROUGH a sibling branch target, so ternary
+    // scaffolding INSIDE the rejected arm scores nearer than the true
+    // re-confluence (SSLConfiguration clinit: with the taken target 9
+    // rejected, block 10 — still inside the same ? : diamond — won on
+    // distance 2+1 over the real merge 14 at 2+3, and the else walk
+    // nested property 3/4 inside the client-default arm again). With
+    // siblings barred, only genuine post-diamond confluences survive
+    // (14 from both sides). When no candidate survives (DHKey's shared
+    // throw: the sibling side has no successors at all), fall back to
+    // the plain non-rejected best.
+    // Locality fence: rescore only when the plain non-rejected best is
+    // NEAR (a tight diamond whose scaffolding outscores the true merge —
+    // SSLConfiguration clinit, plain best 10 at total 3 vs the real
+    // merge 14). In long if-chains the sibling-barred maps only meet at
+    // the method-final tail (jdk26 IndicConjunctBreak isExtend: entry 0's
+    // rescore picked block 622 at pc 4114 as the follow, spanning the
+    // whole 4K-bytecode chain inside one If — every nested COND re-walked
+    // it and the structurer spun at 100% CPU). A far plain best means
+    // there is no tight diamond to repair; keep it.
+    if any_rejected
+        && std::env::var("JCDC_DBG_NOWIDE").is_err()
+        && best.map(|(d, _)| d).unwrap_or(u32::MAX) <= 8
+    {
+        let mut dists2: Vec<HashMap<usize, u32>> = Vec::with_capacity(succs.len());
+        for (i, &s0) in succs.iter().enumerate() {
+            let mut d: HashMap<usize, u32> = HashMap::new();
+            let mut q: VecDeque<(usize, u32)> = VecDeque::new();
+            d.insert(s0, 0);
+            q.push_back((s0, 0));
+            while let Some((b, db)) = q.pop_front() {
+                for &s in &cfg.blocks[b].succ {
+                    if s == entry || !universe.contains(&s) || d.contains_key(&s) {
+                        continue;
+                    }
+                    if succs.iter().enumerate().any(|(j, &sb)| j != i && sb == s) {
+                        continue;
+                    }
+                    d.insert(s, db + 1);
+                    q.push_back((s, db + 1));
+                }
+            }
+            dists2.push(d);
+        }
+        let mut best2: Option<(u32, usize)> = None;
+        for (&cand, &d0) in dists2[0].iter() {
+            if cand == entry || succs.iter().any(|&sc| sc == cand) {
+                // rejected candidates stay rejected; direct successors are
+                // branches, never the merge (the bar above already keeps
+                // them out of the maps, this guards the s0 self-entry).
+                continue;
+            }
+            let mut total = d0;
+            let mut ok = true;
+            for d in &dists2[1..] {
+                match d.get(&cand) {
+                    Some(x) => total += x,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                let better = match best2 {
+                    None => true,
+                    Some((bd, bc)) => {
+                        total < bd
+                            || (total == bd && cfg.blocks[cand].start < cfg.blocks[bc].start)
+                    }
+                };
+                if better {
+                    best2 = Some((total, cand));
+                }
+            }
+        }
+        if let Some(b2) = best2 {
+            if b2.0 <= 8 {
+                if std::env::var("JCDC_DBG_PDJ").is_ok() {
+                    eprintln!("PDJ-RESCORE entry_pc={} pick={} pick_pc={} plain={:?}",
+                        cfg.blocks[entry].start, b2.1, cfg.blocks[b2.1].start,
+                        best.map(|(_, c)| c));
+                }
+                return Some(b2.1);
+            }
+            // The barred maps only met far downstream (a long chain's
+            // final tail): not a diamond merge — keep the plain best.
         }
     }
     best.map(|(_, c)| c)
@@ -1606,7 +1787,8 @@ impl<'a> Structurer<'a> {
                 abrupt_only.insert(b);
             }
         }
-        immediate_postdom(self.cfg, universe, entry, &exempt, &self.body_group, entry_group, &terminators, &abrupt_only, &final_writers)
+        let stmt_counts: Vec<usize> = self.results.iter().map(|r| r.stmts.len()).collect();
+        immediate_postdom(self.cfg, universe, entry, &exempt, &stmt_counts, &self.body_group, entry_group, &terminators, &abrupt_only, &final_writers)
     }
 
     /// True if `b` is an exception-handler head; such blocks must only be
@@ -5427,6 +5609,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                 }
             }
         }
+        let mut outer_cont_some = false;
         let body = match self.cfg.block_at(g.start) {
             Some(entry) if body_universe.contains(&entry) => {
                 // A group whose protected span starts AT an enclosing
@@ -5451,6 +5634,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         !self.handler_flow_only(gi).contains(c)
                             && !body_universe.contains(c)
                     });
+                outer_cont_some = cont.is_some();
                 if std::env::var("JCDC_DBG_IF").is_ok() {
                     eprintln!("try gi={} cont={:?} universe_has_blocks_after_end={} outer_universe={:?} stop={:?}", gi, cont,
                         universe.iter().filter(|b| self.cfg.blocks[**b].start >= g.end).count(),
@@ -5789,7 +5973,25 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                     }
                     // Multi-entry cont==hb: no strip (the f4472a5f shape —
                     // the shared_merge machinery and outer walks handle it).
-                } else if !self.handler_group.contains_key(&cont) && !hf.contains(&cont) {
+                } else if outer_cont_some
+                    && !self.handler_group.contains_key(&cont)
+                    && !hf.contains(&cont)
+                {
+                    // Strip the span-end block's reachable tail from the
+                    // handler universe ONLY when the outer walk will emit
+                    // a post-try continuation: the tail is shared with
+                    // the normal path then. When cont is None (every
+                    // block past the span end is already claimed — the
+                    // body walk's follow chain absorbed the span-end
+                    // goto and the method-final tail), stripping orphans
+                    // the tail entirely: SSLSessionContextImpl
+                    // getDefaults' body walk claimed the span-end
+                    // `goto 234` (pc 205) and the final `return 20480`
+                    // (pc 234); the catch-else arm's term-copy route was
+                    // the only emitter left, and the strip starved it —
+                    // 缺少返回语句, sj17 walk-only since HEAD (SESE renders
+                    // the tail; javac masked it behind OCSP's DA error
+                    // until the rejection suite fixed that).
                     let tail = reachable_within(self.cfg, cont, &HashSet::new());
                     huniverse.retain(|b| !tail.contains(b) || hf.contains(b));
                 }
