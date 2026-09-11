@@ -273,7 +273,16 @@ pub(crate) fn compute_postdominators(cfg: &Cfg, universe: &HashSet<usize>) -> (u
 /// the nearest reconvergence point: the block (other than entry) reachable
 /// from ALL of entry's in-universe successors with the smallest total BFS
 /// distance. Blocks whose in-universe successors are empty are exits.
-pub fn immediate_postdom(cfg: &Cfg, universe: &HashSet<usize>, entry: usize) -> Option<usize> {
+pub fn immediate_postdom(
+    cfg: &Cfg,
+    universe: &HashSet<usize>,
+    entry: usize,
+    group_owned: &HashSet<usize>,
+    body_group_of: &HashMap<usize, usize>,
+    entry_group: Option<usize>,
+    terminators: &HashSet<usize>,
+    final_writers: &HashSet<usize>,
+) -> Option<usize> {
     let succs: Vec<usize> = cfg.blocks[entry]
         .succ
         .iter()
@@ -310,10 +319,181 @@ pub fn immediate_postdom(cfg: &Cfg, universe: &HashSet<usize>, entry: usize) -> 
     // self-loops (a loop header is its own successor; there the nearest
     // confluence is the loop exit and must stay).
     // Candidates: blocks present in all BFS maps (except entry itself).
+    // A DIRECT SUCCESSOR of the entry is one of the branches, never the
+    // merge: it is "reachable from all successors" only because another
+    // branch jumps to it (if-else-if chains over a shared statement
+    // block). Choosing it as the follow renders the branch an EMPTY arm
+    // and parks the block after the chain, where every bypassing path
+    // falls through it — jdk11 OCSPResponse SingleResponse's ctor parked
+    // the shared `revocationReason = UNSPECIFIED` (a blank-final write
+    // no copy route may duplicate) after the reason-range chain and the
+    // values[reason] arm double-assigned (可能已分配变量 x2 trees);
+    // jdk11 JarFile.getBytes' readNBytes arm fell into the parked
+    // readAllBytes (double read). The successor stays a candidate when it
+    // is the entry's ONLY out (degenerate) or a statement-free stub (a
+    // transparent trampoline to the real merge, common in javac output).
+    let self_loop = cfg.blocks[entry]
+        .succ
+        .iter()
+        .any(|&x| x == entry);
     let mut best: Option<(u32, usize)> = None;
     for (&cand, &d0) in dists[0].iter() {
         if cand == entry {
             continue;
+        }
+        let mut rejected = false;
+        if !self_loop && succs.iter().any(|&sc| sc == cand) {
+            let stmt_free = cfg.blocks[cand].ins.len() == 1
+                && cfg.blocks[cand].ins[0].op
+                    == jcdc_classfile::Opcode::Goto;
+            // A statement-bearing successor is only a FALSE merge when
+            // another path BYPASSES it (compound-if then-blocks, the
+            // OCSP shared-assign block): some successor reaches one of
+            // cand's own successors without stepping on cand. When every
+            // route to cand's tails goes through cand, it is the genuine
+            // immediate merge even though a branch jumps straight to it
+            // (`if (c) goto S; stmts; S:` — javac's bottom-exit loops and
+            // goto-merge diamonds; a blanket rejection spun Legacy6's
+            // loop nest into a timeout).
+            // Never reject the FIRST successor of a two-way (COND) entry:
+            // that is the branch's own taken target, and rejecting it
+            // re-routes the guard walk across the try carve-out (huc
+            // getInputStream0 lost its inner catch when the taken target
+            // at pc 813 was rejected as a false merge).
+            let is_fall = succs.len() == 2 && succs[0] == cand;
+            let no_tc = std::env::var("JCDC_DBG_NOTC").is_ok();
+            let no_tcf = std::env::var("JCDC_DBG_NOTCF").is_ok();
+            let no_lr = std::env::var("JCDC_DBG_NOLR").is_ok();
+            // Same-try-body exemption: rejecting a cand that sits in the
+            // SAME protected body as the entry re-routes the guard walk
+            // across the carve-out (huc getInputStream0's inner catch
+            // dissolved into a bare try when its taken target at pc 813
+            // was rejected from the guard at pc 498 inside the same
+            // 283..1853 body). A cand in a DIFFERENT group — or in no
+            // group — keeps the ordinary rules: keytool doCommands' TWR
+            // epilogue blocks must stay rejectable so each case arm gets
+            // its own per-arrival try copy; exempting them wholesale
+            // wrapped the giant shared region in one FileOutputStream TWR
+            // whose javac expansion overflowed (try 语句的代码过长 x93).
+            let same_body = entry_group.is_some()
+                && body_group_of.get(&cand) == entry_group.as_ref();
+            let bypass = !stmt_free
+                && !is_fall
+                && !same_body
+                && !group_owned.contains(&cand)
+                && succs.iter().any(|&s0| {
+                    let mut seen: HashSet<usize> = HashSet::new();
+                    let mut q: VecDeque<usize> = VecDeque::new();
+                    q.push_back(s0);
+                    seen.insert(s0);
+                    while let Some(b) = q.pop_front() {
+                        if b == cand {
+                            continue;
+                        }
+                        for &nx in &cfg.blocks[b].succ {
+                            if nx == cand || seen.contains(&nx) {
+                                continue;
+                            }
+                            if cfg.blocks[cand].succ.contains(&nx) {
+                                // A bypass that lands on a RETURN/THROW
+                                // confluence is benign: the bypassing arm
+                                // renders the terminator inline and exits
+                                // BEFORE any parked copy of cand, so the
+                                // shared tail still executes exactly once
+                                // per arriving path (sun/reflect/annotation/
+                                // AnnotationType: both if_acmpeq guards jump
+                                // to the `retention = RUNTIME` tail, the
+                                // parse arm gotos the bare ctor Return —
+                                // rejecting it let arm 1 claim the tail and
+                                // left arm 2 empty, 可能尚未初始化变量retention
+                                // x3 trees; its parked HEAD shape compiles).
+                                // OCSPResponse's values[reason] arm flows on
+                                // into a live Goto-stub confluence and would
+                                // double-assign the parked tail — harmful.
+                                if !terminators.contains(&nx) || no_tcf {
+                                    return true;
+                                }
+                                seen.insert(nx);
+                                continue;
+                            }
+                            seen.insert(nx);
+                            q.push_back(nx);
+                        }
+                    }
+                    false
+                })
+                // A TERMINATOR cand (shared throw/return block) with a
+                // route that skips it entirely is always a false merge:
+                // parking it after the chain puts an unconditional
+                // throw/return between the skip-path's arm and its
+                // continuation, and the arm's jump elides to a
+                // fallthrough INTO the parked terminator (DHKeyExchange
+                // DHEPossessionGenerator clinit: the size<1024 ||
+                // size>8192 || (&0x3f)!=0 OR-chain over ONE shared
+                // throw; the valid path's goto landed after it, the
+                // parked throw made the try always-throw and the
+                // continuation 无法访问的语句). The succ-confluence probe
+                // above cannot see this: a throw has no successors.
+                // Rejection gives every guard arm its per-arrival copy
+                // and lets the skip path flow past. AnnotationType's
+                // shared tail is NOT a terminator (it falls into the
+                // ctor Return), so its benign parked shape stays.
+                || (!no_tc
+                    && terminators.contains(&cand)
+                    // A final-WRITING terminator must stay parkable:
+                    // every copy route refuses final-writers
+                    // (terminator_writes_final), so rejecting one strands
+                    // the tail with no renderable home and the assigns
+                    // vanish (java/lang/String's compress-path ctors lost
+                    // the shared `value = toBytes; coder = UTF16; return`
+                    // tail, 可能尚未初始化变量value). The parked shape is the
+                    // only renderable form there — and it compiles, since
+                    // the skipping arms exit via their own returns.
+                    && !final_writers.contains(&cand)
+                    && succs.iter().any(|&s0| {
+                        let mut seen: HashSet<usize> = HashSet::new();
+                        let mut q: VecDeque<usize> = VecDeque::new();
+                        q.push_back(s0);
+                        seen.insert(s0);
+                        while let Some(b) = q.pop_front() {
+                            if b == cand {
+                                continue;
+                            }
+                            for &nx in &cfg.blocks[b].succ {
+                                if seen.contains(&nx) {
+                                    continue;
+                                }
+                                // The skipping route must end in a LIVE
+                                // continuation, not an abrupt exit: a route
+                                // that dies in its own throw never needed
+                                // cand (java/util/ResourceBundle loadBundle's
+                                // shared `return bundle` tail was rejected
+                                // because the switch's default-throw arm
+                                // could not reach it — the parked return
+                                // after the loop is the correct shape, and
+                                // rejecting it dropped the method's final
+                                // return, 缺少返回语句 x3 trees). DHKey's
+                                // valid path skips the parked throw via a
+                                // Goto stub into the Return — a live route.
+                                if !can_reach_cfg(cfg, nx, cand, 4096)
+                                    && (no_lr || !terminators.contains(&nx))
+                                {
+                                    return true;
+                                }
+                                seen.insert(nx);
+                                q.push_back(nx);
+                            }
+                        }
+                        false
+                    }));
+            if bypass {
+                if std::env::var("JCDC_DBG_PDJ").is_ok() {
+                    eprintln!("PDJ-REJECT entry_pc={} cand={} cand_pc={} cand_stmts={}",
+                        cfg.blocks[entry].start, cand, cfg.blocks[cand].start,
+                        cfg.blocks[cand].ins.len());
+                }
+                rejected = true;
+            }
         }
         let mut total = d0;
         let mut ok = true;
@@ -326,7 +506,7 @@ pub fn immediate_postdom(cfg: &Cfg, universe: &HashSet<usize>, entry: usize) -> 
                 }
             }
         }
-        if ok {
+        if ok && !rejected {
             let better = match best {
                 None => true,
                 Some((bd, bc)) => {
@@ -1359,7 +1539,29 @@ impl<'a> Structurer<'a> {
     /// O(n) `immediate_postdom` (BFS nearest-confluence with successor-candidate
     /// rejection); kept as a `&mut self` method for call-site convenience.
     fn postdom_ipdom(&mut self, universe: &HashSet<usize>, entry: usize) -> Option<usize> {
-        immediate_postdom(self.cfg, universe, entry)
+        // Successor-candidate rejection exempts every GROUP-OWNED block
+        // (whole try bodies and handler heads, not just group starts):
+        // rejecting an in-body successor re-routes the COND walk across
+        // the carve-out boundary and dissolved
+        // HttpURLConnection.getInputStream0's inner try/catch (bare 'try'
+        // x3 sites x3 trees — the rejected taken target at pc 813 sits
+        // mid-range of the 283..1853 protected body), while the
+        // statement-block rejection outside groups (OCSP/Driver/
+        // AnnotationType families) stays.
+        let mut exempt: HashSet<usize> = self.handler_group.keys().copied().collect();
+        for g in &self.groups {
+            if let Some(b) = self.cfg.block_at(g.start) {
+                exempt.insert(b);
+            }
+        }
+        let entry_group = self.body_group.get(&entry).copied();
+        let terminators: HashSet<usize> = (0..self.results.len())
+            .filter(|&b| self.is_terminator_block(b))
+            .collect();
+        let final_writers: HashSet<usize> = (0..self.results.len())
+            .filter(|&b| self.terminator_writes_final(b))
+            .collect();
+        immediate_postdom(self.cfg, universe, entry, &exempt, &self.body_group, entry_group, &terminators, &final_writers)
     }
 
     /// True if `b` is an exception-handler head; such blocks must only be
@@ -2449,7 +2651,15 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         }
                     }
                     if std::env::var("JCDC_DBG_IF").is_ok() {
-                        eprintln!("COND cur={} follow={:?}", cur, follow);
+                        let tb = self.cfg.block_at(self.cfg.blocks[taken].start);
+                        eprintln!("COND cur={} pc={} fall_pc={} taken_pc={} pd={:?} follow={:?} f_pc={:?} t_id={:?} t_univ={} t_claim={} t_stop={} bstop={:?}",
+                            cur, self.cfg.blocks[cur].start,
+                            self.cfg.blocks[fall].start, self.cfg.blocks[taken].start,
+                            pd, follow, follow.map(|f| self.cfg.blocks[f].start),
+                            tb, tb.map(|b| universe.contains(&b)).unwrap_or(false),
+                            tb.map(|b| claimed.contains(&b)).unwrap_or(false),
+                            tb.map(|b| stop.contains(&b)).unwrap_or(false),
+                            { let mut v: Vec<u16> = bstop.iter().map(|b| self.cfg.blocks[*b].start).collect(); v.sort(); v });
                     }
                     if std::env::var("JCDC_DBG_IF").is_ok() {
                         // absorb_pure is &mut and CLAIMS the absorbed block
