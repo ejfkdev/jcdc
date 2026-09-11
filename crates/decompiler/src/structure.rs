@@ -134,6 +134,17 @@ fn intersect(mut a: usize, mut b: usize, idom: &[usize], rpo_num: &[usize]) -> u
 }
 
 /// Blocks normally reachable from `entry` without entering `stop`.
+thread_local! {
+    /// Set while a SESE consumed-arrival copy runs: there the copy IS the
+    /// arm's only emission route (the consumed merge has no sibling owner
+    /// part in this layout), so the shared-tail-confluence barrier must
+    /// not truncate it (jdk11/17/26 Pattern.family: the else arm's copy of
+    /// the b13 merge tail came out stage-2-less — the bar excluded the
+    /// 12-pred stage-2 switch head — and the method fell off its end,
+    /// 缺少返回语句 ×3 trees). Walk-side copy sites never set this.
+    pub static COPY_ALLOW_CONFLUENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub fn reachable_within(cfg: &Cfg, entry: usize, stop: &HashSet<usize>) -> HashSet<usize> {
     let mut seen = HashSet::new();
     if stop.contains(&entry) {
@@ -4637,7 +4648,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         // into it — 12 inline survivors blew the 64K try-codegen limit).
         // Skip the pre-pass when t is itself a terminator (legit shared
         // return-tail copies never traverse a confluence head anyway).
-        if !self.is_terminator_block(t) {
+        if !self.is_terminator_block(t) && !COPY_ALLOW_CONFLUENCE.with(|c| c.get()) {
             let probe = reachable_within(self.cfg, t, &barriers);
             let extra: Vec<usize> = probe
                 .iter()

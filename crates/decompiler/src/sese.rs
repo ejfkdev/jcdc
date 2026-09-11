@@ -1848,7 +1848,12 @@ impl<'a> Structurer<'a> {
                             cstop.insert(u);
                         }
                     }
-                    match self.copy_walk(cur, &cstop, &ctx.top_groups, usize::MAX) {
+                    let prev_allow = crate::structure::COPY_ALLOW_CONFLUENCE
+                        .with(|c| c.replace(true));
+                    let copied = self.copy_walk(cur, &cstop, &ctx.top_groups, usize::MAX);
+                    crate::structure::COPY_ALLOW_CONFLUENCE
+                        .with(|c| c.set(prev_allow));
+                    match copied {
                         Some(r) => parts.push(r),
                         None => {
                             if !parts.is_empty() {
