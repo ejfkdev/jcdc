@@ -628,6 +628,7 @@ pub fn decompile_method(
     dbg_body!("post-prune-rethrows");
     fix_empty_catchall(&mut body);
     order_try_catches(&mut body, pool);
+    unwrap_bare_tries(&mut body);
     cleanup(&mut body);
     let stack_vars = vt.stack_vars.clone();
     fold_this_stack_vars(&mut body, &vt, &stack_vars);
@@ -3425,6 +3426,43 @@ fn drop_monitor_stores(s: &mut Stmt, vt: &VarTable) {
 }
 
 fn reconstruct_synchronized(s: &mut Stmt) {
+    // Nothing to fold without a monitor entry in the subtree — and the
+    // Block arm's nested-block SPLICING is an observable mutation: running
+    // it over monitor-free code churns statement shapes (decl hoisting,
+    // prune interactions — 77 files rippled and jdk11 Pattern.split lost
+    // a return when the Labeled descent was added ungated).
+    fn has_monitor_enter(s: &Stmt) -> bool {
+        match s {
+            Stmt::MonitorEnter(_) => true,
+            Stmt::Block(v) => v.iter().any(has_monitor_enter),
+            Stmt::Try { body, catches, finally }
+            | Stmt::TryWithResources { body, catches, finally, .. } => {
+                has_monitor_enter(body)
+                    || catches.iter().any(|c| has_monitor_enter(&c.body))
+                    || finally.as_deref().map(has_monitor_enter).unwrap_or(false)
+            }
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                has_monitor_enter(then_stmt)
+                    || else_stmt.as_deref().map(has_monitor_enter).unwrap_or(false)
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::Labeled { body, .. }
+            | Stmt::Synchronized { body, .. } => has_monitor_enter(body),
+            Stmt::For { init, body, .. } => {
+                init.iter().any(has_monitor_enter) || has_monitor_enter(body)
+            }
+            Stmt::Switch { cases, default, .. } => {
+                cases.iter().any(|c| c.body.iter().any(has_monitor_enter))
+                    || default.as_deref().map(has_monitor_enter).unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+    if !has_monitor_enter(s) {
+        return;
+    }
     match s {
         Stmt::Block(v) => {
             // Splice nested plain blocks so MonitorEnter/Try adjacency
@@ -3524,7 +3562,9 @@ fn reconstruct_synchronized(s: &mut Stmt) {
                 reconstruct_synchronized(d);
             }
         }
-        Stmt::Synchronized { body, .. } => reconstruct_synchronized(body),
+        Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => {
+            reconstruct_synchronized(body)
+        }
         _ => {}
     }
 }
@@ -6004,6 +6044,71 @@ fn order_in_expr(e: &mut Expr, pool: &ClassPool) {
             order_in_expr(f, pool);
         }
         _ => {}
+    }
+}
+
+/// A Try with no catches and no (or an empty) finally is not renderable
+/// Java (`'try' 不带有 'catch', 'finally' 或资源声明`) and is
+/// semantically transparent — a leftover protected-region husk whose
+/// handler scaffolding was folded elsewhere (SESE TimerThread mainLoop:
+/// the task.lock monitor-exit copies fold into `synchronized` but leave
+/// three nested husks around the if-chain; walk-mode shapes never emit
+/// them). Unwrap to the body, recursively.
+fn unwrap_bare_tries(s: &mut Stmt) {
+    fn bare(s: &Stmt) -> bool {
+        match s {
+            Stmt::Try { catches, finally, .. } => {
+                catches.is_empty()
+                    && match finally {
+                        None => true,
+                        Some(f) => f.is_empty_block(),
+                    }
+            }
+            _ => false,
+        }
+    }
+    // Recurse first so nested husks collapse bottom-up.
+    match s {
+        Stmt::Try { body, catches, finally }
+        | Stmt::TryWithResources { body, catches, finally, .. } => {
+            unwrap_bare_tries(body);
+            for c in catches.iter_mut() {
+                unwrap_bare_tries(&mut c.body);
+            }
+            if let Some(f) = finally {
+                unwrap_bare_tries(f);
+            }
+        }
+        Stmt::Block(v) => v.iter_mut().for_each(unwrap_bare_tries),
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            unwrap_bare_tries(then_stmt);
+            if let Some(x) = else_stmt {
+                unwrap_bare_tries(x);
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::ForEach { body, .. }
+        | Stmt::Labeled { body, .. }
+        | Stmt::Synchronized { body, .. } => unwrap_bare_tries(body),
+        Stmt::For { init, body, .. } => {
+            init.iter_mut().for_each(unwrap_bare_tries);
+            unwrap_bare_tries(body);
+        }
+        Stmt::Switch { cases, default, .. } => {
+            for c in cases.iter_mut() {
+                c.body.iter_mut().for_each(unwrap_bare_tries);
+            }
+            if let Some(d) = default {
+                unwrap_bare_tries(d);
+            }
+        }
+        _ => {}
+    }
+    if bare(s) {
+        if let Stmt::Try { body, .. } = std::mem::replace(s, Stmt::Block(vec![])) {
+            *s = *body;
+        }
     }
 }
 
