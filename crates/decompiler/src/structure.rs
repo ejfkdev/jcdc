@@ -5551,6 +5551,95 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         }
         case_groups.sort_by_key(|(_, b, _)| self.cfg.blocks[*b].start);
 
+        // Java switch case groups fall through when their body completes
+        // normally: an arm region whose flow does NOT provably land on the
+        // switch follow (a dangling Goto to a claimed sibling block that
+        // conversion elides or inlines without its jump — jdk17/26
+        // AbstractValidatingLambdaMetafactory ctor: case-7's
+        // `if (targetClass == implClass && isPrivate)` middle branch jumped
+        // to the already-claimed `implKind = 7` block whose Goto{follow}
+        // the RawGoto stmt-inline consumed, so the arm fell through into
+        // case 6/8 and re-assigned the blank finals implClass/implKind/
+        // implIsInstanceMethod — 可能已分配变量 ×3) gets an explicit
+        // trailing Goto{follow}, which conversion materializes as `break`.
+        // Arms that bind already (trailing Goto{follow}, terminators,
+        // both-branch if binds) and abrupt arms are untouched; when no
+        // follow is known the historical shape is kept.
+        fn bind_arm(
+            st: &Structurer,
+            r: Region,
+            follow: Option<usize>,
+        ) -> Region {
+            let Some(f) = follow else { return r };
+            if st.arm_binds_to(&r, f) || region_terminates(&r, st.results) {
+                return r;
+            }
+            // A nested switch whose groups are ALL abrupt cannot complete
+            // normally by JLS 14.11.1 (only the LAST group's normal
+            // completion and reachable unlabeled breaks count — arm_binds
+            // _to's nested-switch rule is deliberately conservative and
+            // says "not bindable" there): an appended break after it is an
+            // 无法访问的语句 (jdk internal xml Parser's `switch (wsskip())
+            // { case: continue; case: panic(); default: break L11; }`).
+            // The arm already cannot fall through — append nothing.
+            fn abrupt_switch_at_end(r: &Region, results: &[crate::builder::BlockResult]) -> bool {
+                fn all_abrupt(rr: &Region, results: &[crate::builder::BlockResult]) -> bool {
+                    match rr {
+                        Region::Switch { cases, default, .. } => {
+                            // JLS 14.11.1: a switch CANNOT complete normally
+                            // when its LAST rendered group is abrupt (earlier
+                            // groups either end abruptly or fall THROUGH into
+                            // their successor, which is not normal completion
+                            // of the switch) and no unlabeled break targets
+                            // it — those surface as Goto{this switch's own
+                            // follow}, which structure_switch never leaves
+                            // dangling inside an arm. default renders last.
+                            match default {
+                                Some(d) => all_abrupt(d, results),
+                                None => cases
+                                    .last()
+                                    .map(|c| all_abrupt(&c.1, results))
+                                    .unwrap_or(false),
+                            }
+                        }
+                        Region::Seq(v) => match v.last() {
+                            Some(last) => all_abrupt(last, results),
+                            None => false,
+                        },
+                        Region::If { then_r, else_r, .. } => {
+                            all_abrupt(then_r, results) && all_abrupt(else_r, results)
+                        }
+                        Region::Loop { .. } => true,
+                        Region::Goto { .. } => true,
+                        Region::Basic { block } => {
+                            matches!(
+                                results[*block].term,
+                                Term::Return(_) | Term::Throw(_)
+                            )
+                        }
+                        Region::CopyStmts { .. } => false,
+                        Region::Empty => false,
+                        // Try and any other shape: conservatively NOT
+                        // all-abrupt — the appended break stays reachable.
+                        _ => false,
+                    }
+                }
+                // ONLY a nested switch at the arm's end qualifies — an
+                // arm ending in a bare Goto to a non-follow block is the
+                // dangling-jump case the append exists for (the Goto is
+                // elided/inlined at conversion, so the arm falls through
+                // in the rendered layout despite looking abrupt here).
+                match r {
+                    Region::Seq(v) => matches!(v.last(), Some(Region::Switch { .. }) if all_abrupt(v.last().unwrap(), results)),
+                    Region::Switch { .. } => all_abrupt(r, results),
+                    _ => false,
+                }
+            }
+            if abrupt_switch_at_end(&r, st.results) {
+                return r;
+            }
+            Region::Seq(vec![r, Region::Goto { target: f }])
+        }
         let mut case_stop = stop.clone();
         if let Some(f) = follow {
             case_stop.insert(f);
@@ -5614,7 +5703,8 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             self.case_arm_ctx.push((b, follow, is_pattern));
             let r = self.walk(b, &sub, &cstop, active, claimed, false);
             self.case_arm_ctx.pop();
-            cases.push((vals, strip_fallthrough_goto(r, &head_set)));
+            let r = strip_fallthrough_goto(r, &head_set);
+            cases.push((vals, bind_arm(self, r, follow)));
         }
         let default = default_block.map(|d| {
             if !universe.contains(&d) || claimed.contains(&d) {
@@ -5633,7 +5723,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             self.case_arm_ctx.push((d, follow, is_pattern));
             let r = self.walk(d, &sub, &cstop, active, claimed, false);
             self.case_arm_ctx.pop();
-            Box::new(strip_fallthrough_goto(r, &head_set))
+            Box::new(bind_arm(self, strip_fallthrough_goto(r, &head_set), follow))
         });
         Region::Switch { block, selector, cases, default, follow }
     }
