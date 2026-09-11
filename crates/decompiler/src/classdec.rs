@@ -14380,6 +14380,19 @@ fn witness_map_under_container_cast(e: &mut Expr) {
                     }
                     return;
                 }
+                // mapMulti RE-DETERMINES the stream's element type via its
+                // own free R (the lambda's Consumer<R> accepts), so the
+                // stages above it feed its INPUT type — the cast's element
+                // type can never belong to them. This walk runs at the Cast
+                // node BEFORE the child descent witnesses mapMulti itself
+                // (mapmulti_witness_from_body), so mapMulti's type_args is
+                // still empty here and the walk would pass straight through
+                // (jdk26 PackageSnippets.gatherDependencies2: pinned
+                // .<ClassDesc>flatMap over a Stream<CodeElement>-returning
+                // lambda → lambda 表达式中的返回类型错误).
+                if name == "mapMulti" {
+                    return;
+                }
                 if !type_args.is_empty() {
                     return;
                 }
