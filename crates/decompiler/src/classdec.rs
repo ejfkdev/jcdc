@@ -10773,12 +10773,87 @@ fn upgrade_raw_receiver_casts(
     }
     fn fix_e(e: &mut Expr, pool: &ClassPool, scope: &[String]) {
         match e {
-            Expr::Method { owner, args, .. } => {
+            Expr::Method { name, desc, owner, args, .. } => {
                 if let Some(o) = owner {
                     if let Expr::Cast { ty, .. } = &mut **o {
                         if let TypeRef::J(jcdc_jvm::JavaType::Object(c)) = ty {
                             if let Some(g) = upgraded_ty(c, pool, scope) {
-                                *ty = g;
+                                // The upgrade is only sound when every
+                                // actual still converts against the
+                                // INSTANTIATED formals: a formal that
+                                // stays a bare class typevar demands an
+                                // actual of exactly that typevar. jdk26
+                                // SPILocaleProviderAdapter
+                                // .findInstalledProvider: Delegate's own
+                                // param is also named P, the raw source
+                                // cast `(Delegate) delegate` upgraded to
+                                // Delegate<P>, and addImpl(provider) with
+                                // provider: LocaleServiceProvider died
+                                // (LocaleServiceProvider无法转换为P) —
+                                // the raw form compiles unchecked, as the
+                                // source intended.
+                                let args_ok = {
+                                    let want = format!(
+                                        "({}){}",
+                                        desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+                                        desc.ret.to_descriptor()
+                                    );
+                                    match pool.get(c.as_str()) {
+                                        Some(cpc) => {
+                                            match (0..cpc.cf.methods.len()).find(|&i| {
+                                                cpc.method_name(i) == Some(name.as_str())
+                                                    && cpc.method_desc(i) == Some(want.as_str())
+                                            }) {
+                                                Some(mi) => match method_signature_of(&cpc, mi) {
+                                                    Some(msig) if msig.args.len() == args.len() => {
+                                                        let inst: Vec<jcdc_jvm::GenericType> = match &g {
+                                                            TypeRef::G(jcdc_jvm::GenericType::Class(gcs)) => gcs
+                                                                .parts
+                                                                .last()
+                                                                .map(|p| p.args.clone())
+                                                                .unwrap_or_default(),
+                                                            _ => Vec::new(),
+                                                        };
+                                                        let cparams = class_typevar_names(&cpc);
+                                                        msig.args.iter().zip(args.iter()).all(|(f, a)| {
+                                                            let f = crate::method::subst_typevars(f, &[], &inst);
+                                                            let _ = &cparams;
+                                                            match &f {
+                                                                jcdc_jvm::GenericType::TypeVar(tn) => {
+                                                                    // Exact typevar match, or a
+                                                                    // bare java/lang/Object
+                                                                    // actual: the print-time
+                                                                    // late_typevar_arg_casts
+                                                                    // wraps those in (T) once
+                                                                    // the receiver carries the
+                                                                    // parameterization
+                                                                    // (PriorityQueue
+                                                                    // siftDownComparable's
+                                                                    // es[right]). A CONCRETE
+                                                                    // class actual
+                                                                    // (LocaleServiceProvider
+                                                                    // at P) stays rejected —
+                                                                    // no later pass can bridge
+                                                                    // it and the raw form is
+                                                                    // the source's intent.
+                                                                    matches!(a.type_ref(), TypeRef::G(jcdc_jvm::GenericType::TypeVar(an)) if &an == tn)
+                                                                        || matches!(a.type_ref().erased(), jcdc_jvm::JavaType::Object(n) if n == "java/lang/Object")
+                                                                }
+                                                                _ => true,
+                                                            }
+                                                        })
+                                                    }
+                                                    _ => true,
+                                                },
+                                                None => true,
+                                            }
+                                        }
+                                        None => true,
+                                    }
+                                };
+                                if args_ok {
+                                    *ty = g;
+                                }
                             }
                         }
                     }
