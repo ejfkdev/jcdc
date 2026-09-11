@@ -124,6 +124,36 @@ impl<'a> Converter<'a> {
         })
     }
 
+    /// Chain-aware twin of stmts_write_final for a tail HEAD: walks the
+    /// linear single-succ Fall/Goto chain (bounded) so a blank-final write
+    /// PAST the head still rejects the inline term-copy (URICertStore
+    /// clinit's two-field tail; mirrors structure's
+    /// terminator_writes_final chain probe).
+    fn tail_chain_writes_final(&self, t: usize) -> bool {
+        if self.final_fields.is_empty() {
+            return false;
+        }
+        let mut x = t;
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for _ in 0..8 {
+            if !seen.insert(x) {
+                return false;
+            }
+            if self.stmts_write_final(&self.results[x].stmts) {
+                return true;
+            }
+            if !matches!(self.results[x].term, Term::Fallthrough | Term::Goto) {
+                return false;
+            }
+            let succs = &self.cfg.blocks[x].succ;
+            if succs.len() != 1 {
+                return false;
+            }
+            x = succs[0];
+        }
+        false
+    }
+
     pub fn new(cfg: &'a Cfg, results: &'a Vec<BlockResult>) -> Self {
         let universe: HashSet<usize> = (0..cfg.blocks.len()).collect();
         let dom = crate::structure::compute_dominators(cfg, &universe, cfg.entry);
@@ -343,7 +373,7 @@ impl<'a> Converter<'a> {
                         self.results[target].term,
                         Term::Return(_) | Term::Throw(_)
                     )
-                    && !self.stmts_write_final(&self.results[target].stmts);
+                    && !self.tail_chain_writes_final(target);
                 if inline_terminator {
                     // Copy the WHOLE terminator chain: the target's own
                     // statements plus every fall-through link down to
@@ -402,7 +432,7 @@ impl<'a> Converter<'a> {
                             let term_copy = matches!(
                                 self.results[t].term,
                                 Term::Return(_) | Term::Throw(_)
-                            ) && !self.stmts_write_final(&self.results[t].stmts)
+                            ) && !self.tail_chain_writes_final(t)
                             && !self.is_retry_loop_header(t);
                             if term_copy {
                                 let mut cv = self.results[t].stmts.clone();

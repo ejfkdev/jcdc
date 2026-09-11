@@ -4817,8 +4817,20 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
     /// for the same final_fields reason and elides to the real tail the
     /// enclosing flow emits next.
     fn terminator_writes_final(&self, b: usize) -> bool {
-        !self.final_fields.is_empty()
-            && self.results[b].stmts.iter().any(|s| {
+        if self.final_fields.is_empty() {
+            return false;
+        }
+        // Walk the LINEAR tail chain (single-succ Fall/Goto hops, bounded):
+        // a shared tail whose blank-final write sits PAST the head block
+        // still double-assigns when copied per-arrival (jdk11/26
+        // URICertStore clinit: head `CA_ISS_ALLOW_ANY = allowAny` chains
+        // into `certStoreCache = newSoftMemoryCache(185)` — the head-only
+        // probe missed the second final and the tail copy landed inside
+        // the debug-println branch alongside the canonical render —
+        // 可能已分配变量 ×2). Branching chains stop (a final write on only
+        // one route is not a guaranteed duplicate).
+        let writes = |x: usize| {
+            self.results[x].stmts.iter().any(|s| {
                 matches!(
                     s,
                     crate::stmt::Stmt::ExprStmt(crate::expr::Expr::Assign { target, .. })
@@ -4829,6 +4841,26 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         )
                 )
             })
+        };
+        let mut x = b;
+        let mut seen: HashSet<usize> = HashSet::new();
+        for _ in 0..8 {
+            if !seen.insert(x) {
+                return false;
+            }
+            if writes(x) {
+                return true;
+            }
+            if !matches!(self.results[x].term, Term::Fallthrough | Term::Goto) {
+                return false;
+            }
+            let succs = &self.cfg.blocks[x].succ;
+            if succs.len() != 1 {
+                return false;
+            }
+            x = succs[0];
+        }
+        false
     }
 
     /// Unique enclosing barrier block reachable from `cur`'s branch region.
