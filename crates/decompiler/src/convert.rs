@@ -686,10 +686,19 @@ impl<'a> Converter<'a> {
             Term::Cond { cond } if succs.len() == 2 => {
                 let taken = succs[1];
                 let fall = succs[0];
-                if taken == header {
+                if taken == header && ctx.exits.contains(&fall) {
                     // Self-loop: the header block holds both the body and
                     // the trailing conditional back edge → do-while. The
-                    // fallthrough side is the loop exit.
+                    // fallthrough side is the loop exit. (When the fall
+                    // side is INTERIOR the self-edge is an in-body retry
+                    // jump of a loop with no normal completion at all —
+                    // rotating it into a do-while bottom invents an exit
+                    // path: jdk11/17/26 DSAParameterGenerator.generatePandQ's
+                    // `if (!resultQ.isProbablePrime(..)) goto <Q-gen>`
+                    // self-retry falls through into the P-search interior;
+                    // the fabricated do-while fell out to the method end —
+                    // 缺少返回语句. Those shapes take the interior-diamond
+                    // while(true) arm below.)
                     // A compound (multi-test) trailing condition folds first:
                     // `if(c1)continue; .. if(cN)continue; else exit;` becomes
                     // `do{body}while(c1||..||cN); exit`.
