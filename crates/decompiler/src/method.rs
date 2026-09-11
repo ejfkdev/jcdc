@@ -660,7 +660,58 @@ pub fn decompile_method(
     prune_dead_synth_stores(&mut body, &vt);
     dbg_body!("post-prune-dead");
     cast_generic_locals(&vt, pool, pc, &mut body);
-    cast_object_returns(&mut body, &ret_ty);
+    // Lambda-impl returns: javac erases the SAM's instantiated return in
+    // the impl descriptor, so a plain-Object return would cast to the RAW
+    // erasure — and a raw lambda return collapses the call site's generic
+    // inference (jdk26 ClassRemapperImpl.mapRecordComponent:
+    // `.map(atr -> {..; return (Attribute) stack;}).toList()` typed the
+    // chain List<Attribute>, 无法转换为List<Attribute<?>> at the
+    // RecordComponentInfo.of target). The source-level lambda returns the
+    // SAM's wildcard instantiation; render the cast in wildcard form
+    // (Attribute<?>) whenever the erased return class is itself generic.
+    // For a concretely-parameterized SAM return the raw cast stays
+    // correct, so this is scoped to lambda$ impls only — ordinary methods
+    // keep the erasure cast (their own Signature return is witnessed by
+    // witness_generic_returns).
+    let lambda_ret_wildcard: Option<TypeRef> = if pc
+        .method_name(m_idx)
+        .map(|n| n.starts_with("lambda$"))
+        .unwrap_or(false)
+    {
+        match &ret_ty {
+            jcdc_jvm::JavaType::Object(n) if n != "java/lang/Object" => pool
+                .get(n.as_str())
+                .and_then(|cpc| {
+                    cpc.class_attr("Signature").and_then(|b| {
+                        if b.len() >= 2 {
+                            cpc.utf8(u16::from_be_bytes([b[0], b[1]]))
+                                .and_then(|x| jcdc_jvm::parse_class_signature(x))
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .filter(|csig| !csig.params.is_empty())
+                .map(|csig| {
+                    TypeRef::G(jcdc_jvm::GenericType::Class(jcdc_jvm::ClassSig {
+                        package: n.rfind('/').map(|i| n[..i].to_string()).unwrap_or_default(),
+                        parts: vec![jcdc_jvm::ClassSigPart {
+                            name: n.rsplit('/').next().unwrap_or(n).to_string(),
+                            args: vec![
+                                jcdc_jvm::GenericType::Wildcard(
+                                    jcdc_jvm::WildcardBound::Any,
+                                );
+                                csig.params.len()
+                            ],
+                        }],
+                    }))
+                }),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    cast_object_returns(&mut body, &ret_ty, lambda_ret_wildcard.as_ref());
     cast_narrowing_assigns(&vt, &mut body);
     if pc.method_name(m_idx) != Some("<init>") {
         fold_merged_new_inits(&mut body, pc);
@@ -4418,13 +4469,13 @@ fn cast_narrowing_assigns(vt: &VarTable, s: &mut Stmt) {
 /// `return stackN;` where the merge variable stayed wide Object but the
 /// method returns a concrete reference type: the bytecode verifier
 /// guarantees the value is assignable, so an erased cast always holds.
-fn cast_object_returns(s: &mut Stmt, ret_ty: &JavaType) {
+fn cast_object_returns(s: &mut Stmt, ret_ty: &JavaType, wildcard: Option<&TypeRef>) {
     let want = match ret_ty {
         JavaType::Object(n) if n != "java/lang/Object" => ret_ty.clone(),
         JavaType::Array(_) => ret_ty.clone(),
         _ => return,
     };
-    fn fix(e: &mut Expr, want: &JavaType) {
+    fn fix(e: &mut Expr, want: &JavaType, wildcard: Option<&TypeRef>) {
         // Only plain value reads (locals/merge vars, calls, field reads):
         // casting a lambda or a lambda-bearing conditional would take it
         // out of its poly-expression context.
@@ -4442,59 +4493,63 @@ fn cast_object_returns(s: &mut Stmt, ret_ty: &JavaType) {
         }
         if e.type_ref().erased() == JavaType::Object("java/lang/Object".into()) {
             let inner = std::mem::replace(e, Expr::This);
-            *e = Expr::Cast { ty: TypeRef::J(want.clone()), e: Box::new(inner) };
+            let ty = match wildcard {
+                Some(g) => g.clone(),
+                None => TypeRef::J(want.clone()),
+            };
+            *e = Expr::Cast { ty, e: Box::new(inner) };
         }
     }
-    fn rec(s: &mut Stmt, want: &JavaType) {
+    fn rec(s: &mut Stmt, want: &JavaType, wildcard: Option<&TypeRef>) {
         match s {
-            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, want)),
-            Stmt::Return(Some(e)) => fix(e, want),
+            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, want, wildcard)),
+            Stmt::Return(Some(e)) => fix(e, want, wildcard),
             Stmt::If { then_stmt, else_stmt, .. } => {
-                rec(then_stmt, want);
+                rec(then_stmt, want, wildcard);
                 if let Some(e) = else_stmt {
-                    rec(e, want);
+                    rec(e, want, wildcard);
                 }
             }
-            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => rec(body, want),
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => rec(body, want, wildcard),
             Stmt::For { init, body, .. } => {
-                init.iter_mut().for_each(|i| rec(i, want));
-                rec(body, want);
+                init.iter_mut().for_each(|i| rec(i, want, wildcard));
+                rec(body, want, wildcard);
             }
-            Stmt::ForEach { body, .. } => rec(body, want),
+            Stmt::ForEach { body, .. } => rec(body, want, wildcard),
             Stmt::Switch { cases, default, .. } => {
                 for c in cases.iter_mut() {
-                    c.body.iter_mut().for_each(|x| rec(x, want));
+                    c.body.iter_mut().for_each(|x| rec(x, want, wildcard));
                 }
                 if let Some(d) = default {
-                    rec(d, want);
+                    rec(d, want, wildcard);
                 }
             }
             Stmt::Try { body, catches, finally } => {
-                rec(body, want);
+                rec(body, want, wildcard);
                 for c in catches.iter_mut() {
-                    rec(&mut c.body, want);
+                    rec(&mut c.body, want, wildcard);
                 }
                 if let Some(f) = finally {
-                    rec(f, want);
+                    rec(f, want, wildcard);
                 }
             }
             Stmt::TryWithResources { resources, body, catches, finally } => {
                 for r in resources.iter_mut() {
-                    rec(r, want);
+                    rec(r, want, wildcard);
                 }
-                rec(body, want);
+                rec(body, want, wildcard);
                 for c in catches.iter_mut() {
-                    rec(&mut c.body, want);
+                    rec(&mut c.body, want, wildcard);
                 }
                 if let Some(f) = finally {
-                    rec(f, want);
+                    rec(f, want, wildcard);
                 }
             }
-            Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => rec(body, want),
+            Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => rec(body, want, wildcard),
             _ => {}
         }
     }
-    rec(s, &want);
+    rec(s, &want, wildcard);
 }
 
 fn propagate_bool_copies(s: &Stmt, vt: &mut VarTable, changed: &mut bool) {
