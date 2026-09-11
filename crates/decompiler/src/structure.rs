@@ -3765,6 +3765,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             if std::env::var("JCDC_DBG_IF").is_ok() {
                                 eprintln!("GOTO-FALL cur={} t={} univ={} stop={} claimed={} entry={}", cur, t, universe.contains(&t), stop.contains(&t), claimed.contains(&t), entry);
                             }
+
                             parts.push(Region::Basic { block: cur });
                             if self.is_terminator_block(t)
                                 && !stop.contains(&t)
@@ -3779,6 +3780,36 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                                 // catch(IE) got `get(); throw ISE` —
                                 // 未报告的异常错误 InterruptedException).
                                 parts.push(Region::CopyStmts { block: t });
+                            } else if self.walk_depth == 1
+                                && claimed.contains(&t)
+                                && self.copied_tails.contains(&t)
+                                && self.cfg_all_paths_terminate(t)
+                                && !stop.contains(&t)
+                                && !Self::ctx_is_loop_header(self, t)
+                                && !self.terminator_writes_final(t)
+                            {
+                                // Method-final epilogue recovery: the
+                                // target was claimed by copy/handler walks
+                                // whose owner scopes are FINISHED (the
+                                // active-group deferral below would strand
+                                // it — jdk11/17 Resource.getBytes: the
+                                // shared `if (interrupted) interrupt();
+                                // return b;` selector was claimed inside
+                                // the finally renders, the method-level
+                                // stub arrival deferred to long-finished
+                                // inner groups, and the method ended right
+                                // after the finally — 缺少返回语句). Only at
+                                // method depth (keytool's per-case return
+                                // tails arrive inside switch-arm walks),
+                                // only at an already-copied tail (fresh
+                                // tails stay under the deferral discipline
+                                // — SSLEngineImpl's try-containing arrival
+                                // completes normally and fails the
+                                // all-paths-terminate probe anyway).
+                                match self.copy_walk(t, stop, active, cur) {
+                                    Some(r) => parts.push(r),
+                                    None => parts.push(Region::Goto { target: t }),
+                                }
                             } else if !stop.contains(&t)
                                 && !self.loops_stack.contains(&t)
                                 && !Self::ctx_is_loop_header(self, t)
@@ -4656,6 +4687,47 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             self.results[b].term,
             Term::Return(_) | Term::Throw(_)
         )
+    }
+
+    /// True when EVERY normal flow path out of `b` ends in a
+    /// return/throw within a small budget: the block heads an abrupt
+    /// completion chain (possibly via a cond whose arms both terminate,
+    /// Resource.getBytes' `if (interrupted)` epilogue selector). Used by
+    /// the post-try recovery scan — a tail that can complete normally is
+    /// live fall-through flow some walk emits itself, and copying it
+    /// duplicates statements or whole try-containing tails.
+    fn cfg_all_paths_terminate(&self, b: usize) -> bool {
+        let mut visited: HashSet<usize> = HashSet::new();
+        let mut q: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        q.push_back(b);
+        while let Some(x) = q.pop_front() {
+            if !visited.insert(x) {
+                continue;
+            }
+            if visited.len() > 64 {
+                return false;
+            }
+            match self.results[x].term {
+                Term::Return(_) | Term::Throw(_) => {}
+                Term::Fallthrough | Term::Goto => {
+                    let succs = self.cfg.blocks[x].succ.clone();
+                    if succs.len() != 1 {
+                        return false;
+                    }
+                    q.push_back(succs[0]);
+                }
+                _ => {
+                    let succs = self.cfg.blocks[x].succ.clone();
+                    if succs.is_empty() {
+                        return false;
+                    }
+                    for sx in succs {
+                        q.push_back(sx);
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// True when the block's statements assign a FINAL field of the
