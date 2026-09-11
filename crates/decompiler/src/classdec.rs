@@ -15309,6 +15309,100 @@ fn diamond_args_from_target(
     None
 }
 
+/// Target-driven diamond pin for a CHAINED call: `(ListIterator<String>)
+/// new ArrayList<>().listIterator()` — the diamond receiver infers Object
+/// (owner position has no target typing), so javac rejects the cast
+/// (ListIterator<Object>无法转换为ListIterator<String>, com/sun/java/util/
+/// jar/pack/Driver parseOptions' pbp). pin_owner_diamond's formal-driven
+/// route is powerless when the chained call has NO arguments; here the
+/// CALL'S Signature return, unified against the parameterized target,
+/// binds the receiver class's own typevars (listIterator() returns
+/// ListIterator<E> against ListIterator<String> pins ArrayList<String>).
+fn pin_chain_diamond_from_target(value: &mut Expr, target: &TypeRef, pool: &ClassPool) {
+    let TypeRef::G(tg) = target else { return };
+    let call = match value {
+        Expr::Cast { e: i, .. } => i.as_mut(),
+        other => other,
+    };
+    let Expr::Method { cls: mcls, name, desc, owner: Some(owner), .. } = call else {
+        return;
+    };
+    let Expr::New { cls: ncls, ty, .. } = owner.as_mut() else {
+        return;
+    };
+    if mcls != ncls {
+        // Same-class chain only: an inherited member's Signature lives on
+        // the declaring supertype and its own typevars are substituted
+        // differently there.
+        return;
+    }
+    let already = matches!(ty, TypeRef::G(jcdc_jvm::GenericType::Class(cs))
+        if cs.parts.last().map(|p| !p.args.is_empty()).unwrap_or(false));
+    if already {
+        return;
+    }
+    let Some(npc) = pool.get(ncls.as_str()) else { return };
+    let Some(csig) = npc.class_attr("Signature").and_then(|b| {
+        if b.len() >= 2 {
+            npc.utf8(u16::from_be_bytes([b[0], b[1]])).and_then(|x| parse_class_signature(x))
+        } else {
+            None
+        }
+    }) else {
+        return;
+    };
+    if csig.params.is_empty() {
+        return;
+    }
+    let want_desc = format!(
+        "({}){}",
+        desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
+        desc.ret.to_descriptor()
+    );
+    let Some(mi) = (0..npc.cf.methods.len()).find(|&i| {
+        npc.method_name(i) == Some(name.as_str())
+            && npc.method_desc(i) == Some(want_desc.as_str())
+    }) else {
+        return;
+    };
+    let Some(msig) = method_signature_of(&npc, mi) else {
+        return;
+    };
+    let mut subst: Vec<(String, jcdc_jvm::GenericType)> = Vec::new();
+    if !unify_types(&msig.ret, tg, &mut subst) {
+        return;
+    }
+    let resolved: Option<Vec<jcdc_jvm::GenericType>> = csig
+        .params
+        .iter()
+        .map(|p| {
+            subst.iter().find(|(n, _)| *n == p.name).and_then(|(_, g)| {
+                let ok = match g {
+                    jcdc_jvm::GenericType::Wildcard(_) => false,
+                    jcdc_jvm::GenericType::TypeVar(n) => {
+                        n == &p.name || !g_has_typevar_in(g, &csig.params)
+                    }
+                    other => !g_has_typevar_in(other, &csig.params),
+                };
+                if ok {
+                    Some(g.clone())
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    let Some(resolved) = resolved else { return };
+    let ncs = jcdc_jvm::ClassSig {
+        package: ncls.rfind('/').map(|i| ncls[..i].to_string()).unwrap_or_default(),
+        parts: vec![jcdc_jvm::ClassSigPart {
+            name: ncls.rsplit('/').next().unwrap_or(ncls).to_string(),
+            args: resolved,
+        }],
+    };
+    *ty = TypeRef::G(jcdc_jvm::GenericType::Class(ncs));
+}
+
 fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &ClassPool, pc: &PoolClass) {
     fn inst_from(
         ty: &TypeRef,
@@ -15370,12 +15464,23 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
     }
     match s {
         Stmt::LocalDef { var, init: Some(value), .. } => {
-            if let Some((cls, iargs, n, atys)) = inst_from(&vt.var(*var).ty, value, pool) {
+            let var_id = *var;
+            if let Some((cls, iargs, n, atys)) = inst_from(&vt.var(var_id).ty, value, pool) {
                 if let Some(params) = instantiated_ctor_params_core(&cls, &iargs, n, pool, &atys) {
                     if let Stmt::LocalDef { init: Some(v), .. } = s {
                         apply_to_value(v, &params, pool, pc);
                     }
                 }
+            }
+            // Chained diamond receiver under a parameterized target: the
+            // cast's own instantiation wins over the declared local type
+            // (same precedence as inst_from's generics-cast rule).
+            if let Stmt::LocalDef { init: Some(v), .. } = s {
+                let target = match &*v {
+                    Expr::Cast { ty: t @ TypeRef::G(_), .. } => t.clone(),
+                    _ => vt.var(var_id).ty.clone(),
+                };
+                pin_chain_diamond_from_target(v, &target, pool);
             }
         }
         // Ordinary locals are assignments in the AST (declarations are
