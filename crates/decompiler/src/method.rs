@@ -9600,6 +9600,31 @@ fn split_reassigned_synthetic(vt: &mut VarTable, body: &mut Stmt) {
 }
 
 fn value_concrete_type(e: &Expr) -> Option<JavaType> {
+    // A poly conditional with DIVERGENT reference arms carries no single
+    // concrete type: javac's frame slot for it is the arms' LUB, and
+    // reporting either arm mis-types the receiving variable (jdk26
+    // SSLSessionImpl getExports' return-under-finally slot stored
+    // `keyAlg != null ? deriveKey(..) : deriveData(..)` — SecretKey vs
+    // byte[]; the then arm narrowed the slot to byte[] and the SecretKey
+    // arm failed to convert — 条件表达式中的类型错误). Report no evidence
+    // and let the slot keep its wide merge type. Null/plain-Object arms
+    // stay flexible (the other side carries the information), matching
+    // join_types' plain-Object rule; numeric pairs keep their promoted
+    // type (Cond typing already joins them).
+    if let Expr::Cond { t, f, .. } = e {
+        let ta = t.type_ref().erased();
+        let fa = f.type_ref().erased();
+        let ref_kind = |x: &JavaType| {
+            match x {
+                JavaType::Object(n) => n != "java/lang/Object",
+                JavaType::Array(_) => true,
+                _ => false,
+            }
+        };
+        if ta != fa && ref_kind(&ta) && ref_kind(&fa) {
+            return None;
+        }
+    }
     match e.type_ref().erased() {
         JavaType::Void => None,
         t => Some(t.clone()),
