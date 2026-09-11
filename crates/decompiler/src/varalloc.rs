@@ -343,8 +343,28 @@ impl VarTable {
         // type: synthesize a per-gap variable instead.
         if let Some(code) = code_attribute(pc, m_idx) {
             use jcdc_classfile::instruction::{decode_all, Opcode};
-            let mut gaps: Vec<(u16, u16, u16, JavaType)> = Vec::new();
-            for ins in decode_all(&code.code) {
+            let all_ins: Vec<_> = decode_all(&code.code).into_iter().collect();
+            // Producer evidence for a reference STORE gap access: the
+            // static type of the value being stored, read off the
+            // producing instruction (invoke return descriptor, copied
+            // slot's LVT type, field descriptor, checkcast class). Gap
+            // identities spanning two stores with CONFLICTING evidence
+            // are distinct compiler temporaries sharing a reused slot —
+            // merging them forces one wrong declared type (com/sun/java/
+            // util/jar/pack/Driver main: the fileProps.entrySet()
+            // foreach iterator at pc 739 merged with the string-switch
+            // dispatch copy of `opt` at pc 965; the merged identity
+            // declared String and the iterator's hasNext/next lost
+            // their receiver, 找不到符号 x2).
+            fn concrete_ev(t: JavaType) -> Option<JavaType> {
+                match &t {
+                    JavaType::Object(n) if n != "java/lang/Object" => Some(t),
+                    JavaType::Array(_) => Some(t),
+                    _ => None,
+                }
+            }
+            let mut gaps: Vec<(u16, u16, u16, JavaType, Option<JavaType>)> = Vec::new();
+            for (ii, ins) in all_ins.iter().enumerate() {
                 let a = ins.a as u16;
                 let (slot, ty, is_store) = match ins.op {
                     Opcode::Iinc => (a, JavaType::Int, true),
@@ -429,10 +449,87 @@ impl VarTable {
                     })
                     .unwrap_or(false);
                 if !covered {
-                    gaps.push((slot, pc0, pc0.saturating_add(ins.size), ty));
+                    let ev = if is_store
+                        && matches!(
+                            ins.op,
+                            Opcode::Astore
+                                | Opcode::Astore0
+                                | Opcode::Astore1
+                                | Opcode::Astore2
+                                | Opcode::Astore3
+                        ) {
+                        let prev = if ii > 0 { Some(&all_ins[ii - 1]) } else { None };
+                        match prev.map(|p| p.op) {
+                            Some(Opcode::Invokevirtual)
+                            | Some(Opcode::Invokespecial)
+                            | Some(Opcode::Invokestatic)
+                            | Some(Opcode::Invokeinterface) => {
+                                let p = prev.unwrap();
+                                pc.member_ref(p.a as u16)
+                                    .and_then(|(_, _, d)| {
+                                        jcdc_jvm::parse_method_descriptor(d)
+                                    })
+                                    .and_then(|md| concrete_ev(md.ret))
+                            }
+                            Some(Opcode::Aload)
+                            | Some(Opcode::Aload0)
+                            | Some(Opcode::Aload1)
+                            | Some(Opcode::Aload2)
+                            | Some(Opcode::Aload3) => {
+                                let p = prev.unwrap();
+                                let pslot = match p.op {
+                                    Opcode::Aload0 => 0u16,
+                                    Opcode::Aload1 => 1,
+                                    Opcode::Aload2 => 2,
+                                    Opcode::Aload3 => 3,
+                                    _ => p.a as u16,
+                                };
+                                vt.at(pslot, pc0)
+                                    .map(|id| vt.var(id).ty.erased())
+                                    .and_then(concrete_ev)
+                            }
+                            Some(Opcode::Getfield) | Some(Opcode::Getstatic) => {
+                                let p = prev.unwrap();
+                                pc.member_ref(p.a as u16)
+                                    .and_then(|(_, _, d)| parse_field_descriptor(d))
+                                    .and_then(concrete_ev)
+                            }
+                            Some(Opcode::Checkcast) => {
+                                let p = prev.unwrap();
+                                pc.class_name(p.a as u16)
+                                    .map(|n| JavaType::Object(n.to_string()))
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    // Carry the STATIC access class (primitive vs
+                    // reference) so a primitive-typed identity never
+                    // adopts reference evidence and vice versa: the
+                    // same slot often hosts an int counter temp and a
+                    // later reference temp (keytool Main foreach
+                    // `length`/index ints merged with the String[]
+                    // being iterated — adopting the evidence retyped
+                    // `int var = arr.length` to `String[] var = ...`).
+                    let ev = match (&ev, &ty) {
+                        (None, JavaType::Object(_)) => None,
+                        (None, _) => Some(ty.clone()),
+                        (Some(_), JavaType::Object(_)) => ev,
+                        // primitive store with stray ref evidence: keep primitive
+                        (None2, prim) => {
+                            let _ = None2;
+                            Some(prim.clone())
+                        }
+                    };
+                    let ty = match &ev {
+                        Some(e) => e.clone(),
+                        None => ty,
+                    };
+                    gaps.push((slot, pc0, pc0.saturating_add(ins.size), ty, ev));
                 }
             }
-            gaps.sort_by_key(|(sl, p, _, _)| (*sl, *p));
+            gaps.sort_by_key(|(sl, p, _, _, _)| (*sl, *p));
             // Gap accesses on the same slot belong to one temporary unless
             // a real LVT range starts between them.
             let seg_starts: Vec<(u16, Vec<u16>)> = vt
@@ -445,7 +542,7 @@ impl VarTable {
                     (sl as u16, v)
                 })
                 .collect();
-            let mut merged_gaps: Vec<(u16, u16, u16, JavaType)> = Vec::new();
+            let mut merged_gaps: Vec<(u16, u16, u16, JavaType, Option<JavaType>)> = Vec::new();
             for g in gaps {
                 if let Some(m) = merged_gaps.last_mut() {
                     if m.0 == g.0 {
@@ -455,15 +552,27 @@ impl VarTable {
                             .map(|(_, v)| v.as_slice())
                             .unwrap_or(&[]);
                         let crosses = starts.iter().any(|rs| *rs > m.1 && *rs <= g.1);
-                        if !crosses {
+                        // Conflicting store evidence = distinct temporaries
+                        // on a reused slot: never merge across them.
+                        let conflict = match (&m.4, &g.4) {
+                            (Some(a), Some(b)) => a != b,
+                            _ => false,
+                        };
+                        if !crosses && !conflict {
                             m.2 = m.2.max(g.2);
+                            if m.4.is_none() {
+                                if let Some(e) = g.4.clone() {
+                                    m.3 = e.clone();
+                                    m.4 = Some(e);
+                                }
+                            }
                             continue;
                         }
                     }
                 }
                 merged_gaps.push(g);
             }
-            for (sl, rs, re, ty) in merged_gaps {
+            for (sl, rs, re, ty, _) in merged_gaps {
                 vt.add(
                     sl,
                     format!("var{}_{}", sl, rs),
