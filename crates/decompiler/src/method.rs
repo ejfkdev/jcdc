@@ -6033,6 +6033,50 @@ fn dedupe_finally(s: &mut Stmt) {
                 }
                 i += 1;
             }
+            // Merge-aware retry: a hoisted finally whose in-body branch
+            // copies carry the post-finally MERGE head as well (exit path
+            // flows into shared continuation code) survive the exact-
+            // suffix strip inside the Try arm. From this level the try's
+            // following statements are visible — retry with them as the
+            // tolerated merge run (URICertStore clinit's debug-arm copy).
+            {
+                let mut i = 0;
+                while i < v.len() {
+                    let (fin_c, merge_c): (Option<Vec<Stmt>>, Vec<Stmt>) = match &v[i] {
+                        Stmt::Try { finally: Some(f), .. } => {
+                            let fc = match &**f {
+                                Stmt::Block(inner) => inner.clone(),
+                                other => vec![other.clone()],
+                            };
+                            if fc.is_empty() {
+                                (None, Vec::new())
+                            } else {
+                                let mc: Vec<Stmt> = v[i + 1..]
+                                    .iter()
+                                    .take(8)
+                                    .take_while(|st| {
+                                        !matches!(st, Stmt::Return(_) | Stmt::Throw(_))
+                                    })
+                                    .cloned()
+                                    .collect();
+                                (Some(fc), mc)
+                            }
+                        }
+                        _ => (None, Vec::new()),
+                    };
+                    if let Some(fc) = fin_c {
+                        if !merge_c.is_empty() {
+                            if let Stmt::Try { body, catches, .. } = &mut v[i] {
+                                strip_trailing_copies_merge(body, &fc, &merge_c);
+                                for c in catches.iter_mut() {
+                                    strip_trailing_copies_merge(&mut c.body, &fc, &merge_c);
+                                }
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+            }
         }
         Stmt::If { then_stmt, else_stmt, .. } => {
             dedupe_finally(then_stmt);
@@ -6271,6 +6315,21 @@ fn remove_trailing_throw(s: &mut Vec<Stmt>) {
 /// Remove a trailing copy of `fin` from the statement tree `s` (at any
 /// nesting tail position). Returns true if a copy was removed.
 fn strip_trailing_copies(s: &mut Stmt, fin: &[Stmt]) -> bool {
+    strip_trailing_copies_merge(s, fin, &[])
+}
+
+/// Like strip_trailing_copies, but the trailing copy may be `fin` followed
+/// by a leading run of the try's POST-finally merge statements: javac
+/// gives every in-try exit path its own finally copy, and a path that
+/// exits into shared post-finally code carries the copy PLUS the merge
+/// head (jdk11/26 URICertStore clinit: the debug-println arm's inline
+/// `CA_ISS_ALLOW_ANY = allowAny; certStoreCache = newSoftMemoryCache(185)`
+/// is finally-copy + the static-block continuation — exact-suffix compare
+/// missed it, the arm kept a second blank-final assignment alongside the
+/// hoisted finally and the canonical merge — 可能已分配变量 ×2). The
+/// merge run is matched forward from the try's following statements, so a
+/// diverging path never matches.
+fn strip_trailing_copies_merge(s: &mut Stmt, fin: &[Stmt], merge: &[Stmt]) -> bool {
     if fin.is_empty() {
         return false;
     }
@@ -6281,6 +6340,34 @@ fn strip_trailing_copies(s: &mut Stmt, fin: &[Stmt]) -> bool {
                 if v[start..] == fin[..] {
                     v.truncate(start);
                     return true;
+                }
+            }
+            if !merge.is_empty() {
+                // The copied run may be followed by the path's own abrupt
+                // completion (the clinit/method-final `return;` this arm's
+                // goto-merge carried): KEEP it — it is this path's
+                // terminator, not part of the duplicated tail
+                // (URICertStore clinit's debug arm ends
+                // [println, CA=, certStore=, return]; dropping the return
+                // with the copies would let the arm fall out of the if
+                // and re-run the canonical merge statements).
+                let abrupt = matches!(v.last(), Some(Stmt::Return(_)) | Some(Stmt::Throw(_)));
+                let eff = if abrupt { v.len() - 1 } else { v.len() };
+                let avail = eff.saturating_sub(fin.len());
+                for extra in (1..=merge.len().min(avail)).rev() {
+                    let start = eff - fin.len() - extra;
+                    if v[start..start + fin.len()] == fin[..]
+                        && v[start + fin.len()..eff] == merge[..extra]
+                    {
+                        if abrupt {
+                            let tail = v.remove(v.len() - 1);
+                            v.truncate(start);
+                            v.push(tail);
+                        } else {
+                            v.truncate(start);
+                        }
+                        return true;
+                    }
                 }
             }
             // copies followed by a trailing return/throw
@@ -6297,52 +6384,52 @@ fn strip_trailing_copies(s: &mut Stmt, fin: &[Stmt]) -> bool {
             }
             // descend into the last child tail
             if let Some(last) = v.last_mut() {
-                if strip_trailing_copies(last, fin) {
+                if strip_trailing_copies_merge(last, fin, merge) {
                     return true;
                 }
             }
             false
         }
         Stmt::If { then_stmt, else_stmt, .. } => {
-            let a = strip_trailing_copies(then_stmt, fin);
-            let b = else_stmt.as_mut().map(|e| strip_trailing_copies(e, fin)).unwrap_or(false);
+            let a = strip_trailing_copies_merge(then_stmt, fin, merge);
+            let b = else_stmt.as_mut().map(|e| strip_trailing_copies_merge(e, fin, merge)).unwrap_or(false);
             a || b
         }
         Stmt::Try { body, catches, finally } => {
-            let mut r = strip_trailing_copies(body, fin);
+            let mut r = strip_trailing_copies_merge(body, fin, merge);
             for c in catches.iter_mut() {
-                r |= strip_trailing_copies(&mut c.body, fin);
+                r |= strip_trailing_copies_merge(&mut c.body, fin, merge);
             }
             if let Some(f) = finally {
-                r |= strip_trailing_copies(f, fin);
+                r |= strip_trailing_copies_merge(f, fin, merge);
             }
             r
         }
         Stmt::TryWithResources { body, catches, finally, .. } => {
-            let mut r = strip_trailing_copies(body, fin);
+            let mut r = strip_trailing_copies_merge(body, fin, merge);
             for c in catches.iter_mut() {
-                r |= strip_trailing_copies(&mut c.body, fin);
+                r |= strip_trailing_copies_merge(&mut c.body, fin, merge);
             }
             if let Some(f) = finally {
-                r |= strip_trailing_copies(f, fin);
+                r |= strip_trailing_copies_merge(f, fin, merge);
             }
             r
         }
-        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => strip_trailing_copies(body, fin),
-        Stmt::For { body, .. } | Stmt::ForEach { body, .. } => strip_trailing_copies(body, fin),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => strip_trailing_copies_merge(body, fin, merge),
+        Stmt::For { body, .. } | Stmt::ForEach { body, .. } => strip_trailing_copies_merge(body, fin, merge),
         Stmt::Switch { cases, default, .. } => {
             let mut r = false;
             for c in cases.iter_mut() {
                 for st in c.body.iter_mut() {
-                    r |= strip_trailing_copies(st, fin);
+                    r |= strip_trailing_copies_merge(st, fin, merge);
                 }
             }
             if let Some(d) = default {
-                r |= strip_trailing_copies(d, fin);
+                r |= strip_trailing_copies_merge(d, fin, merge);
             }
             r
         }
-        Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => strip_trailing_copies(body, fin),
+        Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => strip_trailing_copies_merge(body, fin, merge),
         _ => false,
     }
 }
