@@ -9209,6 +9209,7 @@ fn collect_captured_stmt(s: &Stmt, prefix: &str, vars: &mut HashSet<u32>) {
             collect_captured_expr(lock, prefix, vars);
             collect_captured_stmt(body, prefix, vars);
         }
+        Stmt::Labeled { body, .. } => collect_captured_stmt(body, prefix, vars),
         _ => {}
     }
 }

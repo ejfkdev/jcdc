@@ -3071,7 +3071,9 @@ fn resolve_catch_vars(vt: &mut VarTable, s: &mut Stmt) {
                 resolve_catch_vars(vt, d);
             }
         }
-        Stmt::Synchronized { body, .. } => resolve_catch_vars(vt, body),
+        Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => {
+            resolve_catch_vars(vt, body)
+        }
         _ => {}
     }
 }
@@ -3733,7 +3735,7 @@ fn cleanup(s: &mut Stmt) {
                 cleanup(d);
             }
         }
-        Stmt::Synchronized { body, .. } => cleanup(body),
+        Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => cleanup(body),
         _ => {}
     }
     if let Stmt::Block(v) = s {
@@ -4217,6 +4219,7 @@ fn convert_defs_and_collect(s: &mut Stmt, vars: &std::collections::HashSet<u32>,
             collect_expr(lock, vars, used);
             convert_defs_and_collect(body, vars, used);
         }
+        Stmt::Labeled { body, .. } => convert_defs_and_collect(body, vars, used),
         Stmt::MonitorEnter(e) | Stmt::MonitorExit(e) => collect_expr(e, vars, used),
         _ => {}
     }
@@ -4899,6 +4902,7 @@ fn gather_evidence(
             gather_expr(lock, ev, None, bool_vars);
             gather_evidence(body, ev, ret_ty, bool_vars);
         }
+        Stmt::Labeled { body, .. } => gather_evidence(body, ev, ret_ty, bool_vars),
         _ => {}
     }
 }
@@ -5090,6 +5094,7 @@ pub(crate) fn rewrite_local_types(s: &mut Stmt, types: &[TypeRef]) {
             rewrite_expr(lock, types);
             rewrite_local_types(body, types);
         }
+        Stmt::Labeled { body, .. } => rewrite_local_types(body, types),
         _ => {}
     }
 }
