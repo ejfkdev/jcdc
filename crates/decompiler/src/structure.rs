@@ -281,6 +281,7 @@ pub fn immediate_postdom(
     body_group_of: &HashMap<usize, usize>,
     entry_group: Option<usize>,
     terminators: &HashSet<usize>,
+    abrupt_only: &HashSet<usize>,
     final_writers: &HashSet<usize>,
 ) -> Option<usize> {
     let succs: Vec<usize> = cfg.blocks[entry]
@@ -475,9 +476,34 @@ pub fn immediate_postdom(
                                 // return, 缺少返回语句 x3 trees). DHKey's
                                 // valid path skips the parked throw via a
                                 // Goto stub into the Return — a live route.
+                                // A skip route whose confluence DIES
+                                // (a terminator, or a stub whose every
+                                // successor is one) never falls into the
+                                // parked tail, so parking a shared RETURN
+                                // is safe there (CHM.equals: the loop's
+                                // `return false` splits into iconst_0 |
+                                // ireturn — the confluence stub is one hop
+                                // before the Return, invisible to a plain
+                                // terminator check — and cannot reach the
+                                // method-final `return true` at pc 211;
+                                // rejecting it lost the tail, 缺少返回语句).
+                                // DHKeyExchange's shared THROW stays
+                                // rejected because its valid path skips
+                                // via a Goto stub into the Return — the
+                                // stub itself is the confluence and the
+                                // route is live at that point.
+                                let dying = terminators.contains(&nx)
+                                    || abrupt_only.contains(&nx);
                                 if !can_reach_cfg(cfg, nx, cand, 4096)
-                                    && (no_lr || !terminators.contains(&nx))
+                                    && (no_lr || !dying)
                                 {
+                                    if std::env::var("JCDC_DBG_PDJ").is_ok() {
+                                        eprintln!("PDJ-SKIP cand={} cand_pc={} cand_term={} s0={} s0_pc={} nx={} nx_pc={} nx_term={} no_lr={}",
+                                            cand, cfg.blocks[cand].start, terminators.contains(&cand),
+                                            s0, cfg.blocks[s0].start,
+                                            nx, cfg.blocks[nx].start,
+                                            terminators.contains(&nx), no_lr);
+                                    }
                                     return true;
                                 }
                                 seen.insert(nx);
@@ -1561,7 +1587,26 @@ impl<'a> Structurer<'a> {
         let final_writers: HashSet<usize> = (0..self.results.len())
             .filter(|&b| self.terminator_writes_final(b))
             .collect();
-        immediate_postdom(self.cfg, universe, entry, &exempt, &self.body_group, entry_group, &terminators, &final_writers)
+        // Blocks whose every CFG exit is abrupt (return/throw or none):
+        // a route landing there dies before any parked merge, so it
+        // never skips a shared RETURN tail (CHM.equals' method-final
+        // `return true` at pc 211 was rejected because the loop body's
+        // `return false` confluence cannot reach it — parking the tail
+        // is correct there; only DHKey's shared THROW needs the live
+        // skip route rejected).
+        let mut abrupt_only: HashSet<usize> = HashSet::new();
+        for b in 0..self.results.len() {
+            let term_abrupt = matches!(
+                self.results[b].term,
+                crate::builder::Term::Return(_) | crate::builder::Term::Throw(_)
+            );
+            let succs_abrupt = !self.cfg.blocks[b].succ.is_empty()
+                && self.cfg.blocks[b].succ.iter().all(|&x| terminators.contains(&x));
+            if term_abrupt || succs_abrupt {
+                abrupt_only.insert(b);
+            }
+        }
+        immediate_postdom(self.cfg, universe, entry, &exempt, &self.body_group, entry_group, &terminators, &abrupt_only, &final_writers)
     }
 
     /// True if `b` is an exception-handler head; such blocks must only be
