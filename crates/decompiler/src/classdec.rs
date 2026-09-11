@@ -12920,10 +12920,69 @@ fn apply_param_casts(
                         // A parameterized parameter type (`BiFunction<? super
                         // String, ...>`): an argument whose erasure matches
                         // but whose parameters differ needs the source cast.
+                        // EVERY typevar the formal mentions must be
+                        // denotable at the call site: an unresolved
+                        // receiver instantiation leaks the declaring
+                        // interface's own typevar into the formal (jdk26
+                        // components PackageSnippets: Stream.filter's
+                        // Predicate<? super E> with E = Collection's
+                        // typevar — the cast printed `(? super E)` with
+                        // no E in scope, 找不到符号 类 E). Skipping the
+                        // cast leaves the bare actual, which converts
+                        // against the real wildcard at the source level.
                         t @ (jcdc_jvm::GenericType::Class(_) | jcdc_jvm::GenericType::Array(_))
                             if parameterized(t) =>
                         {
-                            Some(t.clone())
+                            fn tvars_of(
+                                g: &jcdc_jvm::GenericType,
+                                out: &mut Vec<String>,
+                            ) {
+                                use jcdc_jvm::GenericType as G;
+                                match g {
+                                    G::TypeVar(n) => {
+                                        if !out.contains(n) {
+                                            out.push(n.clone());
+                                        }
+                                    }
+                                    G::Array(i) => tvars_of(i, out),
+                                    G::Class(cs) => cs.parts.iter().for_each(|p| {
+                                        p.args.iter().for_each(|a| tvars_of(a, out))
+                                    }),
+                                    G::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
+                                    | G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => {
+                                        tvars_of(t, out)
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            let mut tvs: Vec<String> = Vec::new();
+                            tvars_of(t, &mut tvs);
+                            let all_denotable = tvs.iter().all(|n| {
+                                caller_params.iter().any(|p| &p.name == n)
+                                    || pc.map(|p| {
+                                        let mut cname = p.internal_name.clone();
+                                        loop {
+                                            if let Some(cp) = pool.get(&cname) {
+                                                if class_typevar_names(&cp)
+                                                    .iter()
+                                                    .any(|c| c == n)
+                                                {
+                                                    return true;
+                                                }
+                                            }
+                                            match cname.rfind('$') {
+                                                Some(i) if i > 0 => cname.truncate(i),
+                                                _ => return false,
+                                            }
+                                        }
+                                    })
+                                    .unwrap_or(false)
+                            });
+                            if all_denotable {
+                                Some(t.clone())
+                            } else {
+                                None
+                            }
                         }
                         _ => None,
                     };
