@@ -1106,6 +1106,20 @@ fn prune_dead_synth_stores(s: &mut Stmt, vt: &VarTable) {
             | Expr::Assign { .. }
             | Expr::PreIncDec { .. }
             | Expr::PostIncDec { .. } => Some(e.clone()),
+            // A cast WRAPPING a side-effectful value is not itself a
+            // legal statement expression (`(Void) doPrivileged(..);`),
+            // but the inner call is: demote THROUGH the cast and keep
+            // the effect (jdk17 SSLEngineImpl DelegatedTask.run: the
+            // dead `var dummy = (Void) AccessController.doPrivileged(
+            // new DelegatedAction(hc), acc)` store was dropped whole,
+            // emptying the try before its checked
+            // catch(PrivilegedActionException) — 在相应的 try 语句主体中
+            // 不能抛出异常错误). The store is dead, so discarding the
+            // cast's value semantics is safe; nested casts strip
+            // recursively.
+            Expr::Cast { e: inner, .. } => {
+                demote_value(inner).map(|_| (**inner).clone())
+            }
             _ => None,
         }
     }
