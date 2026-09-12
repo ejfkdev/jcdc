@@ -171,8 +171,12 @@ impl BinOp {
             BinOp::Ge => BinOp::Lt,
             BinOp::Gt => BinOp::Le,
             BinOp::Le => BinOp::Gt,
-            BinOp::LogAnd => BinOp::LogOr,
-            BinOp::LogOr => BinOp::LogAnd,
+            // LogAnd/LogOr have NO operand-preserving inversion: negating
+            // them is De Morgan (negate both operands AND swap the op) —
+            // convert.rs negate() handles that recursively; an op-only swap
+            // here silently changed the condition's meaning (Arrays.equals'
+            // folded `a == null || a2 == null` inverted to `a == null &&
+            // a2 == null`, NPE-ing the a2==null path).
             _ => return None,
         })
     }

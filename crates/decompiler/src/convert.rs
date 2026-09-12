@@ -1159,22 +1159,36 @@ fn strip_trailing_continue(s: Stmt) -> Stmt {
 }
 
 pub fn negate(e: Expr) -> Expr {
-    match &e {
-        Expr::Un { op: UnOp::Not, .. } => match e {
-            Expr::Un { e, .. } => *e,
-            _ => unreachable!(),
-        },
-        Expr::Bin { op, .. } => {
-            if let Some(inv) = op.invert() {
-                match e {
-                    Expr::Bin { l, r, ty, .. } => Expr::Bin { op: inv, l, r, ty },
-                    _ => unreachable!(),
-                }
+    match e {
+        Expr::Un { op: UnOp::Not, e } => *e,
+        // De Morgan for the short-circuit operators: !(A && B) =
+        // !A || !B, !(A || B) = !A && !B — recursing through negate
+        // keeps comparison operands cleanly inverted. An op-only swap
+        // (the historical invert() LogAnd<->LogOr mapping) silently
+        // changed the condition's meaning: Arrays.equals' folded
+        // `a == null || a2 == null` inverted to `a == null && a2 ==
+        // null`, NPE-ing the a2==null path.
+        Expr::Bin { op: op @ (crate::expr::BinOp::LogAnd | crate::expr::BinOp::LogOr), l, r, ty } => {
+            let swapped = if matches!(op, crate::expr::BinOp::LogAnd) {
+                crate::expr::BinOp::LogOr
             } else {
-                Expr::Un { op: UnOp::Not, e: Box::new(e) }
+                crate::expr::BinOp::LogAnd
+            };
+            Expr::Bin {
+                op: swapped,
+                l: Box::new(negate(*l)),
+                r: Box::new(negate(*r)),
+                ty,
             }
         }
-        _ => Expr::Un { op: UnOp::Not, e: Box::new(e) },
+        Expr::Bin { op, l, r, ty } => {
+            if let Some(inv) = op.invert() {
+                Expr::Bin { op: inv, l, r, ty }
+            } else {
+                Expr::Un { op: UnOp::Not, e: Box::new(Expr::Bin { op, l, r, ty }) }
+            }
+        }
+        other => Expr::Un { op: UnOp::Not, e: Box::new(other) },
     }
 }
 

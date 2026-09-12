@@ -83,7 +83,7 @@ pub fn decompile_method(
         .iter()
         .map(|e| (e.start_pc, e.end_pc, e.handler_pc, e.catch_type))
         .collect();
-    let cfg = Cfg::build(pc, &code.code, &exc);
+    let mut cfg = Cfg::build(pc, &code.code, &exc);
 
     // Temp-local forwarding pairs: a slot stored EXACTLY once and loaded
     // EXACTLY once by the immediately-following instruction in the same
@@ -542,6 +542,12 @@ pub fn decompile_method(
         let _ = &mut diverged;
         let _ = &mut prev_out;
         break;
+    }
+
+    // Short-circuit pre-fold (before grouping/loop/region analysis; see
+    // short_circuit_prefold).
+    if std::env::var("JCDC_NO_SCFOLD").is_err() {
+        short_circuit_prefold(&mut cfg, &mut results, &fold_regions);
     }
 
     // Structure.
@@ -11063,5 +11069,302 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
             cast_generic_locals(vt, pool, pc, body)
         }
         _ => {}
+    }
+}
+
+/// Pre-structuring short-circuit fold (idea ported from garlic's
+/// expression_logical.c identify_logical_operations fixpoint): javac
+/// compiles `if (A || B) S else Z` as `X: if A goto S; Y: if B goto S;
+/// Z: ..; S: ..` — two tests sharing the taken target S. Unstructured,
+/// S is a branch-target merge candidate: the SESE resolvers park S's
+/// statements as the `if (A)` If's follow while Y's fall side (Z)
+/// completes normally past S's emission point (the jdk11/17/26
+/// OCSPResponse SingleResponse false-merge family — blank-final
+/// double-assign, currently bandaged by the walk-pd reconciliation).
+/// Folding the test pair into `if (A || B)` removes the multi-pred
+/// target before grouping, loop detection, and region analysis ever
+/// see it, and renders the source-faithful `||` / `&&` instead of an
+/// else-if chain with per-arm copies.
+///
+/// && dual: `X: if !A goto Z; Y: if B goto S; Z: ..; S: ..` with X's
+/// taken == Y's fall folds to `if (A && B) goto S`.
+///
+/// Safety gates (each census-motivated): Y single-pred (no other jump,
+/// switch case, or handler entry references it — a switch target's
+/// pred list omits the dispatch block, so len==1 can never hide a
+/// case entry); Y statement-free with side-effect-free operand loads;
+/// Y's instruction opcodes cannot throw beyond what X's position can
+/// (allowed set = consts/loads/stack-ops/cmp/getstatic/arraylength/
+/// instanceof); every exception range covering Y also covers X's
+/// start (protection preserved); X's other successor (the non-shared
+/// one) must not dominate X — a fallthrough into a loop header is a
+/// rotated-loop shape, not a short-circuit; no value-diamond fold
+/// participant is touched; X and Y are not both pure tests (that
+/// shape keeps the else-if chain rendering). Chains fold iteratively
+/// left-to-right (`A || B || C`).
+fn short_circuit_prefold(
+    cfg: &mut Cfg,
+    results: &mut Vec<BlockResult>,
+    fold_regions: &HashMap<usize, (usize, HashSet<usize>)>,
+) {
+    use jcdc_classfile::Opcode;
+    fn allowed_test_ins(op: Opcode, is_last: bool) -> bool {
+        let b = op as u8;
+        if is_last {
+            // The terminating conditional jump itself.
+            return (0x99..=0xA6).contains(&b) || b == 0xC6 || b == 0xC7;
+        }
+        (0x02..=0x14).contains(&b) // aconst_null .. ldc2_w
+            || (0x15..=0x35).contains(&b) // loads incl. _N aliases
+            || (0x57..=0x5F).contains(&b) // pop/dup/swap
+            || (0x94..=0x98).contains(&b) // lcmp/fcmpX/dcmpX
+            || b == 0xB2 // getstatic (range-coverage gate handles clinit)
+            || b == 0xBE // arraylength (range-coverage gate handles NPE)
+            || b == 0xC1 // instanceof
+    }
+    // True when the condition mentions the synthetic assert flag: the
+    // two-test `getstatic $assertionsDisabled; ifne OK / <cond>; if X
+    // THROW` desugaring must reach the structurer UNFOLDED so the assert
+    // idiom recognizer (assert_cond_of) re-sugars `assert c;` — folding it
+    // renders an explicit `if ($jcdcAssertionsDisabled || ...)` whose
+    // simple-name static read inside a constructor is an illegal forward
+    // reference (jdk26 QuicTransportErrors 初始化程序中对静态字段的引用
+    // 不合法 ×2) and loses the assert shape.
+    fn cond_mentions_assert_flag(e: &Expr) -> bool {
+        match e {
+            Expr::Field { name, .. } => name == "$assertionsDisabled",
+            Expr::Local { .. }
+            | Expr::Const(_)
+            | Expr::This
+            | Expr::Raw(_)
+            | Expr::RawT(..) => false,
+            Expr::Bin { l, r, .. } => cond_mentions_assert_flag(l) || cond_mentions_assert_flag(r),
+            Expr::Un { e, .. } | Expr::Cast { e, .. } => cond_mentions_assert_flag(e),
+            Expr::Cond { c, t, f } => {
+                cond_mentions_assert_flag(c)
+                    || cond_mentions_assert_flag(t)
+                    || cond_mentions_assert_flag(f)
+            }
+            Expr::Assign { target, value, .. } => {
+                cond_mentions_assert_flag(target) || cond_mentions_assert_flag(value)
+            }
+            Expr::Method { args, owner, .. } => {
+                owner.as_deref().map(cond_mentions_assert_flag).unwrap_or(false)
+                    || args.iter().any(cond_mentions_assert_flag)
+            }
+            _ => false,
+        }
+    }
+    // Conservative Assign scanner: a condition carrying an embedded
+    // assignment (merge-var artifact) must never be reordered into a
+    // folded short-circuit. Unknown expression shapes count as assigns.
+    fn cond_has_assign(e: &Expr) -> bool {
+        match e {
+            Expr::Assign { .. } => true,
+            Expr::PreIncDec { .. } | Expr::PostIncDec { .. } => true,
+            Expr::Local { .. }
+            | Expr::Const(_)
+            | Expr::This
+            | Expr::Raw(_)
+            | Expr::RawT(..) => false,
+            Expr::Bin { l, r, .. } => cond_has_assign(l) || cond_has_assign(r),
+            Expr::Un { e, .. } | Expr::Cast { e, .. } => cond_has_assign(e),
+            Expr::Cond { c, t, f } => {
+                cond_has_assign(c) || cond_has_assign(t) || cond_has_assign(f)
+            }
+            Expr::Method { args, owner, .. } => {
+                owner.as_deref().map(cond_has_assign).unwrap_or(false)
+                    || args.iter().any(cond_has_assign)
+            }
+            Expr::Field { owner, .. } => {
+                owner.as_deref().map(cond_has_assign).unwrap_or(false)
+            }
+            Expr::InstanceOf { e, .. } => cond_has_assign(e),
+            _ => true,
+        }
+    }
+    // Value-diamond participants keep their exact topology.
+    let mut diamond: HashSet<usize> = HashSet::new();
+    for (m, (root, absorbed)) in fold_regions.iter() {
+        diamond.insert(*m);
+        diamond.insert(*root);
+        diamond.extend(absorbed.iter().copied());
+    }
+    let n = cfg.blocks.len();
+    // Per-block exception-range coverage (handler pcs) for the
+    // protection-preservation gate.
+    let mut cover: Vec<HashSet<u16>> = vec![HashSet::new(); n];
+    for r in cfg.exc_ranges.iter() {
+        for b in cfg.blocks.iter() {
+            if b.ins.is_empty() {
+                continue;
+            }
+            if (b.start as u32) < r.end as u32 && (b.end as u32) > r.start as u32 {
+                cover[b.id].insert(r.handler);
+            }
+        }
+    }
+    let dbg = std::env::var("JCDC_DBG_SCFOLD").is_ok();
+    let mut changed = true;
+    let mut rounds = 0usize;
+    while changed && rounds < 64 {
+        changed = false;
+        rounds += 1;
+        let mut order: Vec<usize> =
+            (0..n).filter(|&b| !cfg.blocks[b].ins.is_empty()).collect();
+        order.sort_by_key(|&b| cfg.blocks[b].start);
+        for &x in order.iter() {
+            if !matches!(results[x].term, crate::builder::Term::Cond { .. }) {
+                continue;
+            }
+            if cfg.blocks[x].succ.len() != 2 || diamond.contains(&x) {
+                continue;
+            }
+            let (fall, taken) = (cfg.blocks[x].succ[0], cfg.blocks[x].succ[1]);
+            let y = fall;
+            if y == x || y >= n || diamond.contains(&y) {
+                continue;
+            }
+            if !matches!(results[y].term, crate::builder::Term::Cond { .. }) {
+                continue;
+            }
+            if cfg.blocks[y].succ.len() != 2 {
+                continue;
+            }
+            if cfg.blocks[y].pred.len() != 1 || cfg.blocks[y].pred[0] != x {
+                continue;
+            }
+            if !cfg.blocks[y].handlers.is_empty() {
+                continue;
+            }
+            if results[y].stmts.iter().any(|s| !matches!(s, Stmt::Comment(_))) {
+                continue;
+            }
+            // Y's instructions: all side-effect/throw free (last = the
+            // cond jump itself).
+            let yins = &cfg.blocks[y].ins;
+            if yins.is_empty() {
+                continue;
+            }
+            if !yins
+                .iter()
+                .enumerate()
+                .all(|(i, ins)| allowed_test_ins(ins.op, i + 1 == yins.len()))
+            {
+                continue;
+            }
+            // Exception protection: every range covering Y must cover X's
+            // start (the folded tests execute at X's position).
+            if !cover[y].iter().all(|h| {
+                cover[x].contains(h)
+                    || cfg.exc_ranges.iter().any(|r| {
+                        &r.handler == h && (r.start as u32) <= cfg.blocks[x].start as u32
+                    })
+            }) {
+                continue;
+            }
+            let (yt, yf) = (cfg.blocks[y].succ[1], cfg.blocks[y].succ[0]);
+            // || : X: if cx goto S; Y: if cy goto S; else Z(=yf).
+            // Folded: if (cx || cy) goto S else Z.
+            // && : X: if cx goto Z; Y: if cy goto S; fall also S?? — the
+            // javac shape is `if !A goto Z; if B goto S; else Z`, i.e.
+            // X.taken == Y.fall == Z and Y.taken == S: the folded test
+            // reaching S is (!cx && cy) with taken=S(yt), fall=Z(taken).
+            let (op, new_taken, z) = if yt == taken && yf != taken {
+                (crate::expr::BinOp::LogOr, taken, yf)
+            } else if yf == taken && yt != taken {
+                (crate::expr::BinOp::LogAnd, yt, taken)
+            } else {
+                continue;
+            };
+            // The non-shared successor must not jump straight back to X:
+            // a direct z->x edge is a rotated-loop back edge (the chain is
+            // a loop condition, not an if short-circuit). Multi-hop flows
+            // back to X are fine — that IS the standard `while (A && B)`
+            // condition reconstruction and folding it is desirable.
+            if z == x || (z < n && cfg.blocks[z].succ.iter().any(|&s| s == x)) {
+                continue;
+            }
+            // No embedded assignments in either condition (merge-var
+            // artifacts must never be reordered by the fold).
+            let cy = match &results[y].term {
+                crate::builder::Term::Cond { cond } => cond.clone(),
+                _ => continue,
+            };
+            if cond_has_assign(&cy) || cond_mentions_assert_flag(&cy) {
+                continue;
+            }
+            if let crate::builder::Term::Cond { cond } = &results[x].term {
+                if cond_has_assign(cond) || cond_mentions_assert_flag(cond) {
+                    continue;
+                }
+            }
+            // Both-pure-tests shape keeps the chain rendering.
+            let x_pure = cfg.blocks[x]
+                .ins
+                .iter()
+                .all(|i| allowed_test_ins(i.op, false) || (0x99..=0xA6).contains(&(i.op as u8)));
+            if x_pure && results[x].stmts.iter().all(|s| matches!(s, Stmt::Comment(_))) {
+                continue;
+            }
+            let cx = match std::mem::replace(
+                &mut results[x].term,
+                crate::builder::Term::Fallthrough,
+            ) {
+                crate::builder::Term::Cond { cond } => cond,
+                other => {
+                    results[x].term = other;
+                    continue;
+                }
+            };
+            let cx = if matches!(op, crate::expr::BinOp::LogAnd) {
+                crate::convert::negate(cx)
+            } else {
+                cx
+            };
+            results[x].term = crate::builder::Term::Cond {
+                cond: Expr::Bin {
+                    op,
+                    l: Box::new(cx),
+                    r: Box::new(cy),
+                    ty: Some(crate::expr::TypeRef::J(JavaType::Boolean)),
+                },
+            };
+            // Y is absorbed: clear its result and empties.
+            results[y] = BlockResult {
+                stmts: vec![],
+                out_stack: vec![],
+                term: crate::builder::Term::Fallthrough,
+            };
+            cfg.blocks[y].ins.clear();
+            cfg.blocks[y].succ.clear();
+            cfg.blocks[y].pred.clear();
+            // Rewire: X.succ = [z, taken]; drop X from Y's preds (gone);
+            // replace Y with X in z/taken preds.
+            cfg.blocks[x].succ = vec![z, new_taken];
+            for &t in [z, new_taken, taken].iter() {
+                if t < n {
+                    if let Some(pos) = cfg.blocks[t].pred.iter().position(|&p| p == y) {
+                        cfg.blocks[t].pred[pos] = x;
+                    }
+                }
+            }
+            // X's cond-jump instruction must target the NEW taken block.
+            if new_taken != taken && new_taken < n {
+                let tpc = cfg.blocks[new_taken].start;
+                if let Some(ins) = cfg.blocks[x].ins.last_mut() {
+                    ins.a = tpc as i32;
+                }
+            }
+            if dbg {
+                eprintln!(
+                    "SCFOLD x={} y={} op={:?} z={} taken={} (x pc {}..{}, y pc {}..{})",
+                    x, y, op, z, taken,
+                    cfg.blocks[x].start, cfg.blocks[x].end,
+                    cfg.blocks[y].start, cfg.blocks[y].end
+                );
+            }
+            changed = true;
+        }
     }
 }
