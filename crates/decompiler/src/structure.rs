@@ -948,6 +948,110 @@ pub fn group_exceptions_with(cfg: &Cfg, results: Option<&Vec<crate::builder::Blo
             break;
         }
     }
+    // HANDLER-PROTECTION NESTING: when one group's HANDLER code is itself
+    // protected by a SUBSET of that group's handlers, javac has split the
+    // source-level `try { while (true) { try { .. } catch (Exception e) {
+    // .. may throw I/N .. } } } catch (I) { .. } catch (N) { .. }` into a
+    // body range plus a handler-protection range (jdk26 javax.crypto.KDF
+    // .chooseProvider: A=(91,162)[Exception@162, IAPE@258, NSAE@263] +
+    // B=(162,258)[IAPE, NSAE] — B protects the catch(Exception) body's
+    // getNext retry, whose NSAE the source-level outer catch converts to
+    // IAPE("No provider supports this input", lastException); the flat
+    // rendering loses that conversion — the documented KDF behavioral
+    // divergence). Reconstruct: OUTER=(A.start, B.end)[B's handlers] +
+    // INNER=(A.start, A.end)[A's handlers minus B's].
+    loop {
+        let mut did = false;
+        'hp: for i in 0..groups.len() {
+            for j in 0..groups.len() {
+                if i == j {
+                    continue;
+                }
+                let x = groups[i].clone();
+                let y = groups[j].clone();
+                // Y must start AT one of X's handler pcs (Y protects X's
+                // handler code) and extend strictly past X.
+                if !x.handlers.iter().any(|(h, _)| *h == y.start) {
+                    continue;
+                }
+                if y.start < x.end || y.start > x.end.saturating_add(8) {
+                    continue;
+                }
+                if y.end <= x.end {
+                    continue;
+                }
+                // Y's handler set is a strict subset of X's (the shared
+                // outer catches); X keeps at least one inner-only handler.
+                if !y.handlers.iter().all(|h| x.handlers.contains(h)) {
+                    continue;
+                }
+                // Y's handlers must ALL be typed catches: a catch-all
+                // (None = java.lang.Throwable) protecting X's handler
+                // code is javac's FINALLY desugaring (the catch body's
+                // inline finally copy), not a source-level outer try —
+                // merging there hoists the finally above the catch and
+                // swallows the loop tail (feat Exceptions.loopTry: the
+                // `++i` increment vanished inside the merged topology —
+                // infinite loop, run timeout ×6 releases). KDF's outer
+                // IAPE/NSAE catches are typed; finally copies never are.
+                if !y.handlers.iter().all(|(_, t)| t.is_some()) {
+                    continue;
+                }
+                let inner_handlers: Vec<(u16, Option<String>)> = x
+                    .handlers
+                    .iter()
+                    .filter(|h| !y.handlers.contains(h))
+                    .cloned()
+                    .collect();
+                if inner_handlers.is_empty() {
+                    continue;
+                }
+                // Split X's exc-range indices: ranges whose handler is
+                // inner-only belong to INNER, the rest to OUTER.
+                let mut inner_ranges = Vec::new();
+                let mut outer_ranges: Vec<usize> = y.ranges.clone();
+                for &ri in x.ranges.iter() {
+                    let h = cfg.exc_ranges[ri].handler;
+                    let t = &cfg.exc_ranges[ri].catch_type;
+                    if y.handlers.iter().any(|(yh, yt)| *yh == h && *yt == *t) {
+                        outer_ranges.push(ri);
+                    } else {
+                        inner_ranges.push(ri);
+                    }
+                }
+                // No foreign handler may live strictly inside the inner
+                // span (it would belong to a deeper nest the walk must
+                // keep owning) or inside the protection gap.
+                let foreign_inside = cfg.exc_ranges.iter().any(|r| {
+                    let owned_by_x_or_y = x.handlers.iter().any(|(h, t)| *h == r.handler)
+                        || y.handlers.iter().any(|(h, t)| *h == r.handler);
+                    !owned_by_x_or_y
+                        && r.start >= x.start
+                        && r.end <= y.end
+                });
+                if foreign_inside {
+                    continue;
+                }
+                let mut outer = y.clone();
+                outer.start = x.start;
+                outer.ranges = outer_ranges;
+                let mut inner = x.clone();
+                inner.handlers = inner_handlers;
+                inner.ranges = inner_ranges;
+                let lo = i.min(j);
+                let hi = i.max(j);
+                groups.remove(hi);
+                groups.remove(lo);
+                groups.push(outer);
+                groups.push(inner);
+                did = true;
+                break 'hp;
+            }
+        }
+        if !did {
+            break;
+        }
+    }
     groups.sort_by_key(|g| (g.start, std::cmp::Reverse(g.end)));
     groups
 }
@@ -1993,6 +2097,40 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
     /// exc-augmented CFG — the catch-and-retry back edge (jdk11
     /// AbstractClassLoaderValue.putIfAbsent: the Throwable handler's
     /// `goto H` is the retry loop's only inbound edge to H besides the
+    /// True when `p` is a normally-unreachable handler-flow root in this
+    /// scope's dominator tree (its idom is itself and it is not the scope
+    /// entry): every path to it runs through an exception edge — the
+    /// signature of a catch body's first block (or a handler-only island).
+    fn dom_is_handler_root(&self, p: usize, dom: &DomInfo, entry: usize) -> bool {
+        dom.idom[p] == p && p != entry
+    }
+
+    /// True when normal flow from block `p` re-enters the pc span
+    /// [start_pc, end_pc) — the HP-merge retry check: a handler-flow
+    /// source whose goto lands back inside the protected span is the
+    /// catch body's `continue` (loop back edge), not a forward merge.
+    fn flows_back_into_span(&self, p: usize, start_pc: u16, end_pc: u16) -> bool {
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut q: Vec<usize> = self.cfg.blocks[p].succ.clone();
+        let mut budget = 512usize;
+        while let Some(b) = q.pop() {
+            if budget == 0 || seen.contains(&b) {
+                if budget == 0 {
+                    return false;
+                }
+                continue;
+            }
+            budget -= 1;
+            seen.insert(b);
+            let bs = self.cfg.blocks[b].start;
+            if bs >= start_pc && bs < end_pc {
+                return true;
+            }
+            q.extend(self.cfg.blocks[b].succ.iter().copied());
+        }
+        false
+    }
+
     /// pre-loop init; jdk11/17 ObjectInputStream$1.run's superclass
     /// walk update block). The scope's dom root is excluded: its idom
     /// is itself too, and root->cur with cur reaching the root is just
@@ -2435,7 +2573,28 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         p != cur
                             && self.closes_back_edge(cur, p, &dom, entry, true)
                             && (self.cfg.blocks[p].end <= self.groups[gi].start
-                                || self.cfg.blocks[p].start >= self.groups[gi].end)
+                                || self.cfg.blocks[p].start >= self.groups[gi].end
+                                // HANDLER-PROTECTION topology: the source
+                                // is normally-unreachable handler flow
+                                // (its dominator set is just itself) that
+                                // flows BACK into the protected span —
+                                // the HP-merge's outer group spans the
+                                // handler code, so the retry edge is
+                                // span-internal yet still handler flow
+                                // (jdk26 javax.crypto.KDF chooseProvider:
+                                // OUTER=(91,258)[IAPE,NSAE] + INNER=
+                                // (91,162)[Exception]; the catch body's
+                                // getNext retry `goto 91` (b30) lives
+                                // inside the outer span — without the
+                                // loop-wins veto here the handler walk
+                                // copy-unrolls the retry loop 4-deep
+                                // instead of resolving `continue`).
+                                || (self.dom_is_handler_root(p, &dom, entry)
+                                    && self.flows_back_into_span(
+                                        p,
+                                        self.groups[gi].start,
+                                        self.groups[gi].end,
+                                    )))
                     })
             });
             if std::env::var("JCDC_DBG_GRP").is_ok() {
