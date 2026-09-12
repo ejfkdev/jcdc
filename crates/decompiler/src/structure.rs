@@ -3203,6 +3203,33 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             && stop.contains(&fall)
                         {
                             self.dual_terminator_branch(taken, active)
+                        } else if self.is_terminator_block(taken)
+                            && stop.contains(&taken)
+                            && !self.loops_stack.is_empty()
+                            && !self.is_terminator_block(fall)
+                            && stop.contains(&fall)
+                            && can_reach_cfg(self.cfg, fall, taken, 4096)
+                        {
+                            // A TERMINATOR loop-exit target as a mid-body
+                            // branch whose FALL sibling also flows to that
+                            // same terminator (both arms are alternate
+                            // routes to one shared exit): Empty would let
+                            // the then-arm fall into the REST OF THE BODY
+                            // instead of the exit emission (jdk11/17/26
+                            // ConcurrentLinkedQueue.poll: the p==h
+                            // cas-success arm targeting the shared
+                            // `return item` block rendered empty and fell
+                            // into the advance code — the dequeued item was
+                            // silently lost until the next poll; offer's
+                            // TAIL-cas arm looped instead of returning
+                            // true). Emit the jump; conversion resolves it
+                            // against the loop exits (break) exactly like
+                            // the sibling arm's chain-end goto. The
+                            // fall-reaches-taken convergence requirement
+                            // keeps single-exit body tails (Locale/Pattern
+                            // hair-trigger shapes) on the historical Empty
+                            // path.
+                            Region::Goto { target: taken }
                         } else {
                             Region::Empty
                         }
