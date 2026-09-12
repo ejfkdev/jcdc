@@ -560,7 +560,8 @@ pub fn decompile_method(
         .collect();
     if std::env::var("JCDC_DBG_MNAME").is_ok() {
         eprintln!(
-            "METHOD {} {}",
+            "METHOD {}.{} {}",
+            pc.internal_name,
             pc.method_name(m_idx).unwrap_or("?"),
             desc_str
         );

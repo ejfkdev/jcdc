@@ -330,12 +330,19 @@ impl<'a> Structurer<'a> {
                 || ctx.consumed.contains(&t)
                 || ctx.loop_stack.contains(&t)
             {
+                if std::env::var("JCDC_DBG_LM").is_ok() {
+                    eprintln!("CM-SKIP t={} stop={} consumed={} lstack={} targets={:?}", t,
+                        stop.contains(&t), ctx.consumed.contains(&t), ctx.loop_stack.contains(&t), targets);
+                }
                 continue;
             }
             if targets
                 .iter()
                 .all(|&o| o == t || self.reaches_within(ctx, o, t, stop))
             {
+                if std::env::var("JCDC_DBG_LM").is_ok() {
+                    eprintln!("CM-RET {} targets={:?}", t, targets);
+                }
                 return Some(t);
             }
         }
@@ -448,13 +455,25 @@ impl<'a> Structurer<'a> {
         // degrades to `break`.
         if live.len() >= 2 {
             for &t in succs.iter() {
-                if stop.contains(&t) || ctx.consumed.contains(&t) {
+                if stop.contains(&t) {
+                    if std::env::var("JCDC_DBG_LM").is_ok() {
+                        eprintln!("LM-SKIP t={} stop succs={:?}", t, succs);
+                    }
+                    continue;
+                }
+                if ctx.consumed.contains(&t) {
+                    if std::env::var("JCDC_DBG_LM").is_ok() {
+                        eprintln!("LM-SKIP t={} consumed succs={:?}", t, succs);
+                    }
                     continue;
                 }
                 if live
                     .iter()
                     .all(|&o| o == t || self.reaches_within(ctx, o, t, stop))
                 {
+                    if std::env::var("JCDC_DBG_LM").is_ok() {
+                        eprintln!("LM-RET {} succs={:?} live={:?}", t, succs, live);
+                    }
                     return Some(t);
                 }
             }
@@ -2725,7 +2744,32 @@ impl<'a> Structurer<'a> {
                                         || self.reaches_within(ctx, t, *f, stop)
                                 })
                         })
-                        .or_else(|| self.convergent_merge(ctx, &[taken, fall], stop));
+                        // The convergent shortcut result gets the same two
+                        // screens as the live_merge result: a branch-target
+                        // follow needs a sibling route (reaches) and a
+                        // shared-terminator follow needs every target to
+                        // flow to it. (Empirically census-neutral; the
+                        // stronger all_routes_via variant of screen #1 is
+                        // documented-FAILED in memory
+                        // ocsp-sese-follow-diagnosis — it trades OCSPResponse
+                        // against BasicImageReader/keytool codegen cliffs.)
+                        .or_else(|| self.convergent_merge(ctx, &[taken, fall], stop))
+                        .filter(|f| {
+                            ![taken, fall].contains(f)
+                                || [taken, fall].iter().any(|&t| {
+                                    t != *f
+                                        && (stop.contains(&t)
+                                            || self.reaches_within(ctx, t, *f, stop))
+                                })
+                        })
+                        .filter(|f| {
+                            !matches!(self.results[*f].term, Term::Return(_) | Term::Throw(_))
+                                || [taken, fall].iter().all(|&t| {
+                                    stop.contains(&t)
+                                        || ctx.consumed.contains(&t)
+                                        || self.reaches_within(ctx, t, *f, stop)
+                                })
+                        });
                     let mut bstop: HashSet<usize> = stop.iter().copied().collect();
                     if let Some(f) = follow {
                         bstop.insert(f);
