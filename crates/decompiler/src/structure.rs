@@ -1860,7 +1860,7 @@ impl<'a> Structurer<'a> {
     /// Immediate post-dominator of `entry` within `universe`. Delegates to the
     /// O(n) `immediate_postdom` (BFS nearest-confluence with successor-candidate
     /// rejection); kept as a `&mut self` method for call-site convenience.
-    fn postdom_ipdom(&mut self, universe: &HashSet<usize>, entry: usize) -> Option<usize> {
+    pub(crate) fn postdom_ipdom(&mut self, universe: &HashSet<usize>, entry: usize) -> Option<usize> {
         // Successor-candidate rejection exempts every GROUP-OWNED block
         // (whole try bodies and handler heads, not just group starts):
         // rejecting an in-body successor re-routes the COND walk across
@@ -2283,6 +2283,13 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             }
             return r;
         }
+        self.structure_method_walk()
+    }
+
+    /// The verified walk baseline, ungated: the SESE hybrid fallback in
+    /// method.rs runs it on a fresh Structurer to compare emission counts.
+    pub(crate) fn structure_method_walk(&mut self) -> Region {
+        let dbg_regions = std::env::var("JCDC_DBG_REGIONS").is_ok();
         let universe: HashSet<usize> = self
             .cfg
             .blocks
@@ -4834,12 +4841,33 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         // into it — 12 inline survivors blew the 64K try-codegen limit).
         // Skip the pre-pass when t is itself a terminator (legit shared
         // return-tail copies never traverse a confluence head anyway).
-        if !self.is_terminator_block(t) && !COPY_ALLOW_CONFLUENCE.with(|c| c.get()) {
+        //
+        // COPY_ALLOW_CONFLUENCE (SESE consumed-arrival copies: the copy IS
+        // the arm's only emission route) crosses a barred confluence only
+        // when its own forward closure is SMALL (≤8 blocks): jdk11/17/26
+        // Pattern.family's stage-2 switch head and DecimalFormat.equals'
+        // chain merge must ride along or the copied arm falls off the
+        // method end (缺少返回语句), while keytool doCommands' 28-pred
+        // load epilogue — a 22-statement TWR finish chain every case arm
+        // flows into — stays barred: crossing it duplicated the epilogue
+        // into every consumed-arrival copy (75 → 329 FileOutputStream
+        // sites, 953KB → 3.2MB render, try 语句的代码过长 ×652 unmasked
+        // the moment OCSPResponse's FLOW error stopped masking javac's
+        // GENERATE phase).
+        if !self.is_terminator_block(t) {
+            let allow = COPY_ALLOW_CONFLUENCE.with(|c| c.get());
             let probe = reachable_within(self.cfg, t, &barriers);
             let extra: Vec<usize> = probe
                 .iter()
                 .copied()
                 .filter(|&x| x != t && self.shared_tail_confluence(x))
+                .filter(|&x| {
+                    !allow
+                        || !(matches!(
+                            self.results[x].term,
+                            crate::builder::Term::Switch { .. }
+                        ) || self.confluence_closure_small(x, &barriers))
+                })
                 .collect();
             barriers.extend(extra);
         }
@@ -4947,7 +4975,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
     /// territory, excluded; the high pred floor keeps ordinary merges
     /// (loop selectors, small diamonds) out — copy-local merges have
     /// their preds inside the closure and close normally.
-    fn shared_tail_confluence(&self, b: usize) -> bool {
+    pub(crate) fn shared_tail_confluence(&self, b: usize) -> bool {
         if self.is_terminator_block(b) || self.is_handler(b) {
             return false;
         }
@@ -4961,6 +4989,18 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             .filter(|p| !self.is_handler(**p))
             .count();
         normal_preds >= 8 && self.reaches_any_return(b)
+    }
+
+    /// True when the forward closure of confluence `b` (within the given
+    /// barriers) is small — ≤8 blocks. The COPY_ALLOW_CONFLUENCE crossing
+    /// budget: small closures are completeness-critical merge stubs /
+    /// stage heads whose loss strands the copied arm (Pattern.family,
+    /// DecimalFormat.equals); big closures are shared finish chains whose
+    /// per-arrival duplication overflows javac's 64K try-codegen limit
+    /// (keytool doCommands' 22-statement TWR epilogue).
+    fn confluence_closure_small(&self, b: usize, barriers: &HashSet<usize>) -> bool {
+        let reach = reachable_within(self.cfg, b, barriers);
+        reach.len() <= 8
     }
 
     /// True when EVERY normal flow path out of `b` ends in a

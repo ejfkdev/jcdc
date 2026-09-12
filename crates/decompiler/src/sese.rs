@@ -769,6 +769,77 @@ impl<'a> Structurer<'a> {
         succs.iter().all(|&s| self.settles_at(ctx, stop, s, e, depth + 1))
     }
 
+    /// Stronger sibling check for a branch-target follow candidate: EVERY
+    /// bounded route from `from` passes through `target` or leaves abruptly
+    /// (return/throw/stop-jump/loop re-entry). Used ONLY as the trigger
+    /// for the false-merge reconciliation below (never as a standalone
+    /// follow filter — the documented-failed variants 1-7 in memory
+    /// ocsp-sese-follow-diagnosis rejected follows outright and traded
+    /// OCSPResponse against BasicImageReader/keytool/Locale/Throwable/
+    /// ConcurrentHashMap families): a sibling route that completes
+    /// normally PAST the parked target's emission point is the crossing
+    /// that makes the empty-arm contract unsound.
+    fn all_routes_via(
+        &self,
+        ctx: &SeseCtx,
+        from: usize,
+        target: usize,
+        stop: &HashSet<usize>,
+    ) -> bool {
+        if from == target {
+            return true;
+        }
+        let mut post = crate::structure::reachable_within(self.cfg, target, stop);
+        post.remove(&target);
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut stack: Vec<usize> = vec![from];
+        let mut budget = 4096usize;
+        while let Some(c) = stack.pop() {
+            if c == target || seen.contains(&c) {
+                continue;
+            }
+            if budget == 0 {
+                return false;
+            }
+            budget -= 1;
+            seen.insert(c);
+            if post.contains(&c) {
+                return false; // bypass into the post-target flow
+            }
+            if stop.contains(&c) || ctx.loop_stack.contains(&c) {
+                continue; // abrupt escape: jump/continue, never falls through
+            }
+            if matches!(
+                self.results[c].term,
+                crate::builder::Term::Return(_) | crate::builder::Term::Throw(_)
+            ) {
+                continue;
+            }
+            let succs: Vec<usize> = self.cfg.blocks[c]
+                .succ
+                .iter()
+                .copied()
+                .filter(|&sx| ctx.universe.contains(&sx))
+                .collect();
+            if succs.is_empty() {
+                continue; // leaves the region: abrupt from this If's view
+            }
+            for sx in succs {
+                if ctx.loop_headers.contains(&sx) && !seen.contains(&sx) {
+                    // Re-entry into a loop header is a back-edge jump
+                    // (continue), not a fallthrough — abrupt.
+                    if self.cfg.blocks[c].succ.iter().any(|&o| o == sx) && sx != target {
+                        if self.cfg.blocks[sx].start <= self.cfg.blocks[c].start {
+                            continue;
+                        }
+                    }
+                }
+                stack.push(sx);
+            }
+        }
+        true
+    }
+
     fn reaches_within(&self, ctx: &SeseCtx, from: usize, target: usize, stop: &HashSet<usize>) -> bool {
         if from == target {
             return true;
@@ -2249,6 +2320,19 @@ impl<'a> Structurer<'a> {
                         natural_follow.push(s);
                     }
                 }
+                // A top-tested Cond header's own fall-out is a LIVE normal
+                // completion no matter what the body does: body_done (every
+                // body path returns/continues) must not suppress it
+                // (jdk11/17/26 AbstractPoller$Request.awaitResult: the
+                // wait-retry body is all-continue, so the body_done veto
+                // dropped the `!interrupted ? result : interrupt+result`
+                // epilogue the condition falls into — 缺少返回语句 ×3
+                // trees, latent behind OCSPResponse's FLOW mask). The
+                // bottom-tested fallback below keeps the veto: for(;;)/
+                // do-while exits are break landings the veto legitimately
+                // owns (TempFileHelper.create's in-try areturn re-emission).
+                let cond_exit_live = !natural_follow.is_empty()
+                    && matches!(self.results[cur].term, Term::Cond { .. });
                 if natural_follow.is_empty() {
                     // Bottom-tested loop (do-while): the header is the body
                     // entry whose only successor is inside the loop; the
@@ -2540,7 +2624,16 @@ impl<'a> Structurer<'a> {
                 let natural_follow = natural_follow
                     .into_iter()
                     .filter(|f| {
-                        !ctx.consumed.contains(f)
+                        // A top-tested Cond header's own fall-out stays the
+                        // continuation even when the body walk consumed it
+                        // (AbstractPoller$Request.awaitResult: the epilogue
+                        // rode into the body as the inner retry loop's
+                        // follow; dropping it left the condition-fall path
+                        // falling off the method — 缺少返回语句 ×3). The
+                        // restart-loop case-target policy only owns
+                        // unconditional (for(;;)/Goto) headers.
+                        cond_exit_live
+                            || !ctx.consumed.contains(f)
                             || !self.cfg.blocks[*f]
                                 .pred
                                 .iter()
@@ -2552,7 +2645,7 @@ impl<'a> Structurer<'a> {
                         header_id, exits, natural_follow,
                         natural_follow.iter().map(|f| ctx.consumed.contains(f)).collect::<Vec<_>>());
                 }
-                if body_done {
+                if body_done && !cond_exit_live {
                     ctx.depth -= 1;
                     return match parts.len() {
                         0 => Region::Empty,
@@ -2571,17 +2664,22 @@ impl<'a> Structurer<'a> {
                     // path's return (missing-return compile error; walk
                     // keeps the tail).
                     //
-                    // body_done vetoes: the loop cannot complete normally,
-                    // so NO continuation is reachable — including the
-                    // bottom-tested fallback's in-try areturn exits (the
-                    // shared terminator CopyStmts policy re-emitted
+                    // body_done vetoes UNLESS the header's own condition
+                    // fall-out is live (cond_exit_live): a top-tested
+                    // while's condition exit is a normal completion even
+                    // when every body path continues/returns
+                    // (AbstractPoller$Request.awaitResult). The veto stays
+                    // for the bottom-tested fallback's in-try areturn exits
+                    // (the shared terminator CopyStmts policy re-emitted
                     // `return Files.createDirectory(..)` after the
                     // non-completing for(;;) — TempFileHelper.create
                     // 无法访问的语句 x2 trees).
-                    Some(f) if !body_done && !stop.contains(&f) && reach.contains(&f) => Some(f),
+                    Some(f) if (!body_done || cond_exit_live)
+                        && !stop.contains(&f)
+                        && reach.contains(&f) => Some(f),
                     _ => None,
                 };
-                let follow_pick = if body_done { None } else { follow_pick.or_else(|| {
+                let follow_pick = if body_done && !cond_exit_live { None } else { follow_pick.or_else(|| {
                     // Stranded break landing: an exit some in-body
                     // `break L` targeted but neither the body nor any
                     // follow consumed (a guarded-pattern case body sits
@@ -2770,6 +2868,135 @@ impl<'a> Structurer<'a> {
                                         || self.reaches_within(ctx, t, *f, stop)
                                 })
                         });
+                    // FALSE-MERGE RECONCILIATION against the walk-side
+                    // picker: a branch-target follow is exactly the class
+                    // immediate_postdom's successor-candidate rejection
+                    // was hardened against (OCSPResponse's parked
+                    // UNSPECIFIED block — its sibling's values[reason]
+                    // route bypasses it into the post-flow; the walk
+                    // renders the golden arm-exclusive copies via this
+                    // rejection). When the walk picker disagrees with the
+                    // SESE resolvers, defer to it: adopt its confluence
+                    // (BasicImageReader's `map!=null && MAP_ALL` chain —
+                    // the shared else-arm block is a false merge whose
+                    // real confluence is the third-conjunct test) or
+                    // reject to None when it finds no merge at all. The
+                    // walk's own gates (is_fall, same_body, group-owned
+                    // exemption, stmt-free stubs, depth-capped bypass
+                    // probe, big-tail exception) come along verbatim.
+                    let recon_enabled = std::env::var("JCDC_NO_RECON").is_err();
+                    let follow = match follow {
+                        Some(f) if recon_enabled && (f == taken || f == fall)
+                            // Switch-case territory keeps its own follow
+                            // discipline: walk's picker REJECTS the case
+                            // epilogue targets on purpose so each arm gets
+                            // per-arrival try copies, while SESE parks them
+                            // under the confluence bar (keytool doCommands'
+                            // 28-pred TWR epilogue — deferring to the walk
+                            // picker there re-armed the 12x copy storm,
+                            // try 语句的代码过长 x525).
+                            && self.switch_depth == 0
+                            // Many-pred tail confluences are owned by the
+                            // SESE copy/confluence-bar machinery for the
+                            // same reason.
+                            && !self.shared_tail_confluence(f)
+                            // Only MULTI-PRED targets can be false merges:
+                            // the pathology is arm CONTENT shared by both
+                            // branch routes (OCSPResponse's UNSPECIFIED
+                            // block has the two range-check arms as preds;
+                            // BasicImageReader's channel-open else-arm has
+                            // both conjunct tests). A SINGLE-pred taken
+                            // target is an ordinary if-else-if chain arm
+                            // entry whose parking IS the dispatch shape
+                            // (keytool doCommands' command bodies — every
+                            // reconciliation there, even pure-stub
+                            // adoption, re-armed the epilogue copy storm).
+                            && self.cfg.blocks[f].pred.len() >= 2
+                            // AND the parked target must carry STATEMENTS:
+                            // parking a statement-free test head is the
+                            // healthy if-else-if chain flattening (keytool
+                            // doGenCert's dispatch chain), not arm-content
+                            // parking — there is nothing to cross.
+                            && !self.results[f].stmts.is_empty()
+                            // AND the sibling must actually BYPASS the
+                            // parked target (a normal-completing route
+                            // into its post-flow — the crossing that
+                            // breaks the empty-arm contract). Without a
+                            // bypass the parking is sound (every sibling
+                            // route flows through the target and the empty
+                            // arm falls into its emission correctly) and
+                            // the SESE choice stands (keytool doPrintEntry
+                            // dispatch parking).
+                            && ![taken, fall].iter().any(|&t| {
+                                t != f
+                                    && (stop.contains(&t)
+                                        || self.all_routes_via(ctx, t, f, stop))
+                            }) =>
+                        {
+                            let w = self.postdom_ipdom(&ctx.universe, cur);
+                            match w {
+                                Some(x) if x != f
+                                    && self.results[x].stmts.is_empty()
+                                    && self.results[x].out_stack.is_empty()
+                                    && self.cfg.blocks[x].succ.len() == 1
+                                    && matches!(
+                                        self.results[x].term,
+                                        Term::Goto | Term::Fallthrough
+                                    ) =>
+                                {
+                                    // Adopt only PURE GOTO/FALL STUB
+                                    // confluentes: in the arm-content
+                                    // parking pathology the false merge's
+                                    // real continuation is the transparent
+                                    // stub past the parked statements
+                                    // (OCSPResponse cur=5: w=9, the
+                                    // `goto 166` stub after the parked
+                                    // UNSPECIFIED block — adopting it puts
+                                    // the parked block in BOTH arms as
+                                    // per-arrival copies, the golden
+                                    // walk-parity shape). Statement-bearing
+                                    // or test-head confluentes are
+                                    // case-arm/dispatch entries whose
+                                    // adoption dissolves the SESE
+                                    // parked-arm architecture (keytool
+                                    // doCommands: every broader adoption
+                                    // re-armed the epilogue copy storm,
+                                    // try 语句的代码过长 x524-540).
+                                    if std::env::var("JCDC_DBG_WPD").is_ok() {
+                                        eprintln!("WPD cur={} taken={} fall={} f={} ADOPT-STUB w={}", cur, taken, fall, f, x);
+                                    }
+                                    if ctx.universe.contains(&x)
+                                        && !stop.contains(&x)
+                                        && !ctx.consumed.contains(&x)
+                                        && !ctx.loop_stack.contains(&x)
+                                        // The stub must not be a loop
+                                        // CONTINUE trampoline (backward
+                                        // goto into a header): adopting it
+                                        // as the follow re-routes the chain
+                                        // into loop machinery (keytool
+                                        // doGenCert's `goto 5` back-edge
+                                        // stub).
+                                        && !self.cfg.blocks[x].succ.iter().any(|&s| {
+                                            ctx.loop_headers.contains(&s)
+                                                && self.cfg.blocks[s].start
+                                                    <= self.cfg.blocks[x].start
+                                        })
+                                    {
+                                        Some(x)
+                                    } else {
+                                        Some(f)
+                                    }
+                                }
+                                // w == None (walk rejects every confluence),
+                                // w == f, or w not a pure stub: keep the
+                                // SESE choice — walk's rejection/selection
+                                // cues its own guard-walk architecture, not
+                                // SESE's parked-follow + confluence-bar one.
+                                _ => Some(f),
+                            }
+                        }
+                        other => other,
+                    };
                     let mut bstop: HashSet<usize> = stop.iter().copied().collect();
                     if let Some(f) = follow {
                         bstop.insert(f);

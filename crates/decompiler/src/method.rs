@@ -547,8 +547,7 @@ pub fn decompile_method(
     // Structure.
     let diamond_merges: std::collections::HashSet<usize> =
         merge_cond.keys().copied().collect();
-    let mut structurer = Structurer::with_diamonds(&cfg, &results, diamond_merges, fold_regions);
-    structurer.final_fields = pc
+    let final_field_set: std::collections::HashSet<String> = pc
         .cf
         .fields
         .iter()
@@ -558,6 +557,15 @@ pub fn decompile_method(
         })
         .filter_map(|f| pc.utf8(f.name_index).map(|n| n.to_string()))
         .collect();
+    let hybrid = std::env::var("JCDC_SESE").is_ok()
+        && std::env::var("JCDC_NO_HYBRID").is_err();
+    let (diamond_merges_w, fold_regions_w) = if hybrid {
+        (diamond_merges.clone(), fold_regions.clone())
+    } else {
+        (std::collections::HashSet::new(), HashMap::new())
+    };
+    let mut structurer = Structurer::with_diamonds(&cfg, &results, diamond_merges, fold_regions);
+    structurer.final_fields = final_field_set.clone();
     if std::env::var("JCDC_DBG_MNAME").is_ok() {
         eprintln!(
             "METHOD {}.{} {}",
@@ -566,10 +574,64 @@ pub fn decompile_method(
             desc_str
         );
     }
-    let region = structurer.structure_method();
-
-    // Convert to statements.
-    let copied_tails = structurer.copied_tails.clone();
+    let (region, copied_tails) = if hybrid {
+        // SESE HYBRID FALLBACK: SESE is the experimental structurer and
+        // must never emit a method BULKIER than the verified walk
+        // baseline — bulky SESE shapes are per-arm duplication that
+        // javac's 64K try-codegen limit rejects (keytool doCommands'
+        // shared kssave epilogue copied into the command-dispatch arms:
+        // try 语句的代码过长 ×18, latent until the OCSPResponse FLOW
+        // error stopped masking the GENERATE phase). Structure both ways,
+        // count block emissions, and keep the walk region when SESE
+        // inflates past 12.5% + 16 emissions (keytool's doCommands walk/
+        // SESE emission ratio ≈ 1.4; Pattern/OCSP/DecimalFormat parity
+        // stays SESE). The walk run uses a FRESH Structurer (structuring
+        // mutates consumed/copied state) and its own copied_tails.
+        let r_sese = structurer.structure_method();
+        let mut walker =
+            Structurer::with_diamonds(&cfg, &results, diamond_merges_w, fold_regions_w);
+        walker.final_fields = final_field_set;
+        let r_walk = walker.structure_method_walk();
+        fn count_emits(r: &crate::structure::Region) -> usize {
+            use crate::structure::Region as R;
+            match r {
+                R::Basic { .. } | R::CopyStmts { .. } => 1,
+                R::Seq(v) => v.iter().map(count_emits).sum(),
+                R::If { then_r, else_r, .. } => count_emits(then_r) + count_emits(else_r),
+                R::Loop { body, .. } => count_emits(body),
+                R::Switch { cases, default, .. } => {
+                    cases.iter().map(|(_, c)| count_emits(c)).sum::<usize>()
+                        + default.as_ref().map(|d| count_emits(d)).unwrap_or(0)
+                }
+                R::Try { body, catches, .. } => {
+                    count_emits(body)
+                        + catches.iter().map(|(_, _, h)| count_emits(h)).sum::<usize>()
+                }
+                _ => 0,
+            }
+        }
+        let cs = count_emits(&r_sese);
+        let cw = count_emits(&r_walk);
+        if cs > cw + cw / 8 + 16 {
+            if std::env::var("JCDC_DBG_HYBRID").is_ok() {
+                eprintln!(
+                    "HYBRID-WALK {}.{} sese_emits={} walk_emits={}",
+                    pc.internal_name,
+                    pc.method_name(m_idx).unwrap_or("?"),
+                    cs,
+                    cw
+                );
+            }
+            (r_walk, walker.copied_tails.clone())
+        } else {
+            (r_sese, structurer.copied_tails.clone())
+        }
+    } else {
+        let region = structurer.structure_method();
+        // Convert to statements.
+        let copied_tails = structurer.copied_tails.clone();
+        (region, copied_tails)
+    };
     // Final fields of this class: the converter must not duplicate a shared
     // terminator block that assigns one (a final field accepts exactly one
     // assignment; copies are a compile error, sun.security.util.Debug).
@@ -2041,76 +2103,142 @@ fn prune_dead_breaks(s: &mut Stmt) {
 /// loop's label in scope we cannot tell whether they target it.
 /// Synchronized/Labeled/If/Block/Try wrappers are transparent.
 fn contains_break_stmt(s: &Stmt) -> bool {
+    breaks_escape(s, &std::collections::HashSet::new(), false)
+}
+
+/// One walker for both break-escape queries: `shielded` is true inside a
+/// nested loop/switch (plain breaks bind there, only labeled breaks can
+/// escape), `bound` holds labels of enclosing nested Labeled constructs
+/// (a `break L` bound by one of them exits THAT loop, not the judged one
+/// — jdk17 SignatureReader.parseType's outer `while (true)` body holds
+/// only `break L3` of the nested `L3: while`, so the outer loop is JLS
+/// non-completing and the post-loop `return offset` is unreachable —
+/// 无法访问的语句 when prune kept it).
+fn breaks_escape(
+    s: &Stmt,
+    bound: &std::collections::HashSet<String>,
+    shielded: bool,
+) -> bool {
     match s {
-        Stmt::Break(_) => true,
-        Stmt::Block(v) => v.iter().any(contains_break_stmt),
-        Stmt::If { then_stmt, else_stmt, .. } => {
-            contains_break_stmt(then_stmt)
-                || else_stmt.as_deref().map(contains_break_stmt).unwrap_or(false)
+        Stmt::Break(Some(l)) => !bound.contains(l),
+        Stmt::Break(None) => !shielded,
+        Stmt::Continue(_) => false,
+        Stmt::Labeled { label, body } => {
+            let mut b2 = bound.clone();
+            b2.insert(label.clone());
+            breaks_escape(body, &b2, shielded)
         }
-        Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => {
-            contains_break_stmt(body)
-        }
-        // Nested loop/switch bodies capture plain breaks; only labeled
-        // breaks inside them could reach the enclosing loop.
         Stmt::While { body, .. }
         | Stmt::DoWhile { body, .. }
-        | Stmt::ForEach { body, .. }
-        | Stmt::For { body, .. } => contains_labeled_break(body),
+        | Stmt::ForEach { body, .. } => breaks_escape(body, bound, true),
+        Stmt::For { init, body, .. } => {
+            init.iter().any(|x| breaks_escape(x, bound, shielded))
+                || breaks_escape(body, bound, true)
+        }
         Stmt::Switch { cases, default, .. } => {
             cases
                 .iter()
                 .flat_map(|c| c.body.iter())
-                .any(contains_labeled_break)
-                || default.as_deref().map(contains_labeled_break).unwrap_or(false)
+                .any(|x| breaks_escape(x, bound, true))
+                || default
+                    .as_deref()
+                    .map(|d| breaks_escape(d, bound, true))
+                    .unwrap_or(false)
         }
+        Stmt::Block(v) => v.iter().any(|x| breaks_escape(x, bound, shielded)),
+        Stmt::If { then_stmt, else_stmt, .. } => {
+            breaks_escape(then_stmt, bound, shielded)
+                || else_stmt
+                    .as_deref()
+                    .map(|e| breaks_escape(e, bound, shielded))
+                    .unwrap_or(false)
+        }
+        Stmt::Synchronized { body, .. } => breaks_escape(body, bound, shielded),
         Stmt::Try { body, catches, finally } => {
-            contains_break_stmt(body)
-                || catches.iter().any(|c| contains_break_stmt(&c.body))
-                || finally.as_deref().map(contains_break_stmt).unwrap_or(false)
+            breaks_escape(body, bound, shielded)
+                || catches.iter().any(|c| breaks_escape(&c.body, bound, shielded))
+                || finally
+                    .as_deref()
+                    .map(|f| breaks_escape(f, bound, shielded))
+                    .unwrap_or(false)
         }
         Stmt::TryWithResources { resources, body, catches, finally } => {
-            resources.iter().any(contains_break_stmt)
-                || contains_break_stmt(body)
-                || catches.iter().any(|c| contains_break_stmt(&c.body))
-                || finally.as_deref().map(contains_break_stmt).unwrap_or(false)
+            resources.iter().any(|x| breaks_escape(x, bound, shielded))
+                || breaks_escape(body, bound, shielded)
+                || catches.iter().any(|c| breaks_escape(&c.body, bound, shielded))
+                || finally
+                    .as_deref()
+                    .map(|f| breaks_escape(f, bound, shielded))
+                    .unwrap_or(false)
         }
         _ => false,
     }
 }
 
-/// Only LABELED breaks (which may target an enclosing construct).
-fn contains_labeled_break(s: &Stmt) -> bool {
+/// Like `contains_labeled_break`, but a `break L` whose label L is
+/// BOUND by a nested Labeled construct inside this body does NOT count:
+/// it exits the nested loop/switch, not the enclosing one (jdk17
+/// SignatureReader.parseType: the outer `while (true)` body's only break
+/// is `break L3` of the nested `L3: while (charAt != '>')` — counting it
+/// as an escape made the loop look completable, prune_unreachable kept
+/// the post-loop `return offset`, and javac rejected the genuinely
+/// unreachable tail — 无法访问的语句, latent behind OCSPResponse's FLOW
+/// mask).
+fn contains_labeled_break_bound(s: &Stmt, bound: &std::collections::HashSet<String>) -> bool {
     match s {
-        Stmt::Break(Some(_)) => true,
+        Stmt::Break(Some(l)) => !bound.contains(l),
         Stmt::Break(None) => false,
-        Stmt::Block(v) => v.iter().any(contains_labeled_break),
+        Stmt::Block(v) => v.iter().any(|x| contains_labeled_break_bound(x, bound)),
         Stmt::If { then_stmt, else_stmt, .. } => {
-            contains_labeled_break(then_stmt)
-                || else_stmt.as_deref().map(contains_labeled_break).unwrap_or(false)
+            contains_labeled_break_bound(then_stmt, bound)
+                || else_stmt
+                    .as_deref()
+                    .map(|e| contains_labeled_break_bound(e, bound))
+                    .unwrap_or(false)
+        }
+        Stmt::Labeled { label, body } => {
+            let mut b2 = bound.clone();
+            b2.insert(label.clone());
+            contains_labeled_break_bound(body, &b2)
         }
         Stmt::While { body, .. }
         | Stmt::DoWhile { body, .. }
         | Stmt::ForEach { body, .. }
-        | Stmt::Synchronized { body, .. }
-        | Stmt::Labeled { body, .. } => contains_labeled_break(body),
+        | Stmt::Synchronized { body, .. } => contains_labeled_break_bound(body, bound),
         Stmt::For { init, body, .. } => {
-            init.iter().any(contains_labeled_break) || contains_labeled_break(body)
+            init.iter().any(|x| contains_labeled_break_bound(x, bound))
+                || contains_labeled_break_bound(body, bound)
         }
         Stmt::Switch { cases, default, .. } => {
-            cases.iter().flat_map(|c| c.body.iter()).any(contains_labeled_break)
-                || default.as_deref().map(contains_labeled_break).unwrap_or(false)
+            cases
+                .iter()
+                .flat_map(|c| c.body.iter())
+                .any(|x| contains_labeled_break_bound(x, bound))
+                || default
+                    .as_deref()
+                    .map(|d| contains_labeled_break_bound(d, bound))
+                    .unwrap_or(false)
         }
         Stmt::Try { body, catches, finally } => {
-            contains_labeled_break(body)
-                || catches.iter().any(|c| contains_labeled_break(&c.body))
-                || finally.as_deref().map(contains_labeled_break).unwrap_or(false)
+            contains_labeled_break_bound(body, bound)
+                || catches
+                    .iter()
+                    .any(|c| contains_labeled_break_bound(&c.body, bound))
+                || finally
+                    .as_deref()
+                    .map(|f| contains_labeled_break_bound(f, bound))
+                    .unwrap_or(false)
         }
         Stmt::TryWithResources { resources, body, catches, finally } => {
-            resources.iter().any(contains_labeled_break)
-                || contains_labeled_break(body)
-                || catches.iter().any(|c| contains_labeled_break(&c.body))
-                || finally.as_deref().map(contains_labeled_break).unwrap_or(false)
+            resources.iter().any(|x| contains_labeled_break_bound(x, bound))
+                || contains_labeled_break_bound(body, bound)
+                || catches
+                    .iter()
+                    .any(|c| contains_labeled_break_bound(&c.body, bound))
+                || finally
+                    .as_deref()
+                    .map(|f| contains_labeled_break_bound(f, bound))
+                    .unwrap_or(false)
         }
         _ => false,
     }
