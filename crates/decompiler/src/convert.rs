@@ -368,6 +368,7 @@ impl<'a> Converter<'a> {
                 // .interrupt() vanished — interruption lost). The
                 // inlined copy keeps the abrupt ending (no fall-out
                 // duplication); a genuine fall-out exit still breaks.
+                //
                 let inline_terminator = self.if_follows.contains(&target)
                     && matches!(
                         self.results[target].term,
@@ -537,6 +538,50 @@ impl<'a> Converter<'a> {
         // belongs to every enclosing loop's exit set, and breaking only the
         // innermost would wrongly re-enter the outer loop.
         if let Some(li) = (0..self.loops.len()).find(|&i| self.loops[i].exits.contains(&target)) {
+            // RESTART-STUB exit: the target chains through statement-free
+            // stubs back into an enclosing-or-self loop HEADER — the jump
+            // re-iterates THAT loop, it does not break out of anything
+            // (jdk11/17/26 ConcurrentLinkedQueue.poll's p==q arm `goto
+            // restartFromHead`: exit 12 is the `goto 0` stub; rendering
+            // break+break fell to the post-loop tail and returned the
+            // STALE item instead of restarting from head). The broad
+            // walk-side continue-stub precedence was reverted once
+            // (Pattern.clazz: switch-case goto stubs must stay
+            // RawGoto-elided so the emitter re-appends case breaks) —
+            // this form is scoped to genuine loop exits with no open
+            // switch on the stack.
+            if self.switches.is_empty() {
+                let mut x = target;
+                let mut guard = 0;
+                let header_hit = loop {
+                    if let Some(hi) = self.loops.iter().position(|l| l.header == x) {
+                        if hi <= li {
+                            break Some(hi);
+                        }
+                    }
+                    if guard >= 8 {
+                        break None;
+                    }
+                    let r = &self.results[x];
+                    let stub = r.stmts.is_empty()
+                        && r.out_stack.is_empty()
+                        && matches!(r.term, Term::Fallthrough | Term::Goto)
+                        && self.cfg.blocks[x].succ.len() == 1;
+                    if !stub {
+                        break None;
+                    }
+                    x = self.cfg.blocks[x].succ[0];
+                    guard += 1;
+                };
+                if let Some(hi) = header_hit {
+                    let depth = self.loops.len() - 1 - hi;
+                    return Some(if depth == 0 {
+                        Jump::Continue(None)
+                    } else {
+                        Jump::Continue(Some(self.loops[hi].label.clone()))
+                    });
+                }
+            }
             // switches opened after that loop intercept a plain `break`
             let crosses_switch = !self.switches.is_empty();
             return Some(if li + 1 == self.loops.len() && !crosses_switch {
