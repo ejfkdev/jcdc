@@ -3493,6 +3493,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             // Goto{108} materialized as Continue) and
                             // prune_unreachable then ate the tail copy
                             // (serverAuthentication.addToCache lost).
+                            let mut bts: Vec<usize> = Vec::new();
                             let coherent = {
                                 fn chain_cont(r: &Region) -> Option<usize> {
                                     match r {
@@ -3518,7 +3519,6 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                                         _ => {}
                                     }
                                 }
-                                let mut bts = Vec::new();
                                 bypass_targets(&arm, &mut bts);
                                 // A copy ending in a Goto to somewhere
                                 // OTHER than the bypass target re-routes
@@ -3533,6 +3533,61 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                                     Some(c) => bts.iter().all(|t| *t == c),
                                     None => true,
                                 }
+                            };
+                            // PER-BYPASS-TARGET ROUTING (the dci receive
+                            // misroute cure): when the arm holds exit
+                            // Gotos to chain-MID blocks (b12/b13's
+                            // `goto 15` = the SKIP path around the parked
+                            // `sender = sourceSocketAddress()` block 14),
+                            // those Gotos elide at conversion (15 is an
+                            // inner If's follow) and fall into the APPENDED
+                            // copy's head — the skip path executed the
+                            // parked SET. Slice the copy at each bypass
+                            // target's block and splice it over that
+                            // target's Goto, so every arm path enters the
+                            // chain exactly where its bytecode jumped:
+                            // skip paths get the from-15 suffix, the
+                            // fall-into path keeps the full from-14 copy.
+                            // Only offered when the appended copy has no
+                            // trailing Goto of its own (chain_cont=None —
+                            // a trailing-Goto copy must keep the strict
+                            // all-bts-equal-cont coherence above).
+                            if std::env::var("JCDC_DBG_IF").is_ok() {
+                                eprintln!("PARKC-ARM cur={} taken={} bts={:?} arm={}", cur, taken, bts, region_shape(&arm));
+                            }
+                            let routed = {
+                                coherent
+                                    && !matches!(taken_r, Region::Empty)
+                                    // The copy must end abruptly (its own
+                                    // return/throw): a filled skip arm must
+                                    // not fall out of the copy into
+                                    // whatever follows the If.
+                                    && region_terminates_ex(&taken_r, self.results, &[])
+                                    && {
+                                        fn has_deep_empty(r: &Region, top: bool) -> bool {
+                                            match r {
+                                                Region::Empty => !top,
+                                                Region::Seq(v) => {
+                                                    let n = v.len();
+                                                    v.iter().enumerate().any(|(k, x)| {
+                                                        has_deep_empty(x, top && k + 1 == n)
+                                                    })
+                                                }
+                                                Region::If { then_r, else_r, .. } => {
+                                                    has_deep_empty(then_r, false)
+                                                        || has_deep_empty(else_r, false)
+                                                }
+                                                Region::Try { body, catches, .. } => {
+                                                    has_deep_empty(body, false)
+                                                        || catches.iter().any(|(_, _, h)| {
+                                                            has_deep_empty(h, false)
+                                                        })
+                                                }
+                                                _ => false,
+                                            }
+                                        }
+                                        has_deep_empty(&arm, true)
+                                    }
                             };
                             if matches!(taken_r, Region::Empty)
                                 || !simple_completion(&taken_r)
@@ -3555,6 +3610,247 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                                 arm
                             } else {
                                 claimed.extend(scratch.iter().copied());
+                                // EMPTY-ARM ROUTING (the dci receive
+                                // misroute cure): the bypass paths render
+                                // as EMPTY If-arms (their Goto to the
+                                // skip target elides at conversion because
+                                // the target is an inner If's follow) and
+                                // fall through the arm tail into the
+                                // appended copy's head — executing the
+                                // parked SET they must skip (jdk26
+                                // DatagramChannelImpl.receive: n<0 and
+                                // n==0&&!isOpen returned
+                                // sourceSocketAddress() instead of the
+                                // null sender). Give every arm-level
+                                // Empty its own copy of the parked
+                                // follow: the fall-into path then takes
+                                // the appended copy and each skip path
+                                // takes its in-arm copy — per-arrival
+                                // copies, the codebase's standard
+                                // shared-tail discipline. Gated: the
+                                // follow must be claimed or parked (its
+                                // canonical emission already exists, so
+                                // the copies are per-arrival
+                                // materializations, not double emission).
+                                let mut arm = arm;
+                                if routed {
+                                    // SKIP-PATH ROUTING: a follow-EMPTY If
+                                    // arm whose target is NOT the parked
+                                    // chain head is a skip path around the
+                                    // head (dci receive: `if (n != 0) {}`
+                                    // and `else if (!isOpen()) {}` must
+                                    // reach `return sender` WITHOUT
+                                    // executing `sender =
+                                    // sourceSocketAddress()`). Give each
+                                    // such Empty its own per-arrival copy:
+                                    // slice the chain copy from that
+                                    // target's part when the copy's parts
+                                    // expose it, else re-walk the target
+                                    // on a scratch claim set. The
+                                    // fall-INTO Empty (target == chain
+                                    // head) stays empty and drops into the
+                                    // appended copy.
+                                    fn fill_skip_empties(
+                                        st: &mut Structurer,
+                                        r: &mut Region,
+                                        copy: &Region,
+                                        taken: usize,
+                                        cu: &HashSet<usize>,
+                                        cstop: &HashSet<usize>,
+                                        active: &[usize],
+                                        claimed: &HashSet<usize>,
+                                        filled: &mut usize,
+                                    ) {
+                                        match r {
+                                            Region::Seq(v) => {
+                                                let n = v.len();
+                                                for (i, x) in v.iter_mut().enumerate() {
+                                                    // A Seq's LAST element
+                                                    // is the fall-through
+                                                    // tail into the
+                                                    // appended copy — never
+                                                    // replace it.
+                                                    if i + 1 == n {
+                                                        if !matches!(x, Region::Goto { .. }) {
+                                                            fill_skip_empties(
+                                                                st, x, copy, taken, cu, cstop,
+                                                                active, claimed, filled,
+                                                            );
+                                                        }
+                                                        continue;
+                                                    }
+                                                    fill_skip_empties(
+                                                        st, x, copy, taken, cu, cstop, active,
+                                                        claimed, filled,
+                                                    );
+                                                }
+                                            }
+                                            Region::Goto { target } if *target != taken => {
+                                                // An elided follow-merge
+                                                // jump to a skip target
+                                                // (b13's `goto 15` rendered
+                                                // empty because 15 is the
+                                                // inner If's follow): give
+                                                // it the suffix copy too.
+                                                let sl = match copy {
+                                                    Region::Seq(v) => v
+                                                        .iter()
+                                                        .position(|p| {
+                                                            crate::structure::region_head_block(p)
+                                                                == *target
+                                                        })
+                                                        .map(|i| {
+                                                            if v.len() - i == 1 {
+                                                                v[i].clone()
+                                                            } else {
+                                                                Region::Seq(v[i..].to_vec())
+                                                            }
+                                                        }),
+                                                    other => {
+                                                        if crate::structure::region_head_block(other)
+                                                            == *target
+                                                        {
+                                                            Some(other.clone())
+                                                        } else {
+                                                            None
+                                                        }
+                                                    }
+                                                };
+                                                let suffix = match sl {
+                                                    Some(x) => Some(x),
+                                                    None => {
+                                                        let mut sc = claimed.clone();
+                                                        let sub = st.walk(
+                                                            *target, cu, cstop, active, &mut sc,
+                                                            false,
+                                                        );
+                                                        if !matches!(sub, Region::Empty)
+                                                            && simple_completion_local(&sub)
+                                                            && region_terminates_ex(
+                                                                &sub, st.results, &[],
+                                                            )
+                                                        {
+                                                            Some(sub)
+                                                        } else {
+                                                            None
+                                                        }
+                                                    }
+                                                };
+                                                if let Some(sfx) = suffix {
+                                                    *r = sfx;
+                                                    *filled += 1;
+                                                }
+                                            }
+                                            Region::If { block, then_r, else_r, .. } => {
+                                                let succ = st.cfg.blocks[*block].succ.clone();
+                                                if succ.len() == 2 {
+                                                    let pairs = [
+                                                        (succ[1], then_r.as_mut()),
+                                                        (succ[0], else_r.as_mut()),
+                                                    ];
+                                                    for (tgt, armr) in pairs {
+                                                        if matches!(*armr, Region::Empty) {
+                                                            if tgt == taken {
+                                                                continue; // fall-into path
+                                                            }
+                                                            // suffix copy from tgt
+                                                            let sl = match copy {
+                                                                Region::Seq(v) => v
+                                                                    .iter()
+                                                                    .position(|p| {
+                                                                        crate::structure::region_head_block(p) == tgt
+                                                                    })
+                                                                    .map(|i| {
+                                                                        if v.len() - i == 1 {
+                                                                            v[i].clone()
+                                                                        } else {
+                                                                            Region::Seq(v[i..].to_vec())
+                                                                        }
+                                                                    }),
+                                                                other => {
+                                                                    if crate::structure::region_head_block(other) == tgt {
+                                                                        Some(other.clone())
+                                                                    } else {
+                                                                        None
+                                                                    }
+                                                                }
+                                                            };
+                                                            let suffix = match sl {
+                                                                Some(x) => Some(x),
+                                                                None => {
+                                                                    let mut sc = claimed.clone();
+                                                                    let sub = st.walk(tgt, cu, cstop, active, &mut sc, false);
+                                                                    if !matches!(sub, Region::Empty)
+                                                                        && simple_completion_local(&sub)
+                                                                        && region_terminates_ex(&sub, st.results, &[])
+                                                                    {
+                                                                        Some(sub)
+                                                                    } else {
+                                                                        None
+                                                                    }
+                                                                }
+                                                            };
+                                                            if let Some(sfx) = suffix {
+                                                                *armr = sfx;
+                                                                *filled += 1;
+                                                            }
+                                                        } else {
+                                                            fill_skip_empties(
+                                                                st, armr, copy, taken, cu, cstop,
+                                                                active, claimed, filled,
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            Region::Try { body, catches, .. } => {
+                                                fill_skip_empties(
+                                                    st, body, copy, taken, cu, cstop, active,
+                                                    claimed, filled,
+                                                );
+                                                for (_, _, h) in catches.iter_mut() {
+                                                    fill_skip_empties(
+                                                        st, h, copy, taken, cu, cstop, active,
+                                                        claimed, filled,
+                                                    );
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    fn simple_completion_local(r: &Region) -> bool {
+                                        match r {
+                                            Region::Basic { .. }
+                                            | Region::CopyStmts { .. }
+                                            | Region::Empty
+                                            | Region::Goto { .. } => true,
+                                            Region::Seq(v) => v.iter().all(simple_completion_local),
+                                            Region::If { then_r, else_r, .. } => {
+                                                simple_completion_local(then_r)
+                                                    && simple_completion_local(else_r)
+                                            }
+                                            _ => false,
+                                        }
+                                    }
+                                    let mut filled = 0usize;
+                                    fill_skip_empties(
+                                        self,
+                                        &mut arm,
+                                        &taken_r,
+                                        taken,
+                                        &cu,
+                                        &cstop,
+                                        active,
+                                        claimed,
+                                        &mut filled,
+                                    );
+                                    if std::env::var("JCDC_DBG_IF").is_ok() {
+                                        eprintln!(
+                                            "PARKCHAIN-ROUTE cur={} filled={} skip-empties",
+                                            cur, filled
+                                        );
+                                    }
+                                }
                                 Region::Seq(vec![arm, taken_r])
                             }
                         }
