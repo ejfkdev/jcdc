@@ -90,11 +90,10 @@ impl Family {
         };
         let prefix = format!("{}$", root);
         // Only primary (input) sources: classpath jars must not leak
-        // foreign nested classes into the emitted family.
-        for name in pool.primary_names() {
-            if !name.starts_with(&prefix) {
-                continue;
-            }
+        // foreign nested classes into the emitted family. The pool's
+        // family index yields exactly the `root$`-prefixed primary names
+        // in sorted order (same order the historical full scan produced).
+        for name in pool.family_names(&root).iter() {
             let rest = &name[prefix.len()..];
             let Some(pc) = pool.get(&name) else { continue };
             // Literal-$ top-level siblings (jextract-generated FFI headers)
@@ -2620,20 +2619,20 @@ fn super_declares_nonprivate(pc: &PoolClass, pool: &ClassPool, name: &str, desc:
     false
 }
 
-/// Method-index → replacement simple name, installed by the family
-/// emitter around methods that collide at the SOURCE level: era bytecode
-/// (jdk9+ java.lang.invoke holders like Invokers$Holder, generated
-/// directly with javac-internal descriptors) legally contains method
-/// pairs with IDENTICAL name + parameter types but DIFFERENT return
-/// types — distinct JVM methods, but Java source overloading ignores
-/// the return type, so rendering both verbatim dies with 已在类中定义了
-///方法 (423 errors on the p11-plat invoke package alone). The second and
-/// later members of each (name, params) group render with a `$jcN`
-/// suffix: the unit stays a faithful, compilable transcription of the
-/// classfile rather than silently dropping generator-internal methods.
-/// Direct calls to these names in generated code bind to the first
-/// variant (the hidden callers are MethodHandle/LambdaForm machinery,
-/// not source-visible invocations).
+// Method-index → replacement simple name, installed by the family
+// emitter around methods that collide at the SOURCE level: era bytecode
+// (jdk9+ java.lang.invoke holders like Invokers$Holder, generated
+// directly with javac-internal descriptors) legally contains method
+// pairs with IDENTICAL name + parameter types but DIFFERENT return
+// types — distinct JVM methods, but Java source overloading ignores
+// the return type, so rendering both verbatim dies with 已在类中定义了
+//方法 (423 errors on the p11-plat invoke package alone). The second and
+// later members of each (name, params) group render with a `$jcN`
+// suffix: the unit stays a faithful, compilable transcription of the
+// classfile rather than silently dropping generator-internal methods.
+// Direct calls to these names in generated code bind to the first
+// variant (the hidden callers are MethodHandle/LambdaForm machinery,
+// not source-visible invocations).
 thread_local! {
     static METHOD_RENAME: std::cell::RefCell<HashMap<usize, String>> =
         std::cell::RefCell::new(HashMap::new());
@@ -2703,7 +2702,7 @@ fn late_typevar_arg_casts(
         var: u32,
         vt: &crate::varalloc::VarTable,
         pc: &PoolClass,
-        pool: &ClassPool,
+        _pool: &ClassPool,
         denotable: &std::collections::HashSet<String>,
     ) {
         let Some(info) = vt.vars.get(var as usize) else { return };
@@ -4912,7 +4911,7 @@ pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: 
                         }
                     }
                 };
-                let mut first_use =
+                let first_use =
                     first_local_mention(v, &marker, &name, vt, fam).unwrap_or(v.len());
                 if std::env::var("JCDC_DBG_LDECL").is_ok() {
                     eprintln!(
@@ -5024,68 +5023,6 @@ fn local_class_captures(name: &str, fam: &Family, pool: &ClassPool) -> Vec<Strin
     caps
 }
 
-/// True when the expression references a local variable by one of `names`.
-fn expr_mentions_local_names(e: &Expr, names: &[String], vt: &VarTable) -> bool {
-    let mut found = false;
-    fn w(e: &Expr, names: &[String], vt: &VarTable, found: &mut bool) {
-        if *found {
-            return;
-        }
-        match e {
-            Expr::Local { var, .. } => {
-                if names.iter().any(|n| vt.var(*var).name == *n) {
-                    *found = true;
-                }
-            }
-            Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
-                args.iter().for_each(|a| w(a, names, vt, found))
-            }
-            Expr::Method { owner, args, .. } => {
-                if let Some(o) = owner {
-                    w(o, names, vt, found);
-                }
-                args.iter().for_each(|a| w(a, names, vt, found));
-            }
-            Expr::Field { owner: Some(o), .. } => w(o, names, vt, found),
-            Expr::ArrayIndex { array, index } => {
-                w(array, names, vt, found);
-                w(index, names, vt, found);
-            }
-            Expr::Cast { e: i, .. } | Expr::InstanceOf { e: i, .. } | Expr::Un { e: i, .. }
-            | Expr::PreIncDec { e: i, .. } | Expr::PostIncDec { e: i, .. } => w(i, names, vt, found),
-            Expr::Bin { l, r, .. } => {
-                w(l, names, vt, found);
-                w(r, names, vt, found);
-            }
-            Expr::Cond { c, t, f } => {
-                w(c, names, vt, found);
-                w(t, names, vt, found);
-                w(f, names, vt, found);
-            }
-            Expr::Assign { target, value, .. } => {
-                w(target, names, vt, found);
-                w(value, names, vt, found);
-            }
-            Expr::NewArray { dims, init, .. } => {
-                dims.iter().for_each(|d| w(d, names, vt, found));
-                if let Some(vals) = init {
-                    vals.iter().for_each(|x| w(x, names, vt, found));
-                }
-            }
-            Expr::NewMultiArray { dims, .. } => dims.iter().for_each(|d| w(d, names, vt, found)),
-            Expr::StringConcat(parts) => parts.iter().for_each(|p| {
-                if let crate::expr::ConcatPart::Str(i) = p {
-                    w(i, names, vt, found);
-                }
-            }),
-            Expr::Lambda(l) => l.captures.iter().for_each(|c| w(c, names, vt, found)),
-            Expr::Invokedynamic { args, .. } => args.iter().for_each(|a| w(a, names, vt, found)),
-            _ => {}
-        }
-    }
-    w(e, names, vt, &mut found);
-    found
-}
 
 /// True when a rendered type mentions the local class simple name.
 fn ty_mentions_local(t: &TypeRef, name: &str, fam: &Family) -> bool {
@@ -8106,12 +8043,6 @@ fn analyze_anon_ctor(apc: &PoolClass, args: Vec<Expr>) -> (Vec<Expr>, HashMap<St
     (kept, captures)
 }
 
-fn self_simple_all_digits(pc: &PoolClass) -> bool {
-    simple_name(&pc.internal_name)
-        .chars()
-        .all(|c| c.is_ascii_digit())
-}
-
 /// Descriptor-param indices of ctor parameters that javac synthesized to
 /// carry captures (stored straight into this$*/val$* fields). Their LVT
 /// names are often absent (`arg1`), so the name-based skip in
@@ -10907,7 +10838,6 @@ fn delegation_value(
         // `str = decode(..)` flows to the trailing delegation.
         Stmt::ExprStmt(Expr::Assign { value, .. }) => Some((**value).clone()),
         Stmt::LocalDef { init: Some(e), .. } => Some(e.clone()),
-        Stmt::Block(v) if v.len() == 1 => delegation_value(&v[0], tmpl, own, fallback),
         _ => None,
     }
 }
@@ -11924,7 +11854,7 @@ pub(crate) fn generic_call_formals(
     if !type_args.is_empty() && type_args.len() == msig.params.len() {
         let mut ref_map: Option<Vec<(String, jcdc_jvm::GenericType)>> = None;
         for (pi, p) in msig.params.iter().enumerate() {
-            let mut g: Option<jcdc_jvm::GenericType> = None;
+            let g: Option<jcdc_jvm::GenericType>;
             let ta = &type_args[pi];
             if !ta.contains('<') && !ta.contains('.') && !ta.contains('[') {
                 g = Some(jcdc_jvm::GenericType::TypeVar(ta.clone()));
@@ -13178,13 +13108,6 @@ fn apply_param_casts(
     caller_params: &[jcdc_jvm::TypeParam],
 ) {
     let apc_dbg = std::env::var("JCDC_DBG_APC").is_ok();
-    fn parameterized(t: &jcdc_jvm::GenericType) -> bool {
-        match t {
-            jcdc_jvm::GenericType::Class(cs) => cs.parts.iter().any(|p| !p.args.is_empty()),
-            jcdc_jvm::GenericType::Array(i) => parameterized(i),
-            _ => false,
-        }
-    }
     for (a, pt) in args.iter_mut().zip(params.iter()) {
                     fn parameterized(t: &jcdc_jvm::GenericType) -> bool {
                         match t {
@@ -14750,12 +14673,6 @@ pub(crate) fn cast_wildcard_call_args(
                 _ => None,
             }
         }
-        fn internal_of(g: &jcdc_jvm::GenericType) -> Option<String> {
-            match g {
-                jcdc_jvm::GenericType::Class(cs) => Some(crate::method::classsig_internal(cs)),
-                _ => None,
-            }
-        }
         // True when one instantiation is convertible to the other (then
         // javac accepts the comparison without casts).
         fn compat(a: &jcdc_jvm::GenericType, b: &jcdc_jvm::GenericType, pool: &ClassPool) -> bool {
@@ -15515,14 +15432,6 @@ fn unify_g_types(
                 })
         }
         (G::Array(pi), G::Array(ci)) => unify_g_types(pi, ci, subst),
-        (
-            G::Wildcard(jcdc_jvm::WildcardBound::Extends(pt)),
-            G::Wildcard(jcdc_jvm::WildcardBound::Extends(ct)),
-        )
-        | (
-            G::Wildcard(jcdc_jvm::WildcardBound::Super(pt)),
-            G::Wildcard(jcdc_jvm::WildcardBound::Super(ct)),
-        ) => unify_g_types(pt, ct, subst),
         (G::Primitive(a), G::Primitive(b)) => a == b,
         _ => false,
     }
@@ -16314,7 +16223,9 @@ fn method_ref_inst_type_args(
     pool: &ClassPool,
 ) -> Option<Vec<String>> {
     use jcdc_jvm::GenericType as G;
-    let inst = lam.inst_sam_desc.as_ref()?;
+    // The instantiatedMethodType must be present (early-return keeps the
+    // caller's None contract); the value itself is re-derived below.
+    lam.inst_sam_desc.as_ref()?;
     let (msig, tvar_names, _sam_cs, sam_msig, sam_cls_params, inst_args) =
         method_ref_common(cls, name, desc, lam, pool)?;
     // The invokedynamic's instantiatedMethodType is javac's own record of
@@ -19008,7 +18919,7 @@ fn pin_underdetermined_return_diamonds(
         // (it becomes the cast).
         enum Resolve {
             Ok(Vec<(String, jcdc_jvm::GenericType)>),
-            Conflict(usize),
+            Conflict,
             Fail,
         }
         fn try_resolve(
@@ -19026,7 +18937,7 @@ fn pin_underdetermined_return_diamonds(
                 let TypeRef::G(ag) = a.type_ref() else { continue };
                 if !unify_formal_relaxed(formal, &ag, &mut subst) {
                     return if skip.is_none() {
-                        Resolve::Conflict(i)
+                        Resolve::Conflict
                     } else {
                         Resolve::Fail
                     };

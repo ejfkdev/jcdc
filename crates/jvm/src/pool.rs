@@ -175,6 +175,10 @@ struct PoolState {
     jars: Vec<PathBuf>,
     /// per jar: internal class name -> zip entry name
     jar_indexes: Vec<HashMap<String, String>>,
+    /// per jar: cached open archive. Re-parsing the central directory on
+    /// EVERY class lookup dominated sys time on jar inputs (rt.jar: 20k
+    /// entries re-scanned per get() x 20k classes).
+    zips: Vec<Option<zip::ZipArchive<std::fs::File>>>,
     cache: HashMap<String, Arc<PoolClass>>,
     negative: HashSet<String>,
     /// Names from primary sources (the inputs being decompiled), as
@@ -182,6 +186,15 @@ struct PoolState {
     /// must only use these, or classpath jars leak foreign nested classes
     /// into the output.
     primary: HashSet<String>,
+    /// Sorted snapshot of `primary` (lazily built; primary only grows
+    /// during add_source, which invalidates).
+    primary_sorted: Option<std::sync::Arc<Vec<String>>>,
+    /// root name (up to the first '$') -> sorted primary names with that
+    /// `root$` prefix. Family::collect used to re-scan AND re-sort the
+    /// whole primary set per family (rt.jar: 20k names x 12.6k families
+    /// = a third of total runtime in quicksort<String>); the index turns
+    /// each lookup into a small vec fetch.
+    family_index: Option<HashMap<String, std::sync::Arc<Vec<String>>>>,
     /// Lazy reverse-reference index for NESTED referenced names:
     /// internal name -> set of referencer NEST ROOTS (top-level class
     /// names), built by scanning the constant-pool Class entries of
@@ -230,6 +243,8 @@ impl ClassPool {
             let mut st = self.state.lock().unwrap();
             if primary {
                 st.primary.extend(index.keys().cloned());
+                st.primary_sorted = None;
+                st.family_index = None;
             }
             // First source wins (javac classpath semantics): the primary
             // family dir is added before reference classpath dirs, so a
@@ -244,9 +259,12 @@ impl ClassPool {
             let mut st = self.state.lock().unwrap();
             if primary {
                 st.primary.extend(index.keys().cloned());
+                st.primary_sorted = None;
+                st.family_index = None;
             }
             st.jars.push(path.to_path_buf());
             st.jar_indexes.push(index);
+            st.zips.push(None);
         } else if path.extension().and_then(|e| e.to_str()) == Some("class") {
             let data = std::fs::read(path)?;
             let guess = path
@@ -263,6 +281,8 @@ impl ClassPool {
             let mut st = self.state.lock().unwrap();
             if primary {
                 st.primary.insert(real.clone());
+                st.primary_sorted = None;
+                st.family_index = None;
             }
             st.cache.insert(real, pc);
         } else {
@@ -301,22 +321,27 @@ impl ClassPool {
     }
 
     fn read_class_bytes(&self, internal_name: &str) -> Option<Vec<u8>> {
-        let st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap();
         if let Some(path) = st.dir_index.get(internal_name) {
-            return std::fs::read(path).ok();
+            let path = path.clone();
+            return std::fs::read(&path).ok();
         }
-        for (jar_idx, index) in st.jar_indexes.iter().enumerate() {
-            if let Some(entry) = index.get(internal_name) {
-                let path = &st.jars[jar_idx];
-                let file = std::fs::File::open(path).ok()?;
-                let mut zip = zip::ZipArchive::new(file).ok()?;
-                let mut e = zip.by_name(entry).ok()?;
-                let mut buf = Vec::with_capacity(e.size() as usize);
-                e.read_to_end(&mut buf).ok()?;
-                return Some(buf);
-            }
+        let hit = st
+            .jar_indexes
+            .iter()
+            .enumerate()
+            .find_map(|(i, index)| index.get(internal_name).map(|e| (i, e.clone())));
+        let (jar_idx, entry) = hit?;
+        if st.zips[jar_idx].is_none() {
+            let path = st.jars[jar_idx].clone();
+            st.zips[jar_idx] =
+                std::fs::File::open(&path).ok().and_then(|f| zip::ZipArchive::new(f).ok());
         }
-        None
+        let zip = st.zips[jar_idx].as_mut()?;
+        let mut e = zip.by_name(&entry).ok()?;
+        let mut buf = Vec::with_capacity(e.size() as usize);
+        e.read_to_end(&mut buf).ok()?;
+        Some(buf)
     }
 
     /// Names from primary (input) sources; falls back to all names when
@@ -369,15 +394,66 @@ impl ClassPool {
         hit
     }
 
-    pub fn primary_names(&self) -> Vec<String> {
-        let st = self.state.lock().unwrap();
-        if st.primary.is_empty() {
-            drop(st);
-            return self.all_names();
+    pub fn primary_names(&self) -> std::sync::Arc<Vec<String>> {
+        {
+            let st = self.state.lock().unwrap();
+            if let Some(v) = &st.primary_sorted {
+                return v.clone();
+            }
+            if st.primary.is_empty() {
+                drop(st);
+                return std::sync::Arc::new(self.all_names());
+            }
         }
-        let mut v: Vec<String> = st.primary.iter().cloned().collect();
+        let mut v: Vec<String> = {
+            let st = self.state.lock().unwrap();
+            st.primary.iter().cloned().collect()
+        };
         v.sort_unstable();
-        v
+        let arc = std::sync::Arc::new(v);
+        self.state.lock().unwrap().primary_sorted = Some(arc.clone());
+        arc
+    }
+
+    /// Sorted primary names nested under `root` (names starting with
+    /// `root$`). Lazily indexed; see `family_index`.
+    pub fn family_names(&self, root: &str) -> std::sync::Arc<Vec<String>> {
+        {
+            let st = self.state.lock().unwrap();
+            if let Some(idx) = &st.family_index {
+                return idx
+                    .get(root)
+                    .cloned()
+                    .unwrap_or_else(|| std::sync::Arc::new(Vec::new()));
+            }
+        }
+        let names = self.primary_names();
+        let mut idx: HashMap<String, Vec<String>> = HashMap::new();
+        for n in names.iter() {
+            // EVERY ancestor prefix gets the name: sub-family collects
+            // query nested roots (Gatherers$Composite must see
+            // Gatherers$Composite$1State; a first-'$'-only bucket drops
+            // grandchildren and the local-class render loses its State —
+            // lambda captures leaked into the ctor args).
+            let mut cut = n.as_str();
+            while let Some(d) = cut.rfind('$') {
+                cut = &cut[..d];
+                idx.entry(cut.to_string()).or_default().push(n.clone());
+            }
+        }
+        let idx: HashMap<String, std::sync::Arc<Vec<String>>> = idx
+            .into_iter()
+            .map(|(k, mut v)| {
+                v.sort_unstable();
+                (k, std::sync::Arc::new(v))
+            })
+            .collect();
+        let out = idx
+            .get(root)
+            .cloned()
+            .unwrap_or_else(|| std::sync::Arc::new(Vec::new()));
+        self.state.lock().unwrap().family_index = Some(idx);
+        out
     }
 
     /// All class names known to the pool indexes (without parsing).
