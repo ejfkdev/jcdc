@@ -915,7 +915,28 @@ fn emit_class(
     let acc = if is_root {
         pc.access()
     } else {
-        fam.nested.get(&internal).map(|n| n.access).unwrap_or_else(|| pc.access())
+        let mut a = fam
+            .nested
+            .get(&internal)
+            .map(|n| n.access)
+            .unwrap_or_else(|| pc.access());
+        // NESTMATE-ERA PRIVATE WIDENING: javac (jdk9+ nestmates) can mark
+        // a package-visible member class `private` in the Outer's
+        // InnerClasses attribute while the class's OWN access flags stay
+        // package and cross-nest bytecode references prove the wider
+        // access (jdk11 BoundMethodHandle$Species_L: source declares
+        // `static final class`, the entry says private, Invokers et al.
+        // dereference its argL0 — rendering the entry's private died with
+        // Species_L 在 BoundMethodHandle 中是 private 访问控制 ×92 on the
+        // p11-plat invoke package). A genuinely private nested class has
+        // no outside-nest referencers and keeps its entry modifiers.
+        if (a.contains(ClassAccessFlags::PRIVATE)
+            || pc.access().contains(ClassAccessFlags::PRIVATE))
+            && pool.referenced_outside_nest(&internal, &fam.root)
+        {
+            a.remove(ClassAccessFlags::PRIVATE);
+        }
+        a
     };
     let major = pc.cf.major_version;
     let is_enum = acc.contains(ClassAccessFlags::ENUM) || pc.is_enum();
@@ -2505,6 +2526,100 @@ fn prune_const_final_ctor_assigns(s: &mut Stmt, pc: &PoolClass) {
     rec(s, &names);
 }
 
+/// The declared checked-exception set (internal names) of the nearest
+/// superclass method with the same (name, params), if any. Era bytecode
+/// can carry an override whose Exceptions attribute is WIDER than the
+/// super's (jdk11 platform image: BoundMethodHandle$Species_*.
+/// copyWithExtend* declare `throws Throwable` while the abstract super
+/// declares none — JVM-legal, source-inexpressible). Rendering the
+/// attribute verbatim dies with 被覆盖的方法未抛出Throwable; the render
+/// intersects instead (an override may always declare FEWER exceptions).
+fn super_throws_set(
+    pc: &PoolClass,
+    pool: &ClassPool,
+    name: &str,
+    desc: &str,
+) -> Option<std::collections::HashSet<String>> {
+    let params = desc.split(')').next().unwrap_or(desc);
+    let mut cur = pc.super_name().map(|s| s.to_string());
+    for _ in 0..32 {
+        let Some(cname) = cur else { break };
+        if cname == "java/lang/Object" {
+            break;
+        }
+        let Some(spc) = pool.get(&cname) else { break };
+        for sm in spc.cf.methods.iter() {
+            let Some(sn) = spc.utf8(sm.name_index) else { continue };
+            if sn != name {
+                continue;
+            }
+            let Some(sd) = spc.utf8(sm.descriptor_index) else { continue };
+            if sd.split(')').next().unwrap_or(sd) != params {
+                continue;
+            }
+            use jcdc_classfile::MethodAccessFlags as MAF2;
+            if sm.access_flags.contains(MAF2::PRIVATE) || sm.access_flags.contains(MAF2::STATIC) {
+                // Not overridable — keep walking the chain (jdk11
+                // IsoChronology.readResolve: a PRIVATE super readResolve
+                // with no Exceptions attribute stripped the child's
+                // throws ObjectStreamException and orphaned its
+                // InvalidObjectException throw).
+                continue;
+            }
+            let mut set = std::collections::HashSet::new();
+            for attr in &sm.attributes {
+                if let ParsedAttribute::Exceptions(e) =
+                    parse_specialized_attribute(attr, &spc.cf.constant_pool)
+                {
+                    for idx in &e.exception_index_table {
+                        if let Some(n) = spc.class_name(*idx) {
+                            set.insert(n.to_string());
+                        }
+                    }
+                }
+            }
+            return Some(set);
+        }
+        cur = spc.super_name().map(|s| s.to_string());
+    }
+    None
+}
+
+/// True when any superclass in the pool chain declares a method with the
+/// same name and parameter types that is NOT private: rendering this
+/// class's same-signature method `private` would then be a weaker-access
+/// override (无法覆盖...正在尝试分配更低的访问权限). Era-generated holders
+/// carry ACC_PRIVATE on package-level override stubs (jdk11
+/// BoundMethodHandle$Species_LL.copyWithExtendL — the source declares it
+/// package-private).
+fn super_declares_nonprivate(pc: &PoolClass, pool: &ClassPool, name: &str, desc: &str) -> bool {
+    let params = desc.split(')').next().unwrap_or(desc);
+    let mut cur = pc.super_name().map(|s| s.to_string());
+    for _ in 0..32 {
+        let Some(cname) = cur else { break };
+        if cname == "java/lang/Object" {
+            break;
+        }
+        let Some(spc) = pool.get(&cname) else { break };
+        for sm in spc.cf.methods.iter() {
+            let Some(sn) = spc.utf8(sm.name_index) else { continue };
+            if sn != name {
+                continue;
+            }
+            let Some(sd) = spc.utf8(sm.descriptor_index) else { continue };
+            if sd.split(')').next().unwrap_or(sd) != params {
+                continue;
+            }
+            use jcdc_classfile::MethodAccessFlags as MAF;
+            if !sm.access_flags.contains(MAF::PRIVATE) {
+                return true;
+            }
+        }
+        cur = spc.super_name().map(|s| s.to_string());
+    }
+    false
+}
+
 /// Method-index → replacement simple name, installed by the family
 /// emitter around methods that collide at the SOURCE level: era bytecode
 /// (jdk9+ java.lang.invoke holders like Invokers$Holder, generated
@@ -2950,7 +3065,14 @@ fn emit_method_with(
     if acc.contains(MethodAccessFlags::PROTECTED) {
         line.push_str("protected ");
     }
-    if acc.contains(MethodAccessFlags::PRIVATE) {
+    // Era-bytecode private widening: an override stub flagged PRIVATE
+    // whose superclass declares the signature non-private renders
+    // package-private (see super_declares_nonprivate).
+    let widen_priv = acc.contains(MethodAccessFlags::PRIVATE)
+        && !is_ctor
+        && !acc.contains(MethodAccessFlags::STATIC)
+        && super_declares_nonprivate(pc, pool, &name, &desc);
+    if acc.contains(MethodAccessFlags::PRIVATE) && !widen_priv {
         line.push_str("private ");
     }
     if acc.contains(MethodAccessFlags::STATIC) {
@@ -3135,6 +3257,7 @@ fn emit_method_with(
             .collect(),
         None => Vec::new(),
     };
+    let mut exc_internals: Vec<String> = Vec::new();
     for attr in &m.attributes {
         if let ParsedAttribute::Exceptions(e) = parse_specialized_attribute(attr, &pc.cf.constant_pool) {
             for idx in &e.exception_index_table {
@@ -3142,12 +3265,49 @@ fn emit_method_with(
                     if sig_erasures.iter().any(|x| x == n) {
                         continue;
                     }
-                    let s = p0.shorten(n);
-                    if !throws.contains(&s) {
-                        throws.push(s);
+                    if !exc_internals.iter().any(|x| x == n) {
+                        exc_internals.push(n.to_string());
                     }
                 }
             }
+        }
+    }
+    // Generic-throws methods (msig.throws non-empty) render typevar names
+    // that never match the super's erased Exceptions entries — filtering
+    // would strip the typevar and orphan the body's `throw x`.
+    let throws_are_plain = msig
+        .as_ref()
+        .map(|sg| sg.throws.is_empty())
+        .unwrap_or(true);
+    if !exc_internals.is_empty()
+        && !is_ctor
+        && throws_are_plain
+        && !acc.contains(MethodAccessFlags::STATIC)
+        && !acc.contains(MethodAccessFlags::PRIVATE)
+    {
+        if let Some(allowed) = super_throws_set(pc, pool, &name, &desc) {
+            // SUBTYPE-AWARE narrowing: an override may declare a SUBCLASS
+            // of a super-declared exception (java.net.Socket.
+            // sendUrgentData throws IOException; jdk11
+            // BaseSSLSocketImpl narrows to SocketException) — a name-set
+            // intersection stripped the narrowing and orphaned the
+            // body's throw.
+            exc_internals.retain(|e| {
+                allowed.iter().any(|a| {
+                    a == e
+                        || is_subtype_of(
+                            pool,
+                            &jcdc_jvm::JavaType::Object(e.clone()),
+                            a,
+                        )
+                })
+            });
+        }
+    }
+    for n in &exc_internals {
+        let s = p0.shorten(n);
+        if !throws.contains(&s) {
+            throws.push(s);
         }
     }
     if !throws.is_empty() {

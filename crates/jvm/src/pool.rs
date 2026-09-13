@@ -182,6 +182,13 @@ struct PoolState {
     /// must only use these, or classpath jars leak foreign nested classes
     /// into the output.
     primary: HashSet<String>,
+    /// Lazy reverse-reference index for NESTED referenced names:
+    /// internal name -> set of referencer NEST ROOTS (top-level class
+    /// names), built by scanning the constant-pool Class entries of
+    /// every primary class. Used to detect nestmate-era InnerClasses
+    /// entries that claim `private` for a class the bytecode proves is
+    /// package-visible (cross-nest references exist).
+    nest_ref_index: Option<HashMap<String, HashSet<String>>>,
 }
 
 /// A searchable collection of classes (directories and jars), with a shared
@@ -314,6 +321,54 @@ impl ClassPool {
 
     /// Names from primary (input) sources; falls back to all names when
     /// nothing was registered as primary (e.g. insert_bytes-only pools).
+    /// True when some primary class OUTSIDE `nest_root`'s family
+    /// references `internal` in its constant pool. Builds the lazy
+    /// reverse-reference index on first use.
+    pub fn referenced_outside_nest(&self, internal: &str, nest_root: &str) -> bool {
+        // Phase 1: snapshot primary names (short lock).
+        let names = {
+            let st = self.state.lock().unwrap();
+            if let Some(idx) = &st.nest_ref_index {
+                return idx
+                    .get(internal)
+                    .map(|roots| roots.iter().any(|r| r != nest_root))
+                    .unwrap_or(false);
+            }
+            st.primary.iter().cloned().collect::<Vec<String>>()
+        };
+        // Phase 2: parse (cached) + scan without holding the lock.
+        let mut index: HashMap<String, HashSet<String>> = HashMap::new();
+        for name in &names {
+            let Some(pc) = self.get(name) else { continue };
+            let root = match name.find('$') {
+                Some(d) => &name[..d],
+                None => name.as_str(),
+            };
+            for e in pc.cf.constant_pool.iter() {
+                if let jcdc_classfile::ConstantPoolEntry::Class(info) = e {
+                    if let Some(ref_name) = pc.utf8(info.name_index) {
+                        if ref_name.contains('$')
+                            && ref_name != "["
+                            && !ref_name.starts_with('[')
+                        {
+                            index
+                                .entry(ref_name.to_string())
+                                .or_default()
+                                .insert(root.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        let hit = index
+            .get(internal)
+            .map(|roots| roots.iter().any(|r| r != nest_root))
+            .unwrap_or(false);
+        // Phase 3: store (another thread may have raced us; same result).
+        self.state.lock().unwrap().nest_ref_index = Some(index);
+        hit
+    }
+
     pub fn primary_names(&self) -> Vec<String> {
         let st = self.state.lock().unwrap();
         if st.primary.is_empty() {
