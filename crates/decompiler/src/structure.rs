@@ -145,6 +145,32 @@ thread_local! {
     pub static COPY_ALLOW_CONFLUENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// True when `from` reaches `to` through normal-flow successors without
+/// expanding any `barred` block (`to` itself may be barred — reaching it
+/// is the success condition). Used by PARKCHAIN's relaxed coherence.
+pub(crate) fn bypass_flows_to(cfg: &Cfg, from: usize, to: usize, barred: &HashSet<usize>) -> bool {
+    if from == to {
+        return true;
+    }
+    let mut seen: HashSet<usize> = HashSet::new();
+    let mut q: VecDeque<usize> = VecDeque::new();
+    q.push_back(from);
+    seen.insert(from);
+    while let Some(x) = q.pop_front() {
+        for &s in &cfg.blocks[x].succ {
+            if s == to {
+                return true;
+            }
+            if barred.contains(&s) || seen.contains(&s) {
+                continue;
+            }
+            seen.insert(s);
+            q.push_back(s);
+        }
+    }
+    false
+}
+
 pub fn reachable_within(cfg: &Cfg, entry: usize, stop: &HashSet<usize>) -> HashSet<usize> {
     let mut seen = HashSet::new();
     if stop.contains(&entry) {
@@ -3529,8 +3555,25 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                                 // the target — JarFile's chain flows
                                 // through b11 into the close/return
                                 // epilogue) preserves it.
+                                //
+                                // REACHABILITY RELAXATION: a bypass
+                                // target that flows to the copy's own
+                                // continuation WITHOUT crossing the
+                                // chain barriers shares that
+                                // continuation — coherent when the arm
+                                // gets a per-arrival fill (routed2
+                                // below). jdk11 HttpURLConnection
+                                // getInputStream0: arm-tail Goto{105}
+                                // flows 105→106→114 == chain_cont; the
+                                // strict equality refused the copy and
+                                // the short-clone arm fell through the
+                                // sibling else into getRootPath (the
+                                // source skips it on the path-
+                                // shortening branch).
                                 match chain_cont(&taken_r) {
-                                    Some(c) => bts.iter().all(|t| *t == c),
+                                    Some(c) => bts.iter().all(|t| {
+                                        *t == c || bypass_flows_to(self.cfg, *t, c, &cstop)
+                                    }),
                                     None => true,
                                 }
                             };
@@ -3555,6 +3598,122 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             if std::env::var("JCDC_DBG_IF").is_ok() {
                                 eprintln!("PARKC-ARM cur={} taken={} bts={:?} arm={}", cur, taken, bts, region_shape(&arm));
                             }
+                                    fn fill_bypass(
+                                        st: &mut Structurer,
+                                        r: &mut Region,
+                                        copy: &Region,
+                                        taken: usize,
+                                        cu2: &HashSet<usize>,
+                                        cstop: &HashSet<usize>,
+                                        active: &[usize],
+                                        claimed: &HashSet<usize>,
+                                        filled: &mut usize,
+                                        failed: &mut bool,
+                                        top: bool,
+                                    ) {
+                                        match r {
+                                            Region::Seq(v) => {
+                                                let n = v.len();
+                                                for i in 0..n {
+                                                    let is_last = i + 1 == n;
+                                                    if is_last {
+                                                        let goto_t = match &v[i] {
+                                                            Region::Goto { target } => Some(*target),
+                                                            _ => None,
+                                                        };
+                                                        if let Some(t) = goto_t {
+                                                            if t == taken && !top {
+                                                                // Deep If-arm tail jumping to the
+                                                                // chain head: own copy of the chain.
+                                                                v[i] = copy.clone();
+                                                                *filled += 1;
+                                                                continue;
+                                                            }
+                                                            if t != taken
+                                                                && bypass_flows_to(
+                                                                    st.cfg, t, taken, cstop,
+                                                                )
+                                                            {
+                                                                // Arm tail flowing into the chain:
+                                                                // fresh walk from t; drop a
+                                                                // preceding CopyStmts{t} (the fresh
+                                                                // Basic(t) supersedes it).
+                                                                let mut sc = claimed.clone();
+                                                                let sub = st.walk(
+                                                                    t, cu2, cstop, active, &mut sc,
+                                                                    false,
+                                                                );
+                                                                if !matches!(sub, Region::Empty)
+                                                                    && simple_completion_local2(&sub)
+                                                                    && region_terminates_ex(
+                                                                        &sub, st.results, &[],
+                                                                    )
+                                                                {
+                                                                    v[i] = sub;
+                                                                    if n >= 2 {
+                                                                        if let Region::CopyStmts {
+                                                                            block,
+                                                                        } = &v[i - 1]
+                                                                        {
+                                                                            if *block == t {
+                                                                                v[i - 1] =
+                                                                                    Region::Empty;
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    *filled += 1;
+                                                                } else {
+                                                                    *failed = true;
+                                                                }
+                                                                continue;
+                                                            }
+                                                        }
+                                                    }
+                                                    fill_bypass(
+                                                        st, &mut v[i], copy, taken, cu2, cstop,
+                                                        active, claimed, filled, failed, false,
+                                                    );
+                                                }
+                                            }
+                                            Region::If { then_r, else_r, .. } => {
+                                                fill_bypass(
+                                                    st, then_r, copy, taken, cu2, cstop, active,
+                                                    claimed, filled, failed, false,
+                                                );
+                                                fill_bypass(
+                                                    st, else_r, copy, taken, cu2, cstop, active,
+                                                    claimed, filled, failed, false,
+                                                );
+                                            }
+                                            Region::Try { body, catches, .. } => {
+                                                fill_bypass(
+                                                    st, body, copy, taken, cu2, cstop, active,
+                                                    claimed, filled, failed, false,
+                                                );
+                                                for (_, _, h) in catches.iter_mut() {
+                                                    fill_bypass(
+                                                        st, h, copy, taken, cu2, cstop, active,
+                                                        claimed, filled, failed, false,
+                                                    );
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    fn simple_completion_local2(r: &Region) -> bool {
+                                        match r {
+                                            Region::Basic { .. }
+                                            | Region::CopyStmts { .. }
+                                            | Region::Empty
+                                            | Region::Goto { .. } => true,
+                                            Region::Seq(v) => v.iter().all(simple_completion_local2),
+                                            Region::If { then_r, else_r, .. } => {
+                                                simple_completion_local2(then_r)
+                                                    && simple_completion_local2(else_r)
+                                            }
+                                            _ => false,
+                                        }
+                                    }
                             let routed = {
                                 coherent
                                     && !matches!(taken_r, Region::Empty)
@@ -3633,6 +3792,55 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                                 // the copies are per-arrival
                                 // materializations, not double emission).
                                 let mut arm = arm;
+                                // SIBLING-INTERIOR ROUTING (the huc
+                                // short-clone-arm cure): with relaxed
+                                // coherence the arm may hold deep Goto
+                                // tails whose target is the chain head
+                                // (an If-arm's last statement jumping to
+                                // `taken`) or flows to the chain's
+                                // continuation (the arm's own back-edge-
+                                // stub tail). Those Gotos would elide and
+                                // fall into the WRONG sibling emission —
+                                // give each its own per-arrival copy:
+                                // Goto{taken} gets the chain copy clone;
+                                // a flow-to-continuation tail gets a fresh
+                                // scratch walk from its target (replacing
+                                // a preceding CopyStmts pair) validated by
+                                // simple completion + abrupt termination.
+                                let routed2 = coherent
+                                    && !routed
+                                    && !matches!(taken_r, Region::Empty)
+                                    && simple_completion(&taken_r);
+                                if routed2 {
+                                    let mut cu2 = cu.clone();
+                                    for t in bts.iter() {
+                                        cu2.insert(*t);
+                                        for x in reachable_within(self.cfg, *t, &cstop) {
+                                            cu2.insert(x);
+                                        }
+                                    }
+                                    let mut filled2 = 0usize;
+                                    let mut failed2 = false;
+                                    fill_bypass(
+                                        self,
+                                        &mut arm,
+                                        &taken_r,
+                                        taken,
+                                        &cu2,
+                                        &cstop,
+                                        active,
+                                        claimed,
+                                        &mut filled2,
+                                        &mut failed2,
+                                        true,
+                                    );
+                                    if std::env::var("JCDC_DBG_IF").is_ok() {
+                                        eprintln!(
+                                            "PARKCHAIN-ROUTE2 cur={} filled={} failed={}",
+                                            cur, filled2, failed2
+                                        );
+                                    }
+                                }
                                 if routed {
                                     // SKIP-PATH ROUTING: a follow-EMPTY If
                                     // arm whose target is NOT the parked
