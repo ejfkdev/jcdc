@@ -61,6 +61,19 @@ pub struct Converter<'a> {
     /// True while converting the last element of a Seq (a trailing Goto
     /// there may be inlined as a copy instead of an unemittable jump).
     goto_is_last: bool,
+    /// The block whose emission IMMEDIATELY follows the current position:
+    /// the innermost enclosing If's follow while converting its arms, or
+    /// the next Seq sibling's head. A RawGoto may elide to fallthrough
+    /// ONLY when its target is this block — the old stack-wide
+    /// `if_follows.contains` check elided jumps to OUTER follows whose
+    /// emission was separated by intervening follow/copy emissions
+    /// (jdk17 DatagramChannelImpl.receive: the b15 fall arm's Goto{SET}
+    /// elided into cur=14's follow emission, skipping
+    /// `sender = sourceSocketAddress()` on the n==0&&isOpen path;
+    /// sun.net.www.protocol.http HttpURLConnection.getInputStream0: the
+    /// clone arms' Goto{addToCache} fell into the post-loop tail — the
+    /// documented addToCache-skip residual).
+    expect_next: std::cell::Cell<Option<usize>>,
     /// Heads of copy-walked shared tails (from the structurer).
     copied_tails: std::collections::HashSet<usize>,
     /// Collected label emissions: block target -> label name (for `Label` stmts).
@@ -169,6 +182,7 @@ impl<'a> Converter<'a> {
             used_labels: HashSet::new(),
             label_counter: 0,
             goto_is_last: false,
+            expect_next: std::cell::Cell::new(None),
             copied_tails: std::collections::HashSet::new(),
             pending_labels: HashMap::new(),
             final_fields: HashSet::new(),
@@ -217,10 +231,25 @@ impl<'a> Converter<'a> {
             Region::Seq(v) => {
                 let mut out = Vec::new();
                 let n = v.len();
+                let heads: Vec<usize> = v
+                    .iter()
+                    .map(crate::structure::region_head_block)
+                    .collect();
                 for (k, x) in v.into_iter().enumerate() {
                     let save = self.goto_is_last;
                     self.goto_is_last = k + 1 == n;
+                    let save_exp = self.expect_next.get();
+                    // Only override when the next emission is KNOWN: a
+                    // headless tail (Goto/Empty — a jump out) must keep
+                    // the inherited expectation, or a nested arm's Goto
+                    // would elide against a phantom (jdk17 dci: Basic17's
+                    // MAX head erased the follow expectation and Goto{16}
+                    // elided past the SET).
+                    if k + 1 < n && heads[k + 1] != usize::MAX {
+                        self.expect_next.set(Some(heads[k + 1]));
+                    }
                     out.push(self.conv(x));
+                    self.expect_next.set(save_exp);
                     self.goto_is_last = save;
                 }
                 Stmt::Block(out)
@@ -237,8 +266,14 @@ impl<'a> Converter<'a> {
                     if let Some(f) = follow {
                         self.if_follows.push(f);
                     }
+                    let save_exp = self.expect_next.get();
+                    // follow=None keeps the inherited expectation: the
+                    // flow leaving this If's arms continues to whatever
+                    // follows the If itself.
+                    self.expect_next.set(follow.or(save_exp));
                     let then_stmt = self.conv(*then_r);
                     let else_stmt = self.conv(*else_r);
+                    self.expect_next.set(save_exp);
                     if follow.is_some() {
                         self.if_follows.pop();
                     }
@@ -464,8 +499,66 @@ impl<'a> Converter<'a> {
                                 // 无法访问的语句 x2 trees). Materialize the
                                 // break (innermost enclosing loop).
                                 Stmt::Break(None)
+                            } else if !matches!(
+                                self.results[t].term,
+                                Term::Return(_) | Term::Throw(_)
+                            ) && !self.results[t].stmts.is_empty()
+                                && self
+                                    .expect_next
+                                    .get()
+                                    .map(|nx| {
+                                        // The next emission is a copy that
+                                        // STARTS PAST t (at a successor of t
+                                        // already in copied_tails): eliding
+                                        // would silently skip t's own
+                                        // statements, and no emitted copy
+                                        // covers them. (sj17 receive:
+                                        // Goto{16=SET}, expect=Some(17),
+                                        // 17 copied, 16 not.) If t itself is
+                                        // in copied_tails, an emitted full
+                                        // copy already includes t's stmts —
+                                        // inlining would double-emit (w26
+                                        // receive: Goto{14}, 14 copied).
+                                        let mut x = t;
+                                        for _ in 0..8 {
+                                            if x == nx {
+                                                return x != t;
+                                            }
+                                            if self.copied_tails.contains(&x) {
+                                                return false;
+                                            }
+                                            match self.cfg.blocks[x].succ.first() {
+                                                Some(&n) => x = n,
+                                                None => return false,
+                                            }
+                                        }
+                                        false
+                                    })
+                                    .unwrap_or(false)
+                                && (self.if_follows.iter().any(|f| {
+                                    self.cfg.blocks[t].succ.contains(f)
+                                }))
+                            {
+                                // Statement-bearing target FIRST: eliding
+                                // (goto_is_last / expect / copy-tail) would
+                                // silently skip t's own statements when the
+                                // next emission is a copy of t's SUCCESSOR
+                                // rather than t itself (jdk17
+                                // DatagramChannelImpl.receive: Goto{16=
+                                // `sender = sourceSocketAddress()`} elided
+                                // via reaches_copy_tail(16->17) into the
+                                // arm's Basic(17) copy — the n==0&&isOpen
+                                // path returned a null sender). The inline
+                                // below emits t's statements and then falls
+                                // through to the same continuation.
+                                let cv = self.results[t].stmts.clone();
+                                if cv.len() == 1 {
+                                    cv.into_iter().next().unwrap()
+                                } else {
+                                    Stmt::Block(cv)
+                                }
                             } else if self.goto_is_last
-                                || self.if_follows.contains(&t)
+                                || self.expect_next.get() == Some(t)
                                 || self.reaches_copy_tail(t)
                             {
                                 // Natural fallthrough reaches the same

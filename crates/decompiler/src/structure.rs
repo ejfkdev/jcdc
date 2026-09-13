@@ -1781,7 +1781,7 @@ fn strip_fallthrough_goto(r: Region, heads: &HashSet<usize>) -> Region {
 }
 
 /// Debug helper: first block id a region starts at (usize::MAX if none).
-fn region_head_block(r: &Region) -> usize {
+pub(crate) fn region_head_block(r: &Region) -> usize {
     match r {
         Region::Basic { block } => *block,
         Region::Seq(v) => v.first().map(region_head_block).unwrap_or(usize::MAX),
