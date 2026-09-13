@@ -20,6 +20,11 @@ use crate::structure::Region;
 pub enum Jump {
     Break(Option<String>),
     Continue(Option<String>),
+    /// Continue of the loop at the given depth-from-innermost, prefixed by
+    /// an emission of the target block's own statements (the jump re-runs
+    /// a shared statement-bearing tail that flows back into the header;
+    /// a bare Continue would skip those statements).
+    ContinueVia(usize, Option<String>),
     /// Unstructured: emit `label:` + goto as comments (best effort).
     RawGoto(usize),
 }
@@ -458,6 +463,18 @@ impl<'a> Converter<'a> {
                             }
                             Stmt::Continue(lbl)
                         }
+                        Jump::ContinueVia(t, lbl) => {
+                            if let Some(l) = &lbl {
+                                self.used_labels.insert(l.clone());
+                            }
+                            let mut cv = self.results[t].stmts.clone();
+                            cv.push(Stmt::Continue(lbl));
+                            if cv.len() == 1 {
+                                cv.into_iter().next().unwrap()
+                            } else {
+                                Stmt::Block(cv)
+                            }
+                        }
                         Jump::RawGoto(t) => {
                             if std::env::var("JCDC_DBG_GOTO").is_ok() {
                                 eprintln!("RAWGOTO t={} copied_tails={:?} if_follows={:?} last={}", t, self.copied_tails, self.if_follows, self.goto_is_last);
@@ -714,17 +731,63 @@ impl<'a> Converter<'a> {
         // switch tail unreachable (无法访问的语句 x3 trees).
         let is_any_exit = self.loops.iter().any(|l| l.exits.contains(&target));
         if !is_any_exit && self.switches.is_empty() {
-        if let Some(i) = (0..self.loops.len())
-            .rev()
-            .find(|&i| crate::structure::can_reach_cfg(self.cfg, target, self.loops[i].header, 4096))
-        {
-            let depth = self.loops.len() - 1 - i;
-            return Some(if depth == 0 {
-                Jump::Continue(None)
+            // STUB-TARGET continue: a statement-free confluence stub that
+            // can reach an enclosing header re-iterates that loop (its own
+            // flow was emitted earlier in this body copy; IPP's can_reach
+            // targets t=43/18/96/89/114/21/7 are all stubs).
+            // HEADER-ADJACENT statement-bearing target: the jump re-runs a
+            // shared tail whose statements were NOT emitted on this path —
+            // inline them and continue (jdk11 BigInteger.nextProbablePrime
+            // sieve arms: Goto{result=result.add(TWO)} flowing straight to
+            // the header; a bare Continue skipped the advance and left
+            // while(true) as the method's only completion: 缺少返回语句).
+            // Statement-bearing targets with a BRANCHING or statement
+            // bearing chain to the header keep RawGoto resolution (huc
+            // getInputStream0's clone/getValue tails flow through shared
+            // forward code — continuing there would skip it).
+            let mut via_label: Option<Option<String>> = None;
+            if self.results[target].stmts.is_empty() {
+                if let Some(i) = (0..self.loops.len())
+                    .rev()
+                    .find(|&i| {
+                        crate::structure::can_reach_cfg(self.cfg, target, self.loops[i].header, 4096)
+                    })
+                {
+                    let depth = self.loops.len() - 1 - i;
+                    via_label = Some(if depth == 0 {
+                        None
+                    } else {
+                        Some(self.loops[i].label.clone())
+                    });
+                }
             } else {
-                Jump::Continue(Some(self.loops[i].label.clone()))
-            });
-        }
+                let mut x = target;
+                for _ in 0..8 {
+                    if let Some(hi) = self.loops.iter().position(|l| l.header == x) {
+                        let depth = self.loops.len() - 1 - hi;
+                        via_label = Some(if depth == 0 {
+                            None
+                        } else {
+                            Some(self.loops[hi].label.clone())
+                        });
+                        break;
+                    }
+                    if !self.results[x].stmts.is_empty() && x != target {
+                        break;
+                    }
+                    if self.cfg.blocks[x].succ.len() != 1 {
+                        break;
+                    }
+                    x = self.cfg.blocks[x].succ[0];
+                }
+            }
+            if let Some(lbl) = via_label {
+                return Some(if self.results[target].stmts.is_empty() {
+                    Jump::Continue(lbl)
+                } else {
+                    Jump::ContinueVia(target, lbl)
+                });
+            }
         }
         // Inside a loop, a forward escape that cannot reach back into the
         // loop is a break of the innermost loop.

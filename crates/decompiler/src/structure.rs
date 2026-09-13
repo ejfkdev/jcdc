@@ -1792,6 +1792,32 @@ pub(crate) fn region_head_block(r: &Region) -> usize {
     }
 }
 
+/// Head of the FLOW that a region emits next when used as the following
+/// emission: like region_head_block but transparent for Empty and Goto
+/// regions (a Goto's emission IS the jump to its target; Empty emits
+/// nothing). Used by the converter's expect_next tracking.
+pub(crate) fn flow_next_head(r: &Region) -> usize {
+    match r {
+        Region::Basic { block } => *block,
+        Region::CopyStmts { block } => *block,
+        Region::Goto { target } => *target,
+        Region::Empty => usize::MAX,
+        Region::Seq(v) => {
+            for x in v {
+                let h = flow_next_head(x);
+                if h != usize::MAX {
+                    return h;
+                }
+            }
+            usize::MAX
+        }
+        Region::If { block, .. } => *block,
+        Region::Loop { header, .. } => *header,
+        Region::Switch { block, .. } => *block,
+        _ => usize::MAX,
+    }
+}
+
 /// Debug helper: compact variant shape of a region for traces.
 fn region_shape(r: &Region) -> String {
     match r {
