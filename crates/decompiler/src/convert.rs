@@ -79,6 +79,15 @@ pub struct Converter<'a> {
     /// clone arms' Goto{addToCache} fell into the post-loop tail — the
     /// documented addToCache-skip residual).
     expect_next: std::cell::Cell<Option<usize>>,
+    /// Set while converting a Seq element that DIRECTLY follows a
+    /// CopyStmts of that same block: the back-edge-stub pattern
+    /// [CopyStmts{b}, Goto{b}] already emitted b's statements, so the
+    /// Goto must not inline them again (jdk11 HttpURLConnection
+    /// getInputStream0: the clone tail rendered the clone/removeFromCache
+    /// block twice — the second removeFromCache removed the just-cloned
+    /// entry from the auth cache; a header-adjacent b would also make
+    /// ContinueVia re-emit b's statements after the copy).
+    prev_copy: std::cell::Cell<Option<usize>>,
     /// Heads of copy-walked shared tails (from the structurer).
     copied_tails: std::collections::HashSet<usize>,
     /// Collected label emissions: block target -> label name (for `Label` stmts).
@@ -188,6 +197,7 @@ impl<'a> Converter<'a> {
             label_counter: 0,
             goto_is_last: false,
             expect_next: std::cell::Cell::new(None),
+            prev_copy: std::cell::Cell::new(None),
             copied_tails: std::collections::HashSet::new(),
             pending_labels: HashMap::new(),
             final_fields: HashSet::new(),
@@ -240,9 +250,23 @@ impl<'a> Converter<'a> {
                     .iter()
                     .map(crate::structure::region_head_block)
                     .collect();
+                let prev_copies: Vec<Option<usize>> = (0..n)
+                    .map(|k| {
+                        if k > 0 {
+                            match &v[k - 1] {
+                                Region::CopyStmts { block } => Some(*block),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 for (k, x) in v.into_iter().enumerate() {
                     let save = self.goto_is_last;
                     self.goto_is_last = k + 1 == n;
+                    let save_pc = self.prev_copy.get();
+                    self.prev_copy.set(prev_copies[k]);
                     let save_exp = self.expect_next.get();
                     // Only override when the next emission is KNOWN: a
                     // headless tail (Goto/Empty — a jump out) must keep
@@ -255,6 +279,7 @@ impl<'a> Converter<'a> {
                     }
                     out.push(self.conv(x));
                     self.expect_next.set(save_exp);
+                    self.prev_copy.set(save_pc);
                     self.goto_is_last = save;
                 }
                 Stmt::Block(out)
@@ -467,7 +492,13 @@ impl<'a> Converter<'a> {
                             if let Some(l) = &lbl {
                                 self.used_labels.insert(l.clone());
                             }
-                            let mut cv = self.results[t].stmts.clone();
+                            let mut cv = if self.prev_copy.get() == Some(t) {
+                                // Statements already emitted by the
+                                // immediately preceding CopyStmts.
+                                Vec::new()
+                            } else {
+                                self.results[t].stmts.clone()
+                            };
                             cv.push(Stmt::Continue(lbl));
                             if cv.len() == 1 {
                                 cv.into_iter().next().unwrap()
@@ -520,6 +551,8 @@ impl<'a> Converter<'a> {
                                 self.results[t].term,
                                 Term::Return(_) | Term::Throw(_)
                             ) && !self.results[t].stmts.is_empty()
+                                && !self.copied_tails.contains(&t)
+                                && self.prev_copy.get() != Some(t)
                                 && self
                                     .expect_next
                                     .get()
@@ -584,9 +617,10 @@ impl<'a> Converter<'a> {
                             } else if !matches!(
                                 self.results[t].term,
                                 Term::Return(_) | Term::Throw(_)
-                            ) && (self.if_follows.iter().any(|f| {
-                                self.cfg.blocks[t].succ.contains(f)
-                            }))
+                            ) && self.prev_copy.get() != Some(t)
+                                && (self.if_follows.iter().any(|f| {
+                                    self.cfg.blocks[t].succ.contains(f)
+                                }))
                             {
                                 // The jump re-enters an already-structured
                                 // block whose flow ends at an enclosing
