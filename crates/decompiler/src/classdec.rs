@@ -9969,6 +9969,12 @@ fn restore_one_switch(
                 Expr::Method { name, owner: Some(o), args, .. } if name == "ordinal" && args.is_empty() => {
                     (**o).clone()
                 }
+                // The switch lives INSIDE the enum class itself (jdk11
+                // VarHandle$AccessType.accessModeType): ordinal() is an
+                // implicit-this call, and the selector is `this`.
+                Expr::Method { name, owner: None, args, .. } if name == "ordinal" && args.is_empty() => {
+                    Expr::This
+                }
                 _ => return,
             };
             (synth, field, recv)
