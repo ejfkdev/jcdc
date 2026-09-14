@@ -150,7 +150,7 @@ impl<'a> Structurer<'a> {
                 }
             }
         }
-        if std::env::var("JCDC_DBG_IF").is_ok() && !exc_retry_only.is_empty() {
+        if crate::dbg_flag!("JCDC_DBG_IF") && !exc_retry_only.is_empty() {
             let mut v: Vec<usize> = exc_retry_only.iter().copied().collect();
             v.sort_unstable();
             eprintln!("EXCRETRY headers={:?}", v);
@@ -330,7 +330,7 @@ impl<'a> Structurer<'a> {
                 || ctx.consumed.contains(&t)
                 || ctx.loop_stack.contains(&t)
             {
-                if std::env::var("JCDC_DBG_LM").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_LM") {
                     eprintln!("CM-SKIP t={} stop={} consumed={} lstack={} targets={:?}", t,
                         stop.contains(&t), ctx.consumed.contains(&t), ctx.loop_stack.contains(&t), targets);
                 }
@@ -340,7 +340,7 @@ impl<'a> Structurer<'a> {
                 .iter()
                 .all(|&o| o == t || self.reaches_within(ctx, o, t, stop))
             {
-                if std::env::var("JCDC_DBG_LM").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_LM") {
                     eprintln!("CM-RET {} targets={:?}", t, targets);
                 }
                 return Some(t);
@@ -456,13 +456,13 @@ impl<'a> Structurer<'a> {
         if live.len() >= 2 {
             for &t in succs.iter() {
                 if stop.contains(&t) {
-                    if std::env::var("JCDC_DBG_LM").is_ok() {
+                    if crate::dbg_flag!("JCDC_DBG_LM") {
                         eprintln!("LM-SKIP t={} stop succs={:?}", t, succs);
                     }
                     continue;
                 }
                 if ctx.consumed.contains(&t) {
-                    if std::env::var("JCDC_DBG_LM").is_ok() {
+                    if crate::dbg_flag!("JCDC_DBG_LM") {
                         eprintln!("LM-SKIP t={} consumed succs={:?}", t, succs);
                     }
                     continue;
@@ -471,7 +471,7 @@ impl<'a> Structurer<'a> {
                     .iter()
                     .all(|&o| o == t || self.reaches_within(ctx, o, t, stop))
                 {
-                    if std::env::var("JCDC_DBG_LM").is_ok() {
+                    if crate::dbg_flag!("JCDC_DBG_LM") {
                         eprintln!("LM-RET {} succs={:?} live={:?}", t, succs, live);
                     }
                     return Some(t);
@@ -988,7 +988,7 @@ impl<'a> Structurer<'a> {
             }
         }
         let natural = &natural;
-        if std::env::var("JCDC_DBG_SESE").is_ok() {
+        if crate::dbg_flag!("JCDC_DBG_SESE") {
             let mut nv: Vec<usize> = natural.iter().copied().collect();
             nv.sort_unstable();
             eprintln!("MXNAT header={} exits={:?} natural={:?}", header, exits, nv);
@@ -1006,9 +1006,7 @@ impl<'a> Structurer<'a> {
             let base_stmt = conv.convert(body.clone());
             Self::count_labeled(&base_stmt)
         };
-        let skip_e: Option<usize> = std::env::var("JCDC_MATEXIT_SKIP")
-            .ok()
-            .and_then(|v| v.parse().ok());
+        let skip_e: Option<usize> = crate::dbg_value!("JCDC_MATEXIT_SKIP", usize);
         for &e in exits {
             if Some(e) == skip_e {
                 continue;
@@ -1248,7 +1246,7 @@ impl<'a> Structurer<'a> {
             if Self::region_contains_try(&r) {
                 continue;
             }
-            if std::env::var("JCDC_DBG_SESE").is_ok() {
+            if crate::dbg_flag!("JCDC_DBG_SESE") {
                 let txt = format!("{:?}", r);
                 eprintln!(
                     "MATEXIT e={} tu={} r={}",
@@ -1355,14 +1353,14 @@ impl<'a> Structurer<'a> {
                 };
                 let (stmt2, lab2) = convert_trial(trial2);
                 if Self::stmt_splice_pathology(&stmt2) || lab2 != base_labeled {
-                    if std::env::var("JCDC_DBG_SESE").is_ok() {
+                    if crate::dbg_flag!("JCDC_DBG_SESE") {
                         eprintln!("MATEXIT-REJECT e={} both tiers pathological", e);
                     }
                     continue;
                 }
                 true
             };
-            if std::env::var("JCDC_DBG_SESE").is_ok() {
+            if crate::dbg_flag!("JCDC_DBG_SESE") {
                 let mut tusize: Vec<usize> = tu.iter().copied().collect();
                 tusize.sort_unstable();
                 eprintln!("MATEXIT-ACCEPT e={} strict={} tu={:?}", e, strict, tusize);
@@ -1848,7 +1846,7 @@ impl<'a> Structurer<'a> {
         let mut last_via_goto = false;
         loop {
             guard += 1;
-            if std::env::var("JCDC_DBG_GOTO").is_ok() {
+            if crate::dbg_flag!("JCDC_DBG_GOTO") {
                 eprintln!("SESETOP entry={} cur={} parts={} reach={} stop={} consumed={} last_via_goto={}",
                     entry, cur, parts.len(), reach.contains(&cur), stop.contains(&cur),
                     ctx.consumed.contains(&cur), last_via_goto);
@@ -2165,7 +2163,7 @@ impl<'a> Structurer<'a> {
                     // finally-if + `return result` after the retry loop went
                     // missing — 缺少返回语句).
                     let mut next: Option<usize> = None;
-                    let dbg_next = std::env::var("JCDC_DBG_SWF").is_ok();
+                    let dbg_next = crate::dbg_flag!("JCDC_DBG_SWF");
                     for nb in self.cfg.blocks.iter() {
                         if nb.start < gend {
                             continue;
@@ -2504,7 +2502,7 @@ impl<'a> Structurer<'a> {
                 }
                 let body_done = region_done_or_continues(&body, self, &handler_exits, header)
                     && !region_has_break_goto(&body, self, header, &exits, &members);
-                if std::env::var("JCDC_DBG_SESE").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_SESE") {
                     eprintln!("BODYDONE header={} done={} term={} brk={} exits={:?} body={:#?}",
                         header, body_done,
                         region_done_or_continues(&body, self, &handler_exits, header),
@@ -2518,7 +2516,7 @@ impl<'a> Structurer<'a> {
                     ctx.consumed.insert(m);
                 }
                 let mut body = body;
-                if std::env::var("JCDC_NO_MATEXIT").is_err() {
+                if !crate::dbg_flag!("JCDC_NO_MATEXIT") {
                     // The header's own out-of-member successors are the
                     // NATURAL exits (the while-cond fall-out / bottom-test
                     // exit): the parent region renders them ONCE after the
@@ -2587,7 +2585,7 @@ impl<'a> Structurer<'a> {
                 // dropped the post-loop `return true`.
                 let all_consumed = !natural_follow.is_empty()
                     && natural_follow.iter().all(|f| ctx.consumed.contains(f));
-                if std::env::var("JCDC_DBG_SESE").is_ok() && all_consumed {
+                if crate::dbg_flag!("JCDC_DBG_SESE") && all_consumed {
                     eprintln!("CHAINWALK header={} nf={:?} succs={:?} cons49={:?}", header_id,
                         natural_follow,
                         natural_follow.iter().map(|f| self.cfg.blocks[*f].succ.clone()).collect::<Vec<_>>(),
@@ -2640,7 +2638,7 @@ impl<'a> Structurer<'a> {
                                 .all(|&p| p == header_id)
                     })
                     .collect::<Vec<_>>();
-                if std::env::var("JCDC_DBG_SESE").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_SESE") {
                     eprintln!("LOOPFOLLOW header={} exits={:?} natural_follow={:?} consumed_nf={:?}",
                         header_id, exits, natural_follow,
                         natural_follow.iter().map(|f| ctx.consumed.contains(f)).collect::<Vec<_>>());
@@ -2884,7 +2882,7 @@ impl<'a> Structurer<'a> {
                     // walk's own gates (is_fall, same_body, group-owned
                     // exemption, stmt-free stubs, depth-capped bypass
                     // probe, big-tail exception) come along verbatim.
-                    let recon_enabled = std::env::var("JCDC_NO_RECON").is_err();
+                    let recon_enabled = !crate::dbg_flag!("JCDC_NO_RECON");
                     let follow = match follow {
                         Some(f) if recon_enabled && (f == taken || f == fall)
                             // Switch-case territory keeps its own follow
@@ -2962,7 +2960,7 @@ impl<'a> Structurer<'a> {
                                     // doCommands: every broader adoption
                                     // re-armed the epilogue copy storm,
                                     // try 语句的代码过长 x524-540).
-                                    if std::env::var("JCDC_DBG_WPD").is_ok() {
+                                    if crate::dbg_flag!("JCDC_DBG_WPD") {
                                         eprintln!("WPD cur={} taken={} fall={} f={} ADOPT-STUB w={}", cur, taken, fall, f, x);
                                     }
                                     if ctx.universe.contains(&x)
@@ -3058,7 +3056,7 @@ impl<'a> Structurer<'a> {
                     // case swallows the tail as `++i; continue` and the rest
                     // spin forever).
                     let succs = self.cfg.blocks[cur].succ.clone();
-                    if std::env::var("JCDC_DBG_GOTO").is_ok() {
+                    if crate::dbg_flag!("JCDC_DBG_GOTO") {
                         eprintln!("SWFOLLOW cur={} ipdom={:?} vx={} succs={:?} stop={:?}",
                             cur, ctx.ipdom.get(&cur), ctx.vx, succs, stop);
                     }
@@ -3084,7 +3082,7 @@ impl<'a> Structurer<'a> {
                         // (jdk26 Pattern.sequence lost the epilogue and the
                         // post-loop tail -> 缺少返回语句).
                         .or_else(|| self.loop_tail_switch_follow(ctx, cur, stop));
-                    if std::env::var("JCDC_DBG_SWF").is_ok() {
+                    if crate::dbg_flag!("JCDC_DBG_SWF") {
                         eprintln!("SWF-RESOLVED cur={} follow={:?}", cur, follow);
                     }
                     // CROSSING follow: see the walk-side twin in
@@ -3135,7 +3133,7 @@ impl<'a> Structurer<'a> {
                             .unwrap_or(false);
                         let bindable = (cont_dead || cont_is_f || cont_via_case_break)
                             && self.switch_follow_bindable(&sw, cur, &targets, f);
-                        if std::env::var("JCDC_DBG_SWF").is_ok() {
+                        if crate::dbg_flag!("JCDC_DBG_SWF") {
                             eprintln!("SWBIND-SESE cur={} f={} cont_dead={} cont_is_f={} cont_case={} bindable={}",
                                 cur, f, cont_dead, cont_is_f, cont_via_case_break, bindable);
                         }
@@ -3157,7 +3155,7 @@ impl<'a> Structurer<'a> {
                     self.switch_depth -= 1;
                     ctx.consumed = claimed;
                     parts.push(sw);
-                    if std::env::var("JCDC_DBG_GOTO").is_ok() {
+                    if crate::dbg_flag!("JCDC_DBG_GOTO") {
                         eprintln!("SWCONT cur={} follow={:?} in_reach={:?} in_stop={:?} consumed={:?}",
                             cur, follow, follow.map(|f| reach.contains(&f)),
                             follow.map(|f| stop.contains(&f)), ctx.consumed);

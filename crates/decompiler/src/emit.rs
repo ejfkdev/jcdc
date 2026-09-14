@@ -2384,7 +2384,7 @@ impl<'a> Printer<'a> {
                                 wrap_returns(&mut body, t);
                             }
                         } else if let Some(inst) = &l.inst_sam_desc {
-                            if std::env::var("JCDC_DBG_LAMRET").is_ok() {
+                            if crate::dbg_flag!("JCDC_DBG_LAMRET") {
                                 eprintln!(
                                     "LAMRET impl={}.{} inst_ret={:?} single={}",
                                     l.impl_owner,
@@ -2470,7 +2470,7 @@ impl<'a> Printer<'a> {
                                 None
                             });
                             if let Some(e) = &mut single_expr {
-                                if std::env::var("JCDC_DBG_LAMRET").is_ok() {
+                                if crate::dbg_flag!("JCDC_DBG_LAMRET") {
                                     eprintln!(
                                         "LAMRET2 inst_ret={:?} expr_ty={:?} sam_ok={} upcast_ok={} g_want={:?}",
                                         inst.ret,
@@ -3287,7 +3287,7 @@ fn truncate_dead_ends(s: &Stmt) -> Stmt {
             let mut out: Vec<Stmt> = Vec::with_capacity(v.len());
             for x in v {
                 if !out.is_empty() && dead_end_infinite_while(out.last().unwrap()) {
-                    if std::env::var("JCDC_DBG_GOTO").is_ok() {
+                    if crate::dbg_flag!("JCDC_DBG_GOTO") {
                         eprintln!(
                             "DEADEND truncate {} unreachable stmt(s)",
                             v.len() - out.len()

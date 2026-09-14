@@ -222,7 +222,7 @@ impl<'a> Converter<'a> {
             Region::Empty => Stmt::Block(vec![]),
             Region::Basic { block } => {
                 self.cur_block = block;
-                if std::env::var("JCDC_DBG_BLOCKS").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_BLOCKS") {
                     eprintln!("conv Basic {} ({} stmts)", block, self.results[block].stmts.len());
                 }
                 self.block_stmts(block)
@@ -331,7 +331,7 @@ impl<'a> Converter<'a> {
                 let ctx = self.loops.pop().unwrap();
                 let _ = members;
                 let mut st = self.classify_loop(header, body_stmt, ctx);
-                if std::env::var("JCDC_DBG_LOOP").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_LOOP") {
                     let kind = match &st {
                         Stmt::While { .. } => "While".to_string(),
                         Stmt::DoWhile { .. } => "DoWhile".to_string(),
@@ -413,7 +413,7 @@ impl<'a> Converter<'a> {
                 Stmt::Try { body: Box::new(body_stmt), catches: catch_stmts, finally: None }
             }
             Region::Goto { target } => {
-                if std::env::var("JCDC_DBG_GOTO").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_GOTO") {
                     eprintln!("conv Goto target={} cur_block={} loops={:?} switches={} if_follows={:?}",
                         target, self.cur_block,
                         self.loops.iter().map(|l| (l.header, l.exits.len())).collect::<Vec<_>>(),
@@ -507,7 +507,7 @@ impl<'a> Converter<'a> {
                             }
                         }
                         Jump::RawGoto(t) => {
-                            if std::env::var("JCDC_DBG_GOTO").is_ok() {
+                            if crate::dbg_flag!("JCDC_DBG_GOTO") {
                                 eprintln!("RAWGOTO t={} copied_tails={:?} if_follows={:?} last={}", t, self.copied_tails, self.if_follows, self.goto_is_last);
                             }
                             // A Goto region is always the last part of its
@@ -975,7 +975,7 @@ impl<'a> Converter<'a> {
                     };
                 }
                 let taken_is_exit = ctx.exits.contains(&taken);
-                if std::env::var("JCDC_DBG_LOOP").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_LOOP") {
                     eprintln!("CLASSIFY2 header={} taken={} fall={} exits={:?}", header, taken, fall, ctx.exits);
                 }
                 if !taken_is_exit && !ctx.exits.contains(&fall) {
@@ -1025,7 +1025,7 @@ impl<'a> Converter<'a> {
                                     };
                                     strip_trailing_continue(rest)
                                 };
-                                if std::env::var("JCDC_DBG_LOOP").is_ok() {
+                                if crate::dbg_flag!("JCDC_DBG_LOOP") {
                                     eprintln!(
                                         "CLASSIFY-CONDCHAIN header={} B={} body={} exits={:?}",
                                         header, fall, taken, ctx.exits
@@ -1061,7 +1061,7 @@ impl<'a> Converter<'a> {
                 // the leading If's statements) does not apply: the If lives
                 // intact inside the Try.
 
-                if std::env::var("JCDC_DBG_LOOP").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_LOOP") {
                     eprintln!(
                         "CLASSIFY header={} taken_is_exit={} exit_stmts={}",
                         header,

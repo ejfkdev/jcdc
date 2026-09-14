@@ -581,7 +581,24 @@ fn parse_inner_classes(info: &[u8]) -> Option<jcdc_classfile::InnerClassesAttrib
 
 /// Decompile one class as a standalone compilation unit, inlining its
 /// nested/anonymous family.
+thread_local! {
+    /// Per-compilation-unit synthetic stack-variable counter (stackN
+    /// names). Reset in decompile_class so renders are deterministic
+    /// under parallel workers.
+    static STACK_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Next synthetic stack-variable sequence number (unit-scoped).
+pub fn next_stack_seq() -> u64 {
+    STACK_SEQ.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    })
+}
+
 pub fn decompile_class(pc: &PoolClass, pool: &ClassPool, opts: &ClassOptions) -> anyhow::Result<String> {
+    STACK_SEQ.with(|c| c.set(0));
     if pc.is_module() {
         return decompile_module_info(pc);
     }
@@ -3477,7 +3494,7 @@ fn emit_method_with(
                 }
             });
             if is_ctor && (class_has_this0(pc) || outer_super_param || is_local_class) {
-                if is_local_class && std::env::var("JCDC_DBG_CTOR").is_ok() {
+                if is_local_class && crate::dbg_flag!("JCDC_DBG_CTOR") {
                     eprintln!("CTORCAP pc={} captures={:?}", pc.internal_name, captures.keys().collect::<Vec<_>>());
                 }
                 if is_local_class {
@@ -3517,7 +3534,7 @@ fn emit_method_with(
                             }
                         }
                     }
-                    if is_local_class && std::env::var("JCDC_DBG_CTOR").is_ok() {
+                    if is_local_class && crate::dbg_flag!("JCDC_DBG_CTOR") {
                         eprintln!("CTORCAP pc={} rep={:?}", pc.internal_name, rep.len());
                     }
                     if !rep.is_empty() {
@@ -4849,7 +4866,7 @@ pub const ASSERT_FIELD: &str = "$jcdcAssertionsDisabled";
 // ---------------------------------------------------------------------------
 
 pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: &Family, vt: &VarTable) {
-    if std::env::var("JCDC_DBG_ANON").is_ok() {
+    if crate::dbg_flag!("JCDC_DBG_ANON") {
         eprintln!("IA pc={} anon={:?} locals={:?} primary_n={}", pc.internal_name, fam.anonymous, fam.locals, pool.primary_names().len());
     }
     if fam.anonymous.is_empty() && fam.locals.is_empty() {
@@ -4885,7 +4902,7 @@ pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: 
                 h.drain(hoist_mark..).collect()
             })
         };
-        if std::env::var("JCDC_DBG_ANON").is_ok() && !drained.is_empty() {
+        if crate::dbg_flag!("JCDC_DBG_ANON") && !drained.is_empty() {
             let names: Vec<&String> = drained.iter().map(|(n, _)| n).collect();
             eprintln!(
                 "DRAIN {:?} is_block={} in_anon_body={}",
@@ -4941,7 +4958,7 @@ pub fn inline_anonymous(body: &mut Stmt, pc: &PoolClass, pool: &ClassPool, fam: 
                 };
                 let first_use =
                     first_local_mention(v, &marker, &name, vt, fam).unwrap_or(v.len());
-                if std::env::var("JCDC_DBG_LDECL").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_LDECL") {
                     eprintln!(
                         "LDECL {} caps={:?} capture_end={} first_use={} vlen={}",
                         name, caps, capture_end, first_use, v.len()
@@ -5840,7 +5857,7 @@ fn walk_stmt_anon(
                         k += 1;
                     }
                     let n0 = v.len();
-                    if std::env::var("JCDC_DBG_ANON").is_ok() {
+                    if crate::dbg_flag!("JCDC_DBG_ANON") {
                         eprintln!("ANONAPPEND n0={} pending={}", n0, pending.len());
                     }
                     v.append(pending);
@@ -5903,7 +5920,7 @@ fn walk_stmt_anon(
                         if target > v.len() {
                             target = v.len();
                         }
-                        if std::env::var("JCDC_DBG_ANON").is_ok() {
+                        if crate::dbg_flag!("JCDC_DBG_ANON") {
                             let shapes: Vec<String> = v
                                 .iter()
                                 .map(|x| match x {
@@ -6074,7 +6091,7 @@ fn emit_local_class_decl(
     // if-branch, mentioned again by the tail return after the chain —
     // 6 "找不到符号 类 State" at the tail).
     if EXTERN_DECL.with(|x| x.borrow().contains(&simple)) {
-        if std::env::var("JCDC_DBG_ANON").is_ok() {
+        if crate::dbg_flag!("JCDC_DBG_ANON") {
             eprintln!("EXTERNHIT {}", simple);
         }
         EXTERN_REDECL.with(|r| r.borrow_mut().insert(simple.clone()));
@@ -6191,7 +6208,7 @@ fn emit_local_class_decl(
     let hoist_mark = ANON_HOIST.with(|h| h.borrow().len());
     let emitted = emit_anon_body(lpc, pool, fam, captures, &mut buf, 0, true);
     if emitted.is_err() {
-        if std::env::var("JCDC_DBG_ANON").is_ok() {
+        if crate::dbg_flag!("JCDC_DBG_ANON") {
             eprintln!(
                 "LOCALDECL fail {} err={:?} emitting={:?} depth={}",
                 cls,
@@ -6254,7 +6271,7 @@ fn emit_local_class_decl(
 }
 
 fn walk_expr_anon(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, fam: &Family, pending: &mut Vec<Stmt>, vt: &VarTable) {
-    if std::env::var("JCDC_DBG_ANON").is_ok() {
+    if crate::dbg_flag!("JCDC_DBG_ANON") {
         if let Expr::New { cls, raw, .. } = e {
             eprintln!("ANON see new {} raw={} in_fam={}", cls, raw, fam.anonymous.contains(cls.as_str()));
         }
@@ -6270,7 +6287,7 @@ fn walk_expr_anon(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, fam: &Family, 
             }
             _ => None,
         };
-        if std::env::var("JCDC_DBG_ANON").is_ok() {
+        if crate::dbg_flag!("JCDC_DBG_ANON") {
             if let Some(c) = member_cls {
                 eprintln!("MEMBERCLS {} in_locals={}", c, fam.locals.contains(c));
             }
@@ -6294,19 +6311,19 @@ fn walk_expr_anon(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, fam: &Family, 
                 Some(apc) => {
                     if let Some(anon) = build_anon_new(&apc, args.clone(), pc, pool, fam, vt, pending) {
                         *e = anon;
-                    } else if std::env::var("JCDC_DBG_ANON").is_ok() {
+                    } else if crate::dbg_flag!("JCDC_DBG_ANON") {
                         eprintln!("ANON inline declined {}", cls);
                     }
                 }
                 None => {
-                    if std::env::var("JCDC_DBG_ANON").is_ok() {
+                    if crate::dbg_flag!("JCDC_DBG_ANON") {
                         eprintln!("ANON not in pool {}", cls);
                     }
                 }
             }
         }
         Expr::New { cls, args, raw: false, ty, .. } if fam.locals.contains(cls.as_str()) => {
-            if std::env::var("JCDC_DBG_ANON").is_ok() {
+            if crate::dbg_flag!("JCDC_DBG_ANON") {
                 eprintln!("LOCALNEW {} pending={} depth={}", cls, pending.len(), ANON_BODY_DEPTH.with(|d| d.get()));
             }
             if let Some(lpc) = pool.get(cls) {
@@ -7648,7 +7665,7 @@ fn render_captures(
                             anon_inlined(owner_cls)
                                 || !mentions_foreign_typevar(t, &class_typevar_names(outer_pc))
                         });
-                    if std::env::var("JCDC_DBG_ANON").is_ok() {
+                    if crate::dbg_flag!("JCDC_DBG_ANON") {
                         eprintln!("NESTCAP {}.{} -> {:?}", fc, fn0, got);
                     }
                     got.unwrap_or_else(|| {
@@ -7657,7 +7674,7 @@ fn render_captures(
                 }
                 _ => TypeRef::J(jcdc_jvm::JavaType::Object("java/lang/Object".into())),
             };
-            if std::env::var("JCDC_DBG_ANON").is_ok() {
+            if crate::dbg_flag!("JCDC_DBG_ANON") {
                 eprintln!("RENDCAP owner={} key={} vty={:?} ty={:?}", owner_cls, k,
                     std::mem::discriminant(&v), ty);
             }
@@ -7745,7 +7762,7 @@ fn build_anon_new(
     let mut body = String::new();
     let hoist_mark = ANON_HOIST.with(|h| h.borrow().len());
     if let Err(e) = emit_anon_body(apc, pool, fam, &captures, &mut body, 0, false) {
-        if std::env::var("JCDC_DBG_ANON").is_ok() {
+        if crate::dbg_flag!("JCDC_DBG_ANON") {
             eprintln!("ANON build fail {}: {}", apc.internal_name, e);
         }
         ANON_HOIST.with(|h| h.borrow_mut().truncate(hoist_mark));
@@ -8048,7 +8065,7 @@ fn analyze_anon_ctor(apc: &PoolClass, args: Vec<Expr>) -> (Vec<Expr>, HashMap<St
             }
         }
     }
-    if std::env::var("JCDC_DBG_ANON").is_ok() {
+    if crate::dbg_flag!("JCDC_DBG_ANON") {
         eprintln!(
             "ANALYZE cls={} ctor={:?} arity={} captures={} captured_idx={:?}",
             apc.internal_name,
@@ -8588,7 +8605,7 @@ pub(crate) fn fix_lambda_captures(
         defs: &mut Vec<Stmt>,
     ) {
         if let Expr::Lambda(l) = e {
-            if std::env::var("JCDC_DBG_LAMPSNAP").is_ok() {
+            if crate::dbg_flag!("JCDC_DBG_LAMPSNAP") {
                 eprintln!(
                     "LAMPSNAP-ENTRY impl={} desc={} found={}",
                     l.impl_name,
@@ -8719,7 +8736,7 @@ pub(crate) fn fix_lambda_captures(
                                 .filter(|(n, _)| !already.contains(n) && !retained.contains(n))
                                 .collect();
                             if !fresh.is_empty() {
-                                if std::env::var("JCDC_DBG_ANON").is_ok() {
+                                if crate::dbg_flag!("JCDC_DBG_ANON") {
                                     let names: Vec<&String> =
                                         fresh.iter().map(|(n, _)| n).collect();
                                     eprintln!("EXTERNREG {:?}", names);
@@ -8764,7 +8781,7 @@ pub(crate) fn fix_lambda_captures(
                     // capturing the non-effectively-final hoisted local
                     // (从lambda 表达式引用的本地变量必须是最终变量).
                     let cap_off = l.captures.len().saturating_sub(n_cap).min(1);
-                    if std::env::var("JCDC_DBG_LAMPSNAP").is_ok() {
+                    if crate::dbg_flag!("JCDC_DBG_LAMPSNAP") {
                         let caps: Vec<String> = l
                             .captures
                             .iter()
@@ -11204,7 +11221,7 @@ fn rethrow_typevar_witness(
             _ => None,
         })
         .collect();
-    if std::env::var("JCDC_DBG_THROW").is_ok() {
+    if crate::dbg_flag!("JCDC_DBG_THROW") {
         eprintln!("RETHROW throws={:?} tvs={:?}", sig.throws, tvs);
     }
     if tvs.is_empty() {
@@ -12957,7 +12974,7 @@ fn instantiated_ctor_params_core(
     pool: &ClassPool,
     arg_tys: &[jcdc_jvm::JavaType],
 ) -> Option<Vec<jcdc_jvm::GenericType>> {
-    let dpc = { let x = pool.get(cls); if x.is_none() && std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA s1 dpc {}", cls); } x? };
+    let dpc = { let x = pool.get(cls); if x.is_none() && crate::dbg_flag!("JCDC_DBG_WIT") { eprintln!("MRTA s1 dpc {}", cls); } x? };
     // A class WITHOUT a class Signature is non-generic: empty substitution
     // domain instead of a bail (EnumConstantNotPresentExceptionProxy's
     // `(Class<? extends Enum<?>>)` ctor formal needs the param casts).
@@ -13135,7 +13152,7 @@ fn apply_param_casts(
     pc: Option<&PoolClass>,
     caller_params: &[jcdc_jvm::TypeParam],
 ) {
-    let apc_dbg = std::env::var("JCDC_DBG_APC").is_ok();
+    let apc_dbg = crate::dbg_flag!("JCDC_DBG_APC");
     for (a, pt) in args.iter_mut().zip(params.iter()) {
                     fn parameterized(t: &jcdc_jvm::GenericType) -> bool {
                         match t {
@@ -13588,7 +13605,7 @@ fn apply_param_casts(
                             if let (Some(ca_int), jcdc_jvm::GenericType::Class(cx)) =
                                 (ca_int_opt, &**x)
                             {
-                                if std::env::var("JCDC_DBG_APC").is_ok() {
+                                if crate::dbg_flag!("JCDC_DBG_APC") {
                                     eprintln!("XIFACE-TY aty={:?}", a.type_ref());
                                 }
                                 let cx_int = crate::method::classsig_internal(cx);
@@ -13960,7 +13977,7 @@ fn type_field_reads(e: &mut Expr, pool: &ClassPool, pc: &PoolClass, concrete_ok:
             // as T_NODE into apply(T_NODE,T_NODE)/setLocalResult
             // (T_NODE) — raw (Node) args are inconvertible
             // ("Node无法转换为T_NODE" x2).
-            if std::env::var("JCDC_DBG_UPG").is_ok() {
+            if crate::dbg_flag!("JCDC_DBG_UPG") {
                 if let Expr::Method { name: mn, .. } = &**inner {
                     if mn == "getValue" {
                         eprintln!(
@@ -14031,7 +14048,7 @@ fn type_field_reads(e: &mut Expr, pool: &ClassPool, pc: &PoolClass, concrete_ok:
                     inst_tvars(&inst, &mut mentioned);
                     mentioned.iter().all(|n| allowed.contains(n))
                 };
-                if std::env::var("JCDC_DBG_UPG").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_UPG") {
                     eprintln!("UPG3 me={} inscope={} inst={:?}", matches_erasure, in_scope, inst);
                 }
                 if matches_erasure && in_scope {
@@ -15274,7 +15291,7 @@ pub(crate) fn cast_wildcard_call_args(
                 if let Some(Expr::Lambda(lam)) = args.first() {
                     if lam.inst_sam_desc.is_some() {
                         if let Some(w) = method_ref_inst_type_args(cls, name, desc, lam, pool) {
-                            if std::env::var("JCDC_DBG_WIT").is_ok() {
+                            if crate::dbg_flag!("JCDC_DBG_WIT") {
                                 eprintln!("INSTTA {}.{} -> {:?}", cls, name, w);
                             }
                             pending_ta = Some(w);
@@ -15305,7 +15322,7 @@ pub(crate) fn cast_wildcard_call_args(
                         if let Some((w, _mapping)) =
                             method_ref_type_args(cls, name, desc, lam, pool)
                         {
-                            if std::env::var("JCDC_DBG_WIT").is_ok() {
+                            if crate::dbg_flag!("JCDC_DBG_WIT") {
                                 eprintln!("REFTA {}.{} -> {:?}", cls, name, w);
                             }
                             pending_ta = Some(w);
@@ -15315,7 +15332,7 @@ pub(crate) fn cast_wildcard_call_args(
                 }
                 if pending_ta.is_none() {
                     if let Some(w) = mapmulti_witness_from_body(cls, name, type_args, args, pool, pc) {
-                        if std::env::var("JCDC_DBG_WIT").is_ok() {
+                        if crate::dbg_flag!("JCDC_DBG_WIT") {
                             eprintln!("MMWIT {}.{} -> {:?}", cls, name, w);
                         }
                         pending_ta = Some(w);
@@ -15336,7 +15353,7 @@ pub(crate) fn cast_wildcard_call_args(
         let params = params
             .or_else(|| instantiated_ctor_params(e, pool))
             .or_else(|| instantiated_super_ctor_params(e, pool, pc));
-        if std::env::var("JCDC_DBG_APC").is_ok() {
+        if crate::dbg_flag!("JCDC_DBG_APC") {
             if let Expr::Method { cls, name, .. } = &*e {
                 eprintln!("APC {}.{} params={:?}", cls, name, params);
             }
@@ -15402,7 +15419,7 @@ pub(crate) fn cast_wildcard_call_args(
                     if let Some(w) = arg_driven_call_witness(
                         cls, name, desc, args, &sib_maps, pool, caller_params,
                     ) {
-                        if std::env::var("JCDC_DBG_WIT").is_ok() {
+                        if crate::dbg_flag!("JCDC_DBG_WIT") {
                             eprintln!("ARGWIT {}.{} -> {:?}", cls, name, w);
                         }
                         if let Expr::Method { type_args, .. } = e {
@@ -16140,7 +16157,7 @@ fn method_ref_common(
 )> {
     use jcdc_jvm::GenericType as G;
     if lam.kind != crate::expr::LambdaKind::MethodRef || lam.impl_is_static {
-        if std::env::var("JCDC_DBG_WIT").is_ok() {
+        if crate::dbg_flag!("JCDC_DBG_WIT") {
             eprintln!(
                 "MRTA bail1 {} {} kind={:?} static={} impl={}.{} ref_recv={:?}",
                 cls, name, lam.kind, lam.impl_is_static, lam.impl_owner, lam.impl_name, lam.ref_receiver
@@ -16156,9 +16173,9 @@ fn method_ref_common(
     );
     let mi = (0..dpc.cf.methods.len())
         .find(|&i| dpc.method_name(i) == Some(name) && dpc.method_desc(i) == Some(want_desc.as_str()))?;
-    let msig = { let x = method_signature_of(&dpc, mi); if x.is_none() && std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA s2 msig {} {}", cls, name); } x? };
+    let msig = { let x = method_signature_of(&dpc, mi); if x.is_none() && crate::dbg_flag!("JCDC_DBG_WIT") { eprintln!("MRTA s2 msig {} {}", cls, name); } x? };
     if msig.params.is_empty() {
-        { if std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA bail{} {} at {}", cls, name, 2); } return None; }
+        { if crate::dbg_flag!("JCDC_DBG_WIT") { eprintln!("MRTA bail{} {} at {}", cls, name, 2); } return None; }
     }
     let tvar_names: Vec<String> = msig.params.iter().map(|p| p.name.clone()).collect();
     let mut sam_cs: Option<jcdc_jvm::ClassSig> = None;
@@ -16170,9 +16187,9 @@ fn method_ref_common(
             }
         }
     }
-    let sam_cs = { if sam_cs.is_none() && std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA s3 sam_cs {}", name); } sam_cs? };
+    let sam_cs = { if sam_cs.is_none() && crate::dbg_flag!("JCDC_DBG_WIT") { eprintln!("MRTA s3 sam_cs {}", name); } sam_cs? };
     let sam_internal = crate::method::classsig_internal(&sam_cs);
-    let sam_pc = { let x = pool.get(&sam_internal); if x.is_none() && std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA s4 sam_pc {}", sam_internal); } x? };
+    let sam_pc = { let x = pool.get(&sam_internal); if x.is_none() && crate::dbg_flag!("JCDC_DBG_WIT") { eprintln!("MRTA s4 sam_pc {}", sam_internal); } x? };
     // The SAM method may be inherited (ofGreedy's param is
     // Integrator$Greedy which does NOT redeclare integrate): walk the
     // interface's supers. Class params of the declaring type pair with
@@ -16225,14 +16242,14 @@ fn method_ref_common(
     }
     let (sam_msig, sam_cls_params) = {
         let x = find_sam(&sam_pc, &lam.sam_name, pool, 0);
-        if x.is_none() && std::env::var("JCDC_DBG_WIT").is_ok() {
+        if x.is_none() && crate::dbg_flag!("JCDC_DBG_WIT") {
             eprintln!("MRTA s5 sam_mi {}", lam.sam_name);
         }
         x?
     };
     let inst_args = {
         let pl = sam_cs.parts.last();
-        if pl.is_none() && std::env::var("JCDC_DBG_WIT").is_ok() {
+        if pl.is_none() && crate::dbg_flag!("JCDC_DBG_WIT") {
             eprintln!("MRTA s7 parts");
         }
         pl?.args.clone()
@@ -16407,7 +16424,7 @@ fn method_ref_type_args(
         .iter()
         .map(|a| crate::method::subst_typevars(a, &sam_cls_params, &inst_args))
         .collect();
-    let rpc = { let x = pool.get(&lam.impl_owner); if x.is_none() && std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA s8 rpc {}", lam.impl_owner); } x? };
+    let rpc = { let x = pool.get(&lam.impl_owner); if x.is_none() && crate::dbg_flag!("JCDC_DBG_WIT") { eprintln!("MRTA s8 rpc {}", lam.impl_owner); } x? };
     let rmi = (0..rpc.cf.methods.len()).find(|&i| {
         rpc.method_name(i) == Some(lam.impl_name.as_str())
             && rpc
@@ -16425,9 +16442,9 @@ fn method_ref_type_args(
                 })
                 .unwrap_or(false)
     })?;
-    let ref_msig = { let x = method_signature_of(&rpc, rmi); if x.is_none() && std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA s10 ref_msig {}.{}", lam.impl_owner, lam.impl_name); } x? };
+    let ref_msig = { let x = method_signature_of(&rpc, rmi); if x.is_none() && crate::dbg_flag!("JCDC_DBG_WIT") { eprintln!("MRTA s10 ref_msig {}.{}", lam.impl_owner, lam.impl_name); } x? };
     if sam_params.len() != ref_msig.args.len() + 1 {
-        { if std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA bail{} {} at {}", cls, name, 3); } return None; }
+        { if crate::dbg_flag!("JCDC_DBG_WIT") { eprintln!("MRTA bail{} {} at {}", cls, name, 3); } return None; }
     }
     let mut mapping: Vec<(String, G)> = Vec::new();
     match &sam_params[0] {
@@ -16435,7 +16452,7 @@ fn method_ref_type_args(
             let tail = lam.impl_owner.rsplit('$').next().unwrap_or(&lam.impl_owner);
             let simple = tail.trim_start_matches(|c: char| c.is_ascii_digit()).to_string();
             if simple.is_empty() {
-                { if std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA bail{} {} at {}", cls, name, 4); } return None; }
+                { if crate::dbg_flag!("JCDC_DBG_WIT") { eprintln!("MRTA bail{} {} at {}", cls, name, 4); } return None; }
             }
             mapping.push((
                 tn.clone(),
@@ -16445,14 +16462,14 @@ fn method_ref_type_args(
                 }),
             ));
         }
-        _ => { if std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA s12 recv {:?}", sam_params.first()); } return None; }
+        _ => { if crate::dbg_flag!("JCDC_DBG_WIT") { eprintln!("MRTA s12 recv {:?}", sam_params.first()); } return None; }
     }
     // Direction matters: `have` is the SAM (callee-typevar) side so the
     // mapping binds CALLEE typevars to the target method's types
     // (A:=State, T:=T, R:=RR), not the reverse.
     for (i, rp) in ref_msig.args.iter().enumerate() {
         if !unify_types(&sam_params[i + 1], rp, &mut mapping) {
-            { if std::env::var("JCDC_DBG_WIT").is_ok() { eprintln!("MRTA bail{} {} at {}", cls, name, 5); } return None; }
+            { if crate::dbg_flag!("JCDC_DBG_WIT") { eprintln!("MRTA bail{} {} at {}", cls, name, 5); } return None; }
         }
     }
     let mut out = Vec::with_capacity(msig.params.len());
@@ -18896,7 +18913,7 @@ fn pin_underdetermined_return_diamonds(
         }
     }
     fn pin_new_from_ctor_args(e: &mut Expr, pool: &ClassPool) {
-        let dbgp = std::env::var("JCDC_DBG_PIN").is_ok();
+        let dbgp = crate::dbg_flag!("JCDC_DBG_PIN");
         if dbgp {
             if let Expr::New { cls, .. } = &*e {
                 if cls.contains("GathererOp") {
@@ -19209,7 +19226,7 @@ fn typevar_array_call_elem(
                         }
                     }
                 }
-                if std::env::var("JCDC_DBG_TVA").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_TVA") {
                     eprintln!("TVA call={} actual_ret={:?}", name, r);
                 }
                 r?

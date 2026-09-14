@@ -318,30 +318,80 @@ impl ClassPool {
 
     /// Look up a class by internal name (e.g. `java/lang/String`).
     pub fn get(&self, internal_name: &str) -> Option<Arc<PoolClass>> {
+        // THREAD-LOCAL L1: the shared-state Mutex is a futex storm under
+        // parallel rendering (rt.jar: sys 2s -> 28s with 16 workers, every
+        // supertype probe taking the lock). Workers resolve from a
+        // per-thread Arc cache first; the entries are the SAME Arcs the
+        // global cache handed out, so identity stays consistent. Keyed by
+        // pool-state address so multiple pools in one process (tests) do
+        // not cross-contaminate. Evicted globals may linger in L1 — a
+        // harmless pure cache (bytes are immutable).
+        thread_local! {
+            static L1: std::cell::RefCell<HashMap<usize, HashMap<String, Arc<PoolClass>>>> =
+                std::cell::RefCell::new(HashMap::new());
+        }
+        let key = Arc::as_ptr(&self.state) as usize;
+        if let Some(pc) = L1.with(|l| l.borrow().get(&key).and_then(|m| m.get(internal_name)).cloned()) {
+            return Some(pc);
+        }
         {
             let st = self.state.lock().unwrap();
             if let Some(pc) = st.cache.get(internal_name) {
-                return Some(pc.clone());
+                let out = pc.clone();
+                drop(st);
+                L1.with(|l| {
+                    let mut l = l.borrow_mut();
+                    let m = l.entry(key).or_default();
+                    if m.len() >= 4096 {
+                        m.clear();
+                    }
+                    m.insert(internal_name.to_string(), out.clone());
+                });
+                return Some(out);
             }
             if st.negative.contains(internal_name) {
                 return None;
             }
         }
         let data = self.read_class_bytes(internal_name);
-        let mut st = self.state.lock().unwrap();
         let Some(data) = data else {
-            st.negative.insert(internal_name.to_string());
+            self.state.lock().unwrap().negative.insert(internal_name.to_string());
             return None;
         };
+        // PARSE OUTSIDE THE LOCK: parsing dominates lookup cost and
+        // holding the pool mutex across it serializes parallel render
+        // workers (rt.jar: sys time 2.1s -> 20s under 16 workers).
+        // A losing racer adopts the winner's already-cached instance so
+        // per-name identity stays unique.
         match PoolClass::parse(&data, internal_name.to_string()) {
             Ok(pc) => {
-                st.cache.insert(internal_name.to_string(), pc.clone());
-                st.cache_order.push_back(internal_name.to_string());
-                evict_to_cap(&mut st);
-                Some(pc)
+                let mut st = self.state.lock().unwrap();
+                let out = match st.cache.get(internal_name) {
+                    Some(existing) => existing.clone(),
+                    None => {
+                        st.cache.insert(internal_name.to_string(), pc.clone());
+                        st.cache_order.push_back(internal_name.to_string());
+                        evict_to_cap(&mut st);
+                        pc
+                    }
+                };
+                drop(st);
+                L1.with(|l| {
+                    let mut l = l.borrow_mut();
+                    let m = l.entry(key).or_default();
+                    if m.len() >= 4096 {
+                        m.clear();
+                    }
+                    m.insert(internal_name.to_string(), out.clone());
+                });
+                Some(out)
             }
             Err(_) => {
-                st.negative.insert(internal_name.to_string());
+                self.state
+                    .lock()
+                    .unwrap()
+                    .negative
+                    .insert(internal_name.to_string());
                 None
             }
         }

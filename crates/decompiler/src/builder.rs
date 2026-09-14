@@ -1332,7 +1332,7 @@ impl<'a> Builder<'a> {
         next_pc: u16,
         val: Expr,
     ) -> Option<Expr> {
-        if std::env::var("JCDC_NO_DUP_INLINE").is_ok() {
+        if crate::dbg_flag!("JCDC_NO_DUP_INLINE") {
             return Some(val);
         }
         let marked = !stack.is_empty()
@@ -1908,7 +1908,7 @@ impl<'a> Builder<'a> {
 
     fn impl_param_names_base(&self, name: &str, desc: &str, n_captures: usize, n: usize, slot_base: u16) -> Vec<String> {
         let fallback = |i: usize| format!("x{}", i);
-        let dbg = std::env::var("JCDC_DBG_LAMBDA").is_ok();
+        let dbg = crate::dbg_flag!("JCDC_DBG_LAMBDA");
         if dbg {
             eprintln!("IMPLPARAMS {} {} caps={} n={} found={}", name, desc, n_captures, n,
                 self.pc.find_own_method(name, desc).is_some());

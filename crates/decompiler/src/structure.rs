@@ -413,9 +413,9 @@ pub fn immediate_postdom(
             // getInputStream0 lost its inner catch when the taken target
             // at pc 813 was rejected as a false merge).
             let is_fall = succs.len() == 2 && succs[0] == cand;
-            let no_tc = std::env::var("JCDC_DBG_NOTC").is_ok();
-            let no_tcf = std::env::var("JCDC_DBG_NOTCF").is_ok();
-            let no_lr = std::env::var("JCDC_DBG_NOLR").is_ok();
+            let no_tc = crate::dbg_flag!("JCDC_DBG_NOTC");
+            let no_tcf = crate::dbg_flag!("JCDC_DBG_NOTCF");
+            let no_lr = crate::dbg_flag!("JCDC_DBG_NOLR");
             // Same-try-body exemption: rejecting a cand that sits in the
             // SAME protected body as the entry re-routes the guard walk
             // across the carve-out (huc getInputStream0's inner catch
@@ -455,7 +455,7 @@ pub fn immediate_postdom(
             // re-routed follow re-walked the 4K-bytecode chain — the
             // structurer spun at 100% CPU).
             let mut cand_reach: HashSet<usize> = HashSet::new();
-            if std::env::var("JCDC_DBG_NOWIDE").is_err() {
+            if !crate::dbg_flag!("JCDC_DBG_NOWIDE") {
                 let mut q: VecDeque<(usize, u32)> = VecDeque::new();
                 for &sx in &cfg.blocks[cand].succ {
                     if sx != entry && cand_reach.insert(sx) {
@@ -637,7 +637,7 @@ pub fn immediate_postdom(
                                 if !can_reach_cfg(cfg, nx, cand, 4096)
                                     && (no_lr || !dying || throw_cand)
                                 {
-                                    if std::env::var("JCDC_DBG_PDJ").is_ok() {
+                                    if crate::dbg_flag!("JCDC_DBG_PDJ") {
                                         eprintln!("PDJ-SKIP cand={} cand_pc={} cand_term={} s0={} s0_pc={} nx={} nx_pc={} nx_term={} no_lr={}",
                                             cand, cfg.blocks[cand].start, terminators.contains(&cand),
                                             s0, cfg.blocks[s0].start,
@@ -653,7 +653,7 @@ pub fn immediate_postdom(
                         false
                     }));
             if bypass {
-                if std::env::var("JCDC_DBG_PDJ").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_PDJ") {
                     eprintln!("PDJ-REJECT entry_pc={} cand={} cand_pc={} cand_stmts={}",
                         cfg.blocks[entry].start, cand, cfg.blocks[cand].start,
                         cfg.blocks[cand].ins.len());
@@ -706,7 +706,7 @@ pub fn immediate_postdom(
     // it and the structurer spun at 100% CPU). A far plain best means
     // there is no tight diamond to repair; keep it.
     if any_rejected
-        && std::env::var("JCDC_DBG_NOWIDE").is_err()
+        && !crate::dbg_flag!("JCDC_DBG_NOWIDE")
         && best.map(|(d, _)| d).unwrap_or(u32::MAX) <= 8
     {
         let mut dists2: Vec<HashMap<usize, u32>> = Vec::with_capacity(succs.len());
@@ -763,7 +763,7 @@ pub fn immediate_postdom(
         }
         if let Some(b2) = best2 {
             if b2.0 <= 8 {
-                if std::env::var("JCDC_DBG_PDJ").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_PDJ") {
                     eprintln!("PDJ-RESCORE entry_pc={} pick={} pick_pc={} plain={:?}",
                         cfg.blocks[entry].start, b2.1, cfg.blocks[b2.1].start,
                         best.map(|(_, c)| c));
@@ -1457,7 +1457,7 @@ impl<'a> Structurer<'a> {
     /// (jdk26 AlgorithmId.getName's shared return tail) is NOT handler-flow.
     pub(crate) fn handler_flow_only(&self, gi: usize) -> HashSet<usize> {
         let hf = self.handler_flow_only_inner(gi);
-        if std::env::var("JCDC_DBG_HF").is_ok() {
+        if crate::dbg_flag!("JCDC_DBG_HF") {
             let g = &self.groups[gi];
             let mut hs: Vec<usize> = hf.iter().copied().collect();
             hs.sort();
@@ -1910,7 +1910,7 @@ impl<'a> Structurer<'a> {
         for (&merge, (root, _vis)) in &fold_regions {
             fold_root_to_merge.insert(*root, merge);
         }
-        Structurer { cfg, results, groups, body_group, handler_group, diamond_merges, fold_regions, fold_root_to_merge, copied_tails: HashSet::new(), loops_stack: Vec::new(), switch_depth: 0, case_arm_ctx: Vec::new(), sese_loop_headers: std::collections::HashSet::new(), sese_exc_retry_headers: std::collections::HashSet::new(), walk_depth: 0, copy_budget: std::cell::Cell::new(BUDGET_OVERRIDE.with(|c| c.get()).or_else(|| std::env::var("JCDC_COPY_BUDGET").ok().and_then(|v| v.parse().ok())).unwrap_or(512)), final_fields: HashSet::new(), structuring_groups: std::cell::RefCell::new(Vec::new()) }
+        Structurer { cfg, results, groups, body_group, handler_group, diamond_merges, fold_regions, fold_root_to_merge, copied_tails: HashSet::new(), loops_stack: Vec::new(), switch_depth: 0, case_arm_ctx: Vec::new(), sese_loop_headers: std::collections::HashSet::new(), sese_exc_retry_headers: std::collections::HashSet::new(), walk_depth: 0, copy_budget: std::cell::Cell::new(BUDGET_OVERRIDE.with(|c| c.get()).or_else(|| crate::dbg_value!("JCDC_COPY_BUDGET", u32)).unwrap_or(512)), final_fields: HashSet::new(), structuring_groups: std::cell::RefCell::new(Vec::new()) }
     }
 
     /// Immediate post-dominator of `entry` within `universe`. Delegates to the
@@ -2306,8 +2306,8 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
     pub fn structure_method(&mut self) -> Region {
         // From-scratch SESE/dominator-tree structurer (rewrite), gated so the
         // default path is the verified `walk` baseline.
-        let dbg_regions = std::env::var("JCDC_DBG_REGIONS").is_ok();
-        if std::env::var("JCDC_SESE").is_ok() {
+        let dbg_regions = crate::dbg_flag!("JCDC_DBG_REGIONS");
+        if crate::dbg_flag!("JCDC_SESE") {
             let r = self.structure_method_sese();
             if dbg_regions {
                 eprintln!("REGIONS_SESE {:#?}", r);
@@ -2406,7 +2406,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         // check for the entry block itself to avoid re-structuring the same
         // loop recursively.
         let entry_preclaimed = claimed.contains(&entry);
-        if std::env::var("JCDC_DBG_IF").is_ok() {
+        if crate::dbg_flag!("JCDC_DBG_IF") {
             eprintln!("WALK entry={} universe={:?} stop={:?} claimed={:?}", entry, universe, stop, claimed);
         }
         let mut parts: Vec<Region> = Vec::new();
@@ -2429,7 +2429,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             }
             if claimed.contains(&cur) && !(first && allow_claimed_entry) {
                 // Flow re-entered an already structured block.
-                if std::env::var("JCDC_DBG_IF").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_IF") {
                     eprintln!("GOTO-CLAIMED cur={} entry={} parts={}", cur, entry, parts.len());
                 }
                 if !parts.is_empty() {
@@ -2634,7 +2634,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                                     )))
                     })
             });
-            if std::env::var("JCDC_DBG_GRP").is_ok() {
+            if crate::dbg_flag!("JCDC_DBG_GRP") {
                 eprintln!("GRPDEC cur={} start={} end={} group_here={:?} active={:?} hg={} structuring={:?}",
                     cur, b.start, b.end, group_here, active,
                     self.handler_group.contains_key(&cur),
@@ -2758,7 +2758,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             members,
                             exits: Vec::new(),
                         });
-                        if std::env::var("JCDC_DBG_LOOP").is_ok() {
+                        if crate::dbg_flag!("JCDC_DBG_LOOP") {
                             eprintln!("ROTATION header={} do-top={}", cur, n);
                         }
                         break;
@@ -2828,7 +2828,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                     claimed.extend(vis.iter().copied());
                     claimed.insert(merge);
                     claimed.insert(cur);
-                    if std::env::var("JCDC_DBG_IF").is_ok() {
+                    if crate::dbg_flag!("JCDC_DBG_IF") {
                         eprintln!("FOLD-COLLAPSE root={} merge={}", cur, merge);
                     }
                     cur = merge;
@@ -2849,7 +2849,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             }
 
             claimed.insert(cur);
-            if std::env::var("JCDC_DBG_CLAIM").is_ok() {
+            if crate::dbg_flag!("JCDC_DBG_CLAIM") {
                 eprintln!("CLAIM blk={} entry={} term_is_cond={}", cur, entry, matches!(self.term(cur), Term::Cond{..}));
             }
             match self.term(cur).clone() {
@@ -2922,7 +2922,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                     // branch-out must stay a loop exit, not an If follow.
                     if !follow_walkable && !at_preclaimed_entry {
                         let m = self.appendix_target(cur, universe, stop, claimed);
-                        if std::env::var("JCDC_DBG_IF").is_ok() {
+                        if crate::dbg_flag!("JCDC_DBG_IF") {
                             eprintln!("COND cur={} pd={:?} unwalkable appendix->{:?}", cur, pd, m);
                         }
                         if let Some(m) = m {
@@ -3084,7 +3084,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             }
                         }
                     }
-                    if std::env::var("JCDC_DBG_IF").is_ok() {
+                    if crate::dbg_flag!("JCDC_DBG_IF") {
                         let tb = self.cfg.block_at(self.cfg.blocks[taken].start);
                         eprintln!("COND cur={} pc={} fall_pc={} taken_pc={} pd={:?} follow={:?} f_pc={:?} t_id={:?} t_univ={} t_claim={} t_stop={} bstop={:?}",
                             cur, self.cfg.blocks[cur].start,
@@ -3095,7 +3095,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             tb.map(|b| stop.contains(&b)).unwrap_or(false),
                             { let mut v: Vec<u16> = bstop.iter().map(|b| self.cfg.blocks[*b].start).collect(); v.sort(); v });
                     }
-                    if std::env::var("JCDC_DBG_IF").is_ok() {
+                    if crate::dbg_flag!("JCDC_DBG_IF") {
                         // absorb_pure is &mut and CLAIMS the absorbed block
                         // — calling it here for the printout pre-claimed the
                         // taken arm and flipped the real decision below
@@ -3272,7 +3272,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         }
                     };
                     let else_r = if Some(fall) == follow && !stop.contains(&fall) {
-                        if std::env::var("JCDC_DBG_IF").is_ok() {
+                        if crate::dbg_flag!("JCDC_DBG_IF") {
                             eprintln!("IF cur={} else Empty (fall==follow {})", cur, fall);
                         }
                         Region::Empty
@@ -3423,7 +3423,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             }
                         }
                         if chain.is_empty() {
-                            if std::env::var("JCDC_DBG_IF").is_ok() {
+                            if crate::dbg_flag!("JCDC_DBG_IF") {
                                 eprintln!("PARKCHAIN cur={} chain=EMPTY arm={}", cur, region_shape(&arm));
                             }
                             arm
@@ -3485,7 +3485,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             } else {
                                 Region::Empty
                             };
-                            if std::env::var("JCDC_DBG_IF").is_ok() {
+                            if crate::dbg_flag!("JCDC_DBG_IF") {
                                 eprintln!(
                                     "PARKCHAIN cur={} chain={:?} cu={} cstop={:?} taken_r={}",
                                     cur, chain, cu.len(), cstop, region_shape(&taken_r)
@@ -3603,7 +3603,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             // trailing Goto of its own (chain_cont=None —
                             // a trailing-Goto copy must keep the strict
                             // all-bts-equal-cont coherence above).
-                            if std::env::var("JCDC_DBG_IF").is_ok() {
+                            if crate::dbg_flag!("JCDC_DBG_IF") {
                                 eprintln!("PARKC-ARM cur={} taken={} bts={:?} arm={}", cur, taken, bts, region_shape(&arm));
                             }
                                     fn fill_bypass(
@@ -3848,7 +3848,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                                         &mut failed2,
                                         true,
                                     );
-                                    if std::env::var("JCDC_DBG_IF").is_ok() {
+                                    if crate::dbg_flag!("JCDC_DBG_IF") {
                                         eprintln!(
                                             "PARKCHAIN-ROUTE2 cur={} filled={} failed={}",
                                             cur, filled2, failed2
@@ -4074,7 +4074,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                                         claimed,
                                         &mut filled,
                                     );
-                                    if std::env::var("JCDC_DBG_IF").is_ok() {
+                                    if crate::dbg_flag!("JCDC_DBG_IF") {
                                         eprintln!(
                                             "PARKCHAIN-ROUTE cur={} filled={} skip-empties",
                                             cur, filled
@@ -4092,7 +4092,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         let branch_universe = self.owner_scope(fall, universe);
                         let mut sub = self.sub_scope(fall, &branch_universe, &bstop, claimed);
                         self.restrict_handler_branch(&mut sub, entry);
-                        if std::env::var("JCDC_DBG_IF").is_ok() {
+                        if crate::dbg_flag!("JCDC_DBG_IF") {
                             eprintln!("IF cur={} else walk fall={} sub={:?}", cur, fall, sub);
                         }
                         self.walk(fall, &sub, &bstop, active, claimed, false)
@@ -4111,13 +4111,13 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             if let Some(r) = self.copy_walk(fall, &bstop, active, cur) {
                                 r
                             } else {
-                                if std::env::var("JCDC_DBG_IF").is_ok() {
+                                if crate::dbg_flag!("JCDC_DBG_IF") {
                                     eprintln!("IF cur={} else Goto(claimed) fall={}", cur, fall);
                                 }
                                 Region::Goto { target: fall }
                             }
                         } else {
-                            if std::env::var("JCDC_DBG_IF").is_ok() {
+                            if crate::dbg_flag!("JCDC_DBG_IF") {
                                 eprintln!("IF cur={} else Goto(claimed) fall={}", cur, fall);
                             }
                             Region::Goto { target: fall }
@@ -4164,7 +4164,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         self.restrict_handler_branch(&mut sub, entry);
                         self.walk(fall, &sub, &bstop, active, claimed, false)
                     } else {
-                        if std::env::var("JCDC_DBG_IF").is_ok() {
+                        if crate::dbg_flag!("JCDC_DBG_IF") {
                             eprintln!(
                                 "IF cur={} else Empty fall={} univ={} bstop={} handler={}",
                                 cur, fall, universe.contains(&fall), bstop.contains(&fall),
@@ -4392,7 +4392,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             .unwrap_or(false);
                         let bindable = (cont_dead || cont_is_f || cont_via_case_break)
                             && self.switch_follow_bindable(&sw, cur, &targets, f);
-                        if std::env::var("JCDC_DBG_SWF").is_ok() {
+                        if crate::dbg_flag!("JCDC_DBG_SWF") {
                             eprintln!("SWBIND cur={} f={} cont_dead={} cont_is_f={} cont_case={} bindable={}",
                                 cur, f, cont_dead, cont_is_f, cont_via_case_break, bindable);
                         }
@@ -4417,7 +4417,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                     // non-terminating case) — else the copy is unreachable
                     // (无法访问的语句).
                     if let Some(f) = follow {
-                        if std::env::var("JCDC_DBG_SWF").is_ok() {
+                        if crate::dbg_flag!("JCDC_DBG_SWF") {
                             eprintln!("SWTAIL cur={} f={} claimed={} stop={} loops={} term={} loophdr={} finw={} completes={}",
                                 cur, f, claimed.contains(&f), stop.contains(&f),
                                 self.loops_stack.contains(&f), self.is_terminator_block(f),
@@ -4493,7 +4493,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             break;
                         }
                         Some(t) => {
-                            if std::env::var("JCDC_DBG_IF").is_ok() {
+                            if crate::dbg_flag!("JCDC_DBG_IF") {
                                 eprintln!("GOTO-FALL cur={} t={} univ={} stop={} claimed={} entry={}", cur, t, universe.contains(&t), stop.contains(&t), claimed.contains(&t), entry);
                             }
 
@@ -4584,7 +4584,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                         }
                         Some(n) if self.is_handler(n) && active.is_empty() => break,
                         Some(n) => {
-                            if std::env::var("JCDC_DBG_IF").is_ok() {
+                            if crate::dbg_flag!("JCDC_DBG_IF") {
                                 eprintln!("GOTO-FT cur={} n={} univ={} stop={} claimed={} entry={}", cur, n, universe.contains(&n), stop.contains(&n), claimed.contains(&n), entry);
                             }
                             // Shared-tail arrival: `n` is CLAIMED (hence
@@ -4648,7 +4648,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                 }
             }
         }
-        if std::env::var("JCDC_DBG_IF").is_ok() {
+        if crate::dbg_flag!("JCDC_DBG_IF") {
             eprintln!("WALK END entry={} nparts={} claimed={:?}", entry, parts.len(), claimed);
         }
         match parts.len() {
@@ -5026,13 +5026,13 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                 return i + 1 < n || default_ok;
             }
             let ok = self.arm_binds_to(r, f);
-            if std::env::var("JCDC_DBG_SWF").is_ok() {
+            if crate::dbg_flag!("JCDC_DBG_SWF") {
                 eprintln!("SWBIND-CASE i={} block={} f={} ok={} region={:?}", i,
                     region_head_block(r), f, ok, region_shape(r));
             }
             ok
         });
-        if std::env::var("JCDC_DBG_SWF").is_ok() {
+        if crate::dbg_flag!("JCDC_DBG_SWF") {
             eprintln!("SWBIND-DEF block={} default_pc={} f={} default_ok={} cases_ok={}",
                 block, default_pc, f, default_ok, cases_ok);
         }
@@ -5703,7 +5703,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         }) {
             return None;
         }
-        let dbg_absorb = std::env::var("JCDC_DBG_ABSORB").is_ok();
+        let dbg_absorb = crate::dbg_flag!("JCDC_DBG_ABSORB");
         let succ_walkable;
         {
             let b = &self.cfg.blocks[blk];
@@ -5735,14 +5735,14 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             succ_walkable = universe.contains(&succ) && !bstop.contains(&succ);
         }
         if succ_walkable {
-            if std::env::var("JCDC_DBG_ABSORB").is_ok() {
+            if crate::dbg_flag!("JCDC_DBG_ABSORB") {
                 eprintln!("absorb REJECT blk={} succ walkable (univ={}, bstop={})", blk,
                     universe.contains(&self.cfg.blocks[blk].succ[0]),
                     bstop.contains(&self.cfg.blocks[blk].succ[0]));
             }
             return None; // normal flow continues; not our case
         }
-        if std::env::var("JCDC_DBG_ABSORB").is_ok() {
+        if crate::dbg_flag!("JCDC_DBG_ABSORB") {
             eprintln!("absorb ACCEPT blk={} claimed={}", blk, claimed.contains(&blk));
         }
         // The unwalkable successor is an already-CLAIMED block this arm's
@@ -6119,7 +6119,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             q.push_back(header);
             while let Some(b) = q.pop_front() {
                 for &s in &self.cfg.blocks[b].succ {
-                    let dbg_lmem = std::env::var("JCDC_DBG_LMEM").is_ok();
+                    let dbg_lmem = crate::dbg_flag!("JCDC_DBG_LMEM");
                     if barriers.contains(&s) && s != header {
                         // enclosing loop header: never absorb it
                         if dbg_lmem { eprintln!("LMEM h={} from={} s={} why=barrier", header, b, s); }
@@ -6223,16 +6223,16 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         inner_stop.extend(exits.iter().copied());
         // NOTE: header is NOT in inner_stop — the walk starts there and the
         // claimed-guard stops re-entry (back edges become Goto{header}).
-        if std::env::var("JCDC_DBG_IF").is_ok() {
+        if crate::dbg_flag!("JCDC_DBG_IF") {
             eprintln!("structure_loop header={} members={:?} exits={:?}", header, members, exits);
         }
-        if std::env::var("JCDC_DBG_LOOP").is_ok() {
+        if crate::dbg_flag!("JCDC_DBG_LOOP") {
             eprintln!("LOOP header={} members={:?} inner_stop={:?}", header, members, inner_stop);
         }
         claimed.insert(header);
         self.loops_stack.push(header);
         let mut body = self.walk(header, &members, &inner_stop, active, claimed, true);
-        if std::env::var("JCDC_DBG_LOOP").is_ok() {
+        if crate::dbg_flag!("JCDC_DBG_LOOP") {
             eprintln!("LOOP body region: {:#?}", body);
         }
         // Walk-side twin of the SESE loop-site call: orphaned
@@ -6243,7 +6243,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         // dropped entirely: the success path RE-LOOPED, re-reserving
         // memory forever; javac can't see it, the walk path structures
         // this method, so the SESE-only pass never ran).
-        if std::env::var("JCDC_NO_MATEXIT").is_err() {
+        if !crate::dbg_flag!("JCDC_NO_MATEXIT") {
             let natural: HashSet<usize> = self.cfg.blocks[header]
                 .succ
                 .iter()
@@ -6285,7 +6285,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         active: &[usize],
         claimed: &mut HashSet<usize>,
     ) -> Region {
-        if std::env::var("JCDC_DBG_GOTO").is_ok() {
+        if crate::dbg_flag!("JCDC_DBG_GOTO") {
             eprintln!("SWITCHENTRY block={} start={} follow={:?} universe={} stop={:?} claimed={:?}",
                 block, self.cfg.blocks[block].start, follow, universe.len(), stop, claimed);
         }
@@ -6465,7 +6465,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                 } else {
                     None
                 };
-                if std::env::var("JCDC_DBG_GOTO").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_GOTO") {
                     eprintln!("SWCASE b={} univ={} claimed={} stop={} follow={:?} loops={:?} copied={}", b,
                         universe.contains(&b), claimed.contains(&b), case_stop.contains(&b), follow,
                         self.loops_stack, copied.is_some());
@@ -6530,7 +6530,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                 }
             })
             .collect();
-        if std::env::var("JCDC_DBG_IF").is_ok() {
+        if crate::dbg_flag!("JCDC_DBG_IF") {
             eprintln!(
                 "structure_try gi={} span=({},{}) body_universe={:?} nested={:?}",
                 gi, g.start, g.end, body_universe, nested
@@ -6683,7 +6683,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             && !body_universe.contains(c)
                     });
                 outer_cont_some = cont.is_some();
-                if std::env::var("JCDC_DBG_IF").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_IF") {
                     eprintln!("try gi={} cont={:?} universe_has_blocks_after_end={} outer_universe={:?} stop={:?}", gi, cont,
                         universe.iter().filter(|b| self.cfg.blocks[**b].start >= g.end).count(),
                         outer_universe, stop);
@@ -6730,7 +6730,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                 }
             }
             let mut huniverse = reachable_within(self.cfg, *hb, &hstop);
-            if std::env::var("JCDC_DBG_HUNIV").is_ok() {
+            if crate::dbg_flag!("JCDC_DBG_HUNIV") {
                 eprintln!("HUNIV0 gi={} hb={} hstop={:?} reach={:?}", gi, hb, {
                     let mut v: Vec<usize> = hstop.iter().copied().collect(); v.sort(); v
                 }, {
@@ -6818,7 +6818,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             // Earliest-pc first: it is the flow confluence, and its
             // reachable tail is the superset covering later candidates.
             shared_merge.sort_by_key(|b| self.cfg.blocks[*b].start);
-            if std::env::var("JCDC_DBG_HUNIV").is_ok() {
+            if crate::dbg_flag!("JCDC_DBG_HUNIV") {
                 eprintln!(
                     "HUNIV1 gi={} hb={} shared_merge={:?} huniverse={:?}",
                     gi, hb, shared_merge,
@@ -6828,7 +6828,7 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             if !shared_merge.is_empty() {
                 let tail = reachable_within(self.cfg, shared_merge[0], &HashSet::new());
                 huniverse.retain(|b| !tail.contains(b) || *b == *hb || hf.contains(b));
-                if std::env::var("JCDC_DBG_HUNIV").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_HUNIV") {
                     eprintln!("HUNIV2 gi={} after-strip={:?}", gi, {
                         let mut v: Vec<usize> = huniverse.iter().copied().collect(); v.sort(); v
                     });

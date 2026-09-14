@@ -31,7 +31,7 @@ pub fn decompile_method(
     m_idx: usize,
 ) -> Result<Option<MethodBody>, String> {
     let m = &pc.cf.methods[m_idx];
-    if std::env::var("JCDC_TRACE_METHOD").is_ok() {
+    if crate::dbg_flag!("JCDC_TRACE_METHOD") {
         let loc = std::panic::Location::caller();
         eprintln!("mtrace {}.{}{} <- {}:{}", pc.internal_name,
             pc.method_name(m_idx).unwrap_or("?"),
@@ -414,23 +414,25 @@ pub fn decompile_method(
                                             } else {
                                                 (JavaType::Object("java/lang/Object".into()), true)
                                             };
-                                            if std::env::var("JCDC_DBG_MERGE").is_ok() {
+                                            if crate::dbg_flag!("JCDC_DBG_MERGE") {
                                                 eprintln!("MERGE bid={} d={} sides={:?} wide={} tyj={:?}", bid, d, sides, wide, &tyj);
                                             }
                                             let ty = TypeRef::J(tyj);
                                             let slot = (code.max_locals + 100 + var_counter as u16) as u16;
                                             var_counter += 1;
-                                            // Globally unique names: lambda
+                                            // Unit-unique names: lambda
                                             // and nested-class bodies are
                                             // inlined into enclosing
                                             // methods, where Java forbids
-                                            // shadowing locals.
-                                            static STACK_SEQ: std::sync::atomic::AtomicU64 =
-                                                std::sync::atomic::AtomicU64::new(0);
-                                            let seq = STACK_SEQ.fetch_add(
-                                                1,
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            );
+                                            // shadowing locals. The
+                                            // counter is thread-local and
+                                            // reset per compilation unit
+                                            // (decompile_class) — the old
+                                            // process-wide atomic made
+                                            // names depend on global
+                                            // class-render ORDER, which
+                                            // parallel rendering shuffles.
+                                            let seq = crate::classdec::next_stack_seq();
                                             let v = vt.add_stack_var(slot, format!("stack{}", seq), ty);
                                             if is_wide {
                                                 vt.wide_stack_vars.insert(v);
@@ -485,7 +487,7 @@ pub fn decompile_method(
                     .with_fwd(fwd.clone());
                 match builder.build_block(&b.ins, in_stack) {
                     Ok(r) => {
-                        if std::env::var("JCDC_DBG_BLOCKS").is_ok() {
+                        if crate::dbg_flag!("JCDC_DBG_BLOCKS") {
                             eprintln!(
                                 "build block {} [{}..{}) ins={} in_stack={} stmts={} out={} succ={:?} term={}",
                                 bid, b.start, b.end, b.ins.len(), in_stacks[bid].len(),
@@ -546,7 +548,7 @@ pub fn decompile_method(
 
     // Short-circuit pre-fold (before grouping/loop/region analysis; see
     // short_circuit_prefold).
-    if std::env::var("JCDC_NO_SCFOLD").is_err() {
+    if !crate::dbg_flag!("JCDC_NO_SCFOLD") {
         short_circuit_prefold(&mut cfg, &mut results, &fold_regions);
     }
 
@@ -563,8 +565,8 @@ pub fn decompile_method(
         })
         .filter_map(|f| pc.utf8(f.name_index).map(|n| n.to_string()))
         .collect();
-    let hybrid = std::env::var("JCDC_SESE").is_ok()
-        && std::env::var("JCDC_NO_HYBRID").is_err();
+    let hybrid = crate::dbg_flag!("JCDC_SESE")
+        && !crate::dbg_flag!("JCDC_NO_HYBRID");
     let (diamond_merges_w, fold_regions_w) = if hybrid {
         (diamond_merges.clone(), fold_regions.clone())
     } else {
@@ -572,7 +574,7 @@ pub fn decompile_method(
     };
     let mut structurer = Structurer::with_diamonds(&cfg, &results, diamond_merges, fold_regions);
     structurer.final_fields = final_field_set.clone();
-    if std::env::var("JCDC_DBG_MNAME").is_ok() {
+    if crate::dbg_flag!("JCDC_DBG_MNAME") {
         eprintln!(
             "METHOD {}.{} {}",
             pc.internal_name,
@@ -619,7 +621,7 @@ pub fn decompile_method(
         let cs = count_emits(&r_sese);
         let cw = count_emits(&r_walk);
         if cs > cw + cw / 8 + 16 {
-            if std::env::var("JCDC_DBG_HYBRID").is_ok() {
+            if crate::dbg_flag!("JCDC_DBG_HYBRID") {
                 eprintln!(
                     "HYBRID-WALK {}.{} sese_emits={} walk_emits={}",
                     pc.internal_name,
@@ -655,17 +657,17 @@ pub fn decompile_method(
         .with_copied_tails(copied_tails)
         .with_final_fields(final_fields);
     let mut body = converter.convert(region);
-    if let Ok(want) = std::env::var("JCDC_DBG_BODY") {
+    if let Some(want) = crate::dbg_value!("JCDC_DBG_BODY", String) {
         if pc.method_name(m_idx) == Some(want.as_str())
             || (want == "<init>" && pc.method_name(m_idx) == Some("<init>")
-                && desc_str.contains(&std::env::var("JCDC_DBG_BODY_DESC").unwrap_or_default()))
+                && desc_str.contains(&crate::dbg_value!("JCDC_DBG_BODY_DESC", String).unwrap_or_default()))
         {
             eprintln!("BODY-CONVERT: {:#?}", body);
         }
     }
     macro_rules! dbg_body {
         ($tag:expr) => {
-            if let Ok(want) = std::env::var("JCDC_DBG_BODY") {
+            if let Some(want) = crate::dbg_value!("JCDC_DBG_BODY", String) {
                 if pc.method_name(m_idx) == Some(want.as_str()) {
                     eprintln!("BODY[{}]: {:#?}", $tag, body);
                 }
@@ -854,7 +856,7 @@ fn ensure_declared(vt: &VarTable, body: &mut Stmt) {
         !info.is_param
     });
     let _ = &mut missing;
-    if std::env::var("JCDC_DBG_HOIST").is_ok() {
+    if crate::dbg_flag!("JCDC_DBG_HOIST") {
         eprintln!("ENSURE missing={:?} declared={} used={}", missing, declared.len(), used.len());
     }
     if missing.is_empty() {
@@ -1850,7 +1852,7 @@ fn try_diamond_fold(
             )
             && cfg.blocks[*p].succ.first() == Some(&bid);
         if !pure {
-            if std::env::var("JCDC_DBG_DIAMOND").is_ok() {
+            if crate::dbg_flag!("JCDC_DBG_DIAMOND") {
                 eprintln!("fold REJECT merge {}: pred {} not pure", bid, p);
             }
             return None;
@@ -1871,7 +1873,7 @@ fn try_diamond_fold(
     }
     for o in &outs {
         if o.len() - k != 1 {
-            if std::env::var("JCDC_DBG_DIAMOND").is_ok() {
+            if crate::dbg_flag!("JCDC_DBG_DIAMOND") {
                 eprintln!("fold REJECT merge {}: suffix len {} after common {}", bid, o.len() - k, k);
             }
             return None;
@@ -1935,7 +1937,7 @@ fn try_diamond_fold(
                 resolve(n, bid, leaf_val, results, cfg, dom, depth + 1, vis, memo)
             }
             _ => {
-                if std::env::var("JCDC_DBG_DIAMOND").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_DIAMOND") {
                     eprintln!("  resolve fail x={} term={:?} succ={:?}", x, std::mem::discriminant(&results[x].term), cfg.blocks[x].succ);
                 }
                 None
@@ -1949,11 +1951,11 @@ fn try_diamond_fold(
     let n = cfg.blocks.len();
     let universe: HashSet<usize> = (0..n).collect();
     let rpo = crate::structure::reverse_postorder(cfg, cfg.entry, &universe);
-    if std::env::var("JCDC_DBG_DIAMOND").is_ok() {
+    if crate::dbg_flag!("JCDC_DBG_DIAMOND") {
         eprintln!("fold merge {} rpo={:?}", bid, rpo);
     }
     let leaves: Vec<usize> = known.iter().map(|(p, _)| *p).collect();
-    let dbg = std::env::var("JCDC_DBG_DIAMOND").is_ok();
+    let dbg = crate::dbg_flag!("JCDC_DBG_DIAMOND");
     let mut best: Option<(usize, Expr, HashSet<usize>)> = None;
     for &h in rpo.iter().rev() {
         if !matches!(results[h].term, crate::builder::Term::Cond { .. }) {
@@ -2011,14 +2013,14 @@ fn try_diamond_fold(
         }
     }
     let Some((root, folded_val, vis)) = best else {
-        if std::env::var("JCDC_DBG_DIAMOND").is_ok() {
+        if crate::dbg_flag!("JCDC_DBG_DIAMOND") {
             eprintln!("fold REJECT merge {}: no resolving root", bid);
         }
         return None;
     };
     let mut folded = prefix;
     folded.push(folded_val);
-    if std::env::var("JCDC_DBG_DIAMOND").is_ok() {
+    if crate::dbg_flag!("JCDC_DBG_DIAMOND") {
         eprintln!("fold OK merge {} depth {} root={} vis={:?}", bid, folded.len(), root, vis);
     }
     Some((folded, root, vis))
@@ -3040,7 +3042,7 @@ fn resolve_catch_vars(vt: &mut VarTable, s: &mut Stmt) {
                         remove_first_stmt(&mut c.body);
                         rewrite_var_until_assign(&mut c.body, v, new_var);
                         c.var = new_var;
-                    } else if std::env::var("JCDC_DBG_CATCH").is_ok() {
+                    } else if crate::dbg_flag!("JCDC_DBG_CATCH") {
                         eprintln!("no store at handler head: {:?}", first_stmt_peek(&c.body));
                     }
                 }
@@ -3095,7 +3097,7 @@ fn resolve_catch_vars(vt: &mut VarTable, s: &mut Stmt) {
                         remove_first_stmt(&mut c.body);
                         rewrite_var_until_assign(&mut c.body, v, new_var);
                         c.var = new_var;
-                    } else if std::env::var("JCDC_DBG_CATCH").is_ok() {
+                    } else if crate::dbg_flag!("JCDC_DBG_CATCH") {
                         eprintln!("no store at handler head: {:?}", first_stmt_peek(&c.body));
                     }
                 }
@@ -3549,7 +3551,7 @@ fn reconstruct_synchronized(s: &mut Stmt) {
                 if i + 1 < v.len() {
                     if let (Stmt::MonitorEnter(_), Stmt::Try { .. }) = (&v[i], &v[i + 1]) {
                         let r = try_make_synchronized(&v[i], &v[i + 1]);
-                        if std::env::var("JCDC_DBG_SYNC").is_ok() {
+                        if crate::dbg_flag!("JCDC_DBG_SYNC") {
                             eprintln!("SYNC pair direct ok={}", r.is_some());
                         }
                         if let Some(sync) = r {
@@ -3562,14 +3564,14 @@ fn reconstruct_synchronized(s: &mut Stmt) {
                         // followed by the sync region). Extract a trailing
                         // MonitorEnter leaf and pair it with the Try.
                         let taken = take_trailing_monitor(&mut v[i]);
-                        if std::env::var("JCDC_DBG_SYNC").is_ok() {
+                        if crate::dbg_flag!("JCDC_DBG_SYNC") {
                             let d = format!("{:?}", &v[i]);
                             eprintln!("SYNC trailing probe i={} taken={} head={}", i, taken.is_some(), d.lines().next().unwrap_or(""));
                         }
                         if let Some(lock) = taken {
                             let enter = Stmt::MonitorEnter(lock);
                             let r2 = try_make_synchronized(&enter, &v[i + 1]);
-                            if std::env::var("JCDC_DBG_SYNC").is_ok() {
+                            if crate::dbg_flag!("JCDC_DBG_SYNC") {
                                 eprintln!("SYNC trailing pair ok={}", r2.is_some());
                             }
                             if let Some(sync) = r2 {
@@ -3635,7 +3637,7 @@ fn reconstruct_synchronized(s: &mut Stmt) {
 }
 
 fn try_make_synchronized(enter: &Stmt, try_stmt: &Stmt) -> Option<Stmt> {
-    if std::env::var("JCDC_DBG_SYNC").is_ok() {
+    if crate::dbg_flag!("JCDC_DBG_SYNC") {
         match (enter, try_stmt) {
             (Stmt::MonitorEnter(_), Stmt::Try { catches, finally, .. }) => {
                 eprintln!("SYNC shape catches={} finally={} exc0={:?}", catches.len(), finally.is_some(),
@@ -4405,7 +4407,7 @@ fn infer_var_types(vt: &mut VarTable, body: &mut Stmt, ret_ty: &JavaType, pc: &P
     for (v, t) in changed.iter().enumerate() {
         if let Some(t) = t {
             let old = vt.vars[v].ty.erased();
-            if std::env::var("JCDC_DBG_MERGE").is_ok() && vt.stack_vars.contains(&(v as u32)) {
+            if crate::dbg_flag!("JCDC_DBG_MERGE") && vt.stack_vars.contains(&(v as u32)) {
                 eprintln!("INFER stackvar v={} old={:?} t={:?} wide={}", v, old, t, vt.wide_stack_vars.contains(&(v as u32)));
             }
             if vt.wide_stack_vars.contains(&(v as u32)) {
@@ -4438,7 +4440,7 @@ fn infer_var_types(vt: &mut VarTable, body: &mut Stmt, ret_ty: &JavaType, pc: &P
                 let concrete = !ev_types.is_empty()
                     && !ev_types.iter().any(plain_object)
                     && (uniform || covariant_ret_array);
-                if std::env::var("JCDC_DBG_MERGE").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_MERGE") {
                     eprintln!("WIDENARROW v={} ev={:?} concrete={}", v, ev_types, concrete);
                 }
                 if !concrete {
@@ -4461,7 +4463,7 @@ fn infer_var_types(vt: &mut VarTable, body: &mut Stmt, ret_ty: &JavaType, pc: &P
             } else {
                 t.clone()
             };
-            if std::env::var("JCDC_DBG_MERGE").is_ok() && vt.stack_vars.contains(&(v as u32)) {
+            if crate::dbg_flag!("JCDC_DBG_MERGE") && vt.stack_vars.contains(&(v as u32)) {
                 eprintln!("INFER-SET v={} newt={:?}", v, newt);
             }
             vt.vars[v].ty = TypeRef::J(newt);
@@ -4481,7 +4483,7 @@ fn infer_var_types(vt: &mut VarTable, body: &mut Stmt, ret_ty: &JavaType, pc: &P
             break;
         }
     }
-    if std::env::var("JCDC_DBG_MERGE").is_ok() {
+    if crate::dbg_flag!("JCDC_DBG_MERGE") {
         for v in &vt.stack_vars {
             eprintln!("POSTINFER stackvar v={} ty={:?}", v, vt.vars[*v as usize].ty);
         }
@@ -5516,7 +5518,7 @@ fn hoist_escaped_vars(body: &mut Stmt, vt: &VarTable) {
     // enclosing catch will handle the exception.
     drop_rethrows(body);
     escaped.retain(|v| *v != u32::MAX);
-    if std::env::var("JCDC_DBG_HOIST").is_ok() {
+    if crate::dbg_flag!("JCDC_DBG_HOIST") {
         eprintln!("HOIST escaped={:?}", escaped);
     }
     if escaped.is_empty() {
@@ -7628,7 +7630,7 @@ fn twr_j7(s: &mut Stmt) {
             let mut i = 0;
             while i < v.len() {
                 twr_j7(&mut v[i]);
-                if std::env::var("JCDC_DBG_TWR").is_ok() {
+                if crate::dbg_flag!("JCDC_DBG_TWR") {
                     if let Stmt::Try { catches, finally, .. } = &v[i] {
                         eprintln!("TWR scan i={} catches={} excs={:?} finally={}", i, catches.len(),
                             catches.iter().map(|c| c.exc.clone()).collect::<Vec<_>>(), finally.is_some());
@@ -7650,7 +7652,7 @@ fn twr_j7(s: &mut Stmt) {
                         .unwrap_or(i);
                     while i < v.len() {
                         let ok = is_close_scaffold_stmt(&v[i]);
-                        if std::env::var("JCDC_DBG_TWR").is_ok() {
+                        if crate::dbg_flag!("JCDC_DBG_TWR") {
                             let d = format!("{:?}", &v[i]);
                             eprintln!("TWR strip i={} ok={} head={}", i, ok, d.lines().next().unwrap_or(""));
                         }
@@ -7899,7 +7901,7 @@ struct J7Plan {
 /// sits either in a `finally` (after dedupe) or in a trailing catch-all
 /// handler (before dedupe).
 fn match_j7(v: &[Stmt], i: usize) -> Option<J7Plan> {
-    let dbg = std::env::var("JCDC_DBG_TWR").is_ok();
+    let dbg = crate::dbg_flag!("JCDC_DBG_TWR");
     let (body, catches, finally) = match &v[i] {
         Stmt::Try { body, catches, finally } => (body.as_ref(), catches.as_slice(), finally.as_deref()),
         _ => return None,
@@ -8484,7 +8486,7 @@ fn restore_asserts(s: &mut Stmt) {
         let mut i = 0;
         while i < v.len() {
             restore_asserts(&mut v[i]);
-            if std::env::var("JCDC_DBG_ASSERT").is_ok() {
+            if crate::dbg_flag!("JCDC_DBG_ASSERT") {
                 if let Stmt::If { cond, .. } = &v[i] {
                     let d = format!("{:?}", cond);
                     if d.contains("assert") || d.contains("Assertion") || d.contains("Field") {
@@ -9561,7 +9563,7 @@ pub(crate) fn prune_post_loop_label_breaks(s: &mut Stmt) {
         let mut i = 0;
         while i + 1 < v.len() {
             let label_owned = label_of(&v[i]).map(|l| l.to_string());
-            if std::env::var("JCDC_DBG_PRUNE").is_ok() {
+            if crate::dbg_flag!("JCDC_DBG_PRUNE") {
                 if let Some(l) = &label_owned {
                     eprintln!("PRUNE label={} next_is_break={}", l, is_break_of(&v[i + 1], l));
                 }
@@ -10190,7 +10192,7 @@ fn split_walk(
                 if !vt.wide_stack_vars.contains(&var) {
                     if let JavaType::Object(n) = vt.vars[cur as usize].ty.erased() {
                         if n == "java/lang/Object" {
-                            if std::env::var("JCDC_DBG_MERGE").is_ok() {
+                            if crate::dbg_flag!("JCDC_DBG_MERGE") {
                                 eprintln!("SPLITNARROW v={} -> {:?}", cur, nt);
                             }
                             vt.vars[cur as usize].ty = TypeRef::J(nt.clone());
@@ -11128,7 +11130,7 @@ fn short_circuit_prefold(
             }
         }
     }
-    let dbg = std::env::var("JCDC_DBG_SCFOLD").is_ok();
+    let dbg = crate::dbg_flag!("JCDC_DBG_SCFOLD");
     let mut changed = true;
     let mut rounds = 0usize;
     while changed && rounds < 64 {

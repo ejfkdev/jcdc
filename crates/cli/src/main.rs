@@ -49,9 +49,9 @@ fn print_help() {
 }
 
 fn main() -> anyhow::Result<()> {
-    if std::env::var("JCDC_PANIC_VERBOSE").is_err() {
+    if !jcdc_decompiler::dbg_flag!("JCDC_PANIC_VERBOSE") {
         std::panic::set_hook(Box::new(|info| {
-            if std::env::var("JCDC_PANIC_LOG").is_ok() {
+            if jcdc_decompiler::dbg_flag!("JCDC_PANIC_LOG") {
                 eprintln!("jcdc-panic: {}", info);
             }
         }));
@@ -207,6 +207,157 @@ fn resolve_target(input: &Path, out: Option<&str>, multi: bool) -> anyhow::Resul
     }
 }
 
+/// One unit of parallel work.
+enum Job {
+    File { path: PathBuf, root: Option<PathBuf> },
+    Bytes { name: String, data: Vec<u8> },
+}
+
+fn job_label(j: &Job) -> String {
+    match j {
+        Job::File { path, .. } => path.display().to_string(),
+        Job::Bytes { name, .. } => name.clone(),
+    }
+}
+
+fn process_job(
+    job: &Job,
+    pool: &ClassPool,
+    opts: &ClassOptions,
+    target: &OutTarget,
+) -> anyhow::Result<usize> {
+    match job {
+        Job::File { path, root } => {
+            decompile_class_file(path, pool, opts, target, root.as_deref())
+        }
+        Job::Bytes { name, data } => {
+            let stem = name.trim_end_matches(".class");
+            if jcdc_decompiler::classdec::is_nested_in_pool(stem, pool) {
+                return Ok(0);
+            }
+            let java_name = format!("{}.java", stem);
+            match decompile_one(data, pool, opts, stem) {
+                Ok(source) => Ok(usize::from(write_source(target, &java_name, &source))),
+                Err(e) => {
+                    eprintln!("jcdc: failed to decompile {}: {}", name, e);
+                    Ok(0)
+                }
+            }
+        }
+    }
+}
+
+/// Run jobs across a pool of big-stack workers. A worker that catches a
+/// panic EXITS and is replaced by a fresh thread: renderer thread-locals
+/// (e.g. structure.rs COPY_DEPTH) are not panic-drop-guarded, so a
+/// contaminated thread must never render another class (output would
+/// depend on job-to-thread assignment).
+fn run_jobs(
+    jobs: Vec<Job>,
+    pool: &ClassPool,
+    opts: &ClassOptions,
+    target: &OutTarget,
+) -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let n_jobs = jobs.len();
+    let workers = jcdc_decompiler::dbg_value!("JCDC_THREADS", usize)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().min(8))
+                .unwrap_or(1)
+        })
+        .clamp(1, 64)
+        .min(n_jobs.max(1));
+    let jobs = Arc::new(jobs);
+    let next = Arc::new(AtomicUsize::new(0));
+    let written = Arc::new(AtomicUsize::new(0));
+    let mut handles: Vec<std::thread::JoinHandle<bool>> = Vec::new();
+    for _ in 0..workers {
+        let (jobs, next, written) = (jobs.clone(), next.clone(), written.clone());
+        let pool = pool.clone();
+        let opts = opts.clone();
+        let target = target.clone();
+        let h = std::thread::Builder::new()
+            .stack_size(512 * 1024 * 1024)
+            .spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= jobs.len() {
+                        return false; // queue drained, clean exit
+                    }
+                    let job = &jobs[i];
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        process_job(job, &pool, &opts, &target)
+                    }));
+                    match res {
+                        Ok(Ok(n)) => {
+                            written.fetch_add(n, Ordering::Relaxed);
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!("jcdc: {}: {}", job_label(job), e);
+                        }
+                        Err(_) => {
+                            eprintln!("jcdc: internal panic on {}", job_label(job));
+                            return true; // contaminated TLS: exit for replacement
+                        }
+                    }
+                }
+            });
+        match h {
+            Ok(h) => handles.push(h),
+            Err(e) => eprintln!("jcdc: cannot spawn worker: {}", e),
+        }
+    }
+    // Supervisor: join workers; replace panicked ones while work remains.
+    let mut i = 0;
+    while i < handles.len() {
+        let h = std::mem::replace(&mut handles[i], std::thread::spawn(|| false));
+        match h.join() {
+            Ok(true) => {
+                if next.load(Ordering::Relaxed) < n_jobs {
+                    let (jobs, next, written) = (jobs.clone(), next.clone(), written.clone());
+                    let pool = pool.clone();
+                    let opts = opts.clone();
+                    let target = target.clone();
+                    if let Ok(nh) = std::thread::Builder::new()
+                        .stack_size(512 * 1024 * 1024)
+                        .spawn(move || {
+                            loop {
+                                let i = next.fetch_add(1, Ordering::Relaxed);
+                                if i >= jobs.len() {
+                                    return false;
+                                }
+                                let job = &jobs[i];
+                                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    process_job(job, &pool, &opts, &target)
+                                }));
+                                match res {
+                                    Ok(Ok(n)) => {
+                                        written.fetch_add(n, Ordering::Relaxed);
+                                    }
+                                    Ok(Err(e)) => eprintln!("jcdc: {}: {}", job_label(job), e),
+                                    Err(_) => {
+                                        eprintln!("jcdc: internal panic on {}", job_label(job));
+                                        return true;
+                                    }
+                                }
+                            }
+                        })
+                    {
+                        handles[i] = nh;
+                        continue; // re-join this slot
+                    }
+                }
+            }
+            Err(_) => eprintln!("jcdc: worker thread failed"),
+            _ => {}
+        }
+        i += 1;
+    }
+    written.load(Ordering::Relaxed)
+}
+
 fn decompile_path(
     path: &Path,
     pool: &ClassPool,
@@ -214,12 +365,15 @@ fn decompile_path(
     target: &OutTarget,
 ) -> anyhow::Result<usize> {
     if path.is_dir() {
-        // every .class file
-        let mut written = 0usize;
-        for entry in walkdir(path)? {
-            written += decompile_class_file(&entry, pool, opts, target, Some(path))?;
-        }
-        return Ok(written);
+        // every .class file, rendered in parallel
+        let jobs = walkdir(path)?
+            .into_iter()
+            .map(|entry| Job::File {
+                path: entry,
+                root: Some(path.to_path_buf()),
+            })
+            .collect();
+        return Ok(run_jobs(jobs, pool, opts, target));
     }
     if is_zip_like(path) {
         if let OutTarget::File(_) = target {
@@ -227,7 +381,7 @@ fn decompile_path(
         }
         let file = std::fs::File::open(path)?;
         let mut zip = zip::ZipArchive::new(file)?;
-        let mut written = 0usize;
+        let mut jobs = Vec::with_capacity(zip.len());
         for i in 0..zip.len() {
             let mut e = zip.by_index(i)?;
             let name = e.name().to_string();
@@ -236,23 +390,21 @@ fn decompile_path(
             }
             let mut buf = Vec::with_capacity(e.size() as usize);
             std::io::Read::read_to_end(&mut e, &mut buf)?;
-            let stem = name.trim_end_matches(".class");
-            if jcdc_decompiler::classdec::is_nested_in_pool(stem, pool) {
-                continue;
-            }
-            let java_name = format!("{}.java", stem);
-            match decompile_one(&buf, pool, opts, stem) {
-                Ok(source) => {
-                    if write_source(target, &java_name, &source) {
-                        written += 1;
-                    }
-                }
-                Err(e) => eprintln!("jcdc: failed to decompile {}: {}", name, e),
-            }
+            jobs.push(Job::Bytes { name, data: buf });
         }
-        return Ok(written);
+        return Ok(run_jobs(jobs, pool, opts, target));
     }
-    decompile_class_file(path, pool, opts, target, None)
+    // Single class file: still via the worker pool so it gets the 512MB
+    // stack + panic isolation the main thread cannot provide.
+    Ok(run_jobs(
+        vec![Job::File {
+            path: path.to_path_buf(),
+            root: None,
+        }],
+        pool,
+        opts,
+        target,
+    ))
 }
 
 fn decompile_class_file(
@@ -262,7 +414,7 @@ fn decompile_class_file(
     target: &OutTarget,
     root: Option<&Path>,
 ) -> anyhow::Result<usize> {
-    if std::env::var("JCDC_TRACE_FILES").is_ok() {
+    if jcdc_decompiler::dbg_flag!("JCDC_TRACE_FILES") {
         eprintln!("jcdc-file: {}", path.display());
     }
     let data = std::fs::read(path).with_context(|| format!("reading {:?}", path))?;
@@ -333,9 +485,7 @@ fn decompile_one(
 fn decompile_with_pool(data: &[u8], pool: &ClassPool, opts: &ClassOptions) -> anyhow::Result<String> {
     use jcdc_classfile::parse_classfile;
     use jcdc_classfile::CpLookup;
-    let slow_ms: Option<u128> = std::env::var("JCDC_SLOW_LOG")
-        .ok()
-        .and_then(|v| v.parse().ok());
+    let slow_ms: Option<u128> = jcdc_decompiler::dbg_value!("JCDC_SLOW_LOG", u128);
     let t0 = slow_ms.map(|_| std::time::Instant::now());
     let (_, cf) = parse_classfile(data).map_err(|e| anyhow::anyhow!("parse error: {:?}", e))?;
     let cp = CpLookup::new(&cf.constant_pool);
@@ -343,43 +493,21 @@ fn decompile_with_pool(data: &[u8], pool: &ClassPool, opts: &ClassOptions) -> an
         .class_name(&cf.constant_pool, cf.this_class)
         .unwrap_or("Unknown")
         .to_string();
-    let name_dbg = name.clone();
-    let owned = (cf, cp, name);
-    // Panic isolation: a bug on one class must not abort the whole run.
-    // Big-stack thread: pathological methods (giant expression trees, deep
-    // CFG recursion) would otherwise overflow the default 2-8 MB stack and
-    // abort the process outright (uncatchable).
-    let pool2 = pool.clone();
-    let opts2 = opts.clone();
-    let worker = std::thread::Builder::new()
-        .stack_size(512 * 1024 * 1024)
-        .spawn(move || {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                let (cf, cp, name) = owned;
-                let pc = std::sync::Arc::new(jcdc_jvm::PoolClass { internal_name: name, cf, cp });
-                jcdc_decompiler::decompile_class(&pc, &pool2, &opts2)
-            }))
-        });
-    let res: Result<anyhow::Result<String>, Box<dyn std::any::Any + Send>> = match worker {
-        Ok(h) => match h.join() {
-            Ok(r) => r,
-            Err(e) => Err(e),
-        },
-        Err(e) => Err(Box::new(e)),
-    };
+    // Runs directly on the caller's thread: run_jobs workers provide the
+    // 512MB stacks and the panic catch (a panic replaces the whole worker
+    // so contaminated thread-locals never render another class).
+    let pc = std::sync::Arc::new(jcdc_jvm::PoolClass { internal_name: name, cf, cp });
+    let res = jcdc_decompiler::decompile_class(&pc, pool, opts);
     if let (Some(thresh), Some(t0)) = (slow_ms, t0) {
         let el = t0.elapsed().as_millis();
         if el >= thresh {
             match &res {
-                Ok(Ok(r)) => eprintln!("jcdc-slow: {} {}ms out={}B", name_dbg, el, r.len()),
-                _ => eprintln!("jcdc-slow: {} {}ms (err)", name_dbg, el),
+                Ok(r) => eprintln!("jcdc-slow: {} {}ms out={}B", pc.internal_name, el, r.len()),
+                Err(_) => eprintln!("jcdc-slow: {} (err)", pc.internal_name),
             }
         }
     }
-    match res {
-        Ok(r) => r,
-        Err(_) => anyhow::bail!("internal panic during decompilation"),
-    }
+    res
 }
 
 /// Send one rendered source to its target: stdout (with a separator header

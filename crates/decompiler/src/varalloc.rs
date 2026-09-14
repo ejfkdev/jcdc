@@ -594,7 +594,7 @@ impl VarTable {
         for v in vt.by_slot.iter_mut() {
             v.sort_by_key(|(s, _, _)| *s);
         }
-        if std::env::var("JCDC_DBG_PVAR").is_ok() {
+        if crate::dbg_flag!("JCDC_DBG_PVAR") {
             for vi in &vt.vars {
                 eprintln!("PVAR {} id={} ty={:?} synth={} range=({},{})", vi.name, vi.id, vi.ty, vi.synthetic_name, vi.range_start, vi.range_end);
             }
