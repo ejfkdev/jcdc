@@ -50,7 +50,10 @@ jobs:
             name: macos-arm64
             archive: tar.gz
             upx: false
-          - os: macos-13
+          # macos-13 (Intel) runners are being retired and sit queued for
+          # a long time; cross-compile x86_64 on the arm64 runner instead
+          # (rustc passes -arch x86_64 to Apple clang automatically).
+          - os: macos-latest
             target: x86_64-apple-darwin
             name: macos-amd64
             archive: tar.gz
