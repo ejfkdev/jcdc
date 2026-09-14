@@ -10,9 +10,9 @@ repository = "https://github.com/ejfkdev/jcdc"
 homepage = "https://github.com/ejfkdev/jcdc"
 
 [workspace.dependencies]
-jcdc-classfile = { path = "crates/classfile" }
-jcdc-jvm = { path = "crates/jvm" }
-jcdc-decompiler = { path = "crates/decompiler" }
+jcdc-classfile = { path = "crates/classfile", version = "0.1.1" }
+jcdc-jvm = { path = "crates/jvm", version = "0.1.1" }
+jcdc-decompiler = { path = "crates/decompiler", version = "0.1.1" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
