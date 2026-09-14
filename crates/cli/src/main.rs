@@ -17,7 +17,13 @@ enum OutTarget {
 }
 
 fn print_help() {
-    println!("jcdc — Java class file decompiler");
+    println!(
+        "jcdc {} — Java class file decompiler",
+        env!("CARGO_PKG_VERSION")
+    );
+    println!();
+    println!("Decompiles .class files (class version 45-70, Java 1.1-26) back");
+    println!("into readable, recompilable Java source.");
     println!();
     println!("Usage: jcdc [OPTIONS] <INPUT>...");
     println!("       jcdc <help|version>");
@@ -48,7 +54,18 @@ fn print_help() {
     println!("  jcdc -o - classes/                      # dump everything to stdout");
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
+    if let Err(e) = run() {
+        // Invalid invocation: show what went wrong, then the full help so
+        // the user does not have to re-run with -h.
+        eprintln!("jcdc: {e:?}");
+        eprintln!();
+        print_help();
+        std::process::exit(2);
+    }
+}
+
+fn run() -> anyhow::Result<()> {
     if !jcdc_decompiler::dbg_flag!("JCDC_PANIC_VERBOSE") {
         std::panic::set_hook(Box::new(|info| {
             if jcdc_decompiler::dbg_flag!("JCDC_PANIC_LOG") {

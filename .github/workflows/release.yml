@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Release artifacts ship without debug symbols (the workspace profile
+  # keeps debug=true for local profiling).
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+
+jobs:
+  # The binary's --version prints CARGO_PKG_VERSION, so the git tag and
+  # the workspace version must be the same string.
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must equal workspace version
+        run: |
+          V=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "tag=${GITHUB_REF_NAME} cargo=v$V"
+          [ "v$V" = "${GITHUB_REF_NAME}" ] || {
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo workspace version v$V"
+            exit 1
+          }
+
+  build:
+    needs: check-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: linux-amd64
+            archive: tar.gz
+            upx: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: windows-amd64
+            archive: zip
+            upx: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: macos-arm64
+            archive: tar.gz
+            upx: false
+          - os: macos-13
+            target: x86_64-apple-darwin
+            name: macos-amd64
+            archive: tar.gz
+            upx: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} --bin jcdc
+
+      - name: UPX-compress (linux/windows)
+        if: matrix.upx
+        shell: bash
+        run: |
+          BIN=target/${{ matrix.target }}/release/jcdc
+          case "${{ runner.os }}" in
+            Linux)   sudo apt-get update -y && sudo apt-get install -y upx ;;
+            Windows) choco install upx -y ;;
+          esac
+          upx --best --lzma "$BIN" || upx --best "$BIN"
+          upx -t "$BIN"
+          ls -la target/${{ matrix.target }}/release/
+
+      - name: Package
+        shell: bash
+        run: |
+          TAG=${GITHUB_REF_NAME}
+          STAGE=jcdc-${TAG}-${{ matrix.name }}
+          mkdir -p "$STAGE" dist
+          BIN=target/${{ matrix.target }}/release/jcdc
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            cp "$BIN.exe" "$STAGE/jcdc.exe"
+            cp README.md "$STAGE/"
+            powershell -NoProfile -Command "Compress-Archive -Path '$STAGE' -DestinationPath 'dist/$STAGE.zip'"
+          else
+            cp "$BIN" "$STAGE/jcdc"
+            cp README.md "$STAGE/"
+            tar -czf "dist/$STAGE.tar.gz" "$STAGE"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jcdc-${{ matrix.name }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: jcdc-*
+          path: assets
+          merge-multiple: true
+      - name: Combined checksums
+        run: (cd assets && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: assets/*
+          generate_release_notes: true
