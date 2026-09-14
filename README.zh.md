@@ -48,12 +48,27 @@ Procyon 快约 16 倍。（jcdc 带 `-cp rt.jar` 提供完整类型上下文；J
 
 ## 安装
 
-从 **[Releases](https://github.com/ejfkdev/jcdc/releases)** 下载预编译二进制——
-**Linux / Windows / macOS × amd64 / arm64** 六平台裸可执行文件（不打压缩包；
-含苹果 M 芯片；Linux/Windows 支持的平台经 UPX 压缩，macOS 因 UPX 不支持
-Mach-O 仅剥离符号），另附 `SHA256SUMS.txt` 校验和。或源码构建：
+**Homebrew**（macOS 苹果 M 芯片 / Intel，以及 Linux amd64/arm64）：
 
 ```sh
+brew install ejfkdev/tap/jcdc
+```
+
+**crates.io**（任何装有 Rust 的平台；会一并安装 `dbg2`/`dbg3` 调试辅助工具）：
+
+```sh
+cargo install jcdc --locked
+```
+
+**预编译二进制**：从 **[Releases](https://github.com/ejfkdev/jcdc/releases)**
+下载——**Linux / Windows / macOS × amd64 / arm64** 六平台裸可执行文件
+（不打压缩包；含苹果 M 芯片；Linux/Windows 支持的平台经 UPX 压缩，macOS
+因 UPX 不支持 Mach-O 仅剥离符号），另附 `SHA256SUMS.txt` 校验和。
+
+**源码构建：**
+
+```sh
+git clone https://github.com/ejfkdev/jcdc && cd jcdc
 cargo build --release        # 产物: target/release/jcdc
 ```
 

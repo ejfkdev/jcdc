@@ -54,13 +54,28 @@ tools resolve from the input jar itself.)
 
 ## Install
 
-Download a prebuilt binary from **[Releases](https://github.com/ejfkdev/jcdc/releases)** —
+**Homebrew** (macOS Apple silicon / Intel, and Linux amd64/arm64):
+
+```sh
+brew install ejfkdev/tap/jcdc
+```
+
+**crates.io** (any platform with Rust; also installs the `dbg2`/`dbg3`
+debug helpers):
+
+```sh
+cargo install jcdc --locked
+```
+
+**Prebuilt binaries** from **[Releases](https://github.com/ejfkdev/jcdc/releases)** —
 raw executables (no archives) for **Linux / Windows / macOS × amd64 / arm64**
 (Apple silicon included; Linux & Windows UPX-compressed where supported,
 macOS stripped-only since UPX has no Mach-O support), plus `SHA256SUMS.txt`.
-Or build from source:
+
+**From source:**
 
 ```sh
+git clone https://github.com/ejfkdev/jcdc && cd jcdc
 cargo build --release        # binary: target/release/jcdc
 ```
 
