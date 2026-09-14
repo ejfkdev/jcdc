@@ -30,6 +30,28 @@ fresh Rust implementation.
   structuring with per-arrival shared-tail copies; source-exact
   short-circuit (`&&`/`||`) and `assert` idiom recovery.
 
+## Performance
+
+Whole-SDK benchmark: every class in Java 8's `rt.jar` (20,413 class entries →
+12,609 emitted compilation units), Apple M5 Pro (18 cores, 48 GB), macOS.
+Java tools run on the same JVM (OpenJDK 26, `-Xmx8g`); each tool gets one
+`/usr/bin/time -l` run after jcdc has warmed the page cache. Reproduce with
+[`scripts/bench.sh`](scripts/bench.sh).
+
+| Tool | Wall time | Peak RSS | Units emitted |
+|---|---:|---:|---:|
+| **jcdc** (parallel — default, 1 worker/core) | **6.5 s** | **618 MB** | 12,609 |
+| jcdc (`JCDC_THREADS=1`, single-threaded) | 22.6 s | 467 MB | 12,609 |
+| Vineflower 1.11.1 | 23.6 s | 8,631 MB | 12,609 |
+| CFR 0.152 | 53.9 s | 4,911 MB | 12,609 |
+| Procyon 0.6.0 | 105.9 s | 4,279 MB | 12,586 |
+
+Even single-threaded, jcdc matches the fastest JVM decompiler's wall time at
+**~1/18 of its peak memory**; with the default parallel pipeline it is ~3.6×
+faster than Vineflower, ~8× faster than CFR and ~16× faster than Procyon on
+this workload. (jcdc runs with `-cp rt.jar` for full type context; the JVM
+tools resolve from the input jar itself.)
+
 ## Install
 
 Download a prebuilt binary from **[Releases](https://github.com/ejfkdev/jcdc/releases)** —

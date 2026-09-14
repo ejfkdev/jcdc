@@ -26,6 +26,26 @@ Java 源码。设计参考了 fernflower/Vineflower、garlic、CFR、Procyon、K
 - **控制流忠实**——循环/条件/switch/try-catch-finally 结构化 + per-arrival
   共享尾拷贝；短路（`&&`/`||`）与 `assert` 习语源码级还原。
 
+## 性能对比
+
+整包 SDK 基准：Java 8 `rt.jar` 全量 class（20,413 个 class 条目 → 12,609 个
+编译单元），Apple M5 Pro（18 核 / 48GB）/ macOS。Java 工具统一跑在同一 JVM
+（OpenJDK 26，`-Xmx8g`）；jcdc 先跑预热页缓存，之后每个工具 `/usr/bin/time -l`
+计时一次。复现脚本：[`scripts/bench.sh`](scripts/bench.sh)。
+
+| 工具 | 墙钟时间 | 峰值内存 | 产出文件 |
+|---|---:|---:|---:|
+| **jcdc**（并行——默认，每核 1 worker） | **6.5 秒** | **618 MB** | 12,609 |
+| jcdc（`JCDC_THREADS=1` 单线程） | 22.6 秒 | 467 MB | 12,609 |
+| Vineflower 1.11.1 | 23.6 秒 | 8,631 MB | 12,609 |
+| CFR 0.152 | 53.9 秒 | 4,911 MB | 12,609 |
+| Procyon 0.6.0 | 105.9 秒 | 4,279 MB | 12,586 |
+
+即便单线程，jcdc 的墙钟时间也与最快的 JVM 反编译器持平，而峰值内存只有其
+**约 1/18**；默认并行管线下比 Vineflower 快约 3.6 倍、比 CFR 快约 8 倍、比
+Procyon 快约 16 倍。（jcdc 带 `-cp rt.jar` 提供完整类型上下文；Java 工具从
+输入 jar 自行解析。）
+
 ## 安装
 
 从 **[Releases](https://github.com/ejfkdev/jcdc/releases)** 下载预编译二进制——
