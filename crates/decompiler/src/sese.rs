@@ -26,7 +26,7 @@ use crate::structure::{
     Region, Structurer,
 };
 
-/// Per-method precomputation for the SESE decomposition.
+// Per-method precomputation for the SESE decomposition.
 thread_local! {
     /// Set when a matexit splice committed in the current method; read by
     /// decompile_method's post-pipeline pathology retry.

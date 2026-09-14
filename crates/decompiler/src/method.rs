@@ -2181,74 +2181,6 @@ fn breaks_escape(
     }
 }
 
-/// Like `contains_labeled_break`, but a `break L` whose label L is
-/// BOUND by a nested Labeled construct inside this body does NOT count:
-/// it exits the nested loop/switch, not the enclosing one (jdk17
-/// SignatureReader.parseType: the outer `while (true)` body's only break
-/// is `break L3` of the nested `L3: while (charAt != '>')` — counting it
-/// as an escape made the loop look completable, prune_unreachable kept
-/// the post-loop `return offset`, and javac rejected the genuinely
-/// unreachable tail — 无法访问的语句, latent behind OCSPResponse's FLOW
-/// mask).
-fn contains_labeled_break_bound(s: &Stmt, bound: &std::collections::HashSet<String>) -> bool {
-    match s {
-        Stmt::Break(Some(l)) => !bound.contains(l),
-        Stmt::Break(None) => false,
-        Stmt::Block(v) => v.iter().any(|x| contains_labeled_break_bound(x, bound)),
-        Stmt::If { then_stmt, else_stmt, .. } => {
-            contains_labeled_break_bound(then_stmt, bound)
-                || else_stmt
-                    .as_deref()
-                    .map(|e| contains_labeled_break_bound(e, bound))
-                    .unwrap_or(false)
-        }
-        Stmt::Labeled { label, body } => {
-            let mut b2 = bound.clone();
-            b2.insert(label.clone());
-            contains_labeled_break_bound(body, &b2)
-        }
-        Stmt::While { body, .. }
-        | Stmt::DoWhile { body, .. }
-        | Stmt::ForEach { body, .. }
-        | Stmt::Synchronized { body, .. } => contains_labeled_break_bound(body, bound),
-        Stmt::For { init, body, .. } => {
-            init.iter().any(|x| contains_labeled_break_bound(x, bound))
-                || contains_labeled_break_bound(body, bound)
-        }
-        Stmt::Switch { cases, default, .. } => {
-            cases
-                .iter()
-                .flat_map(|c| c.body.iter())
-                .any(|x| contains_labeled_break_bound(x, bound))
-                || default
-                    .as_deref()
-                    .map(|d| contains_labeled_break_bound(d, bound))
-                    .unwrap_or(false)
-        }
-        Stmt::Try { body, catches, finally } => {
-            contains_labeled_break_bound(body, bound)
-                || catches
-                    .iter()
-                    .any(|c| contains_labeled_break_bound(&c.body, bound))
-                || finally
-                    .as_deref()
-                    .map(|f| contains_labeled_break_bound(f, bound))
-                    .unwrap_or(false)
-        }
-        Stmt::TryWithResources { resources, body, catches, finally } => {
-            resources.iter().any(|x| contains_labeled_break_bound(x, bound))
-                || contains_labeled_break_bound(body, bound)
-                || catches
-                    .iter()
-                    .any(|c| contains_labeled_break_bound(&c.body, bound))
-                || finally
-                    .as_deref()
-                    .map(|f| contains_labeled_break_bound(f, bound))
-                    .unwrap_or(false)
-        }
-        _ => false,
-    }
-}
 
 pub(crate) fn stmt_terminates(s: &Stmt) -> bool {
     match s {
@@ -2438,7 +2370,7 @@ fn switch_terminates_with(
             // default, the outer switch read as abrupt, and
             // prune_unreachable deleted the merge `return stack0;` —
             // 缺少返回语句).
-            Stmt::Switch { cases, default, .. } => {
+            Stmt::Switch { .. } => {
                 // Does this nested switch complete normally? Group i does
                 // when it holds a PLAIN `break` (exits the switch), or its
                 // last statement is not abrupt (return/throw/break/
@@ -2680,10 +2612,6 @@ fn prune_unreachable(s: &mut Stmt) {
         Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => prune_unreachable(body),
         _ => {}
     }
-}
-
-fn is_terminator_stmt(s: &Stmt) -> bool {
-    matches!(s, Stmt::Return(_) | Stmt::Throw(_) | Stmt::Break(_) | Stmt::Continue(_))
 }
 
 fn strip_tail_break(body: &mut Stmt) {
@@ -7578,10 +7506,6 @@ fn booleanize_deep(e: &mut crate::expr::Expr) {
         Expr::Field { owner: Some(o), .. } => booleanize_deep(o),
         _ => {}
     }
-}
-
-fn booleanize_deep_stmt(s: &mut Stmt) {
-    booleanize_deep_stmt_r(s, false, &jcdc_jvm::JavaType::Int)
 }
 
 /// `numeric_ret`: the enclosing method returns a numeric (non-boolean)

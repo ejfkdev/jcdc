@@ -1,7 +1,7 @@
 //! Class pool: lazy loading of classes from directories and jars, with a
 //! shared cache and hierarchy-aware member resolution.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -180,6 +180,11 @@ struct PoolState {
     /// entries re-scanned per get() x 20k classes).
     zips: Vec<Option<zip::ZipArchive<std::fs::File>>>,
     cache: HashMap<String, Arc<PoolClass>>,
+    /// FIFO insertion order of `cache` for bounded eviction (see
+    /// `evict_to_cap`). Pure cache discipline: an evicted class is
+    /// re-parsed on the next lookup.
+    cache_order: VecDeque<String>,
+    cache_cap: usize,
     negative: HashSet<String>,
     /// Names from primary sources (the inputs being decompiled), as
     /// opposed to classpath references. Family/nested-class enumeration
@@ -206,9 +211,29 @@ struct PoolState {
 
 /// A searchable collection of classes (directories and jars), with a shared
 /// parse cache. Cheap to clone (all state behind Arc).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ClassPool {
     state: Arc<Mutex<PoolState>>,
+}
+
+impl Default for ClassPool {
+    fn default() -> Self {
+        // Bound the parse cache: a whole-jar run (rt.jar) otherwise pins
+        // every parsed PoolClass (~90KB each) for the process lifetime —
+        // 1.8GB peak RSS. Evicted classes re-parse on demand (zip/dir
+        // bytes are still cached at the OS level). JCDC_POOL_CAP=0
+        // disables eviction.
+        let cap = std::env::var("JCDC_POOL_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4096);
+        ClassPool {
+            state: Arc::new(Mutex::new(PoolState {
+                cache_cap: cap,
+                ..Default::default()
+            })),
+        }
+    }
 }
 
 impl ClassPool {
@@ -311,6 +336,8 @@ impl ClassPool {
         match PoolClass::parse(&data, internal_name.to_string()) {
             Ok(pc) => {
                 st.cache.insert(internal_name.to_string(), pc.clone());
+                st.cache_order.push_back(internal_name.to_string());
+                evict_to_cap(&mut st);
                 Some(pc)
             }
             Err(_) => {
@@ -389,6 +416,15 @@ impl ClassPool {
             .get(internal)
             .map(|roots| roots.iter().any(|r| r != nest_root))
             .unwrap_or(false);
+        if std::env::var("JCDC_DBG_MEM").is_ok() {
+            let pairs: usize = index.values().map(|v| v.len()).sum();
+            eprintln!(
+                "NESTIDX built: keys={} pairs={} (query {})",
+                index.len(),
+                pairs,
+                internal
+            );
+        }
         // Phase 3: store (another thread may have raced us; same result).
         self.state.lock().unwrap().nest_ref_index = Some(index);
         hit
@@ -593,6 +629,23 @@ fn is_zip(path: &Path) -> bool {
             }
             false
         }
+    }
+}
+
+/// FIFO-evict parsed classes beyond the cap. Input classes (added via
+/// add_source) are never registered in cache_order and thus pinned.
+/// A stale order entry (name evicted then re-inserted) may drop the
+/// fresh entry too — correctness is unaffected (it re-parses), only a
+/// rare extra parse.
+fn evict_to_cap(st: &mut PoolState) {
+    if st.cache_cap == 0 {
+        return;
+    }
+    while st.cache.len() > st.cache_cap {
+        let Some(old) = st.cache_order.pop_front() else {
+            break;
+        };
+        st.cache.remove(&old);
     }
 }
 

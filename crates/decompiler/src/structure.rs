@@ -133,7 +133,6 @@ fn intersect(mut a: usize, mut b: usize, idom: &[usize], rpo_num: &[usize]) -> u
     a
 }
 
-/// Blocks normally reachable from `entry` without entering `stop`.
 thread_local! {
     /// Set while a SESE consumed-arrival copy runs: there the copy IS the
     /// arm's only emission route (the consumed merge has no sibling owner
@@ -171,6 +170,19 @@ pub(crate) fn bypass_flows_to(cfg: &Cfg, from: usize, to: usize, barred: &HashSe
     false
 }
 
+thread_local! {
+    /// Per-method copy-budget override installed by the method size guard
+    /// in classdec (pathological copy explosion retry); consumed by
+    /// Structurer::with_diamonds at construction.
+    pub static BUDGET_OVERRIDE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Install/clear the per-method copy-budget override (see BUDGET_OVERRIDE).
+pub fn set_budget_override(v: Option<u32>) {
+    BUDGET_OVERRIDE.with(|c| c.set(v));
+}
+
+/// Blocks normally reachable from `entry` without entering `stop`.
 pub fn reachable_within(cfg: &Cfg, entry: usize, stop: &HashSet<usize>) -> HashSet<usize> {
     let mut seen = HashSet::new();
     if stop.contains(&entry) {
@@ -1049,8 +1061,8 @@ pub fn group_exceptions_with(cfg: &Cfg, results: Option<&Vec<crate::builder::Blo
                 // span (it would belong to a deeper nest the walk must
                 // keep owning) or inside the protection gap.
                 let foreign_inside = cfg.exc_ranges.iter().any(|r| {
-                    let owned_by_x_or_y = x.handlers.iter().any(|(h, t)| *h == r.handler)
-                        || y.handlers.iter().any(|(h, t)| *h == r.handler);
+                    let owned_by_x_or_y = x.handlers.iter().any(|(h, _)| *h == r.handler)
+                        || y.handlers.iter().any(|(h, _)| *h == r.handler);
                     !owned_by_x_or_y
                         && r.start >= x.start
                         && r.end <= y.end
@@ -1269,6 +1281,25 @@ pub struct Structurer<'a> {
     /// Current `walk` recursion depth (hang guard for pathological methods
     /// whose shared-tail / branch decomposition does not converge).
     walk_depth: usize,
+    /// Per-method ticket budget for COPY-producing mechanisms
+    /// (copy_walk, PARKCHAIN chain completions, per-arrival fills).
+    /// Nested copies multiply: jdk8 java.awt.Toolkit.eventDispatched's
+    /// 14-deep event-mask if-chain inside synchronized blocks drove
+    /// 2^14 = 17792 duplications of the dispatch chain (47MB single
+    /// method render, ~1GB transient allocations, 5.2s). Golden shapes
+    /// Measured per-method demands: golden shapes <25 (dci ~8, huc
+    /// ~10, keytool epilogue ~22); jdk26 IndicConjunctBreak's SESE path
+    /// needs 457 + 257 on its two heaviest methods (legit shared-tail
+    /// work — cutting it loses returns); Toolkit.eventDispatched wants
+    /// 17792+ (exponential). Default 512 covers the legit demand; the
+    /// METHOD SIZE GUARD in classdec (450KB) re-renders any overflowing
+    /// method at halved budgets, so the exponential cases collapse
+    /// (Toolkit 47.7MB -> 330KB, compilable) without touching the legit
+    /// big renders (keytool doCommands 420KB). Exhausted budget degrades
+    /// to the historical Goto paths (conversion resolves them to
+    /// elision/break/continue). JCDC_COPY_BUDGET overrides; 0 disables
+    /// copying entirely.
+    copy_budget: std::cell::Cell<u32>,
     pub groups: Vec<TryGroup>,
     /// Outermost group index owning each body block.
     pub body_group: HashMap<usize, usize>,
@@ -1839,7 +1870,6 @@ fn region_shape(r: &Region) -> String {
         Region::Empty => "Empty".to_string(),
         Region::Try { group_idx, .. } => format!("Try(g{})", group_idx),
         Region::CopyStmts { block } => format!("Copy({})", block),
-        _ => "?".to_string(),
     }
 }
 
@@ -1880,7 +1910,7 @@ impl<'a> Structurer<'a> {
         for (&merge, (root, _vis)) in &fold_regions {
             fold_root_to_merge.insert(*root, merge);
         }
-        Structurer { cfg, results, groups, body_group, handler_group, diamond_merges, fold_regions, fold_root_to_merge, copied_tails: HashSet::new(), loops_stack: Vec::new(), switch_depth: 0, case_arm_ctx: Vec::new(), sese_loop_headers: std::collections::HashSet::new(), sese_exc_retry_headers: std::collections::HashSet::new(), walk_depth: 0, final_fields: HashSet::new(), structuring_groups: std::cell::RefCell::new(Vec::new()) }
+        Structurer { cfg, results, groups, body_group, handler_group, diamond_merges, fold_regions, fold_root_to_merge, copied_tails: HashSet::new(), loops_stack: Vec::new(), switch_depth: 0, case_arm_ctx: Vec::new(), sese_loop_headers: std::collections::HashSet::new(), sese_exc_retry_headers: std::collections::HashSet::new(), walk_depth: 0, copy_budget: std::cell::Cell::new(BUDGET_OVERRIDE.with(|c| c.get()).or_else(|| std::env::var("JCDC_COPY_BUDGET").ok().and_then(|v| v.parse().ok())).unwrap_or(512)), final_fields: HashSet::new(), structuring_groups: std::cell::RefCell::new(Vec::new()) }
     }
 
     /// Immediate post-dominator of `entry` within `universe`. Delegates to the
@@ -1932,30 +1962,6 @@ impl<'a> Structurer<'a> {
         immediate_postdom(self.cfg, universe, entry, &exempt, &stmt_counts, &self.body_group, entry_group, &terminators, &abrupt_only, &final_writers)
     }
 
-    /// True if `b` is an exception-handler head; such blocks must only be
-    /// entered through their Try region, never through the normal flow.
-    /// True when one of the handlers protecting `cur` is a retry
-    /// trampoline: a handler with NO normal preds whose only out-edge
-    /// returns to `cur`, sitting at/after the group's span end (outside
-    /// the protected range). The normal-pred back-edge scan misses it
-    /// (the edge INTO the handler is exceptional), so the group-vs-loop
-    /// precedence wrongly lets the try carve out the header and the retry
-    /// `goto` inlines as an unprotected copy of the body (jdk26
-    /// Future.exceptionNow: `catch (InterruptedException e) { interrupted
-    /// = true; get(); throw ..; }` — 未报告的异常错误 InterruptedException;
-    /// the source is `while (true) { try { get(); .. } catch (IE) {
-    /// interrupted = true; } }`).
-    pub(crate) fn exc_retry_back_edge(&self, cur: usize, gi: usize) -> bool {
-        let g = &self.groups[gi];
-        self.cfg.exc_edges.iter().any(|e| {
-            e.from == cur
-                && e.to != cur
-                && self.cfg.blocks[e.to].pred.is_empty()
-                && self.cfg.blocks[e.to].succ.len() == 1
-                && self.cfg.blocks[e.to].succ[0] == cur
-                && self.cfg.blocks[e.to].start >= g.end
-        })
-    }
 
     pub(crate) fn is_handler(&self, b: usize) -> bool {
         self.handler_group.contains_key(&b)
@@ -2259,7 +2265,6 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
         // uses). The scope's dom root is excluded: idom[root]==root too,
         // and root→cur with cur⇝root is just the enclosing loop's normal
         // circulation, not a loop at `cur`.
-        let mut exc_succ: Option<HashMap<usize, Vec<usize>>> = None;
         for &p in &self.cfg.blocks[cur].pred {
             if p == cur {
                 return true;
@@ -2315,7 +2320,6 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
     /// The verified walk baseline, ungated: the SESE hybrid fallback in
     /// method.rs runs it on a fresh Structurer to compare emission counts.
     pub(crate) fn structure_method_walk(&mut self) -> Region {
-        let dbg_regions = std::env::var("JCDC_DBG_REGIONS").is_ok();
         let universe: HashSet<usize> = self
             .cfg
             .blocks
@@ -3476,7 +3480,11 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                             let saved_switch_depth = self.switch_depth;
                             let saved_case_ctx = self.case_arm_ctx.clone();
                             let saved_walk_depth = self.walk_depth;
-                            let taken_r = self.walk(taken, &cu, &cstop, active, &mut scratch, false);
+                            let taken_r = if self.take_copy_ticket() {
+                                self.walk(taken, &cu, &cstop, active, &mut scratch, false)
+                            } else {
+                                Region::Empty
+                            };
                             if std::env::var("JCDC_DBG_IF").is_ok() {
                                 eprintln!(
                                     "PARKCHAIN cur={} chain={:?} cu={} cstop={:?} taken_r={}",
@@ -3625,8 +3633,10 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                                                             if t == taken && !top {
                                                                 // Deep If-arm tail jumping to the
                                                                 // chain head: own copy of the chain.
-                                                                v[i] = copy.clone();
-                                                                *filled += 1;
+                                                                if st.take_copy_ticket() {
+                                                                    v[i] = copy.clone();
+                                                                    *filled += 1;
+                                                                }
                                                                 continue;
                                                             }
                                                             if t != taken
@@ -3639,10 +3649,14 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                                                                 // preceding CopyStmts{t} (the fresh
                                                                 // Basic(t) supersedes it).
                                                                 let mut sc = claimed.clone();
-                                                                let sub = st.walk(
-                                                                    t, cu2, cstop, active, &mut sc,
-                                                                    false,
-                                                                );
+                                                                let sub = if st.take_copy_ticket() {
+                                                                    st.walk(
+                                                                        t, cu2, cstop, active,
+                                                                        &mut sc, false,
+                                                                    )
+                                                                } else {
+                                                                    Region::Empty
+                                                                };
                                                                 if !matches!(sub, Region::Empty)
                                                                     && simple_completion_local2(&sub)
                                                                     && region_terminates_ex(
@@ -3928,10 +3942,14 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                                                     Some(x) => Some(x),
                                                     None => {
                                                         let mut sc = claimed.clone();
-                                                        let sub = st.walk(
-                                                            *target, cu, cstop, active, &mut sc,
-                                                            false,
-                                                        );
+                                                        let sub = if st.take_copy_ticket() {
+                                                            st.walk(
+                                                                *target, cu, cstop, active,
+                                                                &mut sc, false,
+                                                            )
+                                                        } else {
+                                                            Region::Empty
+                                                        };
                                                         if !matches!(sub, Region::Empty)
                                                             && simple_completion_local(&sub)
                                                             && region_terminates_ex(
@@ -3987,7 +4005,11 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
                                                                 Some(x) => Some(x),
                                                                 None => {
                                                                     let mut sc = claimed.clone();
-                                                                    let sub = st.walk(tgt, cu, cstop, active, &mut sc, false);
+                                                                    let sub = if st.take_copy_ticket() {
+                                                                        st.walk(tgt, cu, cstop, active, &mut sc, false)
+                                                                    } else {
+                                                                        Region::Empty
+                                                                    };
                                                                     if !matches!(sub, Region::Empty)
                                                                         && simple_completion_local(&sub)
                                                                         && region_terminates_ex(&sub, st.results, &[])
@@ -5311,6 +5333,17 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
     /// region that Java cannot express with a jump (no labelable target):
     /// re-executing the blocks matches the bytecode's per-arrival
     /// semantics. Bounded by depth and a no-reentry check.
+    /// Take one copy ticket; false when the per-method budget is spent
+    /// (copy mechanisms must then decline and leave a Goto).
+    fn take_copy_ticket(&self) -> bool {
+        let b = self.copy_budget.get();
+        if b == 0 {
+            return false;
+        }
+        self.copy_budget.set(b - 1);
+        true
+    }
+
     pub(crate) fn copy_walk(
         &mut self,
         t: usize,
@@ -5323,6 +5356,9 @@ fn ctx_is_loop_header(s: &Structurer, t: usize) -> bool {
             static COPY_DEPTH: Cell<u32> = const { Cell::new(0) };
         }
         if COPY_DEPTH.with(|c| c.get()) >= 4 {
+            return None;
+        }
+        if !self.take_copy_ticket() {
             return None;
         }
         if can_reach_cfg(self.cfg, t, guard_against, 4096) {

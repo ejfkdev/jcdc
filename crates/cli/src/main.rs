@@ -291,7 +291,7 @@ fn decompile_class_file(
         OutTarget::File(f) => {
             usize::from(write_source(target, &f.to_string_lossy(), &source))
         }
-        OutTarget::Dir(d) => {
+        OutTarget::Dir(_) => {
             // Package structure preserved: directory inputs use their
             // relative path; a lone class file uses its THIS_CLASS name
             // (the file may sit anywhere, e.g. `jcdc -o out/ ./Foo.class`).
@@ -333,12 +333,17 @@ fn decompile_one(
 fn decompile_with_pool(data: &[u8], pool: &ClassPool, opts: &ClassOptions) -> anyhow::Result<String> {
     use jcdc_classfile::parse_classfile;
     use jcdc_classfile::CpLookup;
+    let slow_ms: Option<u128> = std::env::var("JCDC_SLOW_LOG")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let t0 = slow_ms.map(|_| std::time::Instant::now());
     let (_, cf) = parse_classfile(data).map_err(|e| anyhow::anyhow!("parse error: {:?}", e))?;
     let cp = CpLookup::new(&cf.constant_pool);
     let name = cp
         .class_name(&cf.constant_pool, cf.this_class)
         .unwrap_or("Unknown")
         .to_string();
+    let name_dbg = name.clone();
     let owned = (cf, cp, name);
     // Panic isolation: a bug on one class must not abort the whole run.
     // Big-stack thread: pathological methods (giant expression trees, deep
@@ -362,6 +367,15 @@ fn decompile_with_pool(data: &[u8], pool: &ClassPool, opts: &ClassOptions) -> an
         },
         Err(e) => Err(Box::new(e)),
     };
+    if let (Some(thresh), Some(t0)) = (slow_ms, t0) {
+        let el = t0.elapsed().as_millis();
+        if el >= thresh {
+            match &res {
+                Ok(Ok(r)) => eprintln!("jcdc-slow: {} {}ms out={}B", name_dbg, el, r.len()),
+                _ => eprintln!("jcdc-slow: {} {}ms (err)", name_dbg, el),
+            }
+        }
+    }
     match res {
         Ok(r) => r,
         Err(_) => anyhow::bail!("internal panic during decompilation"),

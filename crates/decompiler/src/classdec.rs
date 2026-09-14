@@ -1386,8 +1386,36 @@ fn emit_class(
         if skip.contains(&mi) {
             continue;
         }
+        // METHOD SIZE GUARD: a method whose render exceeds the guard is
+        // almost always a copy-explosion pathology (jdk8 Toolkit.
+        // eventDispatched: the 14-deep event-mask if-chain nested inside
+        // synchronized blocks drives per-arrival copies exponential —
+        // 17792 duplications, 47MB, and javac 代码过长 even at moderate
+        // copy counts). Re-render the method with a halved copy budget
+        // until it fits (or the budget bottoms out). Legit big methods
+        // (keytool doCommands 420KB, Indic isExtend 205KB) sit under the
+        // guard and are untouched.
+        const SIZE_GUARD: usize = 450 * 1024;
+        let start_len = out.len();
         if let Err(e) = emit_method(pc, pool, fam, mi, out, indent + 1) {
             method_emit_result = Err(e);
+            break;
+        }
+        let mut budget: u32 = crate::structure::BUDGET_OVERRIDE
+            .with(|c| c.get())
+            .unwrap_or(512);
+        while out.len() - start_len > SIZE_GUARD && budget >= 16 {
+            budget /= 2;
+            out.truncate(start_len);
+            crate::structure::set_budget_override(Some(budget));
+            if let Err(e) = emit_method(pc, pool, fam, mi, out, indent + 1) {
+                crate::structure::set_budget_override(None);
+                method_emit_result = Err(e);
+                break;
+            }
+        }
+        crate::structure::set_budget_override(None);
+        if method_emit_result.is_err() {
             break;
         }
     }

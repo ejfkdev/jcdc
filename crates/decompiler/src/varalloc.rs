@@ -517,10 +517,7 @@ impl VarTable {
                         (None, _) => Some(ty.clone()),
                         (Some(_), JavaType::Object(_)) => ev,
                         // primitive store with stray ref evidence: keep primitive
-                        (None2, prim) => {
-                            let _ = None2;
-                            Some(prim.clone())
-                        }
+                        (_ev, prim) => Some(prim.clone()),
                     };
                     let ty = match &ev {
                         Some(e) => e.clone(),
