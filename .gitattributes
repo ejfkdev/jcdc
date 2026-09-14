@@ -1,0 +1,16 @@
+# GitHub linguist configuration — keep language statistics reflecting
+# actual project source (Rust + tooling), not test fixtures or data.
+
+# Binary class-file fixtures for the parser test suite (~20.7k files):
+# test data, also collapsed in diffs/PRs.
+crates/classfile/testcases/** linguist-vendored
+
+# Verification corpus: the Java feature-suite sources are TEST FIXTURES
+# (compiled, decompiled, and behavior-compared by scripts/verify.py).
+# Without this they make the repo look part-Java. The JDK download
+# manifest data lives here too.
+corpus/** linguist-vendored
+
+# Prose documentation (Markdown is excluded from stats by default;
+# explicit so future non-Markdown docs stay out too).
+docs/** linguist-documentation
