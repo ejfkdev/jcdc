@@ -24,33 +24,57 @@ fresh Rust implementation.
   equality on the behavioral suite and zero run-mismatches; full `rt.jar`
   (12,609 classes) renders panic-free and byte-deterministically on both
   structurizer pipelines.
-- **Fast** — whole `rt.jar` in ~6 s (18-core), ~430 MB peak RSS; parallel by
-  default with deterministic, schedule-independent output.
+- **Fast** — whole `rt.jar` in ~7 s and JDK 26 `java.base` in ~3 s (18-core),
+  under 600 MB peak RSS; parallel by default with deterministic,
+  schedule-independent output.
 - **Faithful control flow** — loops/conditions/switch/try-catch-finally
   structuring with per-arrival shared-tail copies; source-exact
   short-circuit (`&&`/`||`) and `assert` idiom recovery.
 
 ## Performance
 
-Whole-SDK benchmark: every class in Java 8's `rt.jar` (20,413 class entries →
-12,609 emitted compilation units), Apple M5 Pro (18 cores, 48 GB), macOS.
-Java tools run on the same JVM (OpenJDK 26, `-Xmx8g`); each tool gets one
-`/usr/bin/time -l` run after jcdc has warmed the page cache. Reproduce with
-[`scripts/bench.sh`](scripts/bench.sh).
+Whole-SDK benchmarks on two workloads — every class in **Java 8's `rt.jar`**
+(20,413 class entries → 12,609 emitted compilation units) and **Java 26's
+`java.base`** module (7,422 class entries → ~3,400 units, extracted with
+`jimage`). Host: Apple M5 Pro (18 cores, 48 GB), macOS. All Java tools run on
+the same JVM (OpenJDK 26) with a uniform `-Xmx8g` heap; each tool gets one
+`/usr/bin/time -l` run (wall time + peak RSS) after jcdc has warmed the page
+cache. Reproduce with [`scripts/bench.sh`](scripts/bench.sh).
+
+**Workload 1 — `rt.jar` (JDK 8, 12,609 units):**
 
 | Tool | Wall time | Peak RSS | Units emitted |
 |---|---:|---:|---:|
-| **jcdc** (parallel — default, 1 worker/core) | **6.5 s** | **618 MB** | 12,609 |
-| jcdc (`JCDC_THREADS=1`, single-threaded) | 22.6 s | 467 MB | 12,609 |
-| Vineflower 1.11.1 | 23.6 s | 8,631 MB | 12,609 |
-| CFR 0.152 | 53.9 s | 4,911 MB | 12,609 |
-| Procyon 0.6.0 | 105.9 s | 4,279 MB | 12,586 |
+| **jcdc** (parallel — default, 1 worker/core) | **7.4 s** | **594 MB** | 12,609 |
+| jcdc (`JCDC_THREADS=1`, single-threaded) | 23.0 s | 461 MB | 12,609 |
+| Vineflower 1.11.1 | 39.9 s | 8,434 MB | 12,609 |
+| CFR 0.152 | 53.0 s | 4,318 MB | 12,609 |
+| Procyon 0.6.0 | 99.4 s | 2,252 MB | 12,586 |
+| fernflower (JetBrains) | 190.5 s | 2,770 MB | 12,609 |
 
-Even single-threaded, jcdc matches the fastest JVM decompiler's wall time at
-**~1/18 of its peak memory**; with the default parallel pipeline it is ~3.6×
-faster than Vineflower, ~8× faster than CFR and ~16× faster than Procyon on
-this workload. (jcdc runs with `-cp rt.jar` for full type context; the JVM
-tools resolve from the input jar itself.)
+**Workload 2 — `java.base` (JDK 26, modern bytecode):**
+
+| Tool | Wall time | Peak RSS | Units emitted |
+|---|---:|---:|---:|
+| **jcdc** (parallel — default) | **2.9 s** | **216 MB** | 3,383 |
+| jcdc (`JCDC_THREADS=1`, single-threaded) | 9.7 s | 153 MB | 3,383 |
+| CFR 0.152 | 20.5 s | 2,145 MB | 3,386 |
+| Vineflower 1.11.1 † | 41.5 s | 10,236 MB | 3,383 |
+| fernflower (JetBrains) | 51.9 s | 2,549 MB | 3,383 |
+| Procyon 0.6.0 | 79.3 s | 3,474 MB | 3,386 |
+
+† Vineflower **OOMs at `-Xmx8g` on the JDK 26 workload** (zero files
+written); the row above is its `-Xmx16g` retry.
+
+Even single-threaded, jcdc is the fastest or near-fastest tool on both
+workloads while using **153–594 MB peak RSS against 2.1–10.2 GB** for the
+JVM tools (~4×–67× less); with the default parallel pipeline it is ~7×
+faster than the next-fastest tool (CFR) on JDK 26 and ~5–26× faster than
+every JVM tool on `rt.jar`. Emitted-unit counts differ slightly between
+tools: jcdc folds `$`-named hidden classes into their family file (and
+emits `module-info.java`), while Procyon skips `package-info` files (−23 on
+`rt.jar`). (jcdc runs with `-cp <jar>` for full type context; the JVM tools
+resolve from the input jar itself.)
 
 ## Install
 
