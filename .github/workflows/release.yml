@@ -72,13 +72,13 @@ jobs:
         shell: bash
         run: |
           BIN=target/${{ matrix.target }}/release/jcdc
+          if [ "${{ runner.os }}" = "Windows" ]; then BIN="$BIN.exe"; fi
           case "${{ runner.os }}" in
             Linux)   sudo apt-get update -y && sudo apt-get install -y upx ;;
-            Windows) choco install upx -y ;;
+            Windows) choco install upx -y --no-progress ;;
           esac
           upx --best --lzma "$BIN" || upx --best "$BIN"
           upx -t "$BIN"
-          ls -la target/${{ matrix.target }}/release/
 
       - name: Package
         shell: bash
