@@ -3,6 +3,9 @@ name = "jcdc-jvm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Java class pool, type resolution and generic signature parsing for jcdc"
 
 [dependencies]
 jcdc-classfile = { workspace = true }

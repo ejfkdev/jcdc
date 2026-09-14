@@ -6,6 +6,8 @@ members = ["crates/classfile", "crates/jvm", "crates/decompiler", "crates/cli"]
 version = "0.1.1"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/ejfkdev/jcdc"
+homepage = "https://github.com/ejfkdev/jcdc"
 
 [workspace.dependencies]
 jcdc-classfile = { path = "crates/classfile" }

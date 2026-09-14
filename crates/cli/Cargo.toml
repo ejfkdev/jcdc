@@ -3,6 +3,9 @@ name = "jcdc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "jcdc — Java class file decompiler (Java 1.1-26 bytecode to recompilable source)"
 
 [[bin]]
 name = "jcdc"

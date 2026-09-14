@@ -3,6 +3,8 @@ name = "jcdc-classfile"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Java class file format parser (vendored from java-class-rs by ejfkdev, extended for jcdc)"
 
 [dependencies]
