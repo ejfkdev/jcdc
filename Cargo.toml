@@ -5,7 +5,7 @@ members = ["crates/classfile", "crates/jvm", "crates/decompiler", "crates/cli"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [workspace.dependencies]
 jcdc-classfile = { path = "crates/classfile" }
