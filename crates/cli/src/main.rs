@@ -261,12 +261,11 @@ fn run_jobs(
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     let n_jobs = jobs.len();
+    // Default: one worker per available CPU core (JCDC_THREADS overrides;
+    // the 64 clamp only guards absurd core counts — each worker reserves
+    // a 512MB virtual stack and its own L1 pool cache slice).
     let workers = jcdc_decompiler::dbg_value!("JCDC_THREADS", usize)
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get().min(8))
-                .unwrap_or(1)
-        })
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
         .clamp(1, 64)
         .min(n_jobs.max(1));
     let jobs = Arc::new(jobs);
