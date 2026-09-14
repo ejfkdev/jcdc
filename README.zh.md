@@ -28,9 +28,10 @@ Java 源码。设计参考了 fernflower/Vineflower、garlic、CFR、Procyon、K
 
 ## 安装
 
-从 **[Releases](https://github.com/ejfkdev/jcdc/releases)** 下载预编译二进制
-（Linux / Windows 经 UPX 压缩，macOS arm64 与 amd64，附 SHA256 校验和），
-或源码构建：
+从 **[Releases](https://github.com/ejfkdev/jcdc/releases)** 下载预编译二进制——
+**Linux / Windows / macOS × amd64 / arm64** 六平台裸可执行文件（不打压缩包；
+含苹果 M 芯片；Linux/Windows 支持的平台经 UPX 压缩，macOS 因 UPX 不支持
+Mach-O 仅剥离符号），另附 `SHA256SUMS.txt` 校验和。或源码构建：
 
 ```sh
 cargo build --release        # 产物: target/release/jcdc

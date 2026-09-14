@@ -35,28 +35,34 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux x64 + arm64 (native ARM runner) — UPX
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             name: linux-amd64
-            archive: tar.gz
             upx: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            name: linux-arm64
+            upx: true
+          # Windows x64 + arm64 (cross on the x64 runner; UPX best-effort —
+          # ARM64 PE support depends on the runner's UPX build)
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             name: windows-amd64
-            archive: zip
             upx: true
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            name: windows-arm64
+            upx: true
+          # macOS arm64 (Apple silicon) + amd64 (cross on the arm runner);
+          # UPX does not support Mach-O — shipped stripped, uncompressed
           - os: macos-latest
             target: aarch64-apple-darwin
             name: macos-arm64
-            archive: tar.gz
             upx: false
-          # macos-13 (Intel) runners are being retired and sit queued for
-          # a long time; cross-compile x86_64 on the arm64 runner instead
-          # (rustc passes -arch x86_64 to Apple clang automatically).
           - os: macos-latest
             target: x86_64-apple-darwin
             name: macos-amd64
-            archive: tar.gz
             upx: false
     runs-on: ${{ matrix.os }}
     steps:
@@ -70,7 +76,7 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} --bin jcdc
 
-      - name: UPX-compress (linux/windows)
+      - name: UPX-compress (linux/windows; best-effort)
         if: matrix.upx
         shell: bash
         run: |
@@ -80,25 +86,27 @@ jobs:
             Linux)   sudo apt-get update -y && sudo apt-get install -y upx ;;
             Windows) choco install upx -y --no-progress ;;
           esac
-          upx --best --lzma "$BIN" || upx --best "$BIN"
-          upx -t "$BIN"
+          BEFORE=$(stat -c %s "$BIN" 2>/dev/null || wc -c < "$BIN")
+          { upx --best --lzma "$BIN" || upx --best "$BIN"; } && upx -t "$BIN" \
+            || echo "::warning::UPX unsupported for this binary — shipping uncompressed"
+          AFTER=$(stat -c %s "$BIN" 2>/dev/null || wc -c < "$BIN")
+          echo "upx: $BEFORE -> $AFTER bytes"
 
-      - name: Package
+      # Assets are the RAW binaries (no tar/zip), named per platform, plus
+      # one combined SHA256SUMS.txt assembled in the release job.
+      - name: Stage binary asset
         shell: bash
         run: |
-          TAG=${GITHUB_REF_NAME}
-          STAGE=jcdc-${TAG}-${{ matrix.name }}
-          mkdir -p "$STAGE" dist
+          mkdir -p dist
           BIN=target/${{ matrix.target }}/release/jcdc
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            cp "$BIN.exe" "$STAGE/jcdc.exe"
-            cp README.md "$STAGE/"
-            powershell -NoProfile -Command "Compress-Archive -Path '$STAGE' -DestinationPath 'dist/$STAGE.zip'"
+          OUT=dist/jcdc-${GITHUB_REF_NAME}-${{ matrix.name }}
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "$BIN.exe" "$OUT.exe"
           else
-            cp "$BIN" "$STAGE/jcdc"
-            cp README.md "$STAGE/"
-            tar -czf "dist/$STAGE.tar.gz" "$STAGE"
+            cp "$BIN" "$OUT"
+            chmod +x "$OUT"
           fi
+          ls -la dist/
 
       - uses: actions/upload-artifact@v4
         with:

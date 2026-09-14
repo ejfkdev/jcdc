@@ -32,9 +32,11 @@ fresh Rust implementation.
 
 ## Install
 
-Download a prebuilt binary from **[Releases](https://github.com/ejfkdev/jcdc/releases)**
-(Linux / Windows UPX-compressed, macOS arm64 & amd64, checksums attached), or
-build from source:
+Download a prebuilt binary from **[Releases](https://github.com/ejfkdev/jcdc/releases)** —
+raw executables (no archives) for **Linux / Windows / macOS × amd64 / arm64**
+(Apple silicon included; Linux & Windows UPX-compressed where supported,
+macOS stripped-only since UPX has no Mach-O support), plus `SHA256SUMS.txt`.
+Or build from source:
 
 ```sh
 cargo build --release        # binary: target/release/jcdc
