@@ -76,7 +76,7 @@ pub fn decompile_method(
 
     let code = crate::varalloc::code_attribute(pc, m_idx).ok_or("missing Code attribute")?;
     let code_len = code.code.len() as u16;
-    let vt = VarTable::build(pc, m_idx, &desc, is_static, code.max_locals, code_len);
+    let vt = crate::varalloc::build_var_table(pc, m_idx, &desc, is_static, code.max_locals, code_len);
 
     let exc: Vec<(u16, u16, u16, u16)> = code
         .exception_table
@@ -195,7 +195,12 @@ pub fn decompile_method(
     // variable; the merge block reads it (fixpoint iteration).
     let n = cfg.blocks.len();
     let universe: std::collections::HashSet<usize> = (0..n).collect();
-    let mut order = crate::structure::reverse_postorder(&cfg, cfg.entry, &universe);
+    // NB: the CFG's successors are rewritten by later passes (condition
+    // absorption re-orders a branch's succ), so the machine-neutral view is
+    // rebuilt at each use site instead of being snapshotted here.
+    let core_for_order = cfg.to_core();
+    let mut order =
+        crate::structure::reverse_postorder(&core_for_order, core_for_order.entry, &universe);
     {
         let mut seen: std::collections::HashSet<usize> = order.iter().copied().collect();
         for b in &cfg.blocks {
@@ -239,6 +244,10 @@ pub fn decompile_method(
     #[allow(unused_assignments)]
     let mut appends: HashMap<usize, Vec<Stmt>> = HashMap::new();
 
+    // The in-stack fixpoint loop recomputes dominators every round; the CFG is
+    // not mutated until the later passes, so one machine-neutral snapshot
+    // serves all rounds (rebuilding it per round dominated the loop's cost).
+    let core_for_dom = cfg.to_core();
     loop {
         // Errors from intermediate rounds (before merges are folded) are
         // transient; only the final round counts.
@@ -248,7 +257,7 @@ pub fn decompile_method(
         let _builder = Builder::new(pc, pool, &vt, &desc, is_static);
 
         let entry_dom = crate::structure::compute_dominators(
-            &cfg,
+            &core_for_dom,
             &(0..n).collect::<std::collections::HashSet<usize>>(),
             cfg.entry,
         );
@@ -572,7 +581,8 @@ pub fn decompile_method(
     } else {
         (std::collections::HashSet::new(), HashMap::new())
     };
-    let mut structurer = Structurer::with_diamonds(&cfg, &results, diamond_merges, fold_regions);
+    let core_cfg = cfg.to_core();
+    let mut structurer = Structurer::with_diamonds(&core_cfg, &results, diamond_merges, fold_regions);
     structurer.final_fields = final_field_set.clone();
     if crate::dbg_flag!("JCDC_DBG_MNAME") {
         eprintln!(
@@ -597,7 +607,7 @@ pub fn decompile_method(
         // mutates consumed/copied state) and its own copied_tails.
         let r_sese = structurer.structure_method();
         let mut walker =
-            Structurer::with_diamonds(&cfg, &results, diamond_merges_w, fold_regions_w);
+            Structurer::with_diamonds(&core_cfg, &results, diamond_merges_w, fold_regions_w);
         walker.final_fields = final_field_set;
         let r_walk = walker.structure_method_walk();
         fn count_emits(r: &crate::structure::Region) -> usize {
@@ -653,7 +663,8 @@ pub fn decompile_method(
         })
         .filter_map(|f| pc.utf8(f.name_index).map(|n| n.to_string()))
         .collect();
-    let mut converter = Converter::new(&cfg, &results)
+    let core_cfg_out = cfg.to_core();
+    let mut converter = Converter::new(&core_cfg_out, &results)
         .with_copied_tails(copied_tails)
         .with_final_fields(final_fields);
     let mut body = converter.convert(region);
@@ -2144,7 +2155,8 @@ fn try_diamond_fold(
     // leaves. Prefer the latest dominator of the leaves (smallest region).
     let n = cfg.blocks.len();
     let universe: HashSet<usize> = (0..n).collect();
-    let rpo = crate::structure::reverse_postorder(cfg, cfg.entry, &universe);
+    let core_cfg2 = cfg.to_core();
+    let rpo = crate::structure::reverse_postorder(&core_cfg2, core_cfg2.entry, &universe);
     if crate::dbg_flag!("JCDC_DBG_DIAMOND") {
         eprintln!("fold merge {} rpo={:?}", bid, rpo);
     }

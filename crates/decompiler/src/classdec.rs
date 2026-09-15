@@ -444,7 +444,8 @@ fn sig_class_header(lpc: &PoolClass, simple: &str, pool: &ClassPool) -> Option<S
         .utf8(u16::from_be_bytes([sig_bytes[0], sig_bytes[1]]))
         .and_then(|x| parse_class_signature(x))?;
     let vt = empty_vt();
-    let p = Printer::new(lpc, pool, &vt);
+    let __ctx = crate::jvmctx::JvmCtx::new(lpc, pool);
+        let p = Printer::new(&__ctx, &vt);
     let mut h = String::from(simple);
     let mut tp = String::new();
     jcdc_jvm::render_type_params(&sig.params, &mut tp);
@@ -1054,15 +1055,16 @@ fn emit_class(
         || is_record;
     if !suppress_super {
         let rendered = match &class_sig {
-            Some(sig) => Printer::new(pc, pool, empty_vt()).type_name(&TypeRef::G(sig.superclass.clone())),
-            None => Printer::new(pc, pool, empty_vt()).shorten(&super_name),
+            Some(sig) => crate::ctx_shim::ctx_type_name(pc, pool, &TypeRef::G(sig.superclass.clone())),
+            None => crate::ctx_shim::ctx_shorten(pc, pool, &super_name),
         };
         header.push_str(" extends ");
         header.push_str(&rendered);
     }
 
     let interfaces: Vec<String> = {
-        let p = Printer::new(pc, pool, empty_vt());
+        let __ctx = crate::jvmctx::JvmCtx::new(pc, pool);
+        let p = Printer::new(&__ctx, empty_vt());
         if let Some(sig) = &class_sig {
             sig.interfaces.iter().map(|i| p.type_name(&TypeRef::G(i.clone()))).collect()
         } else {
@@ -1081,7 +1083,8 @@ fn emit_class(
     }
 
     if !permitted.is_empty() {
-        let p = Printer::new(pc, pool, empty_vt());
+        let __ctx = crate::jvmctx::JvmCtx::new(pc, pool);
+        let p = Printer::new(&__ctx, empty_vt());
         let names: Vec<String> = permitted.iter().map(|n| p.shorten(n)).collect();
         header.push_str(" permits ");
         header.push_str(&names.join(", "));
@@ -1326,7 +1329,8 @@ fn emit_class(
                 // rename as methods (jdk11 JsseJce's `Provider sun`
                 // obscured sun.security.jca.ProviderList — 找不到符号).
                 rename_package_root_locals(&mut body, &mut vt, pc, pool);
-                let text = Printer::new(pc, pool, &vt).with_indent(indent + 1).into_string(&body);
+                let __ctx = crate::jvmctx::JvmCtx::new(pc, pool);
+let text =  Printer::new(&__ctx, &vt).with_indent(indent + 1).into_string(&body);
                 if !text.trim().is_empty() {
                     out.push('\n');
                     out.push_str(&inner_pad);
@@ -1770,7 +1774,7 @@ fn record_components(pc: &PoolClass, pool: &ClassPool) -> String {
                 Some(field_type_of(pc, fi, d))
             })
             .unwrap_or(TypeRef::J(JavaType::Object("java/lang/Object".into())));
-        out.push_str(&Printer::new(pc, pool, empty_vt()).type_name(&ty));
+        out.push_str(&crate::ctx_shim::ctx_type_name(pc, pool, &ty));
         out.push(' ');
         out.push_str(n);
     }
@@ -1997,7 +2001,8 @@ fn member_annotations(pc: &PoolClass, attrs: &[jcdc_classfile::AttributeInfo]) -
 fn render_annotation(pc: &PoolClass, an: &jcdc_classfile::Annotation) -> Option<String> {
     let type_desc = pc.utf8(an.type_index)?;
     let name = type_desc.trim_start_matches('L').trim_end_matches(';');
-    let p = Printer::new(pc, empty_pool(), empty_vt());
+    let __ctx = crate::jvmctx::JvmCtx::new(pc, empty_pool());
+let p =  Printer::new(&__ctx, empty_vt());
     let short = p.shorten(name);
     if an.element_value_pairs.is_empty() {
         return Some(format!("@{}", short));
@@ -2041,11 +2046,11 @@ fn render_element_value(pc: &PoolClass, v: &jcdc_classfile::ElementValue) -> Str
             let t = pc.utf8(*type_name_index).unwrap_or("?");
             let t = t.trim_start_matches('L').trim_end_matches(';');
             let c = pc.utf8(*const_name_index).unwrap_or("?");
-            format!("{}.{}", Printer::new(pc, empty_pool(), empty_vt()).shorten(t), c)
+            format!("{}.{}", crate::ctx_shim::ctx_shorten(pc, empty_pool(), t), c)
         }
         EV::Class { class_info_index } => pc
             .class_name(*class_info_index)
-            .map(|n| format!("{}.class", Printer::new(pc, empty_pool(), empty_vt()).shorten(n)))
+            .map(|n| format!("{}.class", crate::ctx_shim::ctx_shorten(pc, empty_pool(), n)))
             .unwrap_or_else(|| "void.class".into()),
         EV::AnnotationType { annotation } => render_annotation(pc, annotation).unwrap_or_else(|| "@?".into()),
         EV::Array { values } => {
@@ -2410,7 +2415,7 @@ fn emit_field_impl(pc: &PoolClass, pool: &ClassPool, fi: usize, out: &mut String
         line.push_str("transient ");
     }
     let ty = field_type_of(pc, fi, desc);
-    line.push_str(&Printer::new(pc, pool, empty_vt()).type_name(&ty));
+    line.push_str(&crate::ctx_shim::ctx_type_name(pc, pool, &ty));
     line.push(' ');
     line.push_str(name);
     for attr in &f.attributes {
@@ -2483,7 +2488,8 @@ fn emit_field_impl(pc: &PoolClass, pool: &ClassPool, fi: usize, out: &mut String
             // Need the declaring method's VarTable for local names; ctor
             // initializers of anonymous classes only reference constants,
             // captures (raw text) and fields, so the empty table suffices.
-            let mut p = Printer::new(pc, pool, empty_vt());
+            let __ctx = crate::jvmctx::JvmCtx::new(pc, pool);
+            let mut p = Printer::new(&__ctx, empty_vt());
             let mut t = String::new();
             let is_bool = parse_field_descriptor(desc) == Some(jcdc_jvm::JavaType::Boolean);
             if is_bool {
@@ -3143,7 +3149,8 @@ fn emit_method_with(
         line.push_str("default ");
     }
 
-    let p0 = Printer::new(pc, pool, empty_vt());
+    let __ctx = crate::jvmctx::JvmCtx::new(pc, pool);
+let p0 =  Printer::new(&__ctx, empty_vt());
     if let Some(sig) = &msig {
         let mut tp = String::new();
         jcdc_jvm::render_type_params(&sig.params, &mut tp);
@@ -3681,7 +3688,8 @@ fn emit_method_with(
             // earlier reshaping pass, leaving undefined-label breaks.
             crate::method::demote_undefined_label_jumps(&mut body);
             late_typevar_arg_casts(&mut body, pc, pool, msig.as_ref(), &mb.vt);
-            let text = Printer::new(pc, pool, &mb.vt)
+            let __ctx = crate::jvmctx::JvmCtx::new(pc, pool);
+let text =  Printer::new(&__ctx, &mb.vt)
                 .with_indent(indent + 1)
                 .with_ret_bool(ret_bool)
                 .with_ret_char(ret_char)
@@ -4546,7 +4554,7 @@ fn method_param_names(pc: &PoolClass, mi: usize, desc: &str) -> Vec<String> {
     let code_len = crate::varalloc::code_attribute(pc, mi).map(|c| c.code.len() as u16).unwrap_or(0);
     let max_locals = crate::varalloc::code_attribute(pc, mi).map(|c| c.max_locals).unwrap_or(0);
     let mut names: Vec<String> = if let Some(md) = &md {
-        let vt = VarTable::build(pc, mi, md, is_static, max_locals, code_len);
+        let vt = crate::varalloc::build_var_table(pc, mi, md, is_static, max_locals, code_len);
         vt.vars
             .iter()
             .filter(|v| v.is_param && v.name != "this")
@@ -4759,7 +4767,8 @@ fn walk_enum_inits(s: &Stmt, map: &mut HashMap<String, EnumInit>, pc: &PoolClass
                                     }
                                 }
                             }
-                            let mut p = Printer::new(pc, pool, empty_vt());
+                            let __ctx = crate::jvmctx::JvmCtx::new(pc, pool);
+                            let mut p = Printer::new(&__ctx, empty_vt());
                             let mut s = String::new();
                             p.expr(a, 1, &mut s);
                             s
@@ -6127,7 +6136,8 @@ fn emit_local_class_decl(
         // Runnable` — dropping it made the value unassignable to the
         // method's Runnable return, jdk26
         // AbstractMemorySegmentImpl.cleanupAction).
-        let p = Printer::new(lpc, pool, empty_vt());
+        let __ctx = crate::jvmctx::JvmCtx::new(lpc, pool);
+        let p = Printer::new(&__ctx, empty_vt());
         let mut h = format!("record {}", simple);
         if let Some(sig) = &class_sig {
             let mut tp = String::new();
@@ -6166,7 +6176,8 @@ fn emit_local_class_decl(
     };
     if !is_rec && fam.nested.get(cls).and_then(|n| n.sig_header.as_ref()).is_none() {
         let mut bases: Vec<String> = Vec::new();
-        let p = Printer::new(lpc, pool, empty_vt());
+        let __ctx = crate::jvmctx::JvmCtx::new(lpc, pool);
+        let p = Printer::new(&__ctx, empty_vt());
         {
             for &ii in &lpc.cf.interfaces {
                 if let Some(n) = lpc.class_name(ii) {
@@ -7615,7 +7626,8 @@ fn render_captures(
                     (k, Expr::Raw(format!("{}.this", outer_qthis)))
                 };
             }
-            let mut p = Printer::new(outer_pc, pool, outer_vt);
+            let __ctx = crate::jvmctx::JvmCtx::new(outer_pc, pool);
+            let mut p = Printer::new(&__ctx, outer_vt);
             let mut text = String::new();
             let atomic = matches!(v, Expr::Local { .. } | Expr::This | Expr::Const(_));
             if !atomic {
@@ -8359,7 +8371,8 @@ fn emit_anon_body(
                     }
                     _ => {}
                 }
-                let text = Printer::new(apc, pool, &mb.vt)
+                let __ctx = crate::jvmctx::JvmCtx::new(apc, pool);
+let text =  Printer::new(&__ctx, &mb.vt)
                     .with_indent(indent + 2)
                     .into_string(&body);
                 if !text.trim().is_empty() {
@@ -9853,7 +9866,7 @@ fn restore_one_switch(
             let enum_switch = name == "enumSwitch";
             let recv = args[0].clone();
             let labels = bsm_static_args.clone();
-            let _shorten = |c: &str| Printer::new(pc, pool, empty_vt()).shorten(c);
+            let _shorten = |c: &str| crate::ctx_shim::ctx_shorten(pc, pool, c);
             let mut ok = true;
             let mut new_cases: Vec<(Vec<String>, Vec<String>)> = Vec::new(); // (raw, str)
             let mut pat_ctr = PATTERN_CTR.with(|c| c.get());
@@ -9885,7 +9898,7 @@ fn restore_one_switch(
                                 } else {
                                     TypeRef::J(jcdc_jvm::JavaType::Object(cv.clone()))
                                 };
-                                let tn = Printer::new(pc, pool, empty_vt()).type_name(&ty);
+                                let tn = crate::ctx_shim::ctx_type_name(pc, pool, &ty);
                                 raws.push(format!("{} ignored{}", tn, pat_ctr));
                                 pat_ctr += 1;
                             }

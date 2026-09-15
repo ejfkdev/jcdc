@@ -248,3 +248,64 @@ impl Cfg {
         self.blocks.is_empty()
     }
 }
+
+impl Cfg {
+    /// The machine-neutral view of this graph, for the shared structurer /
+    /// converter (`jdc-core`). Block ids are preserved, so the two views are
+    /// index-compatible and `BlockResult`s apply to both.
+    pub fn to_core(&self) -> jdc_core::cfg::Cfg {
+        if crate::dbg_flag!("JCDC_DBG_CFG") {
+            for b in &self.blocks {
+                eprintln!(
+                    "JVM_CFG b={} start={} end={} ins={} succ={:?} pred={:?} handlers={:?}",
+                    b.id, b.start, b.end, b.ins.len(), b.succ, b.pred, b.handlers
+                );
+            }
+            for (i, r) in self.exc_ranges.iter().enumerate() {
+                eprintln!("JVM_EXC r={} {}..{} -> {} type={:?}", i, r.start, r.end, r.handler, r.catch_type);
+            }
+            for e in &self.exc_edges {
+                eprintln!("JVM_EDGE r={} from={} to={}", e.range, e.from, e.to);
+            }
+        }
+        let blocks = self
+            .blocks
+            .iter()
+            .map(|b| jdc_core::cfg::Block {
+                id: b.id,
+                start: b.start as u32,
+                end: b.end as u32,
+                ins_len: b.ins.len() as u32,
+                succ: b.succ.clone(),
+                pred: b.pred.clone(),
+                handlers: b.handlers.iter().map(|&h| h as u32).collect(),
+            })
+            .collect();
+        let ranges = self
+            .exc_ranges
+            .iter()
+            .map(|r| jdc_core::cfg::ExcRange {
+                start: r.start as u32,
+                end: r.end as u32,
+                handler: r.handler as u32,
+                catch_type: r.catch_type.clone(),
+            })
+            .collect();
+        let mut core = jdc_core::cfg::Cfg::from_blocks(blocks, self.entry, ranges);
+        // The view must be EXACTLY this graph's — including predecessor and
+        // handler lists as this Cfg has them. Passes mutate successors
+        // (`short_circuit_prefold` rewires a folded branch) without updating
+        // preds, and the structurer was calibrated against those lists, so
+        // recomputing them here would change structuring decisions.
+        for (cb, jb) in core.blocks.iter_mut().zip(self.blocks.iter()) {
+            cb.pred = jb.pred.clone();
+            cb.handlers = jb.handlers.iter().map(|&h| h as u32).collect();
+        }
+        core.exc_edges = self
+            .exc_edges
+            .iter()
+            .map(|e| jdc_core::cfg::ExcEdge { range: e.range, from: e.from, to: e.to })
+            .collect();
+        core
+    }
+}

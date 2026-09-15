@@ -4,16 +4,19 @@
 //! control flow structuring → statement conversion → refinement passes →
 //! Java emission.
 
+// The machine-neutral half of the pipeline now lives in `jdc-core`; the
+// modules are re-exported under their historical paths so the JVM-specific
+// front-end (block/builder/classdec/method/varalloc) keeps its imports.
+pub use jdc_core::{analysis, cfg, convert, sese, structure, typeutil, types};
+pub use jdc_core::ir::{expr, stmt};
+
 pub mod block;
 pub mod builder;
-pub mod classdec;
-pub mod convert;
 pub mod emit;
-pub mod expr;
+pub mod classdec;
 pub mod method;
-pub mod stmt;
-pub mod structure;
-pub mod sese;
+mod ctx_shim;
+pub mod jvmctx;
 pub mod varalloc;
 
 pub use classdec::{decompile_class, ClassOptions};

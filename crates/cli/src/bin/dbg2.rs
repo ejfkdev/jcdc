@@ -41,7 +41,8 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                let text = jcdc_decompiler::emit::Printer::new(&pc, &pool, &mb.vt)
+                let __ctx = jcdc_decompiler::emit::JvmCtx::new(&pc, &pool);
+                let text = jcdc_decompiler::emit::Printer::new(&__ctx, &mb.vt)
                     .into_string(&mb.body);
                 println!("{}", text);
             } else {

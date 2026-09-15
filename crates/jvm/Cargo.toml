@@ -8,6 +8,7 @@ homepage.workspace = true
 description = "Java class pool, type resolution and generic signature parsing for jcdc"
 
 [dependencies]
+jdc-core = { workspace = true }
 jcdc-classfile = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

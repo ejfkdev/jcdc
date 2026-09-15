@@ -10,5 +10,6 @@ description = "Java decompiler core: CFG structuring, expression reconstruction 
 [dependencies]
 jcdc-classfile = { workspace = true }
 jcdc-jvm = { workspace = true }
+jdc-core = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }

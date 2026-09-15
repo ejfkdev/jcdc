@@ -29,39 +29,10 @@ fn dup_marks_clear_at_or_above(depth: usize) {
 }
 
 /// How a basic block ends.
-#[derive(Debug, Clone)]
-pub enum Term {
-    Fallthrough,
-    Goto,
-    /// Jumps to succ[1] when `cond` is true; falls through to succ[0].
-    Cond { cond: Expr },
-    Switch { selector: Expr, targets: SwitchTargets },
-    Return(Option<Expr>),
-    Throw(Expr),
-    Jsr,
-    Ret,
-}
-
-#[derive(Debug, Clone)]
-pub enum SwitchTargets {
-    /// pc targets indexed by (key - low).
-    Table { low: i32, targets: Vec<u16> },
-    /// (match value, pc target) pairs.
-    Lookup { pairs: Vec<(i32, u16)> },
-}
-
-#[derive(Debug, Clone)]
-pub struct BlockResult {
-    pub stmts: Vec<Stmt>,
-    /// Operand stack contents at block exit (usually empty).
-    pub out_stack: Vec<Expr>,
-    pub term: Term,
-}
-
-#[derive(Debug)]
-pub struct BuildError(pub String);
-
-type BResult<T> = Result<T, BuildError>;
+// The IR hand-off types live in the core now (the structurer/emitter are
+// machine-neutral); re-exported here so the JVM front-end keeps its imports.
+pub use jdc_core::ir::build::{BlockResult, BuildError, SwitchTargets, Term};
+pub(crate) use jdc_core::ir::build::BResult;
 
 pub struct Builder<'a> {
     pub pc: &'a PoolClass,
@@ -675,16 +646,25 @@ impl<'a> Builder<'a> {
                 Opcode::Ret => term = Term::Ret,
                 Opcode::Tableswitch | Opcode::Lookupswitch => {
                     let sel = pop(&mut stack)?;
-                    let targets = match in0.switch_data.as_deref() {
-                        Some(SwitchData::Table { low, targets, .. }) => {
-                            SwitchTargets::Table { low: *low, targets: targets.clone() }
-                        }
-                        Some(SwitchData::Lookup { pairs, .. }) => {
-                            SwitchTargets::Lookup { pairs: pairs.clone() }
-                        }
+                    // The IR keeps u32 offsets; the default arm rides in the
+                    // term now (the structurer never reads the JVM payload).
+                    let (targets, default) = match in0.switch_data.as_deref() {
+                        Some(SwitchData::Table { low, targets, default }) => (
+                            SwitchTargets::Table {
+                                low: *low,
+                                targets: targets.iter().map(|&t| t as u32).collect(),
+                            },
+                            Some(*default as u32),
+                        ),
+                        Some(SwitchData::Lookup { pairs, default }) => (
+                            SwitchTargets::Lookup {
+                                pairs: pairs.iter().map(|&(m, t)| (m, t as u32)).collect(),
+                            },
+                            Some(*default as u32),
+                        ),
                         _ => return Err(BuildError("switch without data".into())),
                     };
-                    term = Term::Switch { selector: sel, targets };
+                    term = Term::Switch { selector: sel, targets, default };
                 }
 
                 // ---- returns ----
@@ -1070,7 +1050,9 @@ impl<'a> Builder<'a> {
             Term::Return(Some(e)) => Term::Return(Some(self.materialize_arrays(e))),
             Term::Throw(e) => Term::Throw(self.materialize_arrays(e)),
             Term::Cond { cond } => Term::Cond { cond: self.materialize_arrays(cond) },
-            Term::Switch { selector, targets } => Term::Switch { selector: self.materialize_arrays(selector), targets },
+            Term::Switch { selector, targets, default } => {
+                Term::Switch { selector: self.materialize_arrays(selector), targets, default }
+            }
             other => other,
         }
     }

@@ -8,6 +8,7 @@ homepage.workspace = true
 description = "Java class file format parser (vendored from java-class-rs by ejfkdev, extended for jcdc)"
 
 [dependencies]
+jdc-core = { workspace = true }
 nom = "7"
 cesu8 = "1.1"
 bitflags = "2"
