@@ -28,6 +28,18 @@ jobs:
             echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo workspace version v$V"
             exit 1
           }
+      # Releases build against the jdc-core TAG that Cargo.toml pins, so a
+      # released binary is reproducible; the pin and the core tag must move
+      # together (bump the pin, then tag the core, then tag jcdc). CI, in
+      # contrast, tracks jdc-core main.
+      - name: Pinned jdc-core tag must exist
+        run: |
+          C=$(grep -m1 '^jdc-core = ' Cargo.toml | sed 's/.*version = "\(.*\)".*/\1/')
+          echo "jdc-core pin = v$C"
+          git ls-remote --tags --exit-code https://github.com/ejfkdev/jdc-core.git "refs/tags/v$C" >/dev/null || {
+            echo "::error::jdc-core v$C is pinned in Cargo.toml but not tagged in github.com/ejfkdev/jdc-core"
+            exit 1
+          }
 
   build:
     needs: check-version
@@ -67,6 +79,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # Sibling path dependency (`../jdc-core`), checked out at the version
+      # Cargo.toml pins — check-version has already verified that tag exists.
+      - name: Fetch jdc-core (pinned tag)
+        shell: bash
+        run: |
+          C=$(grep -m1 '^jdc-core = ' Cargo.toml | sed 's/.*version = "\(.*\)".*/\1/')
+          git clone --depth 1 --branch "v$C" https://github.com/ejfkdev/jdc-core.git ../jdc-core
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

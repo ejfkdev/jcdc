@@ -13,6 +13,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # jdc-core is a SIBLING path dependency (`../jdc-core`): the machine-
+      # neutral half of the decompiler lives in its own repo. CI builds the
+      # current pair (jcdc main + jdc-core main), so a core change that breaks
+      # this front-end shows up here immediately; releases pin to a tag
+      # instead (see release.yml).
+      - name: Fetch jdc-core (sibling path dependency)
+        run: git clone --depth 1 https://github.com/ejfkdev/jdc-core.git ../jdc-core
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build

@@ -4,15 +4,11 @@
 //! most of them were Printer methods / classdec helpers before the split (the
 //! printer and the pass suite now live in `jdc-core`).
 
-#![allow(unused_imports)]
-
 use jcdc_jvm::{ClassPool, GenericType, JavaType, MethodDescriptor, PoolClass};
 
-use crate::expr::{BinOp, ConstVal, Expr, LambdaExpr, TypeRef};
-use crate::stmt::Stmt;
+use crate::expr::{ConstVal, Expr, LambdaExpr, TypeRef};
 use crate::varalloc::VarTable;
 use crate::jvmctx::JvmCtx;
-use jdc_core::MethodBody;
 
 /// Type name for the current class context (inline printer use).
 pub(crate) fn ctx_type_name(pc: &PoolClass, pool: &ClassPool, ty: &TypeRef) -> String {
@@ -24,12 +20,6 @@ pub(crate) fn ctx_type_name(pc: &PoolClass, pool: &ClassPool, ty: &TypeRef) -> S
 pub(crate) fn ctx_shorten(pc: &PoolClass, pool: &ClassPool, internal: &str) -> String {
     let ctx = JvmCtx::new(pc, pool);
     jdc_core::emit::Printer::new(&ctx, &VarTable::default()).shorten(internal)
-}
-
-/// Print a statement tree with a fresh printer bound to this class context.
-pub(crate) fn ctx_print(pc: &PoolClass, pool: &ClassPool, body: &Stmt) -> String {
-    let ctx = JvmCtx::new(pc, pool);
-    jdc_core::emit::Printer::new(&ctx, &VarTable::default()).into_string(body)
 }
 
 pub(crate) fn find_outer_of(pc: &PoolClass, pool: &ClassPool) -> Option<String> {

@@ -11977,25 +11977,6 @@ pub(crate) fn generic_call_formals(
     Some((formals, mtvars))
 }
 
-/// True when the type mentions any of the given typevar names.
-pub(crate) fn g_mentions_any(g: &jcdc_jvm::GenericType, names: &[String]) -> bool {
-    g_mentions_any_inner(g, names)
-}
-fn g_mentions_any_inner(g: &jcdc_jvm::GenericType, names: &[String]) -> bool {
-    use jcdc_jvm::GenericType as G;
-    match g {
-        G::TypeVar(n) => names.iter().any(|x| x == n),
-        G::Array(i) => g_mentions_any_inner(i, names),
-        G::Class(cs) => cs
-            .parts
-            .iter()
-            .any(|p| p.args.iter().any(|a| g_mentions_any_inner(a, names))),
-        G::Wildcard(jcdc_jvm::WildcardBound::Extends(t))
-        | G::Wildcard(jcdc_jvm::WildcardBound::Super(t)) => g_mentions_any_inner(t, names),
-        _ => false,
-    }
-}
-
 pub(crate) fn instantiated_method_params(
     m: &Expr,
     pool: &ClassPool,

@@ -140,7 +140,6 @@ dependencies = [
 name = "jcdc-classfile"
 version = "0.1.2"
 dependencies = [
- "bitflags",
  "cesu8",
  "jdc-core",
  "nom",
@@ -174,9 +173,10 @@ dependencies = [
 
 [[package]]
 name = "jdc-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bitflags",
+ "serde",
 ]
 
 [[package]]

@@ -1,5 +1,3 @@
-use bitflags::bitflags;
-
 /// Parsed Java class file.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone)]
