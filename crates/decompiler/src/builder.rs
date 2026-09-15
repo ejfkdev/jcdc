@@ -907,6 +907,58 @@ impl<'a> Builder<'a> {
         Ok(BlockResult { stmts, out_stack: stack, term })
     }
 
+    /// Decode one bootstrap-method static argument. Beyond String/Class
+    /// constants, Java 21+ pattern switches carry enum-constant labels as
+    /// `EnumDesc` DYNAMIC constants: follow the condy to
+    /// `ConstantBootstraps.invoke` + `Enum$EnumDesc.of(ClassDesc, NAME)`
+    /// and take NAME, so the label renders as the source constant
+    /// (`case WIN_EXE` — jdk26 PackageBuilder / DocLint switches).
+    fn bsm_arg_of(&self, ai: u16) -> crate::expr::BsmArg {
+        use crate::expr::BsmArg;
+        use jcdc_classfile::ConstantPoolEntry as E;
+        match jcdc_classfile::get_entry(&self.pc.cf.constant_pool, ai) {
+            Some(E::String(_)) => match self.pc.string_value(ai) {
+                Some(v) => BsmArg::Str(v.to_string()),
+                None => BsmArg::Other,
+            },
+            Some(E::Class(_)) => match self.pc.class_name(ai) {
+                Some(n) => BsmArg::Cls(n.to_string()),
+                None => BsmArg::Other,
+            },
+            Some(E::Integer(i)) => BsmArg::Int(i.value),
+            Some(E::Dynamic(d)) => {
+                let Ok(bs) = self.bootstrap_method(d.bootstrap_method_attr_index) else {
+                    return BsmArg::Other;
+                };
+                let mut factory: Option<(&str, &str)> = None;
+                let mut str_arg: Option<String> = None;
+                for &a in &bs.bootstrap_arguments {
+                    match jcdc_classfile::get_entry(&self.pc.cf.constant_pool, a) {
+                        Some(E::MethodHandle(mh)) => {
+                            if let Some((cls, name, _)) = self.pc.member_ref(mh.reference_index) {
+                                factory = Some((cls, name));
+                            }
+                        }
+                        Some(E::String(_)) => {
+                            str_arg = self.pc.string_value(a).map(str::to_string);
+                        }
+                        _ => {}
+                    }
+                }
+                match factory {
+                    Some(("java/lang/Enum$EnumDesc", "of")) => {
+                        str_arg.map(BsmArg::Str).unwrap_or(BsmArg::Other)
+                    }
+                    Some(("java/lang/constant/ClassDesc", "of")) => {
+                        str_arg.map(|n| BsmArg::Cls(n.replace('.', "/"))).unwrap_or(BsmArg::Other)
+                    }
+                    _ => BsmArg::Other,
+                }
+            }
+            _ => BsmArg::Other,
+        }
+    }
+
     /// Replace fresh NewArray expressions that have pending folded stores
     /// with `new T[]{...}` initializers (consumed once). Skips assignment
     /// targets (an array being filled by non-constant stores must stay raw).
@@ -1744,23 +1796,7 @@ impl<'a> Builder<'a> {
         let bsm_static_args: Vec<crate::expr::BsmArg> = bsm
             .bootstrap_arguments
             .iter()
-            .map(|&ai| {
-                match jcdc_classfile::get_entry(&self.pc.cf.constant_pool, ai) {
-                    Some(jcdc_classfile::ConstantPoolEntry::String(_)) => {
-                        match self.pc.string_value(ai) {
-                            Some(v) => crate::expr::BsmArg::Str(v.to_string()),
-                            None => crate::expr::BsmArg::Other,
-                        }
-                    }
-                    Some(jcdc_classfile::ConstantPoolEntry::Class(_)) => {
-                        match self.pc.class_name(ai) {
-                            Some(n) => crate::expr::BsmArg::Cls(n.to_string()),
-                            None => crate::expr::BsmArg::Other,
-                        }
-                    }
-                    _ => crate::expr::BsmArg::Other,
-                }
-            })
+            .map(|&ai| self.bsm_arg_of(ai))
             .collect();
         let e = Expr::Invokedynamic {
             name,

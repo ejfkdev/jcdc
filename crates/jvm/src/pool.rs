@@ -700,8 +700,11 @@ fn evict_to_cap(st: &mut PoolState) {
 }
 
 fn index_dir(root: &Path, dir: &Path, out: &mut HashMap<String, PathBuf>) -> anyhow::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
+    let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
+    // Sorted walk: duplicate internal names across sub-trees (the same test
+    // compiled by several javacs) must resolve the same way every run.
+    entries.sort_by_key(|e| e.path());
+    for entry in entries {
         let path = entry.path();
         if path.is_dir() {
             index_dir(root, &path, out)?;
@@ -709,10 +712,28 @@ fn index_dir(root: &Path, dir: &Path, out: &mut HashMap<String, PathBuf>) -> any
             let rel = path.strip_prefix(root).unwrap_or(&path);
             let mut name = rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
             name.truncate(name.len() - ".class".len());
-            out.insert(name, path);
+            // Key by the class's OWN internal name, not the input-relative
+            // path: directory layouts need not mirror packages (corpus
+            // trees carrying a prefix like `cfr/java_8/`, a package dir
+            // passed directly). A path-derived key makes every lookup by
+            // internal name miss — cross-type resolution, family and
+            // anonymous enumeration — and anonymous members then render as
+            // illegal `Outer.1` names. Files that do not parse keep the
+            // path-derived key so they are still enumerated and reported.
+            let key = read_internal_name(&path).unwrap_or(name);
+            out.insert(key, path);
         }
     }
     Ok(())
+}
+
+/// The class's own internal name (`org/x/Foo$1`) straight from this_class —
+/// a constant-pool walk, no instruction decode.
+fn read_internal_name(path: &Path) -> Option<String> {
+    let data = std::fs::read(path).ok()?;
+    let (_, cf) = parse_classfile(&data).ok()?;
+    let cp = CpLookup::new(&cf.constant_pool);
+    cp.class_name(&cf.constant_pool, cf.this_class).map(str::to_string)
 }
 
 fn index_jar(path: &Path, out: &mut HashMap<String, String>) {

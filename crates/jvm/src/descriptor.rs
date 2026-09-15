@@ -127,10 +127,67 @@ impl fmt::Display for JavaType {
 /// `/`) is kept, with `$` preserved (the emitter resolves nesting later).
 pub fn internal_name_to_java(internal: &str, qualify: bool) -> String {
     if qualify {
-        internal.replace('/', ".")
+        dotted_source(internal)
     } else {
-        internal.rsplit('/').next().unwrap_or(internal).to_string()
+        binary_simple_name(internal)
     }
+}
+
+/// Source form of a `$`-bearing binary name. `Outer$Inner` renders as
+/// `Outer.Inner`, but javac's desugared LOCAL classes (`Outer$1Name`) have
+/// no qualified form — their source name is the digit-prefix-stripped
+/// simple name, referenced without qualification — and a literal-`$` name
+/// (`DolTest2$$dollah$$`) must keep its `$` (`A..b` does not parse).
+pub fn binary_simple_name(internal: &str) -> String {
+    let simple = internal.rsplit(['/', '$']).next().unwrap_or(internal);
+    if simple.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        let stripped = simple.trim_start_matches(|c: char| c.is_ascii_digit());
+        if !stripped.is_empty() {
+            return stripped.to_string();
+        }
+    }
+    if internal.contains('$') && internal.split('$').skip(1).any(|seg| seg.is_empty() || seg.rsplit('/').next().unwrap_or(seg).is_empty()) {
+        return internal.rsplit('/').next().unwrap_or(internal).to_string();
+    }
+    internal.rsplit('/').next().unwrap_or(internal).to_string()
+}
+
+/// Fully qualified source form (`a.b.Outer.Inner`), applying the same
+/// local-class / literal-`$` rules per segment.
+pub fn dotted_source(internal: &str) -> String {
+    let (pkg, simple) = match internal.rfind('/') {
+        Some(i) => (&internal[..i], &internal[i + 1..]),
+        None => ("", internal),
+    };
+    let mut out = String::new();
+    if !pkg.is_empty() {
+        out.push_str(&pkg.replace('/', "."));
+        out.push('.');
+    }
+    let mut segs = simple.split('$');
+    let mut acc = String::new();
+    if let Some(first) = segs.next() {
+        acc.push_str(first);
+    }
+    for seg in segs {
+        if seg.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+            let stripped = seg.trim_start_matches(|c: char| c.is_ascii_digit());
+            if !stripped.is_empty() {
+                // local class: unqualified simple name
+                out.clear();
+                return stripped.to_string();
+            }
+        }
+        if seg.is_empty() {
+            // literal-$ name: keep the binary form
+            out.clear();
+            return simple.to_string();
+        }
+        acc.push('.');
+        acc.push_str(seg);
+    }
+    out.push_str(&acc);
+    out
 }
 
 /// A parsed method descriptor.

@@ -651,9 +651,30 @@ impl<'a> Printer<'a> {
                             self.expr(e, 1, &mut t);
                         }
                         res.push(t);
+                    } else {
+                        // The resource is not a declaration: a reused
+                        // variable was rewritten to a plain assignment by
+                        // dedupe_declarations, and `try (x = expr)` is not
+                        // Java. Print it as the statement it is, BEFORE the
+                        // try (resource init runs before the body anyway) —
+                        // emitting nothing turned the header into the
+                        // illegal `try () {`.
+                        self.stmt(r);
                     }
                 }
-                self.line(&format!("try ({}) {{", res.join("; ")));
+                if res.is_empty() && catches.is_empty() && finally.is_none() {
+                    // Vestigial try-with-resources: the resource was
+                    // hoisted into a plain assignment above and its close
+                    // is a sibling statement, so nothing is left to head
+                    // the statement — a bare `try {` does not compile
+                    // ("'try' without 'catch', 'finally' or resource
+                    // declarations"). A handler-less try IS a block.
+                    self.line("{");
+                } else if res.is_empty() {
+                    self.line("try {");
+                } else {
+                    self.line(&format!("try ({}) {{", res.join("; ")));
+                }
                 self.indent += 1;
                 self.stmt(body);
                 self.indent -= 1;
@@ -2049,7 +2070,25 @@ impl<'a> Printer<'a> {
                     out.push_str(&l.impl_name);
                 } else if !l.captures.is_empty() {
                     // bound receiver: first capture is the instance
-                    self.expr(&l.captures[0], 15, out);
+                    // A method-ref/lambda receiver needs its functional
+                    // type spelled out: `A::new::get` parses as a
+                    // QUALIFIED reference and is rejected — the source form
+                    // is `((Supplier<A>) A::new)::get`.
+                    let cap = &l.captures[0];
+                    let func_ty = match cap {
+                        Expr::Lambda(l2) => Some(l2.sam_cls.clone()),
+                        Expr::Cast { ty, e } if matches!(**e, Expr::Lambda(_)) => Some(ty.erased().to_descriptor()),
+                        _ => None,
+                    };
+                    if let Some(f) = func_ty {
+                        out.push_str("((");
+                        out.push_str(&self.shorten(&f));
+                        out.push_str(") ");
+                        self.expr(cap, 1, out);
+                        out.push(')');
+                    } else {
+                        self.expr(cap, 15, out);
+                    }
                     out.push_str("::");
                     out.push_str(&l.impl_name);
                 } else {
@@ -2953,13 +2992,24 @@ impl<'a> Printer<'a> {
         }
         // Literal-$ top-level class (in pool, no InnerClasses nesting
         // evidence): the $ is part of the SOURCE name (jextract-generated
-        // errno_h$shared) — never dot it into a nested qualifier.
-        let keep_dollar = internal.contains('$')
+        // errno_h$shared) — never dot it into a nested qualifier. Same rule
+        // whenever dotting could not parse: `DolTest2$$dollah$$` has empty
+        // segments, and `$` is a legal identifier character while `A..b` is
+        // not.
+        let dot_safe = |simple: &str| -> bool {
+            simple.split('$').skip(1).all(|seg| {
+                !seg.is_empty()
+                    && seg.chars().next().map(|c| !c.is_ascii_digit()).unwrap_or(false)
+            })
+        };
+        let simple_here = internal.rsplit('/').next().unwrap_or(internal).to_string();
+        let keep_dollar_pool = internal.contains('$')
             && self
                 .pool
                 .get(internal)
                 .map(|pc| crate::classdec::find_outer(&pc, self.pool).is_none())
                 .unwrap_or(false);
+        let keep_dollar = keep_dollar_pool || (internal.contains('$') && !dot_safe(&simple_here));
         // Anonymous class types (all-digit last segment) have no source
         // name: print the base interface/superclass instead.
         if let Some(last) = internal.rsplit('$').next() {
@@ -2981,7 +3031,7 @@ impl<'a> Printer<'a> {
         }
         // Local classes are emitted with their simple source name.
         if let Some(last) = internal.rsplit('$').next() {
-            if !keep_dollar
+            if !keep_dollar_pool
                 && !last.is_empty()
                 && !last.chars().all(|c| c.is_ascii_digit())
                 && internal.contains('$')
@@ -3132,6 +3182,16 @@ impl<'a> Printer<'a> {
                     }
                 }
                 for p in cs.parts.iter().skip(1) {
+                    let digit_led = p.name.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false);
+                    let stripped = p.name.trim_start_matches(|c: char| c.is_ascii_digit());
+                    if digit_led && !stripped.is_empty() && p.args.is_empty() {
+                        // javac's local-class encoding `Outer$1Name`: the
+                        // source name is the prefix-stripped simple name,
+                        // referenced WITHOUT qualification (there is no
+                        // legal `DocLint.1Pair` — `> or ',' expected`).
+                        s = stripped.to_string();
+                        continue;
+                    }
                     s.push('.');
                     s.push_str(&p.name);
                     if !p.args.is_empty() {

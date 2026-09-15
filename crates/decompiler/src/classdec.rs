@@ -579,12 +579,9 @@ fn parse_inner_classes(info: &[u8]) -> Option<jcdc_classfile::InnerClassesAttrib
 // Entry points
 // ---------------------------------------------------------------------------
 
-/// Decompile one class as a standalone compilation unit, inlining its
-/// nested/anonymous family.
+// Per-compilation-unit synthetic stack-variable counter, reset in
+// decompile_class so renders are deterministic under parallel workers.
 thread_local! {
-    /// Per-compilation-unit synthetic stack-variable counter (stackN
-    /// names). Reset in decompile_class so renders are deterministic
-    /// under parallel workers.
     static STACK_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -597,6 +594,8 @@ pub fn next_stack_seq() -> u64 {
     })
 }
 
+/// Decompile one class as a standalone compilation unit, inlining its
+/// nested/anonymous family.
 pub fn decompile_class(pc: &PoolClass, pool: &ClassPool, opts: &ClassOptions) -> anyhow::Result<String> {
     STACK_SEQ.with(|c| c.set(0));
     if pc.is_module() {
@@ -9836,9 +9835,12 @@ fn restore_one_switch(
     pool: &ClassPool,
 ) {
     // Java 21+ SwitchBootstraps.typeSwitch: `switch (recv)` with string
-    // constants, `case null` (index -1) and type patterns.
+    // constants, `case null` (index -1) and type patterns. The
+    // enumSwitch flavour carries the enum CONSTANT NAMES as strings —
+    // those are identifiers in source (`case FIRST:`), not literals.
     if let Expr::Invokedynamic { name, args, bsm_static_args, .. } = &*selector {
-        if name == "typeSwitch" && !args.is_empty() {
+        if (name == "typeSwitch" || name == "enumSwitch") && !args.is_empty() {
+            let enum_switch = name == "enumSwitch";
             let recv = args[0].clone();
             let labels = bsm_static_args.clone();
             let _shorten = |c: &str| Printer::new(pc, pool, empty_vt()).shorten(c);
@@ -9853,7 +9855,14 @@ fn restore_one_switch(
                         raws.push("null".to_string());
                     } else if *k >= 0 && (*k as usize) < labels.len() {
                         match &labels[*k as usize] {
-                            crate::expr::BsmArg::Str(sv) => strs.push(sv.clone()),
+                            crate::expr::BsmArg::Str(sv) => {
+                                if enum_switch {
+                                    raws.push(sv.clone())
+                                } else {
+                                    strs.push(sv.clone())
+                                }
+                            }
+                            crate::expr::BsmArg::Int(iv) => raws.push(iv.to_string()),
                             crate::expr::BsmArg::Cls(cv) => {
                                 // Render the pattern type through the
                                 // printer so array types (`[B` → `byte[]`)

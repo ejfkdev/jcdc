@@ -262,6 +262,9 @@ pub struct LambdaExpr {
 pub enum BsmArg {
     Str(String),
     Cls(String),
+    /// Integer-valued constant label (Java 21+ typeSwitch constant
+    /// patterns: `case 1:`, char constants arrive as their code point).
+    Int(i32),
     Other,
 }
 
@@ -503,6 +506,12 @@ impl Expr {
             Expr::Assign { .. } | Expr::PreIncDec { .. } | Expr::PostIncDec { .. } => outer_prec > 1,
             Expr::Un { .. } => outer_prec > 14,
             Expr::Cast { .. } => outer_prec > 13,
+            // `new int[1][0]` as an indexing base or receiver must
+            // parenthesize: the emitted `new int[1][0][0]` re-parses as a
+            // THREE-dim creation, not an index into a two-dim one — and as
+            // an assignment target it is not a variable at all
+            // (CFR prints `(new int[1][0])[0] = new int[]{a};`).
+            Expr::NewArray { .. } | Expr::NewMultiArray { .. } => outer_prec >= 15,
             _ => false,
         }
     }

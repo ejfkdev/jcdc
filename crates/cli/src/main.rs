@@ -439,9 +439,14 @@ fn decompile_class_file(
         .and_then(|s| s.to_str())
         .unwrap_or("Unknown")
         .to_string();
-    // Internal-name based nesting check (dir names are package dirs).
+    // Nesting check against the class's OWN name: the pool indexes by
+    // this_class, and a directory tree need not be a package tree rooted at
+    // the input dir (corpus layouts like `cfr/java_8/...`), where the
+    // path-derived name misses and the nested class would get its own file
+    // on top of being inlined into its family.
     let internal = internal_name_of(path, root);
-    if jcdc_decompiler::classdec::is_nested_in_pool(&internal, pool) {
+    let nesting = class_rel_name(&data).unwrap_or_else(|| internal.clone());
+    if jcdc_decompiler::classdec::is_nested_in_pool(&nesting, pool) {
         return Ok(0);
     }
     let source = match decompile_one(&data, pool, opts, &stem) {

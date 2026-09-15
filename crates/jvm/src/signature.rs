@@ -369,7 +369,25 @@ impl ClassSig {
                 s.push('.');
             }
             // Nested-class references inside a signature part use the
-            // binary `$` separator; source form uses `.`.
+            // binary `$` separator; source form uses `.` — except javac's
+            // local-class encoding `Outer$1Name`, which has no qualified
+            // form (`DocLint.1Pair` does not parse): the source name is the
+            // digit-stripped simple name, standing alone.
+            let segs: Vec<&str> = p.name.split('$').collect();
+            if let Some(last) = segs.last() {
+                let stripped = last.trim_start_matches(|c: char| c.is_ascii_digit());
+                if segs.len() > 1
+                    && last.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                    && !stripped.is_empty()
+                {
+                    s = stripped.to_string();
+                    continue;
+                }
+                if segs.iter().skip(1).any(|x| x.is_empty()) {
+                    s = p.name.clone();
+                    continue;
+                }
+            }
             s.push_str(&p.name.replace('$', "."));
             if !p.args.is_empty() {
                 s.push('<');

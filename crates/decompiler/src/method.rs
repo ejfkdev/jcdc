@@ -795,6 +795,7 @@ pub fn decompile_method(
         cleanup(&mut body);
     }
     fold_dup_array_stores(&mut body);
+    legalize_discarded_values(&mut body, &mut vt);
     dedupe_declarations(&mut body);
     ensure_declared(&vt, &mut body);
     cleanup(&mut body);
@@ -1293,6 +1294,106 @@ fn prune_dead_synth_stores(s: &mut Stmt, vt: &VarTable) {
         }
     }
     prune(s, vt, &read);
+}
+
+/// Bytecode `pop` can discard values Java has no statement form for: a bare
+/// field read (`a.a;`), an enclosing-instance reference (`Outer.this;`), a
+/// checked cast (`(Object[]) clone();`) — javac's JLS statement-expression
+/// list has no slot for any of them. Rewrite every such discarded-value
+/// statement into a legal one: strip casts down to their side-effecting core
+/// (a cast statement cannot exist in source at all; the discarded value's
+/// only other effect is a possible CCE), otherwise name the value in a
+/// synthetic local so the read still happens — getfield can NPE, so dropping
+/// the statement would change behavior (CFR emits `cfr_ignored_N` here).
+fn legalize_discarded_values(body: &mut Stmt, vt: &mut VarTable) {
+    fn stmt_expr_ok(e: &Expr) -> bool {
+        matches!(
+            e,
+            Expr::Method { .. }
+                | Expr::New { .. }
+                | Expr::AnonNew { .. }
+                | Expr::Assign { .. }
+                | Expr::PreIncDec { .. }
+                | Expr::PostIncDec { .. }
+        )
+    }
+    fn strip_cast(e: &Expr) -> Option<Expr> {
+        match e {
+            Expr::Cast { e: inner, .. } => match strip_cast(inner) {
+                Some(core) => Some(core),
+                None if stmt_expr_ok(inner) => Some((**inner).clone()),
+                None => None,
+            },
+            _ => None,
+        }
+    }
+    fn walk(s: &mut Stmt, vt: &mut VarTable) {
+        match s {
+            Stmt::ExprStmt(e) => {
+                if stmt_expr_ok(e) {
+                    return;
+                }
+                if let Some(core) = strip_cast(e) {
+                    *e = core;
+                    return;
+                }
+                if !crate::builder::has_side_effects(e) {
+                    return;
+                }
+                let ty = e.type_ref();
+                let seq = crate::classdec::next_stack_seq();
+                let slot = vt.vars.iter().map(|v| v.slot).max().unwrap_or(0).saturating_add(1);
+                let id = vt.add_split(slot, format!("discarded{}", seq), ty);
+                let init = std::mem::replace(e, Expr::Const(ConstVal::Null));
+                *s = Stmt::LocalDef { var: id, init: Some(init), is_final: false, force_type: true };
+            }
+            Stmt::Block(v) => v.iter_mut().for_each(|x| walk(x, vt)),
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                walk(then_stmt, vt);
+                if let Some(x) = else_stmt {
+                    walk(x, vt);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::Labeled { body, .. }
+            | Stmt::Synchronized { body, .. } => walk(body, vt),
+            Stmt::For { init, body, .. } => {
+                init.iter_mut().for_each(|x| walk(x, vt));
+                walk(body, vt);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    c.body.iter_mut().for_each(|x| walk(x, vt));
+                }
+                if let Some(d) = default {
+                    walk(d, vt);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                walk(body, vt);
+                for c in catches.iter_mut() {
+                    walk(&mut c.body, vt);
+                }
+                if let Some(f) = finally {
+                    walk(f, vt);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter_mut().for_each(|x| walk(x, vt));
+                walk(body, vt);
+                for c in catches.iter_mut() {
+                    walk(&mut c.body, vt);
+                }
+                if let Some(f) = finally {
+                    walk(f, vt);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(body, vt);
 }
 
 /// Scope-aware deduplication: a variable already declared in an enclosing
