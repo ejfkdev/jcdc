@@ -96,9 +96,12 @@ cargo install jcdc --locked
 （不打压缩包；含苹果 M 芯片；Linux/Windows 支持的平台经 UPX 压缩，macOS
 因 UPX 不支持 Mach-O 仅剥离符号），另附 `SHA256SUMS.txt` 校验和。
 
-**源码构建：**
+**源码构建：**机器无关的反编译核心已独立为
+**[jdc-core](https://github.com/ejfkdev/jdc-core)** 仓库（与未来的 Java 系
+前端共用），以**同级目录** path 依赖引入——两个仓库要克隆在一起：
 
 ```sh
+git clone https://github.com/ejfkdev/jdc-core
 git clone https://github.com/ejfkdev/jcdc && cd jcdc
 cargo build --release        # 产物: target/release/jcdc
 ```
@@ -126,21 +129,25 @@ jcdc --synthetic Foo.class           # 包含 synthetic/bridge 成员
 
 ## Workspace 结构
 
+机器无关的那一半（IR、CFG 结构化、语句还原、Java 打印）已在
+**[jdc-core](https://github.com/ejfkdev/jdc-core)** 独立仓库中——jcdc 自己的
+仓库只留 class 文件前端与 JVM 惯用法；将来做 DEX 前端时与之并列即可。
+
 ```
 crates/classfile    class 文件二进制解析（常量池、属性、指令解码；45–70 全版本）
 crates/jvm          ClassPool（跨类型解析池）、泛型 Signature 解析
-crates/decompiler   反编译核心：
+crates/decompiler   class 文件前端 + JVM 惯用法：
   builder.rs          操作数栈模拟 → Expr/Stmt（indy lambda、字符串拼接、
                       varargs、monitor 指令）
   method.rs           跨块定点迭代：merge 栈变量、钻石折叠（三元还原）、类型
                       推断、布尔化、槽位拆分、泛型 cast 还原、TWR/finally 修剪
-  structure.rs        CFG 结构化：循环/条件/switch/try/sync 域、共享尾拷贝、
-                      parked-chain 路由
-  convert.rs          Region → Stmt 树（break/continue/label 消解）
   classdec.rs         类级输出：嵌套类分类、匿名类内联、枚举 switch/assert
                       还原、access$ 桥内联
-  emit.rs             Java 源码 Printer（优先级括号、import/短名）
+  jvmctx.rs           Ctx 实现：核心看这个前端的唯一接口（类型、嵌套、泛型
+                      Signature、lambda 方法体）
   varalloc.rs         LVT/LVTT 驱动的变量表
+                      （结构化、Region→Stmt 还原、Java Printer 现位于
+                      jdc-core 的 structure.rs/sese.rs/convert.rs/emit.rs）
 crates/cli          jcdc 主程序（+ dbg2/dbg3 调试辅助）
 config/versions.toml  按 class 主版本的特性开关（新 JDK 只需追加条目）
 corpus/               验证语料（features 套件 + JDK 下载清单）

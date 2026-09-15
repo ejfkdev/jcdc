@@ -105,9 +105,13 @@ raw executables (no archives) for **Linux / Windows / macOS × amd64 / arm64**
 (Apple silicon included; Linux & Windows UPX-compressed where supported,
 macOS stripped-only since UPX has no Mach-O support), plus `SHA256SUMS.txt`.
 
-**From source:**
+**From source**: the decompiler core lives in its own repo
+([jdc-core](https://github.com/ejfkdev/jdc-core), shared with future
+Java-family front-ends) and is a *sibling* path dependency — clone both
+side by side:
 
 ```sh
+git clone https://github.com/ejfkdev/jdc-core
 git clone https://github.com/ejfkdev/jcdc && cd jcdc
 cargo build --release        # binary: target/release/jcdc
 ```
@@ -135,23 +139,29 @@ Invalid invocations print the error followed by the full help and exit 2.
 
 ## Workspace layout
 
+The machine-neutral half of the decompiler — IR, CFG structuring, statement
+conversion, Java emission — lives in **[jdc-core](https://github.com/ejfkdev/jdc-core)**
+(a sibling repo, shared with future Java-family front-ends: the class-file
+front-end below is one front-end, a DEX one would be another).
+
 ```
 crates/classfile    class-file binary parsing (constant pool, attributes,
                     instruction decode; versions 45–70)
 crates/jvm          ClassPool (cross-type resolution), generic Signature parsing
-crates/decompiler   the decompiler core:
+crates/decompiler   the class-file front-end + its JVM idioms:
   builder.rs          operand-stack simulation → Expr/Stmt (indy lambdas,
                       string concat, varargs, monitors)
   method.rs           fixpoint passes: merge-slot vars, diamond folding
                       (ternaries), type inference, booleanization, slot
                       splitting, generic cast recovery, TWR/finally pruning
-  structure.rs        CFG structuring: loops/conds/switch/try/sync regions,
-                      shared-tail copy-walks, parked-chain routing
-  convert.rs          Region → Stmt trees (break/continue/label resolution)
   classdec.rs         class-level emission: nested-class taxonomy, anonymous
                       inlining, enum-switch/assert recovery, access$ bridges
-  emit.rs             Java source printer (precedence parens, short names)
+  jvmctx.rs           the Ctx implementation: the core's only view of this
+                      front-end (types, nesting, signatures, lambda bodies)
   varalloc.rs         LVT/LVTT-driven variable tables
+                      (structuring, Region→Stmt conversion and the Java
+                      printer live in jdc-core now — see ../jdc-core/src/
+                      structure.rs, sese.rs, convert.rs, emit.rs)
 crates/cli          the jcdc binary (+ dbg2/dbg3 debug helpers)
 config/versions.toml  per-class-version feature switches (new JDK = new entry)
 corpus/               verification corpus (features suite + JDK manifest)
