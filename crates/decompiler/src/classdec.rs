@@ -6310,6 +6310,16 @@ fn walk_expr_anon(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, fam: &Family, 
                 Some(apc) => {
                     if let Some(anon) = build_anon_new(&apc, args.clone(), pc, pool, fam, vt, pending) {
                         *e = anon;
+                        // Ctor args of the inlined body may hold further
+                        // anonymous `new` sites (`new Outer(new Inner(null)
+                        // { .. }) { .. }`): this arm matched first and the
+                        // generic New/AnonNew arms below never ran, leaving
+                        // the inner site as a bare class reference
+                        // (`new 1(null)` — 需要<标识符>).
+                        if let Expr::AnonNew { args, .. } = &mut *e {
+                            args.iter_mut()
+                                .for_each(|a| walk_expr_anon(a, pc, pool, fam, pending, vt));
+                        }
                     } else if crate::dbg_flag!("JCDC_DBG_ANON") {
                         eprintln!("ANON inline declined {}", cls);
                     }

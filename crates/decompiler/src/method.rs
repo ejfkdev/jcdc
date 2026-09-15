@@ -796,6 +796,7 @@ pub fn decompile_method(
     }
     fold_dup_array_stores(&mut body);
     legalize_discarded_values(&mut body, &mut vt);
+    legalize_monitors(&mut body, &mut vt);
     dedupe_declarations(&mut body);
     ensure_declared(&vt, &mut body);
     cleanup(&mut body);
@@ -1294,6 +1295,98 @@ fn prune_dead_synth_stores(s: &mut Stmt, vt: &VarTable) {
         }
     }
     prune(s, vt, &read);
+}
+
+/// `monitorenter` on a constant is legal bytecode but has no Java source
+/// form: the monitor of a synchronized statement must be a VARIABLE
+/// (`synchronized (null)` — 意外的类型; §14.19 evaluates a variable). Name
+/// the value in a synthetic local so the NPE the original throws is
+/// preserved (CFR emits the illegal form here).
+fn legalize_monitors(body: &mut Stmt, vt: &mut VarTable) {
+    fn variable_like(e: &Expr) -> bool {
+        matches!(
+            e,
+            Expr::Local { .. } | Expr::Field { .. } | Expr::ArrayIndex { .. } | Expr::This
+        )
+    }
+    fn materialize(monitor: &mut Expr, vt: &mut VarTable) -> Stmt {
+        let ty = monitor.type_ref();
+        let seq = crate::classdec::next_stack_seq();
+        let slot = vt.vars.iter().map(|v| v.slot).max().unwrap_or(0).saturating_add(1);
+        let id = vt.add_split(slot, format!("discarded{}", seq), ty);
+        let init = std::mem::replace(monitor, Expr::Local { var: id, ty: vt.var(id).ty.clone() });
+        Stmt::LocalDef { var: id, init: Some(init), is_final: false, force_type: true }
+    }
+    fn walk(s: &mut Stmt, vt: &mut VarTable) {
+        match s {
+            Stmt::Block(v) => {
+                let mut i = 0;
+                while i < v.len() {
+                    match &mut v[i] {
+                        Stmt::Synchronized { lock, .. } if !variable_like(lock) => {
+                            let decl = materialize(lock, vt);
+                            v.insert(i, decl);
+                            i += 2;
+                            continue;
+                        }
+                        Stmt::MonitorEnter(monitor) if !variable_like(monitor) => {
+                            let decl = materialize(monitor, vt);
+                            v.insert(i, decl);
+                            i += 2;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    walk(&mut v[i], vt);
+                    i += 1;
+                }
+            }
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                walk(then_stmt, vt);
+                if let Some(x) = else_stmt {
+                    walk(x, vt);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::Labeled { body, .. }
+            | Stmt::Synchronized { body, .. } => walk(body, vt),
+            Stmt::For { init, body, .. } => {
+                init.iter_mut().for_each(|x| walk(x, vt));
+                walk(body, vt);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    c.body.iter_mut().for_each(|x| walk(x, vt));
+                }
+                if let Some(d) = default {
+                    walk(d, vt);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                walk(body, vt);
+                for c in catches.iter_mut() {
+                    walk(&mut c.body, vt);
+                }
+                if let Some(f) = finally {
+                    walk(f, vt);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter_mut().for_each(|x| walk(x, vt));
+                walk(body, vt);
+                for c in catches.iter_mut() {
+                    walk(&mut c.body, vt);
+                }
+                if let Some(f) = finally {
+                    walk(f, vt);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(body, vt);
 }
 
 /// Bytecode `pop` can discard values Java has no statement form for: a bare
