@@ -48,42 +48,45 @@ cache. Reproduce with [`scripts/bench.sh`](scripts/bench.sh).
 
 | Tool | Wall time | Peak RSS | Units emitted |
 |---|---:|---:|---:|
-| **jcdc** (parallel — default, 1 worker/core) | **6.8 s** | **599 MB** | 12,609 |
-| jcdc (`JCDC_THREADS=1`, single-threaded) | 23.3 s | 503 MB | 12,609 |
-| Vineflower 1.11.1 | 26.2 s | 8,710 MB | 12,609 |
-| CFR 0.152 | 59.4 s | 4,831 MB | 12,609 |
-| Procyon 0.6.0 | 113.1 s | 4,377 MB | 12,586 |
-| fernflower (JetBrains) | 196.8 s | 2,760 MB | 12,609 |
+| **jcdc** (parallel — default, 1 worker/core) | **6.0 s** | **788 MB** | 12,609 |
+| jcdc (`JCDC_THREADS=1`, single-threaded) | 24.1 s | 493 MB | 12,609 |
+| Vineflower 1.11.1 | 38.5 s | 8,765 MB | 12,609 |
+| CFR 0.152 | 87.3 s | 4,242 MB | 12,609 |
+| Procyon 0.6.0 | 172.8 s | 2,282 MB | 12,586 |
+| fernflower (JetBrains) | 297.2 s | 2,438 MB | 12,609 |
 
 **Workload 2 — JDK 26 runtime image (`lib/modules`, 15,231 units):**
 
 | Tool | Wall time | Peak RSS | Units emitted |
 |---|---:|---:|---:|
-| **jcdc** (parallel — default) | **11.9 s** | **801 MB** | 15,231 |
-| jcdc (`JCDC_THREADS=1`, single-threaded) | 72.3 s | 591 MB | 15,231 |
-| CFR 0.152 | 175.8 s | 8,146 MB | 15,235 |
-| fernflower (JetBrains) | 513.1 s | 4,485 MB | 15,231 |
-| Procyon 0.6.0 | 789.4 s | 4,343 MB | 15,233 |
-| Vineflower 1.11.1 † | > 40 min (capped) | 16,964 MB | 0 |
+| **jcdc** (parallel — default) | **17.9 s** | **1,052 MB** | 15,231 |
+| jcdc (`JCDC_THREADS=1`, single-threaded) | 68.0 s | 672 MB | 15,231 |
+| CFR 0.152 | 120.8 s | 8,171 MB | 15,235 |
+| fernflower (JetBrains) | 409.5 s | 6,082 MB | 15,231 |
+| Procyon 0.6.0 | 623.2 s | 4,538 MB | 15,233 |
+| Vineflower 1.11.1 † | capped at 300 s | 8,821 MB | 0 |
 
-† Vineflower **cannot finish this workload**: at `-Xmx8g` and `-Xmx16g` it
-exhausts the heap (hundreds of caught per-class `OutOfMemoryError`s, nothing
-written even after 48 min at 16g); at `-Xmx32g` it was still running when
-capped at 40 min (16.9 GB peak RSS, `Java heap space` errors, zero files
-written). It does finish the core module alone (`java.base`, 7,422 entries)
-with a 16g heap in 41.5 s — still slower than jcdc's whole-image run.
+† Vineflower **cannot finish this workload**: `scripts/bench.sh` climbs a heap
+ladder (8 g → 16 g → 32 g) precisely because this image defeats it — at 8 g and
+16 g it catches hundreds of per-class `Java heap space` errors and writes
+nothing, and at 32 g it was still running at a 40-minute cap (16.9 GB peak RSS,
+zero files). It does finish the core module alone (`java.base`, 7,422 entries)
+with a 16 g heap in 41.5 s — still slower than jcdc's whole-image run.
 
-Even single-threaded, jcdc is the fastest tool on both workloads, and its
-whole-run peak RSS (**503–801 MB against 2.8–17 GB** for the JVM tools,
-3.4×–34× less) is smaller than any of them. With the default parallel
-pipeline it is ~3.9× faster than Vineflower, ~8.8× faster than CFR, ~17×
-faster than Procyon and ~29× faster than fernflower on `rt.jar`, and ~15×
-(CFR) / ~43× (fernflower) / ~66× (Procyon) faster on the JDK 26 image.
-Emitted-unit counts differ slightly between tools: jcdc folds `$`-named
-hidden classes into their family file (and emits `module-info.java`), while
-Procyon skips `package-info` files (−23 on `rt.jar`). (jcdc runs with
-`-cp <jar>` for full type context; the JVM tools resolve from the input jar
-itself.)
+Even **single-threaded**, jcdc finishes both workloads faster than every JVM
+tool here (24.1 s vs Vineflower's 38.5 s on `rt.jar`), and its whole-run peak
+RSS (**493–1,052 MB** against **2.3–8.8 GB** for the JVM tools) is 2.2×–17.8×
+smaller. With its default parallel pipeline it is ~6.4× faster than
+Vineflower, ~14× CFR, ~29× Procyon and ~49× fernflower on `rt.jar`, and ~6.7×
+(CFR) / ~23× (fernflower) / ~35× (Procyon) faster on the JDK 26 image.
+Emitted-unit counts differ slightly between tools: jcdc folds `$`-named hidden
+classes into their family file (and emits `module-info.java`), while Procyon
+skips `package-info` files (−23 on `rt.jar`). (jcdc runs with `-cp <jar>` for
+full type context; the JVM tools resolve from the input jar itself.)
+
+Times move a few tens of percent between sessions on this machine; the rows in
+each table are from one run (2026-09-15, jdc-core-based jcdc), so the ratios
+are what matters.
 
 ## Install
 
