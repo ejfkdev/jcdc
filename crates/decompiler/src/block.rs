@@ -291,21 +291,22 @@ impl Cfg {
                 catch_type: r.catch_type.clone(),
             })
             .collect();
-        let mut core = jdc_core::cfg::Cfg::from_blocks(blocks, self.entry, ranges);
         // The view must be EXACTLY this graph's — including predecessor and
         // handler lists as this Cfg has them. Passes mutate successors
         // (`short_circuit_prefold` rewires a folded branch) without updating
         // preds, and the structurer was calibrated against those lists, so
-        // recomputing them here would change structuring decisions.
-        for (cb, jb) in core.blocks.iter_mut().zip(self.blocks.iter()) {
-            cb.pred = jb.pred.clone();
-            cb.handlers = jb.handlers.iter().map(|&h| h as u32).collect();
-        }
-        core.exc_edges = self
-            .exc_edges
-            .iter()
-            .map(|e| jdc_core::cfg::ExcEdge { range: e.range, from: e.from, to: e.to })
-            .collect();
-        core
+        // recomputing them here would change structuring decisions. That is
+        // also why `from_parts` — not `from_blocks` — is the constructor:
+        // the derived lists would be discarded on the next line, and at four
+        // to five snapshots per method that waste is measurable.
+        jdc_core::cfg::Cfg::from_parts(
+            blocks,
+            self.entry,
+            ranges,
+            self.exc_edges
+                .iter()
+                .map(|e| jdc_core::cfg::ExcEdge { range: e.range, from: e.from, to: e.to })
+                .collect(),
+        )
     }
 }
