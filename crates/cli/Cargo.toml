@@ -12,6 +12,9 @@ name = "jcdc"
 path = "src/main.rs"
 
 [dependencies]
+# Allocation is ~1/3 of the profile on whole-jar runs; the system allocator
+# throttles under 18 render workers. mimalloc keeps per-thread arenas.
+mimalloc = { version = "0.1", default-features = false }
 jcdc-classfile = { workspace = true }
 jcdc-jvm = { workspace = true }
 jcdc-decompiler = { workspace = true }

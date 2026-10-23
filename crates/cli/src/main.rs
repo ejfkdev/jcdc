@@ -5,6 +5,13 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use jcdc_decompiler::{ClassOptions, ClassPool};
 
+/// Allocation is roughly a third of the profile on whole-jar runs and the
+/// system allocator throttles under the render worker pool (18 threads:
+/// ~11 s of system time). mimalloc keeps per-thread arenas and hands pages
+/// back more eagerly, which also lowers the peak.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Where the decompiled source goes for one input.
 #[derive(Debug, Clone)]
 enum OutTarget {
