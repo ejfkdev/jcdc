@@ -407,7 +407,15 @@ def verify_corpus(features, limit, keep=False):
             results[feature] = {"skipped": "no toolchain"}
             continue
         javac = javac_l
-        javap = home / "bin" / "javap" if feature < 8 and (home / "bin" / "javap").exists() else LOCAL_JDK / "bin" / "javap"
+        # javap must understand the class file it reads: the host's javap
+        # dies with "Unsupported class file version: N" past its own release
+        # (the JDK 28 corpus scored 0 methods for exactly that reason), so
+        # past the host use the era javap, like the toolchain fallback.
+        era_javap = home / "bin" / "javap"
+        if (feature < 8 or (HOST_RELEASE is not None and feature > HOST_RELEASE)) and era_javap.exists():
+            javap = era_javap
+        else:
+            javap = LOCAL_JDK / "bin" / "javap"
         srcs = pick_sources(feature, limit)
         if not srcs:
             results[feature] = {"skipped": "no sources"}
