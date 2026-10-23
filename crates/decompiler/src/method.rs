@@ -25,6 +25,21 @@ pub struct MethodBody {
 /// Decompile one method. Returns Err only for malformed input; unsupported
 /// constructs degrade to comments inside the statement tree.
 #[track_caller]
+/// Drop the `super(...)` prologue a record's canonical constructor carries
+/// in bytecode (`invokespecial java/lang/Record.<init>`). Returns true when
+/// a statement was removed.
+fn strip_record_super_call(body: &mut Stmt) {
+    fn is_super_ctor(s: &Stmt) -> bool {
+        matches!(s, Stmt::ExprStmt(Expr::Method { name, is_super: true, .. })
+            if &*name == "<init>")
+    }
+    if let Stmt::Block(v) = body {
+        v.retain(|x| !is_super_ctor(x));
+    } else if is_super_ctor(body) {
+        *body = Stmt::Block(Vec::new());
+    }
+}
+
 pub fn decompile_method(
     pc: &PoolClass,
     pool: &ClassPool,
@@ -735,7 +750,7 @@ pub fn decompile_method(
     // Type inference for synthetic (no-LVT) variables, then fix the embedded
     // types in Local expressions.
     let ret_ty = desc.ret.clone();
-    infer_var_types(&mut vt, &mut body, &ret_ty, pc);
+    infer_var_types(&mut vt, &mut body, &ret_ty, pc, pool);
     // After synthetic-var inference: stack-merge locals now carry their
     // Int type in the VarTable (PKCS12KeyStore.isPasswordless'
     // `return var6_581` under a boolean return).
@@ -828,6 +843,16 @@ pub fn decompile_method(
     if !errors.is_empty() {
         let n = errors.len();
         prepend_comment(&mut body, format!("$JCDC: {} block(s) failed to decompile", n));
+    }
+
+    // A record's canonical constructor must not spell `super(...)`: its
+    // bytecode calls `Record.<init>`, but the source form may not
+    // (JLS 8.10.4.1) — javac rejects the class with "invalid canonical
+    // constructor in record". Only EXPLICIT canonical constructors reach
+    // this point (the implicit one is not emitted), and the call is the
+    // constructor prologue, i.e. a top-level statement.
+    if pc.is_record() && pc.method_name(m_idx) == Some("<init>") {
+        strip_record_super_call(&mut body);
     }
     // Post-pipeline safety net for the matexit splices: the conversion-
     // time trial cannot see pathologies CREATED BY THE POST-CONVERT
@@ -4573,11 +4598,18 @@ enum Evidence {
     BoolCandidate,
 }
 
-fn infer_var_types(vt: &mut VarTable, body: &mut Stmt, ret_ty: &JavaType, pc: &PoolClass) {
+fn infer_var_types(
+    vt: &mut VarTable,
+    body: &mut Stmt,
+    ret_ty: &JavaType,
+    pc: &PoolClass,
+    pool: &jcdc_jvm::ClassPool,
+) {
     let n = vt.vars.len();
     let mut ev: Vec<Vec<Evidence>> = vec![Vec::new(); n];
     let mut bool_vars: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    gather_evidence(body, &mut ev, ret_ty, &mut bool_vars);
+    let mut throw_vars: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    gather_evidence(body, &mut ev, ret_ty, &mut bool_vars, &mut throw_vars);
     let mut changed: Vec<Option<JavaType>> = vec![None; n];
     for (v, evs) in ev.iter().enumerate() {
         if !vt.vars[v].synthetic_name || vt.vars[v].is_param {
@@ -4616,6 +4648,7 @@ fn infer_var_types(vt: &mut VarTable, body: &mut Stmt, ret_ty: &JavaType, pc: &P
             if crate::dbg_flag!("JCDC_DBG_MERGE") && vt.stack_vars.contains(&(v as u32)) {
                 eprintln!("INFER stackvar v={} old={:?} t={:?} wide={}", v, old, t, vt.wide_stack_vars.contains(&(v as u32)));
             }
+            let mut throw_lub: Option<JavaType> = None;
             if vt.wide_stack_vars.contains(&(v as u32)) {
                 // Branches disagreed (or carried a generic/Object value);
                 // keep the wide type so every assignment type-checks —
@@ -4636,6 +4669,28 @@ fn infer_var_types(vt: &mut VarTable, body: &mut Stmt, ret_ty: &JavaType, pc: &P
                     matches!(t, JavaType::Object(n) if n == "java/lang/Object")
                 };
                 let uniform = ev_types.windows(2).all(|w| w[0] == w[1]);
+                // A pool-aware join that lands on a REAL common superclass
+                // (IllegalStateException + IllegalArgumentException →
+                // RuntimeException) is just as usable as a uniform type:
+                // both assignments convert to it. Without this the merged
+                // value stays Object, and `throw stack3;` then fails to
+                // compile (JetBrains @NotNull `$$$reportNull$$$0`).
+                let lub = {
+                    let mut acc: Option<JavaType> = None;
+                    for t in &ev_types {
+                        acc = Some(match acc {
+                            None => (*t).clone(),
+                            Some(a) => join_types_pool(&a, t, pool),
+                        });
+                    }
+                    acc
+                };
+                let lub_concrete = lub
+                    .as_ref()
+                    .is_some_and(|j| !matches!(j, JavaType::Object(n) if n == "java/lang/Object"));
+                if throw_vars.contains(&(v as u32)) && lub_concrete {
+                    throw_lub = lub.clone();
+                }
                 // Array covariance: `return sharedTail;` merges e.g. Class[]
                 // and Type[] branch values; when the method return type is
                 // an array and every observed value is an array, the return
@@ -4645,7 +4700,14 @@ fn infer_var_types(vt: &mut VarTable, body: &mut Stmt, ret_ty: &JavaType, pc: &P
                     && ev_types.iter().all(|t| matches!(t, JavaType::Array(_)));
                 let concrete = !ev_types.is_empty()
                     && !ev_types.iter().any(plain_object)
-                    && (uniform || covariant_ret_array);
+                    && (uniform || covariant_ret_array
+                        // A THROWN local is the exception: `throw x` needs a
+                        // Throwable, so a pool-aware LUB (IllegalState +
+                        // IllegalArgument → RuntimeException) is required
+                        // where keeping Object would not compile. Other
+                        // merged vars keep Object — narrowing them could
+                        // change overload resolution.
+                        || (throw_vars.contains(&(v as u32)) && lub_concrete));
                 if crate::dbg_flag!("JCDC_DBG_MERGE") {
                     eprintln!("WIDENARROW v={} ev={:?} concrete={}", v, ev_types, concrete);
                 }
@@ -4658,6 +4720,12 @@ fn infer_var_types(vt: &mut VarTable, body: &mut Stmt, ret_ty: &JavaType, pc: &P
                 // over the 0/1-carrying Int merge type.
                 if matches!(t, JavaType::Boolean) && matches!(old, JavaType::Int) {
                     JavaType::Boolean
+                } else if let Some(l) = throw_lub {
+                    // A thrown value must be a Throwable: take the pool-aware
+                    // LUB of its evidence (see `lub_concrete`). Kept to this
+                    // one consumer — narrowing other merged vars could change
+                    // which overload a call binds to.
+                    l
                 } else if vt.wide_stack_vars.contains(&(v as u32)) {
                     // Widened merges narrowed here take the evidence type
                     // directly; joining with the plain-Object placeholder
@@ -4993,6 +5061,48 @@ fn combine_types(types: &[&JavaType]) -> Option<JavaType> {
     acc
 }
 
+/// Superclass chain of an internal name (itself first), or empty when the
+/// class is not in the pool.
+fn super_chain(pool: &jcdc_jvm::ClassPool, name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = name.to_string();
+    for _ in 0..256 {
+        out.push(cur.clone());
+        let Some(pc) = pool.get(&cur) else { break };
+        match pc.super_name() {
+            Some(s) if s != cur => cur = s.to_string(),
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Nearest common superclass of two internal names (None when unrelated).
+fn common_superclass(pool: &jcdc_jvm::ClassPool, a: &str, b: &str) -> Option<String> {
+    let cb: std::collections::HashSet<String> = super_chain(pool, b).into_iter().collect();
+    super_chain(pool, a).into_iter().find(|n| cb.contains(n))
+}
+
+/// `join_types` with hierarchy access: two unrelated reference types join to
+/// their nearest common SUPERCLASS instead of plain Object. Object-typed
+/// merges are only usable for reads — a merged value that is thrown must be
+/// a Throwable (`throw stack3;` with an Object declaration is a javac error;
+/// JetBrains @NotNull instrumentation's `$$$reportNull$$$0` merges
+/// IllegalStateException / IllegalArgumentException). Interfaces and absent
+/// classes fall back to the plain-Object rule.
+fn join_types_pool(a: &JavaType, b: &JavaType, pool: &jcdc_jvm::ClassPool) -> JavaType {
+    if let (JavaType::Object(na), JavaType::Object(nb)) = (a, b) {
+        if na != "java/lang/Object" && nb != "java/lang/Object" && na != nb {
+            if let Some(lub) = common_superclass(pool, na, nb) {
+                if lub != "java/lang/Object" && lub != "java/lang/Throwable" {
+                    return JavaType::Object(lub.into());
+                }
+            }
+        }
+    }
+    join_types(a, b)
+}
+
 fn join_types(a: &JavaType, b: &JavaType) -> JavaType {
     use JavaType::*;
     if a == b {
@@ -5054,9 +5164,10 @@ fn gather_evidence(
     ev: &mut Vec<Vec<Evidence>>,
     ret_ty: &JavaType,
     bool_vars: &mut std::collections::HashSet<u32>,
+    throw_vars: &mut std::collections::HashSet<u32>,
 ) {
     match s {
-        Stmt::Block(v) => v.iter().for_each(|x| gather_evidence(x, ev, ret_ty, bool_vars)),
+        Stmt::Block(v) => v.iter().for_each(|x| gather_evidence(x, ev, ret_ty, bool_vars, throw_vars)),
         Stmt::ExprStmt(e) => gather_expr(e, ev, None, bool_vars),
         Stmt::LocalDef { var, init, .. } => {
             if let Some(e) = init {
@@ -5103,6 +5214,7 @@ fn gather_evidence(
             gather_expr(e, ev, None, bool_vars);
             // A thrown local must be a Throwable.
             if let Expr::Local { var, .. } = e {
+                throw_vars.insert(*var);
                 push_ev(
                     ev,
                     *var,
@@ -5113,67 +5225,67 @@ fn gather_evidence(
         Stmt::If { cond, then_stmt, else_stmt } => {
             mark_bool_cond(cond, bool_vars);
             gather_expr(cond, ev, None, bool_vars);
-            gather_evidence(then_stmt, ev, ret_ty, bool_vars);
+            gather_evidence(then_stmt, ev, ret_ty, bool_vars, throw_vars);
             if let Some(x) = else_stmt {
-                gather_evidence(x, ev, ret_ty, bool_vars);
+                gather_evidence(x, ev, ret_ty, bool_vars, throw_vars);
             }
         }
         Stmt::While { cond, body } => {
             mark_bool_cond(cond, bool_vars);
             gather_expr(cond, ev, None, bool_vars);
-            gather_evidence(body, ev, ret_ty, bool_vars);
+            gather_evidence(body, ev, ret_ty, bool_vars, throw_vars);
         }
         Stmt::DoWhile { body, cond } => {
             mark_bool_cond(cond, bool_vars);
             gather_expr(cond, ev, None, bool_vars);
-            gather_evidence(body, ev, ret_ty, bool_vars);
+            gather_evidence(body, ev, ret_ty, bool_vars, throw_vars);
         }
         Stmt::For { init, cond, update, body } => {
-            init.iter().for_each(|i| gather_evidence(i, ev, ret_ty, bool_vars));
+            init.iter().for_each(|i| gather_evidence(i, ev, ret_ty, bool_vars, throw_vars));
             if let Some(c) = cond {
                 mark_bool_cond(c, bool_vars);
                 gather_expr(c, ev, None, bool_vars);
             }
             update.iter().for_each(|u| gather_expr(u, ev, None, bool_vars));
-            gather_evidence(body, ev, ret_ty, bool_vars);
+            gather_evidence(body, ev, ret_ty, bool_vars, throw_vars);
         }
         Stmt::ForEach { iterable, body, .. } => {
             gather_expr(iterable, ev, None, bool_vars);
-            gather_evidence(body, ev, ret_ty, bool_vars);
+            gather_evidence(body, ev, ret_ty, bool_vars, throw_vars);
         }
         Stmt::Switch { selector, cases, default, .. } => {
             gather_expr(selector, ev, None, bool_vars);
             for c in cases {
-                c.body.iter().for_each(|st| gather_evidence(st, ev, ret_ty, bool_vars));
+                c.body.iter().for_each(|st| gather_evidence(st, ev, ret_ty, bool_vars, throw_vars));
             }
             if let Some(d) = default {
-                gather_evidence(d, ev, ret_ty, bool_vars);
+                gather_evidence(d, ev, ret_ty, bool_vars, throw_vars);
             }
         }
         Stmt::Try { body, catches, finally } => {
-            gather_evidence(body, ev, ret_ty, bool_vars);
+            gather_evidence(body, ev, ret_ty, bool_vars, throw_vars);
             for c in catches {
-                gather_evidence(&c.body, ev, ret_ty, bool_vars);
+                gather_evidence(&c.body, ev, ret_ty, bool_vars, throw_vars);
             }
             if let Some(f) = finally {
-                gather_evidence(f, ev, ret_ty, bool_vars);
+                gather_evidence(f, ev, ret_ty, bool_vars, throw_vars);
             }
         }
         Stmt::TryWithResources { resources, body, catches, finally } => {
-            for res in resources.iter() { gather_evidence(res, ev, ret_ty, bool_vars); }
-            gather_evidence(body, ev, ret_ty, bool_vars);
+            for res in resources.iter() { gather_evidence(res, ev, ret_ty, bool_vars, throw_vars); }
+            gather_evidence(body, ev, ret_ty, bool_vars, throw_vars);
             for c in catches {
-                gather_evidence(&c.body, ev, ret_ty, bool_vars);
+                gather_evidence(&c.body, ev, ret_ty, bool_vars, throw_vars);
             }
             if let Some(f) = finally {
-                gather_evidence(f, ev, ret_ty, bool_vars);
+                gather_evidence(f, ev, ret_ty, bool_vars, throw_vars);
             }
         }
         Stmt::Synchronized { lock, body } => {
             gather_expr(lock, ev, None, bool_vars);
-            gather_evidence(body, ev, ret_ty, bool_vars);
+            gather_evidence(body, ev, ret_ty, bool_vars, throw_vars);
         }
-        Stmt::Labeled { body, .. } => gather_evidence(body, ev, ret_ty, bool_vars),
+        Stmt::Labeled { body, .. } => gather_evidence(body, ev, ret_ty, bool_vars, throw_vars),
         _ => {}
     }
 }

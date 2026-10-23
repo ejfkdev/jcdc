@@ -1454,6 +1454,29 @@ let text =  Printer::new(&__ctx, &vt).with_indent(indent + 1).into_string(&body)
     Ok(())
 }
 
+/// `(name, descriptor)` of every method this class's bytecode references on
+/// ITSELF (`Methodref`/`InterfaceMethodref` owned by this class) — used to
+/// keep synthetic helpers the emitted source still calls.
+fn referenced_self_methods(pc: &PoolClass) -> HashSet<(String, String)> {
+    let mut out = HashSet::new();
+    for e in &pc.cf.constant_pool {
+        let (ci, nti) = match e {
+            jcdc_classfile::ConstantPoolEntry::Methodref(m) => (m.class_index, m.name_and_type_index),
+            jcdc_classfile::ConstantPoolEntry::InterfaceMethodref(m) => {
+                (m.class_index, m.name_and_type_index)
+            }
+            _ => continue,
+        };
+        if pc.class_name(ci) != Some(pc.internal_name.as_str()) {
+            continue;
+        }
+        if let Some((n, d)) = pc.name_and_type(nti) {
+            out.insert((n.to_string(), d.to_string()));
+        }
+    }
+    out
+}
+
 fn methods_to_skip(
     pc: &PoolClass,
     pool: &ClassPool,
@@ -1463,17 +1486,56 @@ fn methods_to_skip(
 ) -> HashSet<usize> {
     let mut skip = HashSet::new();
     let lambda_methods = collect_lambda_methods(pc);
+    // Synthetic helpers the emitted code still CALLS must be declared.
+    // JetBrains' @NotNull instrumentation adds `private static void
+    // $$$reportNull$$$0(int)` and every null check calls it; hiding it left
+    // the recompiled class with an unresolved symbol (for a record javac
+    // reports "invalid canonical constructor" first, so the missing helper
+    // surfaced under a misleading name). Bridges and the javac-inlined
+    // families (access$, lambda$) stay hidden: jcdc rewrites their call
+    // sites, so the output references nothing.
+    let referenced: HashSet<(String, String)> = if opts.show_synthetic {
+        HashSet::new()
+    } else {
+        referenced_self_methods(pc)
+    };
     for mi in 0..pc.cf.methods.len() {
         let m = &pc.cf.methods[mi];
         let name = pc.utf8(m.name_index).unwrap_or("").to_string();
+        // A synthetic helper the emitted code still CALLS must be declared
+        // (see `referenced`: JetBrains' `$$$reportNull$$$0` is synthetic,
+        // private and every null check calls it). Bridges and the
+        // javac-inlined families stay hidden — jcdc rewrites their sites.
+        let bridge = m.access_flags.contains(MethodAccessFlags::BRIDGE);
+        let synthetic = m.access_flags.contains(MethodAccessFlags::SYNTHETIC);
+        let inlined_family = name.starts_with("access$")
+            || name.starts_with("lambda$")
+            || name.contains("$lambda$")
+            || name.starts_with("$deserializeLambda$");
+        // Constructors and record components are implicit in the source
+        // (a record's canonical ctor and its accessors, an inner class's
+        // outer-capture ctor): emitting them is legal but not what the
+        // source says, so only real HELPERS are rescued.
+        let implicit_in_source = name == "<init>"
+            // enum's generated backing-array builder: `values()` is printed
+            // with its own clone() body, so nothing in the OUTPUT calls this.
+            || name == "$values"
+            || (is_record && {
+                let comps = record_component_names(pc);
+                comps.iter().any(|c| c == &name)
+            });
+        let called = !bridge
+            && !inlined_family
+            && !implicit_in_source
+            && pc
+                .method_desc(mi)
+                .map(|d| referenced.contains(&(name.clone(), d.to_string())))
+                .unwrap_or(false);
         if name == "<clinit>" || lambda_methods.contains(&mi) {
             skip.insert(mi);
             continue;
         }
-        if !opts.show_synthetic
-            && (m.access_flags.contains(MethodAccessFlags::SYNTHETIC)
-                || m.access_flags.contains(MethodAccessFlags::BRIDGE))
-        {
+        if !opts.show_synthetic && (synthetic || bridge) && !called {
             skip.insert(mi);
             continue;
         }
@@ -1496,7 +1558,7 @@ fn methods_to_skip(
                 continue;
             }
         }
-        if is_record && is_synthetic_record_method(pc, pool, mi) {
+        if is_record && is_synthetic_record_method(pc, pool, mi) && !called {
             skip.insert(mi);
             continue;
         }
