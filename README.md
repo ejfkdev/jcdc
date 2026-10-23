@@ -149,7 +149,7 @@ front-end below is one front-end, a DEX one would be another).
 
 ```
 crates/classfile    class-file binary parsing (constant pool, attributes,
-                    instruction decode; versions 45–70)
+                    instruction decode; versions 45–72)
 crates/jvm          ClassPool (cross-type resolution), generic Signature parsing
 crates/decompiler   the class-file front-end + its JVM idioms:
   builder.rs          operand-stack simulation → Expr/Stmt (indy lambdas,

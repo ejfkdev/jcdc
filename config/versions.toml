@@ -296,5 +296,38 @@ sealed_classes = true
 string_concat_indy = true
 lambda_indy = true
 
-# 18-26 与 17 特性集相同，内置默认值已覆盖；
-# 未来新版本（major > 70）在此追加即可。
+# 18-26 与 17 特性集相同，内置默认值已覆盖；27/28 显式列出，
+# 未来新版本（major > 72）在此追加即可。
+
+[[version]]
+class_major = 71
+java_version = "27"
+jsr_ret = false
+stack_map_table = true
+invokedynamic = true
+interface_default_methods = true
+module_info = true
+private_interface_methods = true
+nest_based_access = true
+dynamic_constant = true
+records = true
+sealed_classes = true
+string_concat_indy = true
+lambda_indy = true
+
+[[version]]
+class_major = 72
+java_version = "28"
+jsr_ret = false
+stack_map_table = true
+invokedynamic = true
+interface_default_methods = true
+module_info = true
+private_interface_methods = true
+nest_based_access = true
+dynamic_constant = true
+records = true
+sealed_classes = true
+string_concat_indy = true
+lambda_indy = true
+

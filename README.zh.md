@@ -137,7 +137,7 @@ jcdc --synthetic Foo.class           # 包含 synthetic/bridge 成员
 仓库只留 class 文件前端与 JVM 惯用法；将来做 DEX 前端时与之并列即可。
 
 ```
-crates/classfile    class 文件二进制解析（常量池、属性、指令解码；45–70 全版本）
+crates/classfile    class 文件二进制解析（常量池、属性、指令解码；45–72 全版本）
 crates/jvm          ClassPool（跨类型解析池）、泛型 Signature 解析
 crates/decompiler   class 文件前端 + JVM 惯用法：
   builder.rs          操作数栈模拟 → Expr/Stmt（indy lambda、字符串拼接、

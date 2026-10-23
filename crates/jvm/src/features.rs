@@ -159,6 +159,8 @@ pub fn major_to_java_version(major: u16) -> &'static str {
         68 => "24",
         69 => "25",
         70 => "26",
+        71 => "27",
+        72 => "28",
         _ => "unknown",
     }
 }
@@ -182,6 +184,11 @@ mod tests {
     fn version_mapping() {
         assert_eq!(major_to_java_version(52), "8");
         assert_eq!(major_to_java_version(61), "17");
+        assert_eq!(major_to_java_version(71), "27");
+        assert_eq!(major_to_java_version(72), "28");
+        // Future majors keep inheriting the modern feature set.
+        let f72 = builtin_features(72);
+        assert!(f72.records && f72.sealed_classes && f72.string_concat_indy);
         assert_eq!(major_to_java_version(45), "1.1");
         assert_eq!(java_version_to_major("1.8"), Some(52));
         assert_eq!(java_version_to_major("8"), Some(52));

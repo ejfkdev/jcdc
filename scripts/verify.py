@@ -91,6 +91,25 @@ def jcdc_cp(feature):
     return []
 LOCAL_JDK = Path("/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home")
 
+def _host_release():
+    """Feature release of LOCAL_JDK, or None when unknown.
+
+    `--release N` works only up to the running javac's own version; past it
+    the corpus JDK's toolchain has to compile (JDK 28 has no backport).
+    """
+    try:
+        text = (LOCAL_JDK / "release").read_text(errors="replace")
+    except OSError:
+        return None
+    m = re.search(r'JAVA_VERSION="([0-9.]+)"', text)
+    if not m:
+        return None
+    v = m.group(1)
+    return int(v.split(".")[1]) if v.startswith("1.") else int(v.split(".")[0])
+
+
+HOST_RELEASE = _host_release()
+
 FEATURE_GATES = {
     # file -> minimum release
     "Legacy6": 6, "Legacy7": 7,
@@ -203,6 +222,11 @@ def normalize_insn(line):
 def toolchain(r):
     """(javac_argv, java_path, release_args) for compiling at release r."""
     if r >= 8:
+        if HOST_RELEASE is not None and r > HOST_RELEASE:
+            home = jdk_home(r)
+            if home is not None:
+                return ([str(home / "bin" / "javac")], home / "bin" / "java",
+                        ["--release", str(r)])
         return ([str(LOCAL_JDK / "bin" / "javac")], LOCAL_JDK / "bin" / "java",
                 ["--release", str(r)])
     home = jdk_home(r)
@@ -255,9 +279,7 @@ def verify_features(releases, keep=False):
                 javac = [str(home / "bin" / "javac")]
             release_args = []
         else:
-            javac = [str(LOCAL_JDK / "bin" / "javac")]
-            java = LOCAL_JDK / "bin" / "java"
-            release_args = ["--release", str(r)]
+            javac, java, release_args = toolchain(r)
         rdir = WORK / "features" / f"r{r}"
         if rdir.exists():
             shutil.rmtree(rdir)

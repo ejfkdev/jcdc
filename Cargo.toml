@@ -13,7 +13,10 @@ homepage = "https://github.com/ejfkdev/jcdc"
 jcdc-classfile = { path = "crates/classfile", version = "0.1.2" }
 jcdc-jvm = { path = "crates/jvm", version = "0.1.2" }
 jcdc-decompiler = { path = "crates/decompiler", version = "0.1.2" }
-jdc-core = { path = "../jdc-core", version = "0.1.6" }
+# Pinned to the published 0.1.11 while ../jdc-core carries unreleased
+# perf work (0.2.0-pre: Arc<str> IR payloads, FxHash, borrowed group/dom
+# APIs). Restore `path = "../jdc-core"` when migrating to 0.2.
+jdc-core = "0.1.11"
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

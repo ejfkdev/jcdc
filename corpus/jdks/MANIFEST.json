@@ -191,6 +191,26 @@
     "class_file_major": 70
   },
   {
+    "feature": 27,
+    "version": "jdk-27+35",
+    "dir": "jdk27",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 71,
+    "notes": "GA (Temurin 27+35, released 2026-09-15). src.zip drops the Graal modules (jdk.graal.compiler, jdk.graal.compiler.management, jdk.internal.vm.ci) that mainline removed in 27 — 15,310 source files."
+  },
+  {
+    "feature": 28,
+    "version": "jdk-28+18-ea",
+    "dir": "jdk28",
+    "os": "mac",
+    "executable": true,
+    "src_zip_extracted": true,
+    "class_file_major": 72,
+    "notes": "Early access (Temurin 28-beta+18-ea; java.version.date 2027-03-23) — the only 28 build published so far."
+  },
+  {
     "feature": 5,
     "version": null,
     "dir": null,
