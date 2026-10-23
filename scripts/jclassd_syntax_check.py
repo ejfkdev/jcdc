@@ -37,6 +37,30 @@ JAVAC = Path(
         "/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home/bin/javac",
     )
 )
+
+
+def _javac_release():
+    """Feature release of the javac being used.
+
+    `--enable-preview` is only accepted together with `--release <its own
+    version>`; hard-coding 26 broke the whole compile once the host JDK moved
+    to 27 ("invalid source release 26 with --enable-preview"), and the run
+    then reported zero syntax errors because javac never ran.
+    """
+    home = JAVAC.parent.parent
+    try:
+        text = (home / "release").read_text(errors="replace")
+    except OSError:
+        return 26
+    m = re.search(r'JAVA_VERSION="([0-9.]+)"', text)
+    if not m:
+        return 26
+    v = m.group(1)
+    return int(v.split(".")[1]) if v.startswith("1.") else int(v.split(".")[0])
+
+
+JAVAC_RELEASE = _javac_release()
+
 SRC = ROOT / "corpus/jclassd/testcases"
 DEC = Path(os.environ.get("JCLASSD_DEC", "/tmp/jclassd-dec"))
 RE = Path(os.environ.get("JCLASSD_RE", "/tmp/jclassd-re"))
@@ -111,7 +135,7 @@ def compile_group(name, d):
             "-J-Duser.language=en",
             "-J-Duser.country=US",
             "--release",
-            "26",
+            str(JAVAC_RELEASE),
             "--enable-preview",
             "-nowarn",
             "-proc:none",

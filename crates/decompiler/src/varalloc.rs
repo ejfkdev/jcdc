@@ -485,8 +485,13 @@ pub fn build_var_table(
                         }
                         Some(Opcode::Checkcast) => {
                             let p = prev.unwrap();
+                            // An array checkcast names its type by DESCRIPTOR
+                            // (`[Ljava/lang/Class;`): building Object(name)
+                            // directly made the declared type the raw
+                            // descriptor (76 rt.jar units printed it, later
+                            // sanitized to `_Ljava.lang.Class_`).
                             pc.class_name(p.a as u16)
-                                .map(|n| JavaType::Object(n.to_string()))
+                                .map(crate::builder::class_name_to_type)
                         }
                         _ => None,
                     }
