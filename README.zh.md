@@ -8,23 +8,24 @@
 [![Built with ZCode](https://img.shields.io/badge/Built%20with%20ZCode-000000.svg?style=flat&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMTgiIGhlaWdodD0iMTAwIiB2aWV3Qm94PSIwIDAgMjU2IDIxOCI+PHBhdGggZmlsbD0iI2ZmZmZmZiIgZD0iTTEzNC40IDAuMTMwMTUyTDExNi40OCAyNS42MDIyQzExMy42NjUgMjkuNTY5OSAxMDkuMDU0IDMyLjAwMTkgMTA0LjA2NCAzMi4wMDE5SDYuMzk5OVYwQzYuMzk5OSAwLjEzMDE0OSAxMzQuNCAwLjEzMDE1MiAxMzQuNCAwLjEzMDE1MloiLz48cGF0aCBmaWxsPSIjZmZmZmZmIiBkPSJNMjU2IDAuMTMwMTI3TDEwMi40MDEgMjE3LjczMkgwTDE1My41OTkgMC4xMzAxMjdIMjU2WiIvPjxwYXRoIGZpbGw9IiNmZmZmZmYiIGQ9Ik0xMjEuNjAxIDIxNy43MzJMMTM5LjY1IDE5Mi4xMzRDMTQyLjQ2NSAxODguMTY2IDE0Ny4wNzYgMTg1LjczNCAxNTIuMDY3IDE4NS43MzRIMjQ5LjYwNFYyMTcuNzM2SDEyMS42MDFWMjE3LjczMloiLz48L3N2Zz4=)](https://zcode.z.ai/)
 
 用 Rust 编写的 Java class 文件反编译器——把任意 JDK（class 文件主版本 45 /
-Java 1.1 至 70 / Java 26）编译出的 `.class` 文件还原为可读、**可重编译**的
+Java 1.1 至 72 / Java 28）编译出的 `.class` 文件还原为可读、**可重编译**的
 Java 源码。设计参考了 fernflower/Vineflower、garlic、CFR、Procyon、Krakatau
 等开源反编译器（研究笔记见 [`docs/ARCHITECTURE_NOTES.md`](docs/ARCHITECTURE_NOTES.md)），
 代码为全新 Rust 实现。
 
 ## 特性
 
-- **全版本覆盖**——Java 1.1 → 26 字节码，含 `invokedynamic`（lambda /
+- **全版本覆盖**——Java 1.1 → 28 字节码，含 `invokedynamic`（lambda /
   字符串拼接 / switch-pattern 脱糖还原）、record、sealed、
   try-with-resources、枚举、泛型见证还原、内部/局部/匿名类重建、
   `synchronized` 域恢复。
-- **大规模验证**——21 个 JDK 版本、630 个源码族的语料：**反编译产物
-  100% 可重编译**，行为套件运行级输出全等、零 run-mismatch；完整
-  `rt.jar`（12,609 个类）在双结构化管线下零 panic、逐字节确定。
-- **快**——18 核机器上整包 `rt.jar` 约 7 秒、JDK 26 完整运行时镜像
-  （27,855 个类）约 12 秒，峰值内存低于 900MB；默认并行且输出与调度无关
-  （确定性）。
+- **大规模验证**——**JDK 6 → 28 的每个版本**都跑通「编译 → 反编译 →
+  重编译 → 运行」输出全等；另有 630 个源码族的语料，**反编译产物
+  100% 可重编译**、零 run-mismatch；完整 `rt.jar`（12,609 个类）在双结构化
+  管线下零 panic、逐字节确定。
+- **快**——18 核机器上整包 `rt.jar` 约 3.6 秒、Java 28 完整运行时镜像
+  （27,766 个类）约 6.2 秒，峰值内存低于 1GB（458–945MB）；默认并行且输出
+  与调度无关（确定性）。
 - **控制流忠实**——循环/条件/switch/try-catch-finally 结构化 + per-arrival
   共享尾拷贝；短路（`&&`/`||`）与 `assert` 习语源码级还原。
 

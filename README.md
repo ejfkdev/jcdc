@@ -8,7 +8,7 @@
 [![Built with ZCode](https://img.shields.io/badge/Built%20with%20ZCode-000000.svg?style=flat&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMTgiIGhlaWdodD0iMTAwIiB2aWV3Qm94PSIwIDAgMjU2IDIxOCI+PHBhdGggZmlsbD0iI2ZmZmZmZiIgZD0iTTEzNC40IDAuMTMwMTUyTDExNi40OCAyNS42MDIyQzExMy42NjUgMjkuNTY5OSAxMDkuMDU0IDMyLjAwMTkgMTA0LjA2NCAzMi4wMDE5SDYuMzk5OVYwQzYuMzk5OSAwLjEzMDE0OSAxMzQuNCAwLjEzMDE1MiAxMzQuNCAwLjEzMDE1MloiLz48cGF0aCBmaWxsPSIjZmZmZmZmIiBkPSJNMjU2IDAuMTMwMTI3TDEwMi40MDEgMjE3LjczMkgwTDE1My41OTkgMC4xMzAxMjdIMjU2WiIvPjxwYXRoIGZpbGw9IiNmZmZmZmYiIGQ9Ik0xMjEuNjAxIDIxNy43MzJMMTM5LjY1IDE5Mi4xMzRDMTQyLjQ2NSAxODguMTY2IDE0Ny4wNzYgMTg1LjczNCAxNTIuMDY3IDE4NS43MzRIMjQ5LjYwNFYyMTcuNzM2SDEyMS42MDFWMjE3LjczMloiLz48L3N2Zz4=)](https://zcode.z.ai/)
 
 A Java class file decompiler written in Rust — turns `.class` files from any
-JDK (class file version 45 / Java 1.1 through 70 / Java 26) back into
+JDK (class file version 45 / Java 1.1 through 72 / Java 28) back into
 readable, **recompilable** Java source. Design studied from
 fernflower/Vineflower, garlic, CFR, Procyon and Krakatau (research notes in
 [`docs/ARCHITECTURE_NOTES.md`](docs/ARCHITECTURE_NOTES.md)); the code is a
@@ -16,18 +16,18 @@ fresh Rust implementation.
 
 ## Highlights
 
-- **Full-era coverage** — Java 1.1 → 26 bytecode, including `invokedynamic`
+- **Full-era coverage** — Java 1.1 → 28 bytecode, including `invokedynamic`
   (lambda / string-concat / switch-pattern desugaring), records, sealed
   classes, try-with-resources, enums, generics re-witnessing, inner/local/
   anonymous class reconstruction, and `synchronized` recovery.
-- **Verified at scale** — across a 21-release JDK corpus (630 source
-  families): **100% of decompiled families recompile**, with run-level output
-  equality on the behavioral suite and zero run-mismatches; full `rt.jar`
-  (12,609 classes) renders panic-free and byte-deterministically on both
-  structurizer pipelines.
-- **Fast** — whole `rt.jar` in ~7 s and the entire JDK 26 runtime image
-  (27,855 classes) in ~12 s (18-core), under 900 MB peak RSS; parallel by
-  default with deterministic, schedule-independent output.
+- **Verified at scale** — compile → decompile → recompile → run equality on
+  the features suite for **every JDK release from 6 to 28**, plus a 630-family
+  source corpus in which **100% of decompiled families recompile** with zero
+  run-mismatches; full `rt.jar` (12,609 classes) renders panic-free and
+  byte-deterministically on both structurizer pipelines.
+- **Fast** — whole `rt.jar` in ~3.6 s and the entire Java 28 runtime image
+  (27,766 classes) in ~6.2 s on 18 cores, under 1 GB peak RSS (458–945 MB);
+  parallel by default with deterministic, schedule-independent output.
 - **Faithful control flow** — loops/conditions/switch/try-catch-finally
   structuring with per-arrival shared-tail copies; source-exact
   short-circuit (`&&`/`||`) and `assert` idiom recovery.
