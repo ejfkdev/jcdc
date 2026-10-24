@@ -36,11 +36,11 @@ fresh Rust implementation.
 
 Whole-SDK benchmarks on two workloads — every class in **Java 8's `rt.jar`**
 (20,413 class entries → 12,609 emitted units) and **every class of the newest
-JDK, Java 26**. (JDK 9+ has no `rt.jar`: the boot classpath became the module
-image `lib/modules`, so workload 2 is that image's complete class set — all
-68 modules, 27,855 entries → 15,231 units — extracted with `jimage`.) Host:
-Apple M5 Pro (18 cores, 48 GB), macOS. All Java tools run on the same JVM
-(OpenJDK 26) with a uniform `-Xmx8g` heap; each tool gets one
+JDK, Java 28 (early access)**. (JDK 9+ has no `rt.jar`: the boot classpath
+became the module image `lib/modules`, so workload 2 is that image's complete
+class set — all 68 modules, 27,766 entries → 15,039 units — extracted with
+`jimage`.) Host: Apple M5 Pro (18 cores, 48 GB), macOS. All Java tools run on
+the same JVM (OpenJDK 27) with a uniform `-Xmx8g` heap; each tool gets one
 `/usr/bin/time -l` run (wall time + peak RSS) after jcdc has warmed the page
 cache. Reproduce with [`scripts/bench.sh`](scripts/bench.sh).
 
@@ -48,44 +48,47 @@ cache. Reproduce with [`scripts/bench.sh`](scripts/bench.sh).
 
 | Tool | Wall time | Peak RSS | Units emitted |
 |---|---:|---:|---:|
-| **jcdc** (parallel — default, 1 worker/core) | **6.0 s** | **788 MB** | 12,609 |
-| jcdc (`JCDC_THREADS=1`, single-threaded) | 24.1 s | 493 MB | 12,609 |
-| Vineflower 1.11.1 | 38.5 s | 8,765 MB | 12,609 |
-| CFR 0.152 | 87.3 s | 4,242 MB | 12,609 |
-| Procyon 0.6.0 | 172.8 s | 2,282 MB | 12,586 |
-| fernflower (JetBrains) | 297.2 s | 2,438 MB | 12,609 |
+| **jcdc** (parallel — default, 1 worker/core) | **3.6 s** | **684 MB** | 12,609 |
+| jcdc (`JCDC_THREADS=1`, single-threaded) | 12.0 s | 458 MB | 12,609 |
+| Vineflower 1.11.1 | 24.7 s | 8,633 MB | 12,609 |
+| CFR 0.152 | 51.9 s | 4,516 MB | 12,609 |
+| Procyon 0.6.0 | 108.8 s | 2,218 MB | 12,586 |
+| fernflower (JetBrains) | 208.6 s | 2,639 MB | 12,609 |
 
-**Workload 2 — JDK 26 runtime image (`lib/modules`, 15,231 units):**
+**Workload 2 — Java 28 runtime image (`lib/modules`, 15,039 units):**
 
 | Tool | Wall time | Peak RSS | Units emitted |
 |---|---:|---:|---:|
-| **jcdc** (parallel — default) | **17.9 s** | **1,052 MB** | 15,231 |
-| jcdc (`JCDC_THREADS=1`, single-threaded) | 68.0 s | 672 MB | 15,231 |
-| CFR 0.152 | 120.8 s | 8,171 MB | 15,235 |
-| fernflower (JetBrains) | 409.5 s | 6,082 MB | 15,231 |
-| Procyon 0.6.0 | 623.2 s | 4,538 MB | 15,233 |
-| Vineflower 1.11.1 † | capped at 300 s | 8,821 MB | 0 |
+| **jcdc** (parallel — default) | **6.2 s** | **945 MB** | 15,039 |
+| jcdc (`JCDC_THREADS=1`, single-threaded) | 31.6 s | 568 MB | 15,039 |
+| CFR 0.152 | 144.7 s | 8,245 MB | 15,012 |
+| fernflower (JetBrains) | 497.5 s | 5,108 MB | 15,039 |
+| Procyon 0.6.0 | 725.2 s | 6,232 MB | 15,011 |
+| Vineflower 1.11.1 † | capped at 300 s | 8,707 MB | 0 |
 
-† Vineflower **cannot finish this workload**: `scripts/bench.sh` climbs a heap
-ladder (8 g → 16 g → 32 g) precisely because this image defeats it — at 8 g and
-16 g it catches hundreds of per-class `Java heap space` errors and writes
-nothing, and at 32 g it was still running at a 40-minute cap (16.9 GB peak RSS,
-zero files). It does finish the core module alone (`java.base`, 7,422 entries)
-with a 16 g heap in 41.5 s — still slower than jcdc's whole-image run.
+† Vineflower **cannot finish this workload**, which is why `scripts/bench.sh`
+climbs a heap ladder (8 g → 16 g → 32 g): at **8 g** it catches 194 per-class
+`Java heap space` errors and writes no file in 300 s; at **16 g** the heap
+holds but it still writes nothing in 7 minutes (≥ 9 GB RSS); a previous **32 g**
+probe on a same-size image was still running at the 40-minute cap (16.9 GB
+peak, zero files). It does finish the core module alone (`java.base`, 7,422
+entries) with a 16 g heap in 41.5 s — still slower than jcdc's whole-image
+run.
 
 Even **single-threaded**, jcdc finishes both workloads faster than every JVM
-tool here (24.1 s vs Vineflower's 38.5 s on `rt.jar`), and its whole-run peak
-RSS (**493–1,052 MB** against **2.3–8.8 GB** for the JVM tools) is 2.2×–17.8×
-smaller. With its default parallel pipeline it is ~6.4× faster than
-Vineflower, ~14× CFR, ~29× Procyon and ~49× fernflower on `rt.jar`, and ~6.7×
-(CFR) / ~23× (fernflower) / ~35× (Procyon) faster on the JDK 26 image.
-Emitted-unit counts differ slightly between tools: jcdc folds `$`-named hidden
-classes into their family file (and emits `module-info.java`), while Procyon
-skips `package-info` files (−23 on `rt.jar`). (jcdc runs with `-cp <jar>` for
-full type context; the JVM tools resolve from the input jar itself.)
+tool here (12.0 s vs Vineflower's 24.7 s on `rt.jar`), and its whole-run peak
+RSS (**458–945 MB** against **2.2–8.7 GB** for the JVM tools) is 2.3×–19×
+smaller. With its default parallel pipeline it is ~6.8× faster than
+Vineflower, ~14× CFR, ~30× Procyon and ~57× fernflower on `rt.jar`, and
+~23× (CFR) / ~80× (fernflower) / ~117× (Procyon) faster on the Java 28
+image. Emitted-unit counts differ slightly between tools: jcdc folds `$`-named
+hidden classes into their family file (and emits `module-info.java`), while
+Procyon skips `package-info` files (−23 on `rt.jar`). (jcdc runs with
+`-cp <jar>` for full type context; the JVM tools resolve from the input jar
+itself.)
 
 Times move a few tens of percent between sessions on this machine; the rows in
-each table are from one run (2026-09-15, jdc-core-based jcdc), so the ratios
+each table are from one run (2026-10-24, mimalloc-based jcdc), so the ratios
 are what matters.
 
 ## Install

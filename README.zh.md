@@ -31,11 +31,11 @@ Java 源码。设计参考了 fernflower/Vineflower、garlic、CFR、Procyon、K
 ## 性能对比
 
 两组整包 SDK 基准——**Java 8 `rt.jar`** 全量 class（20,413 个 class 条目 →
-12,609 个编译单元）与**最新 JDK（Java 26）的全部 class**。（JDK 9 起
+12,609 个编译单元）与**最新 JDK（Java 28 早期访问版）的全部 class**。（JDK 9 起
 `rt.jar` 已不存在：boot classpath 变成了模块镜像 `lib/modules`，因此负载 2
-取该镜像的完整 class 集合——全部 68 个模块、27,855 个条目 → 15,231 个编译
+取该镜像的完整 class 集合——全部 68 个模块、27,766 个条目 → 15,039 个编译
 单元，用 `jimage` 提取。）测试机：Apple M5 Pro（18 核 / 48GB）/ macOS。
-所有 Java 工具统一跑在同一 JVM（OpenJDK 26）、统一 `-Xmx8g` 堆；jcdc 先跑
+所有 Java 工具统一跑在同一 JVM（OpenJDK 27）、统一 `-Xmx8g` 堆；jcdc 先跑
 预热页缓存，之后每个工具 `/usr/bin/time -l` 计时一次（墙钟 + 峰值 RSS）。
 复现脚本：[`scripts/bench.sh`](scripts/bench.sh)。
 
@@ -43,42 +43,43 @@ Java 源码。设计参考了 fernflower/Vineflower、garlic、CFR、Procyon、K
 
 | 工具 | 墙钟时间 | 峰值内存 | 产出文件 |
 |---|---:|---:|---:|
-| **jcdc**（并行——默认，每核 1 worker） | **6.0 秒** | **788 MB** | 12,609 |
-| jcdc（`JCDC_THREADS=1` 单线程） | 24.1 秒 | 493 MB | 12,609 |
-| Vineflower 1.11.1 | 38.5 秒 | 8,765 MB | 12,609 |
-| CFR 0.152 | 87.3 秒 | 4,242 MB | 12,609 |
-| Procyon 0.6.0 | 172.8 秒 | 2,282 MB | 12,586 |
-| fernflower（JetBrains） | 297.2 秒 | 2,438 MB | 12,609 |
+| **jcdc**（并行——默认，每核 1 worker） | **3.6 秒** | **684 MB** | 12,609 |
+| jcdc（`JCDC_THREADS=1` 单线程） | 12.0 秒 | 458 MB | 12,609 |
+| Vineflower 1.11.1 | 24.7 秒 | 8,633 MB | 12,609 |
+| CFR 0.152 | 51.9 秒 | 4,516 MB | 12,609 |
+| Procyon 0.6.0 | 108.8 秒 | 2,218 MB | 12,586 |
+| fernflower（JetBrains） | 208.6 秒 | 2,639 MB | 12,609 |
 
-**负载 2 —— JDK 26 运行时镜像（`lib/modules`，15,231 个编译单元）：**
+**负载 2 —— Java 28 运行时镜像（`lib/modules`，15,039 个编译单元）：**
 
 | 工具 | 墙钟时间 | 峰值内存 | 产出文件 |
 |---|---:|---:|---:|
-| **jcdc**（并行——默认） | **17.9 秒** | **1,052 MB** | 15,231 |
-| jcdc（`JCDC_THREADS=1` 单线程） | 68.0 秒 | 672 MB | 15,231 |
-| CFR 0.152 | 120.8 秒 | 8,171 MB | 15,235 |
-| fernflower（JetBrains） | 409.5 秒 | 6,082 MB | 15,231 |
-| Procyon 0.6.0 | 623.2 秒 | 4,538 MB | 15,233 |
-| Vineflower 1.11.1 † | 300 秒时封顶 | 8,821 MB | 0 |
+| **jcdc**（并行——默认） | **6.2 秒** | **945 MB** | 15,039 |
+| jcdc（`JCDC_THREADS=1` 单线程） | 31.6 秒 | 568 MB | 15,039 |
+| CFR 0.152 | 144.7 秒 | 8,245 MB | 15,012 |
+| fernflower（JetBrains） | 497.5 秒 | 5,108 MB | 15,039 |
+| Procyon 0.6.0 | 725.2 秒 | 6,232 MB | 15,011 |
+| Vineflower 1.11.1 † | 300 秒时封顶 | 8,707 MB | 0 |
 
-† Vineflower **跑不完这组负载**：`scripts/bench.sh` 之所以要爬堆阶梯
-（8g → 16g → 32g）就是被这组负载逼出来的——8g/16g 下逐类捕获 `Java heap
-space`、一个文件都写不出，32g 跑满 40 分钟封顶时仍在运行（峰值 16.9 GB、
-0 个文件）。它单独跑核心模块 `java.base`（7,422 个条目）可以完成：16g 堆
-41.5 秒——但仍慢于 jcdc 跑完整镜像。
+† Vineflower **跑不完这组负载**，`scripts/bench.sh` 的堆阶梯（8g → 16g →
+32g）就是为它设的：**8g** 下逐类捕获 194 次 `Java heap space`、300 秒内
+一个文件都没写出；**16g** 堆不再耗尽，但 7 分钟内依旧 0 文件（RSS ≥ 9 GB）；
+早前在同一规模的镜像上试过 **32g**，跑满 40 分钟封顶时仍在运行（峰值
+16.9 GB、0 个文件）。它单独跑核心模块 `java.base`（7,422 个条目）可以完成：
+16g 堆 41.5 秒——但仍慢于 jcdc 跑完整镜像。
 
 即便**单线程**，jcdc 跑完两组负载也比这里所有 Java 工具快（`rt.jar` 上
-24.1 秒 vs Vineflower 38.5 秒），整轮峰值内存（**493–1,052 MB**，对比
-Java 工具的 **2.3–8.8 GB**）低 2.2×–17.8×。默认并行管线下：`rt.jar` 上比
-Vineflower 快约 6.4 倍、比 CFR 快约 14 倍、比 Procyon 快约 29 倍、比
-fernflower 快约 49 倍；JDK 26 镜像上比 CFR 快约 6.7 倍、比 fernflower 快
-约 23 倍、比 Procyon 快约 35 倍。各工具产出文件数的细微差异来自归类口径：
+12.0 秒 vs Vineflower 24.7 秒），整轮峰值内存（**458–945 MB**，对比
+Java 工具的 **2.2–8.7 GB**）低 2.3×–19×。默认并行管线下：`rt.jar` 上比
+Vineflower 快约 6.8 倍、比 CFR 快约 14 倍、比 Procyon 快约 30 倍、比
+fernflower 快约 57 倍；Java 28 镜像上比 CFR 快约 23 倍、比 fernflower 快
+约 80 倍、比 Procyon 快约 117 倍。各工具产出文件数的细微差异来自归类口径：
 jcdc 把 `$` 命名的隐藏类折叠进所属族文件（并输出 `module-info.java`），
 Procyon 则跳过 `package-info` 文件（`rt.jar` 上少 23 个）。（jcdc 带
 `-cp <jar>` 提供完整类型上下文；Java 工具从输入 jar 自行解析。）
 
 同一台机器不同时段跑，绝对秒数会有几十个百分点的波动；每张表内的数据取自
-同一次运行（2026-09-15，基于 jdc-core 的 jcdc），看比值更有意义。
+同一次运行（2026-10-24，采用 mimalloc 分配器的 jcdc），看比值更有意义。
 
 ## 安装
 
