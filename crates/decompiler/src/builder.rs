@@ -25,6 +25,36 @@ thread_local! {
         std::cell::RefCell::new(HashSet::new());
 }
 
+/// The conditional branch consuming the value a store just wrote, looking
+/// past constant pushes (`dup; istore v; iconst_m1; if_icmpeq` is how javac
+/// compiles `(v = f()) != -1`). Only constants are skipped: any other
+/// instruction could reassign the local and make the stack value stale.
+fn cond_branch_ahead(ins: &[Instruction], mut i: usize) -> Option<Opcode> {
+    loop {
+        let op = ins.get(i)?.op;
+        match op {
+            Opcode::AconstNull
+            | Opcode::IconstM1
+            | Opcode::Iconst0
+            | Opcode::Iconst1
+            | Opcode::Iconst2
+            | Opcode::Iconst3
+            | Opcode::Iconst4
+            | Opcode::Iconst5
+            | Opcode::Lconst0
+            | Opcode::Lconst1
+            | Opcode::Fconst0
+            | Opcode::Fconst1
+            | Opcode::Fconst2
+            | Opcode::Dconst0
+            | Opcode::Dconst1
+            | Opcode::Bipush
+            | Opcode::Sipush => i += 1,
+            _ => return Some(op),
+        }
+    }
+}
+
 fn dup_marks_clear_at_or_above(depth: usize) {
     DUP_MARKS.with(|m| m.borrow_mut().retain(|&d| d < depth));
 }
@@ -213,6 +243,16 @@ impl<'a> Builder<'a> {
                     {
                         continue;
                     }
+                    if self.localize_dup_condition(
+                        &mut stack,
+                        slot,
+                        in0.pc,
+                        next_pc,
+                        cond_branch_ahead(ins, i),
+                    ) {
+                        self.store(&mut stmts, slot, in0.pc, next_pc, val)?;
+                        continue;
+                    }
                     match self.inline_dup_store(&mut stack, slot, in0.pc, next_pc, val) {
                         Some(left) => self.store(&mut stmts, slot, in0.pc, next_pc, left)?,
                         None => {}
@@ -221,6 +261,16 @@ impl<'a> Builder<'a> {
                 Opcode::Istore0 | Opcode::Istore1 | Opcode::Istore2 | Opcode::Istore3 => {
                     let slot = (op as u8 - Opcode::Istore0 as u8) as u16;
                     let val = pop(&mut stack)?;
+                    if self.localize_dup_condition(
+                        &mut stack,
+                        slot,
+                        in0.pc,
+                        next_pc,
+                        cond_branch_ahead(ins, i),
+                    ) {
+                        self.store(&mut stmts, slot, in0.pc, next_pc, val)?;
+                        continue;
+                    }
                     match self.inline_dup_store(&mut stack, slot, in0.pc, next_pc, val) {
                         Some(left) => self.store(&mut stmts, slot, in0.pc, next_pc, left)?,
                         None => {}
@@ -229,6 +279,16 @@ impl<'a> Builder<'a> {
                 Opcode::Lstore0 | Opcode::Lstore1 | Opcode::Lstore2 | Opcode::Lstore3 => {
                     let slot = (op as u8 - Opcode::Lstore0 as u8) as u16;
                     let val = pop(&mut stack)?;
+                    if self.localize_dup_condition(
+                        &mut stack,
+                        slot,
+                        in0.pc,
+                        next_pc,
+                        cond_branch_ahead(ins, i),
+                    ) {
+                        self.store(&mut stmts, slot, in0.pc, next_pc, val)?;
+                        continue;
+                    }
                     match self.inline_dup_store(&mut stack, slot, in0.pc, next_pc, val) {
                         Some(left) => self.store(&mut stmts, slot, in0.pc, next_pc, left)?,
                         None => {}
@@ -237,6 +297,16 @@ impl<'a> Builder<'a> {
                 Opcode::Fstore0 | Opcode::Fstore1 | Opcode::Fstore2 | Opcode::Fstore3 => {
                     let slot = (op as u8 - Opcode::Fstore0 as u8) as u16;
                     let val = pop(&mut stack)?;
+                    if self.localize_dup_condition(
+                        &mut stack,
+                        slot,
+                        in0.pc,
+                        next_pc,
+                        cond_branch_ahead(ins, i),
+                    ) {
+                        self.store(&mut stmts, slot, in0.pc, next_pc, val)?;
+                        continue;
+                    }
                     match self.inline_dup_store(&mut stack, slot, in0.pc, next_pc, val) {
                         Some(left) => self.store(&mut stmts, slot, in0.pc, next_pc, left)?,
                         None => {}
@@ -245,6 +315,16 @@ impl<'a> Builder<'a> {
                 Opcode::Dstore0 | Opcode::Dstore1 | Opcode::Dstore2 | Opcode::Dstore3 => {
                     let slot = (op as u8 - Opcode::Dstore0 as u8) as u16;
                     let val = pop(&mut stack)?;
+                    if self.localize_dup_condition(
+                        &mut stack,
+                        slot,
+                        in0.pc,
+                        next_pc,
+                        cond_branch_ahead(ins, i),
+                    ) {
+                        self.store(&mut stmts, slot, in0.pc, next_pc, val)?;
+                        continue;
+                    }
                     match self.inline_dup_store(&mut stack, slot, in0.pc, next_pc, val) {
                         Some(left) => self.store(&mut stmts, slot, in0.pc, next_pc, left)?,
                         None => {}
@@ -255,6 +335,16 @@ impl<'a> Builder<'a> {
                     let val = pop(&mut stack)?;
                     // synchronized scaffolding (see the wide Astore arm).
                     if matches!(ins.get(i).map(|x| x.op), Some(Opcode::Monitorenter)) {
+                        continue;
+                    }
+                    if self.localize_dup_condition(
+                        &mut stack,
+                        slot,
+                        in0.pc,
+                        next_pc,
+                        cond_branch_ahead(ins, i),
+                    ) {
+                        self.store(&mut stmts, slot, in0.pc, next_pc, val)?;
                         continue;
                     }
                     match self.inline_dup_store(&mut stack, slot, in0.pc, next_pc, val) {
@@ -1360,6 +1450,68 @@ impl<'a> Builder<'a> {
     /// `this(-1, .., arguments = Arrays.copyOf(..))` — hoisting the store
     /// to a statement precedes the ctor delegation: "灵活构造器" error).
     /// Returns None when handled, else the untouched value for `store`.
+    /// `x = f(); if (x == null)` — javac's dup-arm-store idiom. The store
+    /// just wrote the very value the surviving dup holds, so the branch must
+    /// read the LOCAL. Leaving the call expression on the stack printed the
+    /// call a second time (`while (r.readLine() != null)` beside a body that
+    /// read the same stream again — MailcapFile consumed three lines per
+    /// iteration instead of one). Only an immediately-following conditional
+    /// branch is rewritten: a later use could follow a reassignment of the
+    /// local, where the stack value and the local genuinely diverge.
+    /// Parameter stores keep the inline-assignment form (`inline_dup_store`).
+    fn localize_dup_condition(
+        &self,
+        stack: &mut Vec<Expr>,
+        slot: u16,
+        at_pc: u16,
+        next_pc: u16,
+        next_op: Option<Opcode>,
+    ) -> bool {
+        let consumes = matches!(
+            next_op,
+            Some(
+                Opcode::Ifeq
+                    | Opcode::IfNe
+                    | Opcode::IfLt
+                    | Opcode::IfGe
+                    | Opcode::IfGt
+                    | Opcode::IfLe
+                    | Opcode::IfIcmpEq
+                    | Opcode::IfIcmpNe
+                    | Opcode::IfIcmpLt
+                    | Opcode::IfIcmpGe
+                    | Opcode::IfIcmpGt
+                    | Opcode::IfIcmpLe
+                    | Opcode::IfAcmpeq
+                    | Opcode::IfAcmpne
+                    | Opcode::IfNull
+                    | Opcode::IfNonnull
+            )
+        );
+        if !consumes || stack.is_empty() {
+            return false;
+        }
+        let marked = DUP_MARKS.with(|m| m.borrow_mut().remove(&(stack.len() - 1)));
+        if !marked {
+            return false;
+        }
+        let Some(v) = self
+            .vt
+            .at(slot, next_pc)
+            .or_else(|| self.vt.at(slot, at_pc))
+        else {
+            return false;
+        };
+        if self.vt.var(v).is_param {
+            // Put the decision back for the inline-assignment path.
+            DUP_MARKS.with(|m| m.borrow_mut().insert(stack.len() - 1));
+            return false;
+        }
+        let Some(last) = stack.last_mut() else { return false };
+        *last = self.local_expr(v);
+        true
+    }
+
     fn inline_dup_store(
         &self,
         stack: &mut Vec<Expr>,

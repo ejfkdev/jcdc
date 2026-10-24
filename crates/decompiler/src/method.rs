@@ -4617,6 +4617,11 @@ enum Evidence {
     /// must not be confused with the plain-Object unknown marker.
     OfThis,
     BoolCandidate,
+    /// An Int value that is NOT a 0/1 literal (array/call result, arithmetic).
+    /// Such a variable cannot be a boolean: `int p = ports[i]; if (p == 0)`
+    /// compiles exactly like a boolean test, but declaring `boolean p` makes
+    /// the store itself illegal.
+    IntWide,
 }
 
 fn infer_var_types(
@@ -4648,7 +4653,16 @@ fn infer_var_types(
             && types
                 .iter()
                 .all(|t| matches!(t, JavaType::Int | JavaType::Boolean));
-        let inferred = if (bool_vars.contains(&(v as u32))
+        // A bare `v == 0` test alone proves nothing: an int local read from
+        // an array (`ports[i] == 0`) renders the same shape as a boolean one
+        // (javac has no distinct test opcode). Require value-range evidence —
+        // a 0/1 literal assignment/init — before flipping the type. Without
+        // it, `int p = ports[i]; if (p == 0)` was declared `boolean p`, which
+        // does not even compile (`boolean p = ports[i]`).
+        let has_bool_candidate = evs.iter().any(|e| matches!(e, Evidence::BoolCandidate));
+        let has_int_wide = evs.iter().any(|e| matches!(e, Evidence::IntWide));
+        let inferred = if (bool_vars.contains(&(v as u32)) && has_bool_candidate
+            && !has_int_wide
             && types.iter().all(|t| matches!(t, JavaType::Int))
             && !types.is_empty())
             || (has_bool_ev && only_int_bool)
@@ -5180,6 +5194,47 @@ fn join_types(a: &JavaType, b: &JavaType) -> JavaType {
     a.clone()
 }
 
+/// True when the value can only be an int, never a boolean rendered as int.
+/// A boolean local's declared IR type is Int until inference runs, so an
+/// assignment that merely COPIES a local (or combines one with `&`/`|`/`^`,
+/// legal for both int and boolean) proves nothing; only unambiguous
+/// int-producing expressions (calls with int returns, array elements, int
+/// fields/casts, arithmetic) disqualify a boolean inference.
+fn unambiguous_int_value(e: &Expr) -> bool {
+    match e {
+        Expr::Const(ConstVal::Int(n)) => *n != 0 && *n != 1,
+        Expr::Method { .. } | Expr::Invokedynamic { .. } => true,
+        Expr::ArrayIndex { .. } => true,
+        Expr::Field { .. } => true,
+        Expr::Cast { ty, .. } => matches!(
+            ty,
+            TypeRef::J(
+                JavaType::Int
+                    | JavaType::Char
+                    | JavaType::Byte
+                    | JavaType::Short
+                    | JavaType::Long
+            )
+        ),
+        Expr::Bin { op, .. } => matches!(
+            op,
+            crate::expr::BinOp::Add
+                | crate::expr::BinOp::Sub
+                | crate::expr::BinOp::Mul
+                | crate::expr::BinOp::Div
+                | crate::expr::BinOp::Rem
+                | crate::expr::BinOp::Shl
+                | crate::expr::BinOp::Shr
+                | crate::expr::BinOp::Ushr
+        ),
+        Expr::Un { op, .. } => matches!(
+            op,
+            crate::expr::UnOp::Neg | crate::expr::UnOp::BitNot
+        ),
+        _ => false,
+    }
+}
+
 fn gather_evidence(
     s: &Stmt,
     ev: &mut Vec<Vec<Evidence>>,
@@ -5209,6 +5264,9 @@ fn gather_evidence(
                     // the sibling branch's concrete type (DoubleConsumer)
                     // win the narrowing.
                     let t = e.type_ref().erased();
+                    if matches!(t, JavaType::Int) && unambiguous_int_value(e) {
+                        push_ev(ev, *var, Evidence::IntWide);
+                    }
                     if !matches!(t, JavaType::Void) {
                         push_ev(ev, *var, Evidence::T(t));
                     }
@@ -5377,6 +5435,9 @@ fn gather_expr(e: &Expr, ev: &mut Vec<Vec<Evidence>>, assign_target: Option<u32>
                     } else {
                         value.type_ref().erased()
                     };
+                    if matches!(t, JavaType::Int) && unambiguous_int_value(value) {
+                        push_ev(ev, *var, Evidence::IntWide);
+                    }
                     if !matches!(t, JavaType::Void) {
                         push_ev(ev, *var, Evidence::T(t));
                     }

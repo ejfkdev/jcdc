@@ -24,7 +24,7 @@ Java 源码。设计参考了 fernflower/Vineflower、garlic、CFR、Procyon、K
   100% 可重编译**、零 run-mismatch；完整 `rt.jar`（12,609 个类）在双结构化
   管线下零 panic、逐字节确定。
 - **快**——18 核机器上整包 `rt.jar` 约 2.4 秒、Java 28 完整运行时镜像
-  （27,766 个类）约 5.1 秒，峰值内存低于 1GB（426–947MB）；默认并行且输出
+  （27,766 个类）约 4.7 秒，峰值内存低于 1GB（424–978MB）；默认并行且输出
   与调度无关（确定性）。
 - **控制流忠实**——循环/条件/switch/try-catch-finally 结构化 + per-arrival
   共享尾拷贝；短路（`&&`/`||`）与 `assert` 习语源码级还原。
@@ -44,8 +44,8 @@ Java 源码。设计参考了 fernflower/Vineflower、garlic、CFR、Procyon、K
 
 | 工具 | 墙钟时间 | 峰值内存 | 产出文件 |
 |---|---:|---:|---:|
-| **jcdc**（并行——默认，每核 1 worker） | **2.4 秒** | **694 MB** | 12,609 |
-| jcdc（`JCDC_THREADS=1` 单线程） | 10.0 秒 | 426 MB | 12,609 |
+| **jcdc**（并行——默认，每核 1 worker） | **2.3 秒** | **686 MB** | 12,609 |
+| jcdc（`JCDC_THREADS=1` 单线程） | 9.4 秒 | 427 MB | 12,609 |
 | Vineflower 1.11.1 | 24.7 秒 | 8,633 MB | 12,609 |
 | CFR 0.152 | 51.9 秒 | 4,516 MB | 12,609 |
 | Procyon 0.6.0 | 108.8 秒 | 2,218 MB | 12,586 |
@@ -55,8 +55,8 @@ Java 源码。设计参考了 fernflower/Vineflower、garlic、CFR、Procyon、K
 
 | 工具 | 墙钟时间 | 峰值内存 | 产出文件 |
 |---|---:|---:|---:|
-| **jcdc**（并行——默认） | **5.1 秒** | **947 MB** | 15,039 |
-| jcdc（`JCDC_THREADS=1` 单线程） | 25.0 秒 | 526 MB | 15,039 |
+| **jcdc**（并行——默认） | **4.7 秒** | **978 MB** | 15,039 |
+| jcdc（`JCDC_THREADS=1` 单线程） | 23.3 秒 | 525 MB | 15,039 |
 | CFR 0.152 | 144.7 秒 | 8,245 MB | 15,012 |
 | fernflower（JetBrains） | 497.5 秒 | 5,108 MB | 15,039 |
 | Procyon 0.6.0 | 725.2 秒 | 6,232 MB | 15,011 |
@@ -70,11 +70,11 @@ Java 源码。设计参考了 fernflower/Vineflower、garlic、CFR、Procyon、K
 16g 堆 41.5 秒——但仍慢于 jcdc 跑完整镜像。
 
 即便**单线程**，jcdc 跑完两组负载也比这里所有 Java 工具快（`rt.jar` 上
-10.0 秒 vs Vineflower 24.7 秒），整轮峰值内存（**426–947 MB**，对比
-Java 工具的 **2.2–8.7 GB**）低 2.3×–20×。默认并行管线下：`rt.jar` 上比
-Vineflower 快约 10 倍、比 CFR 快约 21 倍、比 Procyon 快约 45 倍、比
-fernflower 快约 86 倍；Java 28 镜像上比 CFR 快约 28 倍、比 fernflower 快
-约 98 倍、比 Procyon 快约 142 倍。各工具产出文件数的细微差异来自归类口径：
+9.4 秒 vs Vineflower 24.7 秒），整轮峰值内存（**424–978 MB**，对比
+Java 工具的 **2.2–8.7 GB**）低 2.3×–21×。默认并行管线下：`rt.jar` 上比
+Vineflower 快约 11 倍、比 CFR 快约 23 倍、比 Procyon 快约 48 倍、比
+fernflower 快约 93 倍；Java 28 镜像上比 CFR 快约 31 倍、比 fernflower 快
+约 106 倍、比 Procyon 快约 154 倍。各工具产出文件数的细微差异来自归类口径：
 jcdc 把 `$` 命名的隐藏类折叠进所属族文件（并输出 `module-info.java`），
 Procyon 则跳过 `package-info` 文件（`rt.jar` 上少 23 个）。（jcdc 带
 `-cp <jar>` 提供完整类型上下文；Java 工具从输入 jar 自行解析。）
