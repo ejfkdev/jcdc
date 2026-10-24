@@ -1,5 +1,6 @@
 //! Bytecode → expression/statement building via per-block stack simulation.
 
+use crate::strref::JStr;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
@@ -330,7 +331,7 @@ impl<'a> Builder<'a> {
                     // EXPLICIT requireNonNull statement has no dup survivor
                     // and keeps its ExprStmt.
                     let implicit_check = matches!(&v, Expr::Method { cls, name, .. }
-                        if name == "requireNonNull" && cls == "java/util/Objects")
+                        if (name).jstr() == ("requireNonNull").jstr() && (cls).jstr() == ("java/util/Objects").jstr())
                         && !stack.is_empty()
                         && DUP_MARKS.with(|m| m.borrow().contains(&(stack.len() - 1)));
                     if !implicit_check && has_side_effects(&v) {
@@ -699,13 +700,13 @@ impl<'a> Builder<'a> {
                 Opcode::Getstatic => {
                     let (cls, name, d) = self.member(in0.a as u16)?;
                     let ty = self.field_type(&cls, &name, &d);
-                    stack.push(Expr::Field { owner: None, cls, name, ty, is_static: true });
+                    stack.push(Expr::Field { owner: None, cls: (cls).into(), name: (name).into(), ty, is_static: true });
                 }
                 Opcode::Putstatic => {
                     let val = pop(&mut stack)?;
                     let (cls, name, d) = self.member(in0.a as u16)?;
                     let ty = self.field_type(&cls, &name, &d);
-                    let target = Expr::Field { owner: None, cls, name, ty, is_static: true };
+                    let target = Expr::Field { owner: None, cls: (cls).into(), name: (name).into(), ty, is_static: true };
                     stmts.push(mk_assign(target, val));
                 }
                 Opcode::Getfield => {
@@ -713,7 +714,7 @@ impl<'a> Builder<'a> {
                     let (cls, name, d) = self.member(in0.a as u16)?;
                     let ty = self.field_type(&cls, &name, &d);
                     let owner = self.owner_expr(obj, &cls);
-                    stack.push(Expr::Field { owner, cls, name, ty, is_static: false });
+                    stack.push(Expr::Field { owner, cls: (cls).into(), name: (name).into(), ty, is_static: false });
                 }
                 Opcode::Putfield => {
                     let val = pop(&mut stack)?;
@@ -721,7 +722,7 @@ impl<'a> Builder<'a> {
                     let (cls, name, d) = self.member(in0.a as u16)?;
                     let ty = self.field_type(&cls, &name, &d);
                     let owner = self.owner_expr(obj, &cls);
-                    let target = Expr::Field { owner, cls, name, ty, is_static: false };
+                    let target = Expr::Field { owner, cls: (cls).into(), name: (name).into(), ty, is_static: false };
                     stmts.push(mk_assign(target, val));
                 }
 
@@ -738,8 +739,8 @@ impl<'a> Builder<'a> {
                     let cls = self.pc.class_name(in0.a as u16)
                         .ok_or_else(|| BuildError("new: bad cp".into()))?
                         .to_string();
-                    let ty = TypeRef::J(JavaType::Object(cls.clone()));
-                    stack.push(Expr::New { cls, ty, args: Vec::new(), raw: true });
+                    let ty = TypeRef::J(JavaType::Object((cls.clone()).into()));
+                    stack.push(Expr::New { cls: (cls).into(), ty, args: Vec::new(), arg_tys: Vec::new(), raw: true });
                 }
                 Opcode::Newarray => {
                     let n = pop(&mut stack)?;
@@ -766,9 +767,9 @@ impl<'a> Builder<'a> {
                     // trailing_dims so emission reads `new byte[x][]`.
                     let levels = cls.chars().take_while(|&c| c == '[').count() as u8;
                     let mut elem = if levels > 0 {
-                        jcdc_jvm::parse_field_descriptor(&cls).unwrap_or(JavaType::Object(cls))
+                        jcdc_jvm::parse_field_descriptor(&cls).unwrap_or(JavaType::Object((cls).into()))
                     } else {
-                        JavaType::Object(cls)
+                        JavaType::Object((cls).into())
                     };
                     for _ in 0..levels {
                         elem = match elem {
@@ -821,7 +822,7 @@ impl<'a> Builder<'a> {
                     let arr = pop(&mut stack)?;
                     stack.push(Expr::Field {
                         owner: Some(Box::new(arr)),
-                        cls: String::new(),
+                        cls: (String::new()).into(),
                         name: "length".into(),
                         ty: JavaType::Int.into(),
                         is_static: false,
@@ -844,7 +845,7 @@ impl<'a> Builder<'a> {
                         (
                             Expr::Method { name, owner: Some(o), .. },
                             TypeRef::J(jcdc_jvm::JavaType::Array(_)),
-                        ) if name == "clone" => match o.type_ref() {
+                        ) if (name).jstr() == ("clone").jstr() => match o.type_ref() {
                             TypeRef::G(g @ jcdc_jvm::GenericType::Array(_))
                                 if TypeRef::G(g.clone()).erased() == ty.erased() =>
                             {
@@ -898,7 +899,7 @@ impl<'a> Builder<'a> {
         use jcdc_classfile::ConstantPoolEntry as E;
         match jcdc_classfile::get_entry(&self.pc.cf.constant_pool, ai) {
             Some(E::String(_)) => match self.pc.string_value(ai) {
-                Some(v) => BsmArg::Str(v.to_string()),
+                Some(v) => BsmArg::Str((v.to_string()).into()),
                 None => BsmArg::Other,
             },
             Some(E::Class(_)) => match self.pc.class_name(ai) {
@@ -927,7 +928,7 @@ impl<'a> Builder<'a> {
                 }
                 match factory {
                     Some(("java/lang/Enum$EnumDesc", "of")) => {
-                        str_arg.map(BsmArg::Str).unwrap_or(BsmArg::Other)
+                        str_arg.map(|s| BsmArg::Str(s.into())).unwrap_or(BsmArg::Other)
                     }
                     Some(("java/lang/constant/ClassDesc", "of")) => {
                         str_arg.map(|n| BsmArg::Cls(n.replace('.', "/"))).unwrap_or(BsmArg::Other)
@@ -960,10 +961,11 @@ impl<'a> Builder<'a> {
                 op,
                 value: Box::new(self.materialize_arrays(*value)),
             },
-            Expr::New { cls, ty, args, raw } => Expr::New {
+            Expr::New { cls, ty, args, arg_tys, raw } => Expr::New {
                 cls,
                 ty,
                 args: args.into_iter().map(|a| self.materialize_arrays(a)).collect(),
+                arg_tys,
                 raw,
             },
             Expr::Method { owner, cls, name, desc, args, is_static, is_interface, is_special, is_super, is_dynamic, type_args } => {
@@ -1134,7 +1136,7 @@ impl<'a> Builder<'a> {
             (Expr::Field { cls, name, is_static, .. }, Opcode::Putstatic | Opcode::Putfield) => {
                 let (scls, sname, _) = self.member(i2.a as u16).ok()?;
                 let want_static = matches!(i2.op, Opcode::Putstatic);
-                if scls == *cls && sname == *name && want_static == *is_static {
+                if (scls).jstr() == (*cls).jstr() && (sname).jstr() == (*name).jstr() && want_static == *is_static {
                     Some((3, k))
                 } else {
                     None
@@ -1246,7 +1248,7 @@ impl<'a> Builder<'a> {
             ConstantPoolEntry::Float(f) => stack.push(Expr::Const(ConstVal::Float(f.value))),
             ConstantPoolEntry::String(_) => {
                 let v = self.pc.string_value(idx).ok_or_else(|| BuildError("ldc str".into()))?;
-                stack.push(Expr::Const(ConstVal::Str(v.to_string())));
+                stack.push(Expr::Const(ConstVal::Str((v.to_string()).into())));
             }
             ConstantPoolEntry::Class(_) => {
                 let name = self.pc.class_name(idx).ok_or_else(|| BuildError("ldc class".into()))?;
@@ -1515,6 +1517,10 @@ impl<'a> Builder<'a> {
 
         // Constructor calls.
         if name == "<init>" {
+            // Formal types of the folded `<init>`, kept in step with `args`
+            // (the marker drop below removes the same slot from both). Core
+            // 0.2 uses this as ground truth for typed-argument rendering.
+            let mut init_arg_tys = mdesc.args.clone();
             // javac <= 8 synthesizes access constructors for private inner
             // constructors: `Inner(Outer, Outer$1)` where the trailing
             // marker parameter (an empty synthetic class) always receives
@@ -1537,18 +1543,19 @@ impl<'a> Builder<'a> {
                         .unwrap_or(false);
                 if marker_is_synthetic && matches!(args.last(), Some(Expr::Const(ConstVal::Null))) {
                     args.pop();
+                    init_arg_tys.pop();
                 }
             }
             if let Some(Expr::New { raw: true, .. }) = owner_raw {
-                let ty = TypeRef::J(JavaType::Object(cls.clone()));
-                let folded = Expr::New { cls: cls.clone(), ty, args, raw: false };
+                let ty = TypeRef::J(JavaType::Object((cls.clone()).into()));
+                let folded = Expr::New { cls: (cls.clone()).into(), ty, args, arg_tys: init_arg_tys, raw: false };
                 // Standard `new C; dup; ...; invokespecial <init>` pattern:
                 // the raw twin pushed by `new` is still on the stack and now
                 // denotes the initialized object — replace it instead of
                 // pushing a second value.
                 let twin_on_top = matches!(
                     stack.last(),
-                    Some(Expr::New { raw: true, cls: c2, .. }) if *c2 == cls
+                    Some(Expr::New { raw: true, cls: c2, .. }) if *c2 == (cls).into()
                 );
                 if twin_on_top {
                     stack.pop();
@@ -1562,9 +1569,9 @@ impl<'a> Builder<'a> {
             let is_super = !matches!(owner, Expr::This) || cls != self.pc.internal_name;
             let call = Expr::Method {
                 owner: Some(Box::new(owner)),
-                cls: cls.clone(),
+                cls: (cls.clone()).into(),
                 name: "<init>".into(),
-                desc: mdesc,
+                desc: std::sync::Arc::new(mdesc),
                 args,
                 is_static: false,
                 is_interface: false,
@@ -1620,9 +1627,9 @@ impl<'a> Builder<'a> {
 
         let e = Expr::Method {
             owner,
-            cls,
-            name,
-            desc: mdesc.clone(),
+            cls: (cls).into(),
+            name: (name).into(),
+            desc: std::sync::Arc::new(mdesc.clone()),
             args,
             is_static,
             is_interface,
@@ -1723,7 +1730,7 @@ impl<'a> Builder<'a> {
                         impl_handle_idx,
                         inst_md,
                         match &mdesc.ret {
-                            JavaType::Object(n) => n.clone(),
+                            JavaType::Object(n) => (n.clone()).to_string(),
                             _ => String::new(),
                         },
                     )?
@@ -2078,9 +2085,9 @@ pub fn is_poly_expr(e: &Expr, pool: &ClassPool) -> bool {
 
 pub fn class_name_to_type(name: &str) -> JavaType {
     if name.starts_with('[') {
-        jcdc_jvm::parse_field_descriptor(name).unwrap_or(JavaType::Object(name.to_string()))
+        jcdc_jvm::parse_field_descriptor(name).unwrap_or(JavaType::Object((name.to_string()).into()))
     } else {
-        JavaType::Object(name.to_string())
+        JavaType::Object((name.to_string()).into())
     }
 }
 
@@ -2153,7 +2160,7 @@ fn fold_const_binop(op: BinOp, l: &Expr, r: &Expr) -> Option<Expr> {
             Some(Expr::Const(Long(a.wrapping_rem(*b))))
         }
         (BinOp::Add, Expr::Const(Str(a)), Expr::Const(Str(b))) => {
-            Some(Expr::Const(Str(format!("{}{}", a, b))))
+            Some(Expr::Const(Str(format!("{}{}", a, b).into())))
         }
         _ => None,
     }
@@ -2202,7 +2209,7 @@ fn collect_append_chain(owner: Option<Expr>) -> Option<Vec<ConcatPart>> {
     loop {
         match cur {
             Expr::Method { owner: ref o, cls: ref c, name: ref n, args: ref a, .. }
-                if n == "append" && is_sb(c) && a.len() == 1 && o.is_some() =>
+                if (n).jstr() == ("append").jstr() && is_sb(c) && a.len() == 1 && o.is_some() =>
             {
                 parts.push(ConcatPart::Str(a[0].clone()));
                 cur = *o.clone().unwrap();
@@ -2215,7 +2222,7 @@ fn collect_append_chain(owner: Option<Expr>) -> Option<Vec<ConcatPart>> {
                         // capacity (int) or char[] forms are not concat
                         // desugaring — bail out.
                         match a[0].type_ref().erased() {
-                            JavaType::Object(ref n) if n == "java/lang/String" => {
+                            JavaType::Object(ref n) if (n).jstr() == ("java/lang/String").jstr() => {
                                 parts.push(ConcatPart::Str(a[0].clone()));
                                 break;
                             }

@@ -2,6 +2,7 @@
 //! code bytes → CFG → block expressions → region tree → statement tree →
 //! post-passes (catch vars, synchronized, if/loop refinements).
 
+use crate::strref::JStr;
 use std::collections::{HashMap, HashSet};
 
 use jcdc_classfile::MethodAccessFlags;
@@ -31,7 +32,7 @@ pub struct MethodBody {
 fn strip_record_super_call(body: &mut Stmt) {
     fn is_super_ctor(s: &Stmt) -> bool {
         matches!(s, Stmt::ExprStmt(Expr::Method { name, is_super: true, .. })
-            if &*name == "<init>")
+            if name.as_ref() == "<init>")
     }
     if let Stmt::Block(v) = body {
         v.retain(|x| !is_super_ctor(x));
@@ -209,7 +210,7 @@ pub fn decompile_method(
     // variables": each predecessor assigns its outgoing value to the
     // variable; the merge block reads it (fixpoint iteration).
     let n = cfg.blocks.len();
-    let universe: std::collections::HashSet<usize> = (0..n).collect();
+    let universe: jdc_core::FxHashSet<usize> = (0..n).collect();
     // NB: the CFG's successors are rewritten by later passes (condition
     // absorption re-orders a branch's succ), so the machine-neutral view is
     // rebuilt at each use site instead of being snapshotted here.
@@ -273,7 +274,7 @@ pub fn decompile_method(
 
         let entry_dom = crate::structure::compute_dominators(
             &core_for_dom,
-            &(0..n).collect::<std::collections::HashSet<usize>>(),
+            &(0..n).collect::<jdc_core::FxHashSet<usize>>(),
             cfg.entry,
         );
         // Phase 1: iterate in-stack propagation to a fixpoint WITHIN this
@@ -388,7 +389,7 @@ pub fn decompile_method(
                                                 }
                                                 if matches!(x, Expr::This) {
                                                     sides.push(JavaType::Object(
-                                                        pc.internal_name.clone(),
+                                                        (pc.internal_name.clone()).into(),
                                                     ));
                                                     continue;
                                                 }
@@ -396,7 +397,7 @@ pub fn decompile_method(
                                                     wide = true;
                                                 }
                                                 let e = x.type_ref().erased();
-                                                if matches!(&e, JavaType::Object(n) if n == "java/lang/Object") {
+                                                if matches!(&e, JavaType::Object(n) if (n).jstr() == ("java/lang/Object").jstr()) {
                                                     wide = true;
                                                 }
                                                 sides.push(e);
@@ -577,9 +578,9 @@ pub fn decompile_method(
     }
 
     // Structure.
-    let diamond_merges: std::collections::HashSet<usize> =
+    let diamond_merges: jdc_core::FxHashSet<usize> =
         merge_cond.keys().copied().collect();
-    let final_field_set: std::collections::HashSet<String> = pc
+    let final_field_set: jdc_core::FxHashSet<String> = pc
         .cf
         .fields
         .iter()
@@ -594,10 +595,15 @@ pub fn decompile_method(
     let (diamond_merges_w, fold_regions_w) = if hybrid {
         (diamond_merges.clone(), fold_regions.clone())
     } else {
-        (std::collections::HashSet::new(), HashMap::new())
+        (jdc_core::FxHashSet::default(), HashMap::new())
     };
     let core_cfg = cfg.to_core();
-    let mut structurer = Structurer::with_diamonds(&core_cfg, &results, diamond_merges, fold_regions);
+    let mut structurer = Structurer::with_diamonds(
+        &core_cfg,
+        &results,
+        diamond_merges,
+        core_fold_regions(&fold_regions),
+    );
     structurer.final_fields = final_field_set.clone();
     if crate::dbg_flag!("JCDC_DBG_MNAME") {
         eprintln!(
@@ -621,8 +627,12 @@ pub fn decompile_method(
         // stays SESE). The walk run uses a FRESH Structurer (structuring
         // mutates consumed/copied state) and its own copied_tails.
         let r_sese = structurer.structure_method();
-        let mut walker =
-            Structurer::with_diamonds(&core_cfg, &results, diamond_merges_w, fold_regions_w);
+        let mut walker = Structurer::with_diamonds(
+            &core_cfg,
+            &results,
+            diamond_merges_w,
+            core_fold_regions(&fold_regions_w),
+        );
         walker.final_fields = final_field_set;
         let r_walk = walker.structure_method_walk();
         fn count_emits(r: &crate::structure::Region) -> usize {
@@ -668,7 +678,7 @@ pub fn decompile_method(
     // Final fields of this class: the converter must not duplicate a shared
     // terminator block that assigns one (a final field accepts exactly one
     // assignment; copies are a compile error, sun.security.util.Debug).
-    let final_fields: std::collections::HashSet<String> = pc
+    let final_fields: jdc_core::FxHashSet<String> = pc
         .cf
         .fields
         .iter()
@@ -778,8 +788,8 @@ pub fn decompile_method(
         .unwrap_or(false)
     {
         match &ret_ty {
-            jcdc_jvm::JavaType::Object(n) if n != "java/lang/Object" => pool
-                .get(n.as_str())
+            jcdc_jvm::JavaType::Object(n) if (n).jstr() != ("java/lang/Object").jstr() => pool
+                .get((n).jstr())
                 .and_then(|cpc| {
                     cpc.class_attr("Signature").and_then(|b| {
                         if b.len() >= 2 {
@@ -1752,11 +1762,11 @@ fn fold_merged_new_inits(body: &mut Stmt, pc: &PoolClass) {
     fn find_inits(s: &Stmt, pc: &PoolClass, out: &mut Vec<(u32, String, Vec<Expr>)>) {
         match s {
             Stmt::ExprStmt(Expr::Method { name, cls, owner, args, .. })
-                if name == "<init>" && cls != &pc.internal_name =>
+                if (name).jstr() == ("<init>").jstr() && (cls).jstr() != (&pc.internal_name).jstr() =>
             {
                 if let Some(o) = owner {
                     if let Expr::Local { var, .. } = &**o {
-                        out.push((*var, cls.clone(), args.clone()));
+                        out.push((*var, (cls.clone()).to_string(), args.clone()));
                     }
                 }
             }
@@ -1823,7 +1833,7 @@ fn fold_merged_new_inits(body: &mut Stmt, pc: &PoolClass) {
                         Stmt::ExprStmt(Expr::Assign { target, value, .. }) => {
                             match (&**target, &**value) {
                                 (Expr::Local { var, .. }, Expr::New { cls, raw: true, .. })
-                                    if inits.iter().any(|(_, c, _)| c == cls) =>
+                                    if inits.iter().any(|(_, c, _)| (c).jstr() == (cls).jstr()) =>
                                 {
                                     Some(*var)
                                 }
@@ -1843,13 +1853,13 @@ fn fold_merged_new_inits(body: &mut Stmt, pc: &PoolClass) {
                 while i < v.len() {
                     let folded = match &v[i] {
                         Stmt::ExprStmt(Expr::Method { name, cls, owner, args, .. })
-                            if name == "<init>" && cls != &pc.internal_name =>
+                            if (name).jstr() == ("<init>").jstr() && (cls).jstr() != (&pc.internal_name).jstr() =>
                         {
                             match owner.as_deref() {
                                 Some(Expr::Local { var, ty }) => {
                                     let var = *var;
                                     let ty = ty.clone();
-                                    inits.iter().find(|(v2, c2, _)| *v2 == var && c2 == cls).map(
+                                    inits.iter().find(|(v2, c2, _)| *v2 == var && (c2).jstr() == (cls).jstr()).map(
                                         |(_, _, iargs)| {
                                             let mut stmts = vec![Stmt::ExprStmt(Expr::Assign {
                                                 target: Box::new(Expr::Local { var, ty: ty.clone() }),
@@ -1860,6 +1870,7 @@ fn fold_merged_new_inits(body: &mut Stmt, pc: &PoolClass) {
                                                         jcdc_jvm::JavaType::Object(cls.clone()),
                                                     ),
                                                     args: iargs.clone(),
+                                                    arg_tys: Vec::new(),
                                                     raw: false,
                                                 }),
                                             })];
@@ -2061,6 +2072,16 @@ fn dedupe_walk(s: &mut Stmt, scopes: &mut Vec<std::collections::HashSet<u32>>) {
 /// Decide pure value-diamond folding for a divergent 2-pred merge using the
 /// previous round's block results (terms and purity are stable across rounds
 /// for javac-style code).
+/// The structurer (jdc-core 0.2) keys its fold regions with the Fx
+/// hashers; jcdc's prefold pass still uses the std maps it always had.
+fn core_fold_regions(
+    m: &HashMap<usize, (usize, HashSet<usize>)>,
+) -> jdc_core::FxHashMap<usize, (usize, jdc_core::FxHashSet<usize>)> {
+    m.iter()
+        .map(|(k, (root, vis))| (*k, (*root, vis.iter().copied().collect())))
+        .collect()
+}
+
 fn try_diamond_fold(
     bid: usize,
     known: &[(usize, Vec<Expr>)],
@@ -2179,7 +2200,7 @@ fn try_diamond_fold(
     // relationship is irrelevant here — we need the header that routes ALL
     // leaves. Prefer the latest dominator of the leaves (smallest region).
     let n = cfg.blocks.len();
-    let universe: HashSet<usize> = (0..n).collect();
+    let universe: jdc_core::FxHashSet<usize> = (0..n).collect();
     let core_cfg2 = cfg.to_core();
     let rpo = crate::structure::reverse_postorder(&core_cfg2, core_cfg2.entry, &universe);
     if crate::dbg_flag!("JCDC_DBG_DIAMOND") {
@@ -2690,7 +2711,7 @@ fn switch_terminates_with(
 /// `if (!c) { throw ..; } super(..); ..`.
 fn hoist_ctor_call_guards(s: &mut Stmt) {
     fn is_ctor_call(x: &Stmt) -> bool {
-        matches!(x, Stmt::ExprStmt(Expr::Method { name, .. }) if name == "<init>")
+        matches!(x, Stmt::ExprStmt(Expr::Method { name, .. }) if (name).jstr() == ("<init>").jstr())
     }
     fn throw_terminated(x: &Stmt) -> bool {
         match x {
@@ -3067,14 +3088,14 @@ fn type_catch_vars(vt: &mut VarTable, s: &Stmt) {
                     let want = if c.exc.is_empty() {
                         Some("java/lang/Throwable".to_string())
                     } else {
-                        c.exc.first().cloned()
+                        (c.exc.first().cloned()).map(|v| v.to_string())
                     };
                     if let Some(w) = want {
                         let cur = vt.vars[c.var as usize].ty.erased();
-                        let placeholder = matches!(&cur, JavaType::Object(n) if n == "java/lang/Object")
+                        let placeholder = matches!(&cur, JavaType::Object(n) if (n).jstr() == ("java/lang/Object").jstr())
                             || cur == JavaType::Int;
                         if placeholder {
-                            vt.vars[c.var as usize].ty = TypeRef::J(JavaType::Object(w));
+                            vt.vars[c.var as usize].ty = TypeRef::J(JavaType::Object(w.into()));
                         }
                     }
                 }
@@ -3092,14 +3113,14 @@ fn type_catch_vars(vt: &mut VarTable, s: &Stmt) {
                     let want = if c.exc.is_empty() {
                         Some("java/lang/Throwable".to_string())
                     } else {
-                        c.exc.first().cloned()
+                        (c.exc.first().cloned()).map(|v| v.to_string())
                     };
                     if let Some(w) = want {
                         let cur = vt.vars[c.var as usize].ty.erased();
-                        let placeholder = matches!(&cur, JavaType::Object(n) if n == "java/lang/Object")
+                        let placeholder = matches!(&cur, JavaType::Object(n) if (n).jstr() == ("java/lang/Object").jstr())
                             || cur == JavaType::Int;
                         if placeholder {
-                            vt.vars[c.var as usize].ty = TypeRef::J(JavaType::Object(w));
+                            vt.vars[c.var as usize].ty = TypeRef::J(JavaType::Object(w.into()));
                         }
                     }
                 }
@@ -4393,7 +4414,7 @@ fn prepend_decls(body: &mut Stmt, mut decls: Vec<Stmt>) {
     match body {
         Stmt::Block(v) => {
             let lead = match v.first() {
-                Some(Stmt::ExprStmt(Expr::Method { name, .. })) if name == "<init>" => 1,
+                Some(Stmt::ExprStmt(Expr::Method { name, .. })) if (name).jstr() == ("<init>").jstr() => 1,
                 _ => 0,
             };
             let mut out: Vec<Stmt> = v.drain(..lead).collect();
@@ -4660,13 +4681,13 @@ fn infer_var_types(
                     .iter()
                     .filter_map(|e| match e {
                         Evidence::T(t) => Some(t.clone()),
-                        Evidence::OfThis => Some(JavaType::Object(pc.internal_name.clone())),
+                        Evidence::OfThis => Some(JavaType::Object((pc.internal_name.clone()).into())),
                         _ => None,
                     })
                     .collect();
                 let ev_types: Vec<&JavaType> = ev_types.iter().collect();
                 let plain_object = |t: &&JavaType| {
-                    matches!(t, JavaType::Object(n) if n == "java/lang/Object")
+                    matches!(t, JavaType::Object(n) if (n).jstr() == ("java/lang/Object").jstr())
                 };
                 let uniform = ev_types.windows(2).all(|w| w[0] == w[1]);
                 // A pool-aware join that lands on a REAL common superclass
@@ -4687,7 +4708,7 @@ fn infer_var_types(
                 };
                 let lub_concrete = lub
                     .as_ref()
-                    .is_some_and(|j| !matches!(j, JavaType::Object(n) if n == "java/lang/Object"));
+                    .is_some_and(|j| !matches!(j, JavaType::Object(n) if (n).jstr() == ("java/lang/Object").jstr()));
                 if throw_vars.contains(&(v as u32)) && lub_concrete {
                     throw_lub = lub.clone();
                 }
@@ -4868,7 +4889,7 @@ fn cast_narrowing_assigns(vt: &VarTable, s: &mut Stmt) {
 /// guarantees the value is assignable, so an erased cast always holds.
 fn cast_object_returns(s: &mut Stmt, ret_ty: &JavaType, wildcard: Option<&TypeRef>) {
     let want = match ret_ty {
-        JavaType::Object(n) if n != "java/lang/Object" => ret_ty.clone(),
+        JavaType::Object(n) if (n).jstr() != ("java/lang/Object").jstr() => ret_ty.clone(),
         JavaType::Array(_) => ret_ty.clone(),
         _ => return,
     };
@@ -5042,7 +5063,7 @@ fn combine_types(types: &[&JavaType]) -> Option<JavaType> {
     // KeyStore)=Object with the next KeyStore evidence into KeyStore,
     // typing jdk11 KeyStore.getInstance's iterator gap var as KeyStore).
     let mut lub_object = false;
-    let plain_object = |t: &JavaType| matches!(t, JavaType::Object(n) if n == "java/lang/Object");
+    let plain_object = |t: &JavaType| matches!(t, JavaType::Object(n) if (n).jstr() == ("java/lang/Object").jstr());
     for t in types {
         acc = Some(match acc {
             None => (*t).clone(),
@@ -5092,7 +5113,7 @@ fn common_superclass(pool: &jcdc_jvm::ClassPool, a: &str, b: &str) -> Option<Str
 /// classes fall back to the plain-Object rule.
 fn join_types_pool(a: &JavaType, b: &JavaType, pool: &jcdc_jvm::ClassPool) -> JavaType {
     if let (JavaType::Object(na), JavaType::Object(nb)) = (a, b) {
-        if na != "java/lang/Object" && nb != "java/lang/Object" && na != nb {
+        if (na).jstr() != ("java/lang/Object").jstr() && (nb).jstr() != ("java/lang/Object").jstr() && na != nb {
             if let Some(lub) = common_superclass(pool, na, nb) {
                 if lub != "java/lang/Object" && lub != "java/lang/Throwable" {
                     return JavaType::Object(lub.into());
@@ -5110,10 +5131,10 @@ fn join_types(a: &JavaType, b: &JavaType) -> JavaType {
     }
     // `java/lang/Throwable` only appears as the conservative type of a
     // rethrow; any concrete exception type is narrower, so prefer it.
-    if matches!(a, Object(n) if n == "java/lang/Throwable") {
+    if matches!(a, Object(n) if (n).jstr() == ("java/lang/Throwable").jstr()) {
         return b.clone();
     }
-    if matches!(b, Object(n) if n == "java/lang/Throwable") {
+    if matches!(b, Object(n) if (n).jstr() == ("java/lang/Throwable").jstr()) {
         return a.clone();
     }
     let num_rank = |t: &JavaType| -> i8 {
@@ -5137,12 +5158,12 @@ fn join_types(a: &JavaType, b: &JavaType) -> JavaType {
         // class typing, uninitialized placeholder) joins anything: the
         // other side carries the real information.
         if let Object(n) = a {
-            if n == "java/lang/Object" {
+            if (n).jstr() == ("java/lang/Object").jstr() {
                 return b.clone();
             }
         }
         if let Object(n) = b {
-            if n == "java/lang/Object" {
+            if (n).jstr() == ("java/lang/Object").jstr() {
                 return a.clone();
             }
         }
@@ -5932,7 +5953,7 @@ fn hoist_escaped_vars(body: &mut Stmt, vt: &VarTable) {
     match body {
         Stmt::Block(items) => {
             let lead = match items.first() {
-                Some(Stmt::ExprStmt(Expr::Method { name, .. })) if name == "<init>" => 1,
+                Some(Stmt::ExprStmt(Expr::Method { name, .. })) if (name).jstr() == ("<init>").jstr() => 1,
                 _ => 0,
             };
             let mut out: Vec<Stmt> = items.drain(..lead).collect();
@@ -6327,9 +6348,9 @@ fn demote_defs(s: &mut Stmt, vars: &std::collections::HashSet<u32>, vt: &VarTabl
 /// moves left only past catches it is a STRICT subtype of; unrelated or
 /// multi-catch entries keep table order.
 fn order_try_catches(s: &mut Stmt, pool: &ClassPool) {
-    fn single(exc: &[String]) -> Option<&str> {
+    fn single(exc: &[std::sync::Arc<str>]) -> Option<&str> {
         if exc.len() == 1 {
-            Some(exc[0].as_str())
+            Some(&*exc[0])
         } else {
             None
         }
@@ -6353,7 +6374,7 @@ fn order_try_catches(s: &mut Stmt, pool: &ClassPool) {
                             cur != prev
                                 && crate::classdec::is_subtype_of(
                                     pool,
-                                    &jcdc_jvm::JavaType::Object(cur.to_string()),
+                                    &jcdc_jvm::JavaType::Object((cur.to_string()).into()),
                                     prev,
                                 )
                         }
@@ -7070,7 +7091,7 @@ fn twr_j11(s: &mut Stmt) {
             }
             if finally.is_none() && catches.len() == 1 {
                 let c = &catches[0];
-                let is_throwable = c.exc.iter().any(|e| e == "java/lang/Throwable");
+                let is_throwable = c.exc.iter().any(|e| (e).jstr() == ("java/lang/Throwable").jstr());
                 if is_throwable && is_twr_boilerplate(&c.body) {
                     // Extract the close call(s) from the handler.
                     let closes = extract_close_calls(&c.body);
@@ -7092,7 +7113,7 @@ fn twr_j11(s: &mut Stmt) {
             }
             if finally.is_none() && catches.len() == 1 {
                 let c = &catches[0];
-                let is_throwable = c.exc.iter().any(|e| e == "java/lang/Throwable");
+                let is_throwable = c.exc.iter().any(|e| (e).jstr() == ("java/lang/Throwable").jstr());
                 if is_throwable && is_twr_boilerplate(&c.body) {
                     // Extract the close call(s) from the handler.
                     let closes = extract_close_calls(&c.body);
@@ -7162,10 +7183,10 @@ fn is_twr_boilerplate(s: &Stmt) -> bool {
                 && else_stmt.as_ref().map(|e| is_twr_boilerplate(e)).unwrap_or(true)
         }
         Stmt::ExprStmt(Expr::Method { name, cls, .. }) => {
-            name == "close"
-                || name == "addSuppressed"
-                || name == "getSuppressed"
-                || name == "<init>" && cls == "java/lang/Throwable"
+            (name).jstr() == ("close").jstr()
+                || (name).jstr() == ("addSuppressed").jstr()
+                || (name).jstr() == ("getSuppressed").jstr()
+                || (name).jstr() == ("<init>").jstr() && (cls).jstr() == ("java/lang/Throwable").jstr()
         }
         Stmt::ExprStmt(Expr::Assign { .. }) => true,
         Stmt::LocalDef { .. } => true,
@@ -7202,7 +7223,7 @@ fn collect_close(s: &Stmt, out: &mut Vec<Stmt>) {
                 collect_close(e, out);
             }
         }
-        Stmt::ExprStmt(e @ Expr::Method { name, .. }) if name == "close" => {
+        Stmt::ExprStmt(e @ Expr::Method { name, .. }) if (name).jstr() == ("close").jstr() => {
             out.push(Stmt::ExprStmt(e.clone()));
         }
         _ => {}
@@ -8136,7 +8157,7 @@ fn flatten_stmts(s: &Stmt) -> Vec<Stmt> {
 fn close_target(f: &Stmt) -> Option<u32> {
     fn rec(e: &Expr) -> Option<u32> {
         match e {
-            Expr::Method { name, owner, args, .. } if name == "close" && args.is_empty() => {
+            Expr::Method { name, owner, args, .. } if (name).jstr() == ("close").jstr() && args.is_empty() => {
                 match owner.as_deref() {
                     Some(Expr::Local { var, .. }) => return Some(*var),
                     _ => {}
@@ -8275,7 +8296,7 @@ fn match_j7(v: &[Stmt], i: usize) -> Option<J7Plan> {
         // catch-all (or Throwable-typed) handler holding the close
         // scaffolding (pre-dedupe finally shapes)
         let scaffolding_exc = c.exc.is_empty()
-            || (c.exc.len() == 1 && c.exc[0] == "java/lang/Throwable");
+            || (c.exc.len() == 1 && c.exc[0] == ("java/lang/Throwable").into());
         if scaffolding_exc && finally.is_none() && scaffold.is_none() {
             let ok = is_close_scaffold_stmt(&c.body);
             if dbg && !ok {
@@ -8534,7 +8555,7 @@ fn scaffold_check(s: &Stmt, nested: bool) -> bool {
     match s {
         Stmt::Block(v) => v.iter().all(|x| scaffold_check(x, true)),
         Stmt::LocalDef { .. } => true,
-        Stmt::ExprStmt(Expr::Method { name, .. }) if name == "close" => true,
+        Stmt::ExprStmt(Expr::Method { name, .. }) if (name).jstr() == ("close").jstr() => true,
         Stmt::ExprStmt(Expr::Assign { target, .. })
             if matches!(&**target, Expr::Local { .. }) => true,
         Stmt::If { cond, then_stmt, else_stmt } => {
@@ -8558,7 +8579,7 @@ fn scaffold_check(s: &Stmt, nested: bool) -> bool {
                 && catches.iter().all(|c| {
                     flatten_stmts(&c.body).iter().all(|h| match h {
                         Stmt::ExprStmt(Expr::Method { name, .. })
-                            if name == "addSuppressed" || name == "close" => true,
+                            if (name).jstr() == ("addSuppressed").jstr() || (name).jstr() == ("close").jstr() => true,
                         Stmt::Throw(_) | Stmt::Return(_) => true,
                         Stmt::ExprStmt(Expr::Assign { .. }) => true,
                         Stmt::LocalDef { .. } => true,
@@ -8573,7 +8594,7 @@ fn scaffold_check(s: &Stmt, nested: bool) -> bool {
                 && catches.iter().all(|c| {
                     flatten_stmts(&c.body).iter().all(|h| match h {
                         Stmt::ExprStmt(Expr::Method { name, .. })
-                            if name == "addSuppressed" || name == "close" => true,
+                            if (name).jstr() == ("addSuppressed").jstr() || (name).jstr() == ("close").jstr() => true,
                         Stmt::Throw(_) | Stmt::Return(_) => true,
                         Stmt::ExprStmt(Expr::Assign { .. }) => true,
                         Stmt::LocalDef { .. } => true,
@@ -8746,7 +8767,7 @@ fn strip_all_monitors(s: &mut Stmt) {
 fn ad_polarity(e: &Expr) -> Option<bool> {
     use crate::expr::BinOp;
     match e {
-        Expr::Field { name, .. } if name == "$assertionsDisabled" => Some(true),
+        Expr::Field { name, .. } if (name).jstr() == ("$assertionsDisabled").jstr() => Some(true),
         Expr::Un { op: crate::expr::UnOp::Not, e } => ad_polarity(e).map(|p| !p),
         Expr::Bin { op: BinOp::Ne, l, r, .. }
             if matches!(&**r, Expr::Const(crate::expr::ConstVal::Int(0))) =>
@@ -8779,7 +8800,7 @@ fn as_assert_throw(s: &Stmt) -> Option<Option<Expr>> {
         match st {
             Stmt::Throw(e) => {
                 if let Expr::New { cls, args, .. } = e {
-                    if cls == "java/lang/AssertionError" {
+                    if (cls).jstr() == ("java/lang/AssertionError").jstr() {
                         msg = args.first().cloned();
                         seen = true;
                         continue;
@@ -9605,7 +9626,7 @@ fn strip_inflight_throws(s: &mut Stmt, inflight: &std::collections::HashSet<u32>
 fn is_inflight_throw(s: &Stmt, _inflight: &std::collections::HashSet<u32>) -> bool {
     match s {
         Stmt::Throw(Expr::Local { ty, .. }) => {
-            matches!(ty, crate::expr::TypeRef::J(JavaType::Object(n)) if n == "java/lang/Throwable")
+            matches!(ty, crate::expr::TypeRef::J(JavaType::Object(n)) if (n).jstr() == ("java/lang/Throwable").jstr())
         }
         _ => false,
     }
@@ -10329,7 +10350,7 @@ fn value_concrete_type(e: &Expr) -> Option<JavaType> {
         let fa = f.type_ref().erased();
         let ref_kind = |x: &JavaType| {
             match x {
-                JavaType::Object(n) => n != "java/lang/Object",
+                JavaType::Object(n) => (n).jstr() != ("java/lang/Object").jstr(),
                 JavaType::Array(_) => true,
                 _ => false,
             }
@@ -10460,7 +10481,7 @@ fn split_walk(
             )
         };
         let unknown = |t: &JavaType| {
-            matches!(t, JavaType::Object(n) if n == "java/lang/Object")
+            matches!(t, JavaType::Object(n) if (n).jstr() == ("java/lang/Object").jstr())
         };
         let need_split = match cur_ty.get(&var) {
             Some(prev) => {
@@ -10490,7 +10511,7 @@ fn split_walk(
                             // Iterator lineage until the split).
                             if !vt.wide_stack_vars.contains(&var) {
                                 if let JavaType::Object(n) = vt.vars[cur as usize].ty.erased() {
-                                    if n == "java/lang/Object" {
+                                    if n == ("java/lang/Object").into() {
                                         vt.vars[cur as usize].ty = TypeRef::J(nt.clone());
                                     }
                                 }
@@ -10509,7 +10530,7 @@ fn split_walk(
                 // of several incompatible types across branches).
                 if !vt.wide_stack_vars.contains(&var) {
                     if let JavaType::Object(n) = vt.vars[cur as usize].ty.erased() {
-                        if n == "java/lang/Object" {
+                        if n == ("java/lang/Object").into() {
                             if crate::dbg_flag!("JCDC_DBG_MERGE") {
                                 eprintln!("SPLITNARROW v={} -> {:?}", cur, nt);
                             }
@@ -10750,7 +10771,7 @@ pub(crate) fn instantiated_field_type(
                 (classsig_internal(&cs), args)
             }
             t => match t.erased() {
-                JavaType::Object(n) => (n, Vec::new()),
+                JavaType::Object(n) => ((n).to_string(), Vec::new()),
                 _ => return None,
             },
         },
@@ -10849,7 +10870,7 @@ pub(crate) fn instantiated_field_type(
 /// would be illegal against a type-var target).
 fn generic_call_ret_typevar(a: &Expr, pool: &ClassPool) -> Option<String> {
     let (cls, name, desc) = match a {
-        Expr::Method { cls, name, desc, .. } => (cls.as_str(), name.as_str(), desc),
+        Expr::Method { cls, name, desc, .. } => ((cls).jstr(), (name).jstr(), desc),
         _ => return None,
     };
     let mut s = String::new();
@@ -10989,7 +11010,7 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
                 let convertible_classes = cc_internal == wc_internal
                     || crate::classdec::is_subtype_of(
                         pool,
-                        &jcdc_jvm::JavaType::Object(cc_internal.clone()),
+                        &jcdc_jvm::JavaType::Object((cc_internal.clone()).into()),
                         &wc_internal,
                     );
                 if args_differ
@@ -11039,7 +11060,7 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
             // Concrete target, unknown (plain Object) value: the flow
             // guarantees assignability; make it explicit.
             if let JavaType::Object(n) = want.erased() {
-                if n != "java/lang/Object"
+                if n != ("java/lang/Object").into()
                     && value.type_ref().erased() == JavaType::Object("java/lang/Object".into())
                     && matches!(value, Expr::Local { .. } | Expr::Method { .. } | Expr::Field { .. } | Expr::ArrayIndex { .. })
                 {
@@ -11142,7 +11163,7 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
                 TypeRef::G(jcdc_jvm::GenericType::Array(b))
                     if matches!(b.as_ref(), jcdc_jvm::GenericType::TypeVar(_))
             ) && matches!(value, Expr::Method { args, .. } if args.iter().any(|x| {
-                matches!(x, Expr::Method { name, args: ga, .. } if name == "getClass" && ga.is_empty())
+                matches!(x, Expr::Method { name, args: ga, .. } if (name).jstr() == ("getClass").jstr() && ga.is_empty())
             }));
             // A WILDCARD-bearing target over a generic call also needs
             // the cast: the bare assignment lets the call's typevar
@@ -11202,7 +11223,7 @@ fn cast_generic_locals(vt: &VarTable, pool: &ClassPool, pc: &PoolClass, s: &mut 
             ) || (matches!(value, Expr::New { .. } | Expr::AnonNew { .. })
                 && matches!(want, TypeRef::G(jcdc_jvm::GenericType::TypeVar(_))
                     | TypeRef::G(jcdc_jvm::GenericType::Array(_))));
-            if valueish && hn != "java/lang/Object" && hn != "java/lang/String" {
+            if valueish && (hn).jstr() != ("java/lang/Object").jstr() && (hn).jstr() != ("java/lang/String").jstr() {
                 let inner = std::mem::replace(value, Expr::This);
                 // A type-var target needs the cast to the VARIABLE: the
                 // raw value-erasure cast is not assignable to it
@@ -11376,7 +11397,7 @@ fn short_circuit_prefold(
     // 不合法 ×2) and loses the assert shape.
     fn cond_mentions_assert_flag(e: &Expr) -> bool {
         match e {
-            Expr::Field { name, .. } => name == "$assertionsDisabled",
+            Expr::Field { name, .. } => (name).jstr() == ("$assertionsDisabled").jstr(),
             Expr::Local { .. }
             | Expr::Const(_)
             | Expr::This

@@ -288,7 +288,7 @@ impl Cfg {
                 start: r.start as u32,
                 end: r.end as u32,
                 handler: r.handler as u32,
-                catch_type: r.catch_type.clone(),
+                catch_type: (r.catch_type.clone()).map(Into::into),
             })
             .collect();
         // The view must be EXACTLY this graph's — including predecessor and

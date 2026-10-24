@@ -1,6 +1,7 @@
 //! Class-level decompilation: header, fields, methods, static initializer,
 //! nested/anonymous class families.
 
+use crate::strref::JStr;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
@@ -314,7 +315,7 @@ fn accessor_replacement(e: &Expr, _pc: &PoolClass, pool: &ClassPool, depth: u8) 
     }
     let (cls, name, args) = match e {
         Expr::Method { cls, name, args, is_static: true, .. } if name.starts_with("access$") => {
-            (cls.as_str(), name.as_str(), args)
+            ((cls).jstr(), (name).jstr(), args)
         }
         _ => return None,
     };
@@ -1196,9 +1197,9 @@ fn emit_class(
                 ) -> bool {
                     match e {
                         Expr::Field { cls, name, is_static: true, owner: None, .. }
-                            if cls == &pc.internal_name =>
+                            if (cls).jstr() == (&pc.internal_name).jstr() =>
                         {
-                            field_pos.get(name).map(|p| *p >= my_pos).unwrap_or(false)
+                            field_pos.get(&**name).map(|p| *p >= my_pos).unwrap_or(false)
                         }
                         Expr::Field { owner: Some(o), .. } => refs_forward(o, pc, field_pos, my_pos),
                         Expr::Method { owner, args, .. } => {
@@ -1242,13 +1243,13 @@ fn emit_class(
                         Stmt::ExprStmt(Expr::Assign { target, value, .. }) => {
                             match &**target {
                                 Expr::Field { name, is_static: true, cls, .. }
-                                    if cls == &pc.internal_name =>
+                                    if (cls).jstr() == (&pc.internal_name).jstr() =>
                                 {
-                                    let my_pos = field_pos.get(name).copied().unwrap_or(usize::MAX);
+                                    let my_pos = field_pos.get(&**name).copied().unwrap_or(usize::MAX);
                                     if refs_forward(value, pc, &field_pos, my_pos) {
                                         all_assigns = false;
                                     } else {
-                                        folded.insert(name.clone(), (**value).clone());
+                                        folded.insert((name.clone()).to_string(), (**value).clone());
                                     }
                                 }
                                 _ => all_assigns = false,
@@ -1600,7 +1601,7 @@ fn marker_ctor(pc: &PoolClass, mi: usize) -> bool {
     let Some(d) = pc.method_desc(mi) else { return false };
     let Some(md) = parse_method_descriptor(d) else { return false };
     let Some(JavaType::Object(last)) = md.args.last() else { return false };
-    last != &pc.internal_name
+    (last).jstr() != (&pc.internal_name).jstr()
         && last.rsplit('$').next().map(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit())).unwrap_or(false)
 }
 
@@ -1632,15 +1633,15 @@ fn is_trivial_inner_ctor(pc: &PoolClass, pool: &ClassPool, mi: usize) -> bool {
         .filter_map(|f| pc.utf8(f.name_index).map(|s| s.to_string()))
         .collect();
     stmts.iter().all(|st| match st {
-        Stmt::ExprStmt(Expr::Method { name: n, args, .. }) if n == "<init>" => {
+        Stmt::ExprStmt(Expr::Method { name: n, args, .. }) if (n).jstr() == ("<init>").jstr() => {
                 args.len() <= 2
                     && args.iter().all(|a| matches!(a, Expr::This | Expr::Local { .. }))
             }
         Stmt::ExprStmt(Expr::Method { name: n, cls, .. })
-            if n == "requireNonNull" && cls == "java/util/Objects" => true,
+            if (n).jstr() == ("requireNonNull").jstr() && (cls).jstr() == ("java/util/Objects").jstr() => true,
         Stmt::ExprStmt(Expr::Assign { target, .. }) => match &**target {
             Expr::Field { name: f, is_static: false, .. } => {
-                f.starts_with("this$") || field_names.contains(f)
+                f.starts_with("this$") || field_names.contains(&**f)
             }
             _ => false,
         },
@@ -1721,7 +1722,7 @@ pub(crate) fn outer_param_via_super(pc: &PoolClass, desc: &str) -> bool {
     let mut prefix = name.as_str();
     while let Some(i) = prefix.rfind('$') {
         prefix = &prefix[..i];
-        if prefix == first {
+        if (prefix).jstr() == (first).jstr() {
             return true;
         }
     }
@@ -1909,7 +1910,7 @@ fn is_synthetic_record_method(pc: &PoolClass, pool: &ClassPool, mi: usize) -> bo
             if let Ok(Some(mb)) = decompile_method(pc, pool, mi) {
                 let stmts = stmt_vec(&mb.body);
                 let implicit = stmts.len() == 1
-                    && matches!(&stmts[0], Stmt::Return(Some(Expr::Field { name: fname, is_static: false, .. })) if fname == name);
+                    && matches!(&stmts[0], Stmt::Return(Some(Expr::Field { name: fname, is_static: false, .. })) if (fname).jstr() == (name).jstr());
                 if implicit {
                     return true;
                 }
@@ -1940,7 +1941,7 @@ fn is_synthetic_record_method(pc: &PoolClass, pool: &ClassPool, mi: usize) -> bo
             let trivial = !stmts.is_empty()
                 && stmts.iter().all(|st| match st {
                     Stmt::ExprStmt(Expr::Method { name: n, cls, args, .. })
-                        if n == "<init>" && cls != &pc.internal_name =>
+                        if (n).jstr() == ("<init>").jstr() && (cls).jstr() != (&pc.internal_name).jstr() =>
                     {
                         // Only a synthetic delegation (outer-instance /
                         // marker passthrough) is trivial: super(outer,
@@ -1953,7 +1954,7 @@ fn is_synthetic_record_method(pc: &PoolClass, pool: &ClassPool, mi: usize) -> bo
                                 .all(|a| matches!(a, Expr::This | Expr::Local { .. }))
                     }
                     Stmt::ExprStmt(Expr::Method { name: n, cls, .. })
-                        if n == "requireNonNull" && cls == "java/util/Objects" => true,
+                        if (n).jstr() == ("requireNonNull").jstr() && (cls).jstr() == ("java/util/Objects").jstr() => true,
                     Stmt::ExprStmt(Expr::Assign { target, .. }) => {
                         matches!(&**target, Expr::Field { name: f, .. } if f.starts_with("this$"))
                     }
@@ -1977,7 +1978,7 @@ fn is_synthetic_record_method(pc: &PoolClass, pool: &ClassPool, mi: usize) -> bo
             let trivial = !stmts.is_empty()
                 && stmts.iter().all(|st| match st {
                     Stmt::ExprStmt(Expr::Method { name: n, cls, args, .. })
-                        if n == "<init>" && cls != &pc.internal_name =>
+                        if (n).jstr() == ("<init>").jstr() && (cls).jstr() != (&pc.internal_name).jstr() =>
                     {
                         // Only a synthetic delegation (outer-instance /
                         // marker passthrough) is trivial: super(outer,
@@ -2176,9 +2177,9 @@ fn anon_field_inits(
             if let Stmt::ExprStmt(Expr::Assign { target, value, .. }) = st {
                 if let Expr::Field { name, is_static: false, .. } = target.as_ref() {
                     let r = if name.starts_with("this$") {
-                        otm.get(name.as_str())
+                        otm.get((name).jstr())
                     } else if name.starts_with("val$") {
-                        captures.get(name.as_str())
+                        captures.get((name).jstr())
                     } else {
                         None
                     };
@@ -2207,7 +2208,7 @@ fn anon_field_inits(
                         Stmt::Return(Some(x)) => x,
                         _ => Expr::This,
                     };
-                    map.insert(name.clone(), v);
+                    map.insert((name.clone()).to_string(), v);
                 }
             }
         }
@@ -2604,7 +2605,7 @@ fn prune_const_final_ctor_assigns(s: &mut Stmt, pc: &PoolClass) {
         match target.as_ref() {
             Expr::Field { owner, name, is_static: false, .. } => {
                 (owner.is_none() || matches!(owner.as_deref(), Some(Expr::This)))
-                    && names.contains(name)
+                    && names.contains(&**name)
             }
             _ => false,
         }
@@ -2823,7 +2824,7 @@ fn late_typevar_arg_casts(
             return;
         }
         let Expr::Method { cls, name, desc, args, type_args, owner, .. } = init else { return };
-        if !type_args.is_empty() || cls != &pc.internal_name {
+        if !type_args.is_empty() || (cls).jstr() != (&pc.internal_name).jstr() {
             return;
         }
         if owner.as_ref().map(|o| !matches!(o.as_ref(), Expr::This)).unwrap_or(false) {
@@ -2835,7 +2836,7 @@ fn late_typevar_arg_casts(
             desc.ret.to_descriptor()
         );
         let Some(mi) = (0..pc.cf.methods.len()).find(|&i| {
-            pc.method_name(i) == Some(name.as_str())
+            pc.method_name(i) == Some((name).jstr())
                 && pc.method_desc(i) == Some(want_desc.as_str())
         }) else {
             return;
@@ -2963,7 +2964,7 @@ fn late_typevar_arg_casts(
             if let Some(dpc) = pool.get(&decl) {
                 if let Some(mi) = (0..dpc.cf.methods.len()).find(|&i| {
                     dpc.method_name(i) == match e {
-                        Expr::Method { name, .. } => Some(name.as_str()),
+                        Expr::Method { name, .. } => Some((name).jstr()),
                         _ => None,
                     } && dpc.method_desc(i) == Some(want_desc.as_str())
                 }) {
@@ -3409,7 +3410,7 @@ let p0 =  Printer::new(&__ctx, empty_vt());
                     a == e
                         || is_subtype_of(
                             pool,
-                            &jcdc_jvm::JavaType::Object(e.clone()),
+                            &jcdc_jvm::JavaType::Object((e.clone()).into()),
                             a,
                         )
                 })
@@ -3580,7 +3581,7 @@ let p0 =  Printer::new(&__ctx, empty_vt());
                                     if name.starts_with("val$") || name.starts_with("this$") =>
                                 {
                                     if let (Some(e), Expr::Local { var, .. }) =
-                                        (captures.get(name.as_str()), value.as_ref())
+                                        (captures.get((name).jstr()), value.as_ref())
                                     {
                                         rep.insert(*var, e.clone());
                                     }
@@ -3817,7 +3818,7 @@ fn strip_outer_super_arg(body: &mut Stmt, vt: &VarTable) {
     let is_pre_junk = |st: &Stmt| -> bool {
         is_this_store(st)
             || matches!(st, Stmt::ExprStmt(Expr::Method { name, args, .. })
-                if (name == "requireNonNull" || name == "checkNotNull")
+                if ((name).jstr() == ("requireNonNull").jstr() || (name).jstr() == ("checkNotNull").jstr())
                     && args.len() == 1
                     && match &args[0] {
                         Expr::Local { var, .. } => vt.var(*var).is_param,
@@ -3828,7 +3829,7 @@ fn strip_outer_super_arg(body: &mut Stmt, vt: &VarTable) {
     };
     let Some(idx) = stmts.iter().position(|st| !is_pre_junk(st)) else { return };
     if let Some(Stmt::ExprStmt(Expr::Method { name, args, .. })) = stmts.get_mut(idx) {
-        if name == "<init>" && !args.is_empty() {
+        if (name).jstr() == ("<init>").jstr() && !args.is_empty() {
             // The outer instance is ALWAYS the first param (slot 1):
             // a bare is_param check ate a real super arg when the super
             // is static-nested and takes none (jdk17 ExplodedImage
@@ -4465,7 +4466,7 @@ fn strip_trivial_super(body: &mut Stmt, pc: &PoolClass) {
     let idx = stmts.iter().position(|s| !trivial_decl(s));
     if let Some(i) = idx {
         if let Stmt::ExprStmt(Expr::Method { name, cls, args, .. }) = &stmts[i] {
-            if name == "<init>" && args.is_empty() && cls != &pc.internal_name {
+            if (name).jstr() == ("<init>").jstr() && args.is_empty() && (cls).jstr() != (&pc.internal_name).jstr() {
                 stmts[i] = Stmt::Block(vec![]);
             }
         }
@@ -4482,9 +4483,9 @@ fn strip_enum_super(body: &mut Stmt) {
     };
     if let Some(first) = stmts.first_mut() {
         if let Stmt::ExprStmt(Expr::Method { name, cls, args, .. }) = first {
-            if name == "<init>" && cls == "java/lang/Enum" {
+            if (name).jstr() == ("<init>").jstr() && (cls).jstr() == ("java/lang/Enum").jstr() {
                 *first = Stmt::Block(vec![]);
-            } else if name == "<init>" && args.len() > 2 {
+            } else if (name).jstr() == ("<init>").jstr() && args.len() > 2 {
                 // this(name, ordinal, real...) → this(real...)
                 args.drain(0..2);
             }
@@ -4519,7 +4520,7 @@ fn cast_pruned_delegation_typevar_args(body: &mut Stmt, pc: &PoolClass, mi_self:
     let Stmt::ExprStmt(Expr::Method { name, cls, args, .. }) = first else {
         return;
     };
-    if name != "<init>" || cls != &pc.internal_name || args.is_empty() {
+    if (name).jstr() != ("<init>").jstr() || (cls).jstr() != (&pc.internal_name).jstr() || args.is_empty() {
         return;
     }
     // The target ctor: same class, Signature-bearing, formals matching the
@@ -4542,7 +4543,7 @@ fn cast_pruned_delegation_typevar_args(body: &mut Stmt, pc: &PoolClass, mi_self:
             continue;
         }
         if !matches!(a.type_ref(), TypeRef::J(jcdc_jvm::JavaType::Object(n))
-            if n == "java/lang/Object")
+            if n == ("java/lang/Object").into())
         {
             continue;
         }
@@ -4563,7 +4564,7 @@ fn prune_local_ctor_delegation(body: &mut Stmt, pc: &PoolClass, mi_self: usize) 
     let Stmt::ExprStmt(Expr::Method { name, cls, args, desc, .. }) = first else {
         return;
     };
-    if name != "<init>" || cls != &pc.internal_name {
+    if (name).jstr() != ("<init>").jstr() || (cls).jstr() != (&pc.internal_name).jstr() {
         return;
     }
     // Locate the target ctor by its descriptor.
@@ -4601,11 +4602,13 @@ fn prune_local_ctor_delegation(body: &mut Stmt, pc: &PoolClass, mi_self: usize) 
         keep
     });
     i = 0;
-    desc.args.retain(|_| {
+    let mut pruned_desc = (**desc).clone();
+    pruned_desc.args.retain(|_| {
         let keep = !skip.contains(&i);
         i += 1;
         keep
     });
+    *desc = std::sync::Arc::new(pruned_desc);
 }
 
 fn method_param_names(pc: &PoolClass, mi: usize, desc: &str) -> Vec<String> {
@@ -4743,7 +4746,7 @@ fn walk_enum_inits(s: &Stmt, map: &mut HashMap<String, EnumInit>, pc: &PoolClass
         Stmt::ExprStmt(Expr::Assign { target, value, .. }) => {
             if let Expr::Field { name, is_static: true, .. } = &**target {
                 if let Expr::New { cls, args, .. } = &**value {
-                    let body_cls = if cls != &pc.internal_name { Some(cls.clone()) } else { None };
+                    let body_cls = if (cls).jstr() != (&pc.internal_name).jstr() { Some(cls.clone()) } else { None };
                     // Resolve the enum ctor descriptor so boolean/char
                     // constant arguments render as `true`/`'x'`, not 1/120.
                     // Same-arity overloads ((String,String,String...) vs
@@ -4787,7 +4790,7 @@ fn walk_enum_inits(s: &Stmt, map: &mut HashMap<String, EnumInit>, pc: &PoolClass
                                     (Expr::Const(CV::Int(_)), jcdc_jvm::JavaType::Int) => 2,
                                     (Expr::Const(CV::Int(_)), jcdc_jvm::JavaType::Array(_)) => 0,
                                     (Expr::Const(CV::Str(_)), jcdc_jvm::JavaType::Object(n))
-                                        if n == "java/lang/String" => 2,
+                                        if (n).jstr() == ("java/lang/String").jstr() => 2,
                                     (Expr::NewArray { .. }, jcdc_jvm::JavaType::Array(_)) => 3,
                                     _ => 1,
                                 })
@@ -4836,7 +4839,7 @@ fn walk_enum_inits(s: &Stmt, map: &mut HashMap<String, EnumInit>, pc: &PoolClass
                             s
                         })
                         .collect();
-                    map.insert(name.clone(), EnumInit { args: extra.join(", "), body_class: body_cls });
+                    map.insert((name.clone()).to_string(), EnumInit { args: extra.join(", "), body_class: (body_cls).map(|v| v.to_string()) });
                 }
             }
         }
@@ -4865,11 +4868,11 @@ fn strip_enum_const_stores(s: &mut Stmt, pc: &PoolClass) {
                 v.retain(|st| {
                     !matches!(st, Stmt::ExprStmt(Expr::Assign { target, .. })
                         if matches!(&**target, Expr::Field { name, is_static: true, .. }
-                            if name == "$VALUES"))
+                            if (name).jstr() == ("$VALUES").jstr()))
                         && !matches!(st, Stmt::ExprStmt(Expr::Assign { target, value, .. })
                         if matches!(&**target, Expr::Field { name, is_static: true, .. }
-                            if names.contains(name))
-                            && matches!(&**value, Expr::New { cls, .. } if cls == &pc.internal_name
+                            if names.contains(&**name))
+                            && matches!(&**value, Expr::New { cls, .. } if (cls).jstr() == (&pc.internal_name).jstr()
                                 || pc.cf.fields.iter().any(|f| {
                                     f.access_flags.contains(FieldAccessFlags::ENUM)
                                 })))
@@ -4916,9 +4919,9 @@ fn clinit_only_enum_init(pc: &PoolClass, pool: &ClassPool, ci: usize) -> bool {
         && stmts.iter().all(|s| match s {
             Stmt::ExprStmt(Expr::Assign { target, .. }) => match &**target {
                 Expr::Field { name, is_static: true, .. } => {
-                    name == "$VALUES"
-                        || (name.starts_with('$') && name != "$assertionsDisabled")
-                        || const_names.contains(name)
+                    (name).jstr() == ("$VALUES").jstr()
+                        || (name.starts_with('$') && (name).jstr() != ("$assertionsDisabled").jstr())
+                        || const_names.contains(&**name)
                 }
                 _ => false,
             },
@@ -5665,7 +5668,7 @@ fn stmt_mentions_local(s: &Stmt, marker: &str, name: &str, vt: &VarTable, fam: &
         }
         match e {
             Expr::New { cls, ty, args, .. } => {
-                if cls == marker {
+                if (cls).jstr() == (marker).jstr() {
                     *found = true;
                     return;
                 }
@@ -5691,7 +5694,7 @@ fn stmt_mentions_local(s: &Stmt, marker: &str, name: &str, vt: &VarTable, fam: &
                     *found = true;
                 }
                 if !*found
-                    && fam.nested.get(cls.as_str()).map(|x| x.simple.as_str()) == Some(name)
+                    && fam.nested.get((cls).jstr()).map(|x| x.simple.as_str()) == Some(name)
                 {
                     *found = true;
                 }
@@ -5717,7 +5720,7 @@ fn stmt_mentions_local(s: &Stmt, marker: &str, name: &str, vt: &VarTable, fam: &
                     walk_e(o, marker, name, fam, found);
                 }
                 if !*found
-                    && fam.nested.get(cls.as_str()).map(|x| x.simple.as_str()) == Some(name)
+                    && fam.nested.get((cls).jstr()).map(|x| x.simple.as_str()) == Some(name)
                 {
                     *found = true;
                 }
@@ -6345,7 +6348,7 @@ fn emit_local_class_decl(
 fn walk_expr_anon(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, fam: &Family, pending: &mut Vec<Stmt>, vt: &VarTable) {
     if crate::dbg_flag!("JCDC_DBG_ANON") {
         if let Expr::New { cls, raw, .. } = e {
-            eprintln!("ANON see new {} raw={} in_fam={}", cls, raw, fam.anonymous.contains(cls.as_str()));
+            eprintln!("ANON see new {} raw={} in_fam={}", cls, raw, fam.anonymous.contains((cls).jstr()));
         }
     }
     // A local class mentioned only through a static member access
@@ -6355,7 +6358,7 @@ fn walk_expr_anon(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, fam: &Family, 
     if !fam.locals.is_empty() {
         let member_cls = match e {
             Expr::Field { cls, owner: None, .. } | Expr::Method { cls, owner: None, .. } => {
-                Some(cls.as_str())
+                Some((cls).jstr())
             }
             _ => None,
         };
@@ -6378,7 +6381,7 @@ fn walk_expr_anon(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, fam: &Family, 
         }
     }
     match e {
-        Expr::New { cls, args, raw: false, .. } if fam.anonymous.contains(cls.as_str()) => {
+        Expr::New { cls, args, raw: false, .. } if fam.anonymous.contains((cls).jstr()) => {
             match pool.get(cls) {
                 Some(apc) => {
                     if let Some(anon) = build_anon_new(&apc, args.clone(), pc, pool, fam, vt, pending) {
@@ -6404,23 +6407,24 @@ fn walk_expr_anon(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, fam: &Family, 
                 }
             }
         }
-        Expr::New { cls, args, raw: false, ty, .. } if fam.locals.contains(cls.as_str()) => {
+        Expr::New { cls, args, raw: false, ty, .. } if fam.locals.contains((cls).jstr()) => {
             if crate::dbg_flag!("JCDC_DBG_ANON") {
                 eprintln!("LOCALNEW {} pending={} depth={}", cls, pending.len(), ANON_BODY_DEPTH.with(|d| d.get()));
             }
             if let Some(lpc) = pool.get(cls) {
                 let simple = fam
                     .nested
-                    .get(cls)
+                    .get(&**cls)
                     .map(|n| n.simple.clone())
                     .unwrap_or_else(|| simple_name(cls));
                 let (kept, captures) = analyze_anon_ctor(&lpc, args.clone());
                 let captures = render_captures(captures, pc, pool, vt, cls);
                 emit_local_class_decl(cls, &lpc, &simple, pc, pool, fam, &captures, pending);
                 *e = Expr::New {
-                    cls: format!("\u{2}{}", simple),
+                    cls: format!("\u{2}{}", simple).into(),
                     ty: ty.clone(),
                     args: kept,
+                    arg_tys: Vec::new(),
                     raw: false,
                 };
             }
@@ -6433,16 +6437,16 @@ fn walk_expr_anon(e: &mut Expr, pc: &PoolClass, pool: &ClassPool, fam: &Family, 
             let internal = match t {
                 TypeRef::J(JavaType::Object(n)) => Some(n.clone()),
                 TypeRef::G(jcdc_jvm::GenericType::Class(cs)) => {
-                    Some(crate::method::classsig_internal(cs))
+                    (Some(crate::method::classsig_internal(cs))).map(Into::into)
                 }
                 _ => None,
             };
             if let Some(internal) = internal {
-                if fam.locals.contains(internal.as_str()) {
-                    if let Some(lpc) = pool.get(&internal) {
+                if fam.locals.contains(&*internal) {
+                    if let Some(lpc) = pool.get(&*internal) {
                         let simple = fam
                             .nested
-                            .get(&internal)
+                            .get(&*internal)
                             .map(|n| n.simple.clone())
                             .unwrap_or_else(|| simple_name(&internal));
                         emit_local_class_decl(
@@ -6539,7 +6543,7 @@ fn qualified_this_tail(internal: &str) -> String {
 fn collapse_this_chain(e: &Expr, pool: &ClassPool) -> Option<String> {
     let (name, cls) = match e {
         Expr::Field { name, cls, is_static: false, .. } if name.starts_with("this$") => {
-            (name.as_str(), cls.as_str())
+            ((name).jstr(), (cls).jstr())
         }
         _ => return None,
     };
@@ -6782,7 +6786,7 @@ pub(crate) fn repair_pushed_branches(
         if let Expr::Method { cls, name, desc, type_args, .. } = e {
             if type_args.is_empty() && igc {
                 if let Some((w, _)) =
-                    compute_witness(cls.as_str(), name.as_str(), desc, None, want, pool, Some(params))
+                    compute_witness((cls).jstr(), (name).jstr(), desc, None, want, pool, Some(params))
                 {
                     *type_args = w;
                 }
@@ -6829,7 +6833,7 @@ fn generic_decl_call(e: &Expr, pool: &ClassPool) -> bool {
         format!("({}){}", a, desc.ret.to_descriptor())
     };
     let Some(mi) = (0..dpc.cf.methods.len())
-        .find(|&i| dpc.method_name(i) == Some(name.as_str()) && dpc.method_desc(i) == Some(want_desc.as_str()))
+        .find(|&i| dpc.method_name(i) == Some((name).jstr()) && dpc.method_desc(i) == Some(want_desc.as_str()))
     else {
         return false
     };
@@ -7018,8 +7022,8 @@ fn push_witness_into_branches(
                     }
                     let Expr::Method { cls, name, desc, .. } = b else { unreachable!() };
                     if compute_witness(
-                        cls.as_str(),
-                        name.as_str(),
+                        (cls).jstr(),
+                        (name).jstr(),
                         desc,
                         None,
                         want,
@@ -7278,8 +7282,8 @@ fn witness_generic_returns(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature
                     // diamond contradictory bounds (jdk17 Stream.toList).
                     if !args_have_generic_new(args, pool) {
                         let w = compute_witness(
-                            cls.as_str(),
-                            name.as_str(),
+                            (cls).jstr(),
+                            (name).jstr(),
                             desc,
                             owner.as_deref(),
                             want,
@@ -7409,7 +7413,7 @@ pub(crate) fn polymorphic_ret_cast(
         // ANY other reference return (e.g. invokeBasic's `(BoundMethodHandle)
         // factory().invokeBasic(..)` — the source cast fixes the descriptor)
         // must be witnessed, or the bare call types as Object.
-        jcdc_jvm::JavaType::Object(n) if n == "java/lang/Object" => None,
+        jcdc_jvm::JavaType::Object(n) if (n).jstr() == ("java/lang/Object").jstr() => None,
         jcdc_jvm::JavaType::Void => None,
         _ if is_spec_polymorphic(cls, name) => Some(desc.ret.clone()),
         _ => None,
@@ -7521,10 +7525,10 @@ fn strip_erasure_casts_generic_ret(
                             // stripped to a bare Object return —
                             // Object无法转换为List<String> x2 x3 trees).
                             || matches!(&**inner, Expr::Method { name, owner: Some(o), desc, .. }
-                                if name == "clone"
+                                if (name).jstr() == ("clone").jstr()
                                     && matches!(o.type_ref(), TypeRef::G(_))
                                     && !matches!(desc.ret, jcdc_jvm::JavaType::Object(ref n)
-                                        if n == "java/lang/Object")));
+                                        if (n).jstr() == ("java/lang/Object").jstr())));
                     if droppable {
                         let v = std::mem::replace(&mut **inner, Expr::This);
                         *e = v;
@@ -7582,7 +7586,7 @@ fn strip_erasure_casts_generic_ret(
 
 pub(crate) fn is_generic_call(a: &Expr, pool: &ClassPool) -> bool {
     let (cls, name, desc) = match a {
-        Expr::Method { cls, name, desc, .. } => (cls.as_str(), name.as_str(), desc),
+        Expr::Method { cls, name, desc, .. } => ((cls).jstr(), (name).jstr(), desc),
         _ => return false,
     };
     let want_desc = {
@@ -7743,7 +7747,7 @@ fn render_captures(
                     if fn0.starts_with("val$") =>
                 {
                     let got = CAPTURE_FIELD_TYPES
-                        .with(|m| m.borrow().get(&(fc.clone(), fn0.clone())).cloned())
+                        .with(|m| m.borrow().get(&((fc.clone()).to_string(), (fn0.clone()).to_string())).cloned())
                         .filter(|t| {
                             anon_inlined(owner_cls)
                                 || !mentions_foreign_typevar(t, &class_typevar_names(outer_pc))
@@ -7826,7 +7830,7 @@ fn build_anon_new(
     });
     let base = if let Some(&i) = apc.cf.interfaces.first() {
         let n = apc.class_name(i)?;
-        sig_base.unwrap_or(TypeRef::J(JavaType::Object(n.to_string())))
+        sig_base.unwrap_or(TypeRef::J(JavaType::Object((n.to_string()).into())))
     } else {
         let sup = apc.super_name()?.to_string();
         // An Object superclass is NOT a decline reason at this point:
@@ -7836,7 +7840,7 @@ fn build_anon_new(
         // the decline left the marker fallback printing the illegal
         // `new 1()`, 需要<标识符>). Synthetic Object-extenders without new
         // sites (switch-map holders) never reach here.
-        sig_base.unwrap_or(TypeRef::J(JavaType::Object(sup)))
+        sig_base.unwrap_or(TypeRef::J(JavaType::Object((sup).into())))
     };
 
     let (kept_args, captures) = analyze_anon_ctor(apc, args);
@@ -7935,7 +7939,7 @@ fn analyze_anon_ctor(apc: &PoolClass, args: Vec<Expr>) -> (Vec<Expr>, HashMap<St
                                 let vname = mb.vt.var(*var).name.clone();
                                 if let Some((_, pi)) = param_names.iter().find(|(n, _)| *n == vname) {
                                     if let Some(e) = args.get(*pi) {
-                                        captures.insert(fname.clone(), e.clone());
+                                        captures.insert((fname.clone()).to_string(), e.clone());
                                         captured_idx.insert(*pi);
                                     }
                                 }
@@ -7954,7 +7958,7 @@ fn analyze_anon_ctor(apc: &PoolClass, args: Vec<Expr>) -> (Vec<Expr>, HashMap<St
             if captures.is_empty() {
                 let deleg = stmt_vec(&mb.body).iter().find_map(|st| match st {
                     Stmt::ExprStmt(Expr::Method { name, cls, desc, args: dargs, is_special: true, .. })
-                        if name == "<init>" && cls == &apc.internal_name =>
+                        if (name).jstr() == ("<init>").jstr() && (cls).jstr() == (&apc.internal_name).jstr() =>
                     {
                         Some((desc.args.len(), dargs.clone()))
                     }
@@ -8032,7 +8036,7 @@ fn analyze_anon_ctor(apc: &PoolClass, args: Vec<Expr>) -> (Vec<Expr>, HashMap<St
                     fn collect_stmt_locals(st: &Stmt, selfcls: &str, out: &mut HashSet<u32>) {
                         match st {
                             Stmt::ExprStmt(Expr::Method { name, cls, is_special: true, args, .. })
-                                if name == "<init>" && cls == selfcls =>
+                                if (name).jstr() == ("<init>").jstr() && (cls).jstr() == (selfcls).jstr() =>
                             {
                                 for a in args {
                                     match a {
@@ -8096,7 +8100,7 @@ fn analyze_anon_ctor(apc: &PoolClass, args: Vec<Expr>) -> (Vec<Expr>, HashMap<St
                                                 continue;
                                             };
                                             if let Some(e) = args.get(*pi) {
-                                                captures.insert(fname.clone(), e.clone());
+                                                captures.insert((fname.clone()).to_string(), e.clone());
                                                 // A declared param that DOUBLES
                                                 // as a capture source stays in
                                                 // the kept args: only pure
@@ -8135,7 +8139,7 @@ fn analyze_anon_ctor(apc: &PoolClass, args: Vec<Expr>) -> (Vec<Expr>, HashMap<St
                         let mut encloses = false;
                         while let Some(i) = prefix.rfind('$') {
                             prefix = &prefix[..i];
-                            if prefix == first {
+                            if (prefix).jstr() == (first).jstr() {
                                 encloses = true;
                                 break;
                             }
@@ -8234,7 +8238,7 @@ fn collect_expr_locals(e: &Expr, out: &mut HashSet<u32>) {
 fn collect_stmt_locals(st: &Stmt, selfcls: &str, out: &mut HashSet<u32>) {
     match st {
         Stmt::ExprStmt(Expr::Method { name, cls, is_special: true, args, .. })
-            if name == "<init>" && cls == selfcls =>
+            if (name).jstr() == ("<init>").jstr() && (cls).jstr() == (selfcls).jstr() =>
         {
             for a in args {
                 match a {
@@ -8260,7 +8264,7 @@ fn delegation_forward_params(apc: &PoolClass, mb: &crate::method::MethodBody) ->
     let mut fwd: HashSet<usize> = HashSet::new();
     let deleg = stmt_vec(&mb.body).iter().find_map(|st| match st {
         Stmt::ExprStmt(Expr::Method { name, cls, is_special: true, args, .. })
-            if name == "<init>" && cls == &apc.internal_name =>
+            if (name).jstr() == ("<init>").jstr() && (cls).jstr() == (&apc.internal_name).jstr() =>
         {
             Some(args.clone())
         }
@@ -8420,14 +8424,14 @@ fn emit_anon_body(
                     v.retain(|st| {
                         !matches!(st, Stmt::ExprStmt(Expr::Assign { target, .. })
                             if matches!(&**target, Expr::Field { name, is_static: true, .. }
-                                if name == "$assertionsDisabled" || name == ASSERT_FIELD))
+                                if (name).jstr() == ("$assertionsDisabled").jstr() || (name).jstr() == (ASSERT_FIELD).jstr()))
                     });
                 }
                 match &mut body {
                     Stmt::Block(v) => drop_assert_stores(v),
                     Stmt::ExprStmt(Expr::Assign { target, .. })
                         if matches!(&**target, Expr::Field { name, is_static: true, .. }
-                            if name == "$assertionsDisabled" || name == ASSERT_FIELD) =>
+                            if (name).jstr() == ("$assertionsDisabled").jstr() || (name).jstr() == (ASSERT_FIELD).jstr()) =>
                     {
                         body = Stmt::Block(vec![]);
                     }
@@ -9375,7 +9379,7 @@ fn collect_captured_expr(e: &Expr, prefix: &str, vars: &mut HashSet<u32>) {
         }
     };
     match e {
-        Expr::Method { cls, name, args, .. } if name == "<init>" && cls.starts_with(prefix) => {
+        Expr::Method { cls, name, args, .. } if (name).jstr() == ("<init>").jstr() && cls.starts_with(prefix) => {
             grab_locals(args, vars);
         }
         Expr::AnonNew { args, .. } => grab_locals(args, vars),
@@ -9636,7 +9640,7 @@ fn walk_expr_subst(e: &mut Expr, caps: &HashMap<String, Expr>, pool: &ClassPool)
             Some(o) => matches!(&**o, Expr::This),
         };
         if owner_is_this {
-            if let Some(rep) = caps.get(name.as_str()) {
+            if let Some(rep) = caps.get((name).jstr()) {
                 *e = rep.clone();
                 return;
             }
@@ -9942,9 +9946,9 @@ fn restore_one_switch(
                         match &labels[*k as usize] {
                             crate::expr::BsmArg::Str(sv) => {
                                 if enum_switch {
-                                    raws.push(sv.clone())
+                                    raws.push((sv.clone()).to_string())
                                 } else {
-                                    strs.push(sv.clone())
+                                    strs.push(sv.to_string())
                                 }
                             }
                             crate::expr::BsmArg::Int(iv) => raws.push(iv.to_string()),
@@ -9955,10 +9959,10 @@ fn restore_one_switch(
                                 let ty = if cv.starts_with('[') {
                                     match jcdc_jvm::parse_field_descriptor(cv) {
                                         Some(t) => TypeRef::J(t),
-                                        None => TypeRef::J(jcdc_jvm::JavaType::Object(cv.clone())),
+                                        None => TypeRef::J(jcdc_jvm::JavaType::Object((cv.clone()).into())),
                                     }
                                 } else {
-                                    TypeRef::J(jcdc_jvm::JavaType::Object(cv.clone()))
+                                    TypeRef::J(jcdc_jvm::JavaType::Object((cv.clone()).into()))
                                 };
                                 let tn = crate::ctx_shim::ctx_type_name(pc, pool, &ty);
                                 raws.push(format!("{} ignored{}", tn, pat_ctr));
@@ -10036,13 +10040,13 @@ fn restore_one_switch(
                 _ => return,
             };
             let recv = match &**index {
-                Expr::Method { name, owner: Some(o), args, .. } if name == "ordinal" && args.is_empty() => {
+                Expr::Method { name, owner: Some(o), args, .. } if (name).jstr() == ("ordinal").jstr() && args.is_empty() => {
                     (**o).clone()
                 }
                 // The switch lives INSIDE the enum class itself (jdk11
                 // VarHandle$AccessType.accessModeType): ordinal() is an
                 // implicit-this call, and the selector is `this`.
-                Expr::Method { name, owner: None, args, .. } if name == "ordinal" && args.is_empty() => {
+                Expr::Method { name, owner: None, args, .. } if (name).jstr() == ("ordinal").jstr() && args.is_empty() => {
                     Expr::This
                 }
                 _ => return,
@@ -10171,7 +10175,7 @@ fn strip_inner_ctor_artifacts(s: &mut Stmt, vt: &VarTable, outer_param: Option<(
                 _ => false,
             },
             Stmt::ExprStmt(Expr::Method { name, args, .. }) => {
-                (name == "requireNonNull" || name == "checkNotNull")
+                ((name).jstr() == ("requireNonNull").jstr() || (name).jstr() == ("checkNotNull").jstr())
                     && args.len() == 1
                     && is_this_param(&args[0], vt, outer_param)
             }
@@ -10209,8 +10213,8 @@ fn strip_inner_ctor_artifacts(s: &mut Stmt, vt: &VarTable, outer_param: Option<(
                 let ty = info.ty.clone();
                 *e = Expr::Field {
                     owner: Some(Box::new(Expr::This)),
-                    cls: String::new(),
-                    name,
+                    cls: (String::new()).into(),
+                    name: (name).into(),
                     ty,
                     is_static: false,
                 };
@@ -10549,7 +10553,7 @@ fn collapse_ctor_delegation_multi(body: &mut Stmt, pc: &PoolClass) {
             // (cpm,index,String,int) kept only `super(cpm, index, 0);` --
             // 7 final-field assignments lost: 可能尚未初始化变量rawBytes).
             Stmt::ExprStmt(Expr::Method { name, cls, .. })
-                if name == "<init>" && cls == own => true,
+                if (name).jstr() == ("<init>").jstr() && (cls).jstr() == (own).jstr() => true,
             Stmt::If { then_stmt, else_stmt, .. } => {
                 let t = match then_stmt.as_ref() {
                     Stmt::Block(b) => has_mid_ctor(b, own),
@@ -10670,8 +10674,8 @@ fn collapse_ctor_delegation_multi(body: &mut Stmt, pc: &PoolClass) {
                     None
                 }
             }
-            Stmt::ExprStmt(e @ Expr::Method { name, cls, .. }) if name == "<init>" => {
-                if cls != own {
+            Stmt::ExprStmt(e @ Expr::Method { name, cls, .. }) if (name).jstr() == ("<init>").jstr() => {
+                if (cls).jstr() != (own).jstr() {
                     // super(...) — not a foldable delegation (see
                     // has_mid_ctor); bail and leave the legal shape intact.
                     return None;
@@ -10826,7 +10830,7 @@ fn collapse_ctor_delegation(body: &mut Stmt, pc: &PoolClass) {
     // copy: 对于JarEntry(CodeSigner[]), 找不到合适的构造器). A ctor
     // never has a second delegation after the first, so this is safe.
     if let Some(Stmt::ExprStmt(Expr::Method { name, .. })) = items.first() {
-        if name == "<init>" {
+        if (name).jstr() == ("<init>").jstr() {
             return;
         }
     }
@@ -10839,7 +10843,7 @@ fn collapse_ctor_delegation(body: &mut Stmt, pc: &PoolClass) {
     // call not allowed here", blocked every jdk26 corpus family).
     let (tail, fallback) = match items.last() {
         Some(Stmt::ExprStmt(e @ Expr::Method { name, cls, args, .. }))
-            if name == "<init>" && cls == &pc.internal_name && args.len() == 1 =>
+            if (name).jstr() == ("<init>").jstr() && (cls).jstr() == (&pc.internal_name).jstr() && args.len() == 1 =>
         {
             (&items[..items.len() - 1], Some(e.clone()))
         }
@@ -10857,7 +10861,7 @@ fn collapse_ctor_delegation(body: &mut Stmt, pc: &PoolClass) {
     // Only a delegation to THIS class (not super) may appear mid-body.
     match &mut call {
         Expr::Method { cls, args, .. } if args.len() == 1 => {
-            if cls != &pc.internal_name {
+            if (cls).jstr() != (&pc.internal_name).jstr() {
                 return;
             }
             args[0] = val;
@@ -10894,7 +10898,7 @@ fn delegation_value_seq(
                 val = delegation_value(st, tmpl, own, fallback);
             }
             Stmt::ExprStmt(e @ Expr::Method { name, cls, .. })
-                if name == "<init>" && cls == own =>
+                if (name).jstr() == ("<init>").jstr() && (cls).jstr() == (own).jstr() =>
             {
                 if tmpl.is_none() {
                     *tmpl = Some(e.clone());
@@ -10932,7 +10936,7 @@ fn delegation_value(
                     }
                     Stmt::LocalDef { init: None, .. } => {}
                     Stmt::ExprStmt(e @ Expr::Method { name, cls, .. })
-                        if name == "<init>" && cls == own && call.is_none() =>
+                        if (name).jstr() == ("<init>").jstr() && (cls).jstr() == (own).jstr() && call.is_none() =>
                     {
                         call = Some(e.clone());
                     }
@@ -10966,7 +10970,7 @@ fn delegation_value(
             })
         }
         Stmt::ExprStmt(e @ Expr::Method { name, cls, args, .. })
-            if name == "<init>" && cls == own && args.len() == 1 =>
+            if (name).jstr() == ("<init>").jstr() && (cls).jstr() == (own).jstr() && args.len() == 1 =>
         {
             if tmpl.is_none() {
                 *tmpl = Some(e.clone());
@@ -11004,7 +11008,7 @@ fn generic_erasure(t: &jcdc_jvm::GenericType, params: &[jcdc_jvm::TypeParam]) ->
 /// AND interface chains via the pool; unknown classes are not subtypes).
 pub(crate) fn is_subtype_of(pool: &ClassPool, ty: &jcdc_jvm::JavaType, target: &str) -> bool {
     let jcdc_jvm::JavaType::Object(n0) = ty else { return false };
-    let mut stack: Vec<String> = vec![n0.clone()];
+    let mut stack: Vec<String> = vec![(n0.clone()).to_string()];
     let mut seen: HashSet<String> = HashSet::new();
     while let Some(n) = stack.pop() {
         if n == target {
@@ -11132,10 +11136,10 @@ fn upgrade_raw_receiver_casts(
                                         desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
                                         desc.ret.to_descriptor()
                                     );
-                                    match pool.get(c.as_str()) {
+                                    match pool.get((c).jstr()) {
                                         Some(cpc) => {
                                             match (0..cpc.cf.methods.len()).find(|&i| {
-                                                cpc.method_name(i) == Some(name.as_str())
+                                                cpc.method_name(i) == Some((name).jstr())
                                                     && cpc.method_desc(i) == Some(want.as_str())
                                             }) {
                                                 Some(mi) => match method_signature_of(&cpc, mi) {
@@ -11171,7 +11175,7 @@ fn upgrade_raw_receiver_casts(
                                                                     // it and the raw form is
                                                                     // the source's intent.
                                                                     matches!(a.type_ref(), TypeRef::G(jcdc_jvm::GenericType::TypeVar(an)) if &an == tn)
-                                                                        || matches!(a.type_ref().erased(), jcdc_jvm::JavaType::Object(n) if n == "java/lang/Object")
+                                                                        || matches!(a.type_ref().erased(), jcdc_jvm::JavaType::Object(n) if n == ("java/lang/Object").into())
                                                                 }
                                                                 _ => true,
                                                             }
@@ -11335,7 +11339,7 @@ fn rethrow_typevar_witness(
         })
         .map(|b| TypeRef::G(b).erased())
         .and_then(|j| match j {
-            jcdc_jvm::JavaType::Object(n) => Some(n),
+            jcdc_jvm::JavaType::Object(n) => Some(n.to_string()),
             _ => None,
         })
         .unwrap_or_else(|| "java/lang/Object".to_string());
@@ -11348,7 +11352,7 @@ fn rethrow_typevar_witness(
         {
             return false;
         }
-        n == "java/lang/Throwable"
+        (n).jstr() == ("java/lang/Throwable").jstr()
             || is_subtype_of(pool, &jcdc_jvm::JavaType::Object(n.clone()), bound_er)
     }
     fn rec(s: &mut Stmt, tvs: &[String], pool: &ClassPool, bound_er: &str) {
@@ -11503,7 +11507,7 @@ fn add_throw_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, p
                 }
                 let Some(cpc) = pool.get(cls) else { return };
                 let mi = (0..cpc.cf.methods.len()).find(|&i| {
-                    cpc.method_name(i) == Some(name.as_str())
+                    cpc.method_name(i) == Some((name).jstr())
                         && cpc
                             .method_desc(i)
                             .and_then(parse_method_descriptor)
@@ -11684,8 +11688,8 @@ pub(crate) fn instantiated_method_ret(
 ) -> Option<jcdc_jvm::GenericType> {
     let (cls, name, desc, owner, is_static, args) = match m {
         Expr::Method { cls, name, desc, owner, is_static, args, .. } => (
-            cls.as_str(),
-            name.as_str(),
+            (cls).jstr(),
+            (name).jstr(),
             desc,
             owner.as_deref(),
             *is_static,
@@ -11755,12 +11759,12 @@ pub(crate) fn instantiated_method_ret(
                     }
                     t => match t.erased() {
                         jcdc_jvm::JavaType::Object(n) => {
-                            if pc.internal_name.starts_with(&n)
+                            if pc.internal_name.starts_with(&*n)
                                 && pc.internal_name.as_bytes().get(n.len()) == Some(&b'$')
                             {
-                                (n.clone(), own_typevars(&n, pool))
+                                ((n.clone()).to_string(), own_typevars(&n, pool))
                             } else {
-                                (n, Vec::new())
+                                ((n).to_string(), Vec::new())
                             }
                         }
                         _ => return None,
@@ -11913,7 +11917,7 @@ pub(crate) fn generic_call_formals(
     use jcdc_jvm::GenericType as G;
     let (cls, name, desc, owner, is_static) = match m {
         Expr::Method { cls, name, desc, owner, is_static, .. } => {
-            (cls.as_str(), name.as_str(), desc, owner.as_deref(), *is_static)
+            ((cls).jstr(), (name).jstr(), desc, owner.as_deref(), *is_static)
         }
         _ => return None,
     };
@@ -12046,7 +12050,7 @@ pub(crate) fn instantiated_method_params(
 ) -> Option<Vec<jcdc_jvm::GenericType>> {
     let (cls, name, desc, owner, is_static) = match m {
         Expr::Method { cls, name, desc, owner, is_static, .. } => {
-            (cls.as_str(), name.as_str(), desc, owner.as_deref(), *is_static)
+            ((cls).jstr(), (name).jstr(), desc, owner.as_deref(), *is_static)
         }
         _ => return None,
     };
@@ -12133,12 +12137,12 @@ pub(crate) fn instantiated_method_params(
                                 // class's own typevars are in scope inside
                                 // the inner one, so parameterize with them
                                 // (IdentityHashMap.this.put needs K/V).
-                                if pc.internal_name.starts_with(&n)
+                                if pc.internal_name.starts_with(&*n)
                                     && pc.internal_name.as_bytes().get(n.len()) == Some(&b'$')
                                 {
-                                    (n.clone(), own_typevars(&n, pool))
+                                    ((n.clone()).to_string(), own_typevars(&n, pool))
                                 } else {
-                                    (n, Vec::new())
+                                    ((n).to_string(), Vec::new())
                                 }
                             }
                             _ => return None,
@@ -12439,14 +12443,14 @@ fn prune_witnessed_raw_sam_casts(e: &mut Expr, pool: &ClassPool) {
     if type_args.is_empty() {
         return;
     }
-    let Some(dpc) = pool.get(cls.as_str()) else { return };
+    let Some(dpc) = pool.get((cls).jstr()) else { return };
     let want_desc = format!(
         "({}){}",
         desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
         desc.ret.to_descriptor()
     );
     let Some(mi) = (0..dpc.cf.methods.len())
-        .find(|&i| dpc.method_name(i) == Some(name.as_str()) && dpc.method_desc(i) == Some(want_desc.as_str()))
+        .find(|&i| dpc.method_name(i) == Some((name).jstr()) && dpc.method_desc(i) == Some(want_desc.as_str()))
     else {
         return;
     };
@@ -12464,7 +12468,7 @@ fn prune_witnessed_raw_sam_casts(e: &mut Expr, pool: &ClassPool) {
             jcdc_jvm::GenericType::Class(cs) => crate::method::classsig_internal(cs),
             _ => continue,
         };
-        if &formal_class != raw_n {
+        if (&formal_class).jstr() != (raw_n).jstr() {
             continue;
         }
         // The witness pins the TYPE ARGUMENTS, not the overload: when a
@@ -12489,7 +12493,7 @@ fn prune_witnessed_raw_sam_casts(e: &mut Expr, pool: &ClassPool) {
         // disambiguating raw cast stays.
         let witness_fits_chosen = msig.params.len() == type_args.len();
         let sibling_sam = (0..dpc.cf.methods.len()).any(|oi| {
-            if oi == mi || dpc.method_name(oi) != Some(name.as_str()) {
+            if oi == mi || dpc.method_name(oi) != Some((name).jstr()) {
                 return false;
             }
             let Some(od) = dpc.method_desc(oi).and_then(parse_method_descriptor) else {
@@ -12507,7 +12511,7 @@ fn prune_witnessed_raw_sam_casts(e: &mut Expr, pool: &ClassPool) {
             }
             match od.args.get(pos) {
                 Some(jcdc_jvm::JavaType::Object(n)) if n != raw_n => pool
-                    .get(n.as_str())
+                    .get((n).jstr())
                     .map(|ipc| ipc.is_interface())
                     .unwrap_or(false),
                 _ => false,
@@ -12580,7 +12584,7 @@ fn mapmulti_witness_from_body(
             return;
         }
         if let Expr::Method { name, owner, args, .. } = e {
-            if name == "accept" && args.len() == 1 {
+            if (name).jstr() == ("accept").jstr() && args.len() == 1 {
                 if let Some(Expr::Local { var, .. }) = owner.as_deref() {
                     if *var == sink {
                         *out = Some(args[0].type_ref());
@@ -12670,7 +12674,7 @@ fn mapmulti_witness_from_body(
                     jcdc_jvm::JavaType::Object(n) => {
                         let (pkg, simple) = match n.rfind('/') {
                             Some(i) => (n[..i].to_string(), n[i + 1..].to_string()),
-                            None => (String::new(), n.clone()),
+                            None => (String::new(), n.to_string()),
                         };
                         jcdc_jvm::GenericType::Class(jcdc_jvm::ClassSig {
                             package: pkg,
@@ -12707,7 +12711,7 @@ fn witness_ambiguous_lambda_args(e: &mut Expr, pool: &ClassPool, pc: &PoolClass)
         return;
     }
     let dpc;
-    let dref: &PoolClass = if cls == pc.internal_name {
+    let dref: &PoolClass = if &*cls == pc.internal_name.as_str() {
         pc
     } else {
         dpc = match pool.get(&cls) {
@@ -12718,7 +12722,7 @@ fn witness_ambiguous_lambda_args(e: &mut Expr, pool: &ClassPool, pc: &PoolClass)
     };
     let mut ambiguous = vec![false; desc.args.len()];
     for mi in 0..dref.cf.methods.len() {
-        if dref.method_name(mi) != Some(name.as_str()) {
+        if dref.method_name(mi) != Some((name).jstr()) {
             continue;
         }
         let Some(d_str) = dref.method_desc(mi) else { continue };
@@ -12749,7 +12753,7 @@ fn witness_ambiguous_lambda_args(e: &mut Expr, pool: &ClassPool, pc: &PoolClass)
     // 找不到符号), while `(Predicate<Byte>)` keeps the body well-typed.
     let msig_args: Option<(bool, Vec<jcdc_jvm::GenericType>)> = (0..dref.cf.methods.len())
         .find(|&i| {
-            dref.method_name(i) == Some(name.as_str())
+            dref.method_name(i) == Some((name).jstr())
                 && dref.method_desc(i) == Some(format!(
                     "({}){}",
                     desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
@@ -12839,7 +12843,7 @@ fn raw_witness_generic_method_args(e: &mut Expr, pool: &ClassPool, pc: &PoolClas
         desc.ret.to_descriptor()
     );
     let dpc;
-    let dref: &PoolClass = if cls == pc.internal_name {
+    let dref: &PoolClass = if &*cls == pc.internal_name.as_str() {
         pc
     } else {
         dpc = match pool.get(&cls) {
@@ -12849,7 +12853,7 @@ fn raw_witness_generic_method_args(e: &mut Expr, pool: &ClassPool, pc: &PoolClas
         &dpc
     };
     let Some(mi) = (0..dref.cf.methods.len())
-        .find(|&i| dref.method_name(i) == Some(name.as_str()) && dref.method_desc(i) == Some(want_desc.as_str()))
+        .find(|&i| dref.method_name(i) == Some((name).jstr()) && dref.method_desc(i) == Some(want_desc.as_str()))
     else {
         return;
     };
@@ -12967,7 +12971,7 @@ fn raw_witness_generic_method_args(e: &mut Expr, pool: &ClassPool, pc: &PoolClas
         if !pinned[idx] {
             continue;
         }
-        let raw = TypeRef::J(jcdc_jvm::JavaType::Object(crate::method::classsig_internal(&ca)));
+        let raw = TypeRef::J(jcdc_jvm::JavaType::Object((crate::method::classsig_internal(&ca)).into()));
         let inner = std::mem::replace(a, Expr::This);
         *a = Expr::Cast { ty: raw, e: Box::new(inner) };
     }
@@ -13016,10 +13020,10 @@ fn instantiated_super_ctor_params(
     pc: &PoolClass,
 ) -> Option<Vec<jcdc_jvm::GenericType>> {
     let Expr::Method { cls, name, args, .. } = e else { return None };
-    if name != "<init>" || cls == &pc.internal_name {
+    if (name).jstr() != ("<init>").jstr() || (cls).jstr() == (&pc.internal_name).jstr() {
         return None;
     }
-    if pc.super_name() != Some(cls.as_str()) {
+    if pc.super_name() != Some((cls).jstr()) {
         return None;
     }
     let sup_args = pc.class_attr("Signature").and_then(|b| {
@@ -13030,7 +13034,7 @@ fn instantiated_super_ctor_params(
         let sig = pc.utf8(idx).and_then(|s| parse_class_signature(s))?;
         match &sig.superclass {
             jcdc_jvm::GenericType::Class(cs)
-                if crate::method::classsig_internal(cs) == *cls =>
+                if (crate::method::classsig_internal(cs)).jstr() == (*cls).jstr() =>
             {
                 Some(cs.parts.last()?.args.clone())
             }
@@ -13104,7 +13108,7 @@ fn instantiated_ctor_params_core(
                 (jcdc_jvm::JavaType::Object(x), jcdc_jvm::JavaType::Object(y)) if x == y => 2,
                 (jcdc_jvm::JavaType::Array(_), jcdc_jvm::JavaType::Array(_)) => 2,
                 (x, y) if x == y => 2,
-                (_, jcdc_jvm::JavaType::Object(y)) if y == "java/lang/Object" => 1,
+                (_, jcdc_jvm::JavaType::Object(y)) if (y).jstr() == ("java/lang/Object").jstr() => 1,
                 (jcdc_jvm::JavaType::Object(x), jcdc_jvm::JavaType::Object(y))
                     if is_subtype_of(pool, &jcdc_jvm::JavaType::Object(y.clone()), x) =>
                 {
@@ -13393,7 +13397,7 @@ fn apply_param_casts(
                             // own. Supertype formal (Entry<K,V> against a
                             // SimpleImmutableEntry diamond): resolve through
                             // the supertype unification.
-                            let wargs = if crate::method::classsig_internal(wcs) == *acls {
+                            let wargs = if (crate::method::classsig_internal(wcs)).jstr() == (*acls).jstr() {
                                 wcs.parts.last().map(|p| p.args.clone()).unwrap_or_default()
                             } else {
                                 diamond_args_from_target(acls, wcs, pool).unwrap_or_default()
@@ -13540,7 +13544,7 @@ fn apply_param_casts(
                         let cw_internal = crate::method::classsig_internal(cw);
                         if cw.parts.iter().any(|p| {
                             p.args.iter().any(crate::classdec::g_has_wildcard)
-                        }) && an != &cw_internal
+                        }) && (an).jstr() != (&cw_internal).jstr()
                             && !matches!(a, Expr::Cast { .. } | Expr::Const(_) | Expr::Lambda(_))
                             && is_subtype_of(
                                 pool,
@@ -13606,7 +13610,7 @@ fn apply_param_casts(
                                 None => None,
                             };
                             let cast_ty = precise_ty.unwrap_or_else(|| {
-                                TypeRef::J(jcdc_jvm::JavaType::Object(cw_internal.clone()))
+                                TypeRef::J(jcdc_jvm::JavaType::Object((cw_internal.clone()).into()))
                             });
                             let inner = std::mem::replace(a, Expr::This);
                             *a = Expr::Cast { ty: cast_ty, e: Box::new(inner) };
@@ -13674,7 +13678,7 @@ fn apply_param_casts(
                                 TypeRef::G(jcdc_jvm::GenericType::Class(ca)) => {
                                     Some(crate::method::classsig_internal(&ca))
                                 }
-                                TypeRef::J(jcdc_jvm::JavaType::Object(n)) => Some(n),
+                                TypeRef::J(jcdc_jvm::JavaType::Object(n)) => (Some(n)).map(|v| v.to_string()),
                                 _ => None,
                             };
                             if let (Some(ca_int), jcdc_jvm::GenericType::Class(cx)) =
@@ -13711,12 +13715,12 @@ fn apply_param_casts(
                                     && both_if(&cx_int)
                                     || is_subtype_of(
                                         pool,
-                                        &jcdc_jvm::JavaType::Object(ca_int.clone()),
+                                        &jcdc_jvm::JavaType::Object((ca_int.clone()).into()),
                                         &cx_int,
                                     )
                                     || is_subtype_of(
                                         pool,
-                                        &jcdc_jvm::JavaType::Object(cx_int.clone()),
+                                        &jcdc_jvm::JavaType::Object((cx_int.clone()).into()),
                                         &ca_int,
                                     );
                                 if !exact
@@ -13747,7 +13751,7 @@ fn apply_param_casts(
                     // source cast against a self-bounded Attribute<T>).
                     if matches!(a, Expr::This) {
                         if let Some(p) = pc {
-                            have = jcdc_jvm::JavaType::Object(p.internal_name.clone());
+                            have = jcdc_jvm::JavaType::Object((p.internal_name.clone()).into());
                         }
                     }
                     let want_er = match &want {
@@ -13829,7 +13833,7 @@ fn disambiguate_overload_args(e: &mut Expr, pool: &ClassPool) {
         Expr::Method { cls, name, desc, .. } => (cls.clone(), name.clone(), desc.clone()),
         _ => return,
     };
-    if name == "<init>" {
+    if name == ("<init>").into() {
         return;
     }
     let own_desc = format!(
@@ -13840,7 +13844,7 @@ fn disambiguate_overload_args(e: &mut Expr, pool: &ClassPool) {
     let Some(cpc) = pool.get(&cls) else { return };
     let mut variants: Vec<String> = Vec::new();
     for mi in 0..cpc.cf.methods.len() {
-        if cpc.method_name(mi) != Some(name.as_str()) {
+        if cpc.method_name(mi) != Some((name).jstr()) {
             continue;
         }
         if let Some(d) = cpc.method_desc(mi) {
@@ -13913,7 +13917,7 @@ pub(crate) fn upgrade_typevar_array_casts(s: &mut Stmt, pool: &ClassPool, pc: &P
             if let TypeRef::J(jcdc_jvm::JavaType::Array(el)) = ty {
                 if let jcdc_jvm::JavaType::Object(en) = el.as_ref() {
                     let generic = pool
-                        .get(en.as_str())
+                        .get((en).jstr())
                         .and_then(|epc| {
                             epc.class_attr("Signature").and_then(|b| {
                                 if b.len() >= 2 {
@@ -13997,7 +14001,7 @@ fn type_field_reads(e: &mut Expr, pool: &ClassPool, pc: &PoolClass, concrete_ok:
             TypeRef::G(jcdc_jvm::GenericType::Class(cs))
                 if cs.parts.iter().all(|p| p.args.is_empty()) =>
             {
-                Some(crate::method::classsig_internal(cs))
+                (Some(crate::method::classsig_internal(cs))).map(Into::into)
             }
             _ => None,
         };
@@ -14013,7 +14017,7 @@ fn type_field_reads(e: &mut Expr, pool: &ClassPool, pc: &PoolClass, concrete_ok:
                     Expr::Field { .. },
                     TypeRef::G(jcdc_jvm::GenericType::Class(ics)),
                 ) => {
-                    crate::method::classsig_internal(&ics) == *ci
+                    crate::method::classsig_internal(&ics).as_str() == ci.as_ref()
                         // A WILDCARD-parameterized read keeps its raw
                         // cast: `(SetN) ImmutableCollections.EMPTY_SET`
                         // strips SetN<?>'s capture so the value assigns
@@ -14054,7 +14058,7 @@ fn type_field_reads(e: &mut Expr, pool: &ClassPool, pc: &PoolClass, concrete_ok:
             // ("Node无法转换为T_NODE" x2).
             if crate::dbg_flag!("JCDC_DBG_UPG") {
                 if let Expr::Method { name: mn, .. } = &**inner {
-                    if mn == "getValue" {
+                    if (mn).jstr() == ("getValue").jstr() {
                         eprintln!(
                             "UPG2 getValue cast_ty={:?} ret={:?}",
                             ty,
@@ -14173,7 +14177,7 @@ fn witness_methodref_localdef_calls(
             _ => return,
         };
         let Some((w, _)) =
-            compute_witness(cls.as_str(), name.as_str(), &desc, None, want, pool, Some(caller_params))
+            compute_witness((cls).jstr(), (name).jstr(), &desc, None, want, pool, Some(caller_params))
         else {
             return;
         };
@@ -14496,14 +14500,14 @@ fn arg_driven_call_witness(
             continue;
         }
         // The sibling's generic return, instantiated with its witness.
-        let sdpc = pool.get(scls.as_str())?;
+        let sdpc = pool.get((scls).jstr())?;
         let swant = format!(
             "({}){}",
             sdesc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
             sdesc.ret.to_descriptor()
         );
         let smi = (0..sdpc.cf.methods.len()).find(|&i| {
-            sdpc.method_name(i) == Some(sname.as_str())
+            sdpc.method_name(i) == Some((sname).jstr())
                 && sdpc.method_desc(i) == Some(swant.as_str())
         })?;
         let smsig = method_signature_of(&sdpc, smi)?;
@@ -14615,7 +14619,7 @@ fn arg_driven_call_witness(
                         let ti = crate::method::classsig_internal(tc);
                         let bi = crate::method::classsig_internal(bc);
                         if ti != bi
-                            && !is_subtype_of(pool, &jcdc_jvm::JavaType::Object(ti), &bi)
+                            && !is_subtype_of(pool, &jcdc_jvm::JavaType::Object((ti).into()), &bi)
                         {
                             return None;
                         }
@@ -14661,7 +14665,7 @@ fn witness_map_under_container_cast(e: &mut Expr) {
         return;
     };
     if !matches!(
-        tname.as_str(),
+        (tname).jstr(),
         "collect" | "toList" | "toUnmodifiableList" | "toUnmodifiableSet" | "findFirst" | "findAny"
     ) {
         return;
@@ -14679,7 +14683,7 @@ fn witness_map_under_container_cast(e: &mut Expr) {
         depth += 1;
         let next: Option<&mut Expr> = match cur {
             Expr::Method { name, type_args, args, owner, .. } => {
-                if matches!(name.as_str(), "map" | "flatMap")
+                if matches!((name).jstr(), "map" | "flatMap")
                     && type_args.is_empty()
                     && matches!(args.first(), Some(Expr::Lambda(_)))
                 {
@@ -14698,7 +14702,7 @@ fn witness_map_under_container_cast(e: &mut Expr) {
                 // (jdk26 PackageSnippets.gatherDependencies2: pinned
                 // .<ClassDesc>flatMap over a Stream<CodeElement>-returning
                 // lambda → lambda 表达式中的返回类型错误).
-                if name == "mapMulti" {
+                if (name).jstr() == ("mapMulti").jstr() {
                     return;
                 }
                 if !type_args.is_empty() {
@@ -14747,7 +14751,7 @@ pub(crate) fn cast_wildcard_call_args(
                         jcdc_jvm::JavaType::Object(n) => {
                             let (pkg, simple) = match n.rfind('/') {
                                 Some(i) => (n[..i].to_string(), n[i + 1..].to_string()),
-                                None => (String::new(), n.clone()),
+                                None => (String::new(), n.to_string()),
                             };
                             jcdc_jvm::GenericType::Class(jcdc_jvm::ClassSig {
                                 package: pkg,
@@ -14808,7 +14812,7 @@ pub(crate) fn cast_wildcard_call_args(
                         (G::Class(cx), G::Class(ct)) => {
                             crate::classdec::is_subtype_of(
                                 pool,
-                                &jcdc_jvm::JavaType::Object(crate::method::classsig_internal(cx)),
+                                &jcdc_jvm::JavaType::Object((crate::method::classsig_internal(cx)).into()),
                                 &crate::method::classsig_internal(ct),
                             )
                         }
@@ -14818,7 +14822,7 @@ pub(crate) fn cast_wildcard_call_args(
                         (G::Class(cx), G::Class(ct)) => {
                             crate::classdec::is_subtype_of(
                                 pool,
-                                &jcdc_jvm::JavaType::Object(crate::method::classsig_internal(ct)),
+                                &jcdc_jvm::JavaType::Object((crate::method::classsig_internal(ct)).into()),
                                 &crate::method::classsig_internal(cx),
                             )
                         }
@@ -14829,7 +14833,7 @@ pub(crate) fn cast_wildcard_call_args(
                             cx.parts.len() == cy.parts.len()
                                 && crate::classdec::is_subtype_of(
                                     pool,
-                                    &jcdc_jvm::JavaType::Object(crate::method::classsig_internal(cx)),
+                                    &jcdc_jvm::JavaType::Object((crate::method::classsig_internal(cx)).into()),
                                     &crate::method::classsig_internal(cy),
                                 )
                         }
@@ -14868,7 +14872,7 @@ pub(crate) fn cast_wildcard_call_args(
             // is_special and emits renders them as super(...)/this(...)
             // using `cls` (is_super or foreign cls → super form).
             Expr::Method { name, cls, desc, is_special, args, .. }
-                if name == "<init>" && *is_special && !args.is_empty() =>
+                if (name).jstr() == ("<init>").jstr() && *is_special && !args.is_empty() =>
             {
                 (
                     cls.clone(),
@@ -14881,7 +14885,7 @@ pub(crate) fn cast_wildcard_call_args(
             }
             _ => return,
         };
-        let inst_args: Vec<jcdc_jvm::GenericType> = if target_cls == pc.internal_name {
+        let inst_args: Vec<jcdc_jvm::GenericType> = if &*target_cls == pc.internal_name.as_str() {
             pc.class_attr("Signature")
                 .and_then(|b| {
                     if b.len() < 2 {
@@ -14904,7 +14908,7 @@ pub(crate) fn cast_wildcard_call_args(
             }
         };
         let dpc;
-        let dref: &PoolClass = if target_cls == pc.internal_name {
+        let dref: &PoolClass = if &*target_cls == pc.internal_name.as_str() {
             pc
         } else {
             match pool.get(&target_cls) {
@@ -14955,7 +14959,7 @@ pub(crate) fn cast_wildcard_call_args(
             // already carry a generic type.
             if let jcdc_jvm::GenericType::TypeVar(tn) = &formal {
                 if matches!(a.type_ref(), TypeRef::J(jcdc_jvm::JavaType::Object(n))
-                    if n == "java/lang/Object")
+                    if n == ("java/lang/Object").into())
                 {
                     let inner = std::mem::replace(a, Expr::This);
                     *a = Expr::Cast {
@@ -15054,7 +15058,7 @@ pub(crate) fn cast_wildcard_call_args(
             ),
             _ => return,
         };
-        if name == "<init>" {
+        if name == ("<init>").into() {
             return;
         }
         let Expr::Method { owner: Some(owner), args, .. } = e else {
@@ -15081,7 +15085,7 @@ pub(crate) fn cast_wildcard_call_args(
             return;
         }
         let dpc;
-        let dref: &PoolClass = if cls == pc.internal_name {
+        let dref: &PoolClass = if &*cls == pc.internal_name.as_str() {
             pc
         } else {
             match pool.get(&cls) {
@@ -15093,7 +15097,7 @@ pub(crate) fn cast_wildcard_call_args(
             }
         };
         let Some(mi) = (0..dref.cf.methods.len())
-            .find(|&i| dref.method_name(i) == Some(name.as_str()) && desc_raw(dref, i) == desc_str)
+            .find(|&i| dref.method_name(i) == Some((name).jstr()) && desc_raw(dref, i) == desc_str)
         else {
             return;
         };
@@ -15144,7 +15148,7 @@ pub(crate) fn cast_wildcard_call_args(
                 (
                     G::Wildcard(jcdc_jvm::WildcardBound::Any),
                     TypeRef::J(jcdc_jvm::JavaType::Object(n)),
-                ) => n == "java/lang/Object",
+                ) => n == ("java/lang/Object").into(),
                 _ => false,
             }
         });
@@ -15209,7 +15213,7 @@ pub(crate) fn cast_wildcard_call_args(
             }
             _ => return,
         };
-        if name == "<init>" {
+        if name == ("<init>").into() {
             return;
         }
         let want_desc = format!(
@@ -15218,7 +15222,7 @@ pub(crate) fn cast_wildcard_call_args(
             desc.ret.to_descriptor()
         );
         let dpc;
-        let dref: &PoolClass = if cls == pc.internal_name {
+        let dref: &PoolClass = if &*cls == pc.internal_name.as_str() {
             pc
         } else {
             match pool.get(&cls) {
@@ -15230,7 +15234,7 @@ pub(crate) fn cast_wildcard_call_args(
             }
         };
         let Some(mi) = (0..dref.cf.methods.len())
-            .find(|&i| dref.method_name(i) == Some(name.as_str()) && desc_raw(dref, i) == want_desc)
+            .find(|&i| dref.method_name(i) == Some((name).jstr()) && desc_raw(dref, i) == want_desc)
         else {
             return;
         };
@@ -15345,7 +15349,7 @@ pub(crate) fn cast_wildcard_call_args(
         let erased_generic_param = match (&params, &*e) {
             (Some(ps), Expr::Method { desc, .. }) => {
                 ps.iter().zip(desc.args.iter()).any(|(p, d)| {
-                    matches!(d, jcdc_jvm::JavaType::Object(n) if n == "java/lang/Object")
+                    matches!(d, jcdc_jvm::JavaType::Object(n) if (n).jstr() == ("java/lang/Object").jstr())
                         && !matches!(p, jcdc_jvm::GenericType::Class(cs)
                             if crate::method::classsig_internal(cs) == "java/lang/Object")
                 })
@@ -15648,7 +15652,7 @@ fn pin_chain_diamond_from_target(value: &mut Expr, target: &TypeRef, pool: &Clas
     if already {
         return;
     }
-    let Some(npc) = pool.get(ncls.as_str()) else { return };
+    let Some(npc) = pool.get((ncls).jstr()) else { return };
     let Some(csig) = npc.class_attr("Signature").and_then(|b| {
         if b.len() >= 2 {
             npc.utf8(u16::from_be_bytes([b[0], b[1]])).and_then(|x| parse_class_signature(x))
@@ -15667,7 +15671,7 @@ fn pin_chain_diamond_from_target(value: &mut Expr, target: &TypeRef, pool: &Clas
         desc.ret.to_descriptor()
     );
     let Some(mi) = (0..npc.cf.methods.len()).find(|&i| {
-        npc.method_name(i) == Some(name.as_str())
+        npc.method_name(i) == Some((name).jstr())
             && npc.method_desc(i) == Some(want_desc.as_str())
     }) else {
         return;
@@ -15738,8 +15742,8 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
         let arg_tys: Vec<jcdc_jvm::JavaType> =
             args.iter().map(|a| a.type_ref().erased()).collect();
         let ty_internal = crate::method::classsig_internal(cs);
-        if ty_internal == *cls {
-            return Some((cls.clone(), last.args.clone(), args.len(), arg_tys));
+        if (ty_internal).jstr() == (*cls).jstr() {
+            return Some(((cls.clone()).to_string(), last.args.clone(), args.len(), arg_tys));
         }
         // Diamond against a SUPERTYPE-typed local (`Spliterator<Provider
         // <S>> s = new ProviderSpliterator<>(it)`): the local's args are
@@ -15751,7 +15755,7 @@ fn fix_diamond_localdefs(s: &mut Stmt, vt: &crate::varalloc::VarTable, pool: &Cl
         // declared supertype instantiation (with own typevars symbolic)
         // against the local's concrete type.
         let resolved = diamond_args_from_target(cls, cs, pool)?;
-        Some((cls.clone(), resolved, args.len(), arg_tys))
+        Some(((cls.clone()).to_string(), resolved, args.len(), arg_tys))
     }
     fn apply_to_value(
         value: &mut Expr,
@@ -16165,7 +16169,7 @@ fn add_return_witnesses(s: &mut Stmt, msig: Option<&jcdc_jvm::MethodSignature>, 
                     if args_have_generic_new(args, pool) {
                         None
                     } else {
-                        compute_witness(cls.as_str(), name.as_str(), desc, owner.as_deref(), want, pool, Some(&sig.params))
+                        compute_witness((cls).jstr(), (name).jstr(), desc, owner.as_deref(), want, pool, Some(&sig.params))
                     }
                 }
                 _ => None,
@@ -16364,7 +16368,7 @@ fn method_ref_inst_type_args(
                     jcdc_jvm::JavaType::Object(n) => {
                         let (pkg, simple) = match n.rfind('/') {
                             Some(i) => (n[..i].to_string(), n[i + 1..].to_string()),
-                            None => (String::new(), n.clone()),
+                            None => (String::new(), n.to_string()),
                         };
                         G::Class(jcdc_jvm::ClassSig {
                             package: pkg,
@@ -17635,7 +17639,7 @@ fn compute_witness(
                                         ti == bi
                                             || is_subtype_of(
                                                 pool,
-                                                &jcdc_jvm::JavaType::Object(ti),
+                                                &jcdc_jvm::JavaType::Object((ti).into()),
                                                 &bi,
                                             )
                                     }
@@ -18389,7 +18393,7 @@ fn target_inferable_diamonds(
         saw_diamond = true;
         let inst_formal = crate::method::subst_typevars(formal, &msig.params, &vals);
         let own = if let G::Class(fcs) = &inst_formal {
-            if crate::method::classsig_internal(fcs) == *ncls {
+            if (crate::method::classsig_internal(fcs)).jstr() == (*ncls).jstr() {
                 fcs.parts.last().map(|p| p.args.clone()).unwrap_or_default()
             } else {
                 match diamond_args_from_target(ncls, fcs, pool) {
@@ -18446,7 +18450,7 @@ fn target_inferable_diamonds(
                     jcdc_jvm::JavaType::Object(n) => {
                         let (pkg, simple) = match n.rfind('/') {
                             Some(i) => (n[..i].to_string(), n[i + 1..].to_string()),
-                            None => (String::new(), n.clone()),
+                            None => (String::new(), n.to_string()),
                         };
                         jcdc_jvm::GenericType::Class(jcdc_jvm::ClassSig {
                             package: pkg,
@@ -18494,7 +18498,7 @@ fn target_inferable_diamonds(
         } else {
             return false;
         };
-        if f_internal == *ncls {
+        if (f_internal).jstr() == (*ncls).jstr() {
             if standalone != own {
                 return false;
             }
@@ -18604,7 +18608,7 @@ fn diamond_explicit_args_from_call_args(
     // Bind own params from the target through the supertype chain.
     let want_internal = crate::method::classsig_internal(wcs);
     let mut subst: HashMap<String, G> = HashMap::new();
-    if want_internal == *cls {
+    if (want_internal).jstr() == (*cls).jstr() {
         let want_args = &wcs.parts.last()?.args;
         if want_args.len() != csig.params.len() {
             return None;
@@ -18710,14 +18714,14 @@ fn diamond_explicit_args_from_call_args(
             }
             Expr::Cast { e: i, .. } => witnessed_ret(i, pool),
             Expr::Method { cls, name, desc, type_args, args, .. } if !type_args.is_empty() => {
-                let dpc = pool.get(cls.as_str())?;
+                let dpc = pool.get((cls).jstr())?;
                 let want_desc = format!(
                     "({}){}",
                     desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
                     desc.ret.to_descriptor()
                 );
                 let mi = (0..dpc.cf.methods.len()).find(|&i| {
-                    dpc.method_name(i) == Some(name.as_str())
+                    dpc.method_name(i) == Some((name).jstr())
                         && dpc.method_desc(i) == Some(want_desc.as_str())
                 })?;
                 let msig = method_signature_of(&dpc, mi)?;
@@ -18847,7 +18851,7 @@ fn pin_underdetermined_return_diamonds(
         };
         let Expr::Method { cls: mcls, name, desc, owner: Some(owner), args, .. } = call else { return };
         let Expr::New { cls: ncls, ty, args: nargs, .. } = owner.as_mut() else { return };
-        if ncls != mcls && !mcls.starts_with(ncls.as_str()) {
+        if ncls != mcls && !mcls.starts_with((ncls).jstr()) {
             // the call may be inherited; allow only same-class chains here
         }
         let already = matches!(ty, TypeRef::G(jcdc_jvm::GenericType::Class(cs))
@@ -18855,7 +18859,7 @@ fn pin_underdetermined_return_diamonds(
         if already {
             return;
         }
-        let Some(npc) = pool.get(ncls.as_str()) else { return };
+        let Some(npc) = pool.get((ncls).jstr()) else { return };
         let Some(csig) = npc.class_attr("Signature").and_then(|b| {
             if b.len() >= 2 {
                 npc.utf8(u16::from_be_bytes([b[0], b[1]])).and_then(|x| parse_class_signature(x))
@@ -18875,7 +18879,7 @@ fn pin_underdetermined_return_diamonds(
             desc.ret.to_descriptor()
         );
         let Some(mi) = (0..npc.cf.methods.len()).find(|&i| {
-            npc.method_name(i) == Some(name.as_str())
+            npc.method_name(i) == Some((name).jstr())
                 && npc.method_desc(i) == Some(want_desc.as_str())
         }) else {
             return;
@@ -19241,14 +19245,14 @@ fn typevar_array_call_elem(
 ) -> Option<jcdc_jvm::GenericType> {
     use jcdc_jvm::GenericType as G;
     let Expr::Method { cls, name, desc, args, owner, .. } = e else { return None };
-    let dpc = pool.get(cls.as_str())?;
+    let dpc = pool.get((cls).jstr())?;
     let want_desc = format!(
         "({}){}",
         desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
         desc.ret.to_descriptor()
     );
     let mi = (0..dpc.cf.methods.len())
-        .find(|&i| dpc.method_name(i) == Some(name.as_str()) && dpc.method_desc(i) == Some(want_desc.as_str()))?;
+        .find(|&i| dpc.method_name(i) == Some((name).jstr()) && dpc.method_desc(i) == Some(want_desc.as_str()))?;
     let msig = method_signature_of(&dpc, mi)?;
     let G::Array(inner) = &msig.ret else { return None };
     let G::TypeVar(tn) = inner.as_ref() else { return None };
@@ -19269,7 +19273,7 @@ fn typevar_array_call_elem(
                     // MethodType.ptypes(): Class<?>[]; the lambda impl's
                     // erased param starves instantiated_method_ret).
                     if let Expr::Method { cls: acls, name: aname, desc: adesc, .. } = actual {
-                        if let Some(adpc) = pool.get(acls.as_str()) {
+                        if let Some(adpc) = pool.get((acls).jstr()) {
                             let cls_generic = adpc
                                 .class_attr("Signature")
                                 .and_then(|b| {
@@ -19288,7 +19292,7 @@ fn typevar_array_call_elem(
                                     adesc.ret.to_descriptor()
                                 );
                                 if let Some(ami) = (0..adpc.cf.methods.len()).find(|&i| {
-                                    adpc.method_name(i) == Some(aname.as_str())
+                                    adpc.method_name(i) == Some((aname).jstr())
                                         && adpc.method_desc(i) == Some(awant.as_str())
                                 }) {
                                     if let Some(amsig) = method_signature_of(&adpc, ami) {
@@ -19349,7 +19353,7 @@ fn relay_inconvertible_local_casts(s: &mut Stmt, vt: &crate::varalloc::VarTable,
         let cc_internal = crate::method::classsig_internal(cc);
         let wc_internal = crate::method::classsig_internal(wc);
         let convertible_classes = cc_internal == wc_internal
-            || is_subtype_of(pool, &jcdc_jvm::JavaType::Object(cc_internal.clone()), &wc_internal);
+            || is_subtype_of(pool, &jcdc_jvm::JavaType::Object((cc_internal.clone()).into()), &wc_internal);
         if !convertible_classes || g_has_wildcard(&G::Class(cc.clone())) || g_has_wildcard(wg) {
             return;
         }
@@ -19423,19 +19427,19 @@ fn relay_inconvertible_local_casts(s: &mut Stmt, vt: &crate::varalloc::VarTable,
 /// explicit cast restores exactly that guarantee.
 fn cast_object_locals_at_typed_formals(e: &mut Expr) {
     let Expr::Method { desc, args, name, .. } = e else { return };
-    if name == "<init>" || desc.args.len() != args.len() {
+    if (name).jstr() == ("<init>").jstr() || desc.args.len() != args.len() {
         return;
     }
     for (a, ft) in args.iter_mut().zip(desc.args.iter()) {
         let jcdc_jvm::JavaType::Object(fn_name) = ft else { continue };
-        if fn_name == "java/lang/Object" {
+        if (fn_name).jstr() == ("java/lang/Object").jstr() {
             continue;
         }
         if !matches!(a, Expr::Local { .. }) {
             continue;
         }
         if !matches!(a.type_ref(), TypeRef::J(jcdc_jvm::JavaType::Object(n))
-            if n == "java/lang/Object")
+            if n == ("java/lang/Object").into())
         {
             continue;
         }
@@ -19458,14 +19462,14 @@ pub(crate) fn classlit_want_conflict(value: &Expr, want: &TypeRef, pool: &ClassP
         return false;
     }
     let TypeRef::G(want_g) = want else { return false };
-    let Some(dpc) = pool.get(cls.as_str()) else { return false };
+    let Some(dpc) = pool.get((cls).jstr()) else { return false };
     let want_desc = format!(
         "({}){}",
         desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
         desc.ret.to_descriptor()
     );
     let Some(mi) = (0..dpc.cf.methods.len())
-        .find(|&i| dpc.method_name(i) == Some(name.as_str()) && dpc.method_desc(i) == Some(want_desc.as_str()))
+        .find(|&i| dpc.method_name(i) == Some((name).jstr()) && dpc.method_desc(i) == Some(want_desc.as_str()))
     else {
         return false;
     };
@@ -19484,7 +19488,7 @@ pub(crate) fn classlit_want_conflict(value: &Expr, want: &TypeRef, pool: &ClassP
         let G::Class(fc) = formal else { continue };
         let lit_internal = match lit {
             TypeRef::J(jcdc_jvm::JavaType::Object(n)) => n.clone(),
-            TypeRef::G(G::Class(cs)) => crate::method::classsig_internal(cs),
+            TypeRef::G(G::Class(cs)) => (crate::method::classsig_internal(cs)).into(),
             _ => continue,
         };
         let Some(last) = fc.parts.last() else { continue };
@@ -19497,7 +19501,7 @@ pub(crate) fn classlit_want_conflict(value: &Expr, want: &TypeRef, pool: &ClassP
             // literal (a typevar bound is the usual conflicting shape).
             let conflicts = match bound {
                 G::TypeVar(_) => true,
-                G::Class(bc) => crate::method::classsig_internal(bc) != lit_internal,
+                G::Class(bc) => crate::method::classsig_internal(bc).as_str() != lit_internal.as_ref(),
                 _ => true,
             };
             if conflicts {
@@ -19528,14 +19532,14 @@ pub(crate) fn target_binding_bound_conflict(
         return false;
     }
     let TypeRef::G(want_g) = want else { return false };
-    let Some(dpc) = pool.get(cls.as_str()) else { return false };
+    let Some(dpc) = pool.get((cls).jstr()) else { return false };
     let want_desc = format!(
         "({}){}",
         desc.args.iter().map(|t| t.to_descriptor()).collect::<String>(),
         desc.ret.to_descriptor()
     );
     let Some(mi) = (0..dpc.cf.methods.len())
-        .find(|&i| dpc.method_name(i) == Some(name.as_str()) && dpc.method_desc(i) == Some(want_desc.as_str()))
+        .find(|&i| dpc.method_name(i) == Some((name).jstr()) && dpc.method_desc(i) == Some(want_desc.as_str()))
     else {
         return false;
     };
@@ -19588,7 +19592,7 @@ pub(crate) fn target_binding_bound_conflict(
         let er = TypeRef::G(bound_to.clone()).erased();
         let violates = match &er {
             jcdc_jvm::JavaType::Object(n) => {
-                if n == &bound_class {
+                if (n).jstr() == (&bound_class).jstr() {
                     false
                 } else if let G::TypeVar(tn) = bound_to {
                     // A caller typevar: its own declared bound's erasure
@@ -19669,7 +19673,7 @@ fn cast_generic_returns(s: &mut Stmt, want: &TypeRef, pc: &PoolClass, pool: &Cla
         // diamond, 无法推断UnmodifiableEntrySetSpliterator<>).
         if let Expr::New { cls: ncls, args, ty: nty, .. } = e {
             if let TypeRef::G(jcdc_jvm::GenericType::Class(wcs)) = want {
-                let same_cls = crate::method::classsig_internal(wcs) == *ncls;
+                let same_cls = (crate::method::classsig_internal(wcs)).jstr() == (*ncls).jstr();
                 let own = if same_cls {
                     wcs.parts.last().map(|p| p.args.clone()).unwrap_or_default()
                 } else {
@@ -19740,7 +19744,7 @@ fn cast_generic_returns(s: &mut Stmt, want: &TypeRef, pc: &PoolClass, pool: &Cla
         // Only cast when the erasures line up (avoid nonsense casts).
         // `this` erases to the enclosing class, not java/lang/Object.
         let have_er = if matches!(e, Expr::This) {
-            jcdc_jvm::JavaType::Object(pc.internal_name.clone())
+            jcdc_jvm::JavaType::Object((pc.internal_name.clone()).into())
         } else {
             e.type_ref().erased()
         };

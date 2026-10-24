@@ -29,7 +29,7 @@ fn print_help() {
         env!("CARGO_PKG_VERSION")
     );
     println!();
-    println!("Decompiles .class files (class version 45-70, Java 1.1-26) back");
+    println!("Decompiles .class files (class version 45-72, Java 1.1-28) back");
     println!("into readable, recompilable Java source.");
     println!();
     println!("Usage: jcdc [OPTIONS] <INPUT>...");

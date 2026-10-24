@@ -16,6 +16,7 @@ pub mod emit;
 pub mod classdec;
 pub mod method;
 mod ctx_shim;
+pub(crate) mod strref;
 pub mod jvmctx;
 pub mod varalloc;
 

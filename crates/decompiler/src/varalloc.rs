@@ -11,6 +11,7 @@ use jcdc_jvm::{
 };
 
 use crate::expr::TypeRef;
+use crate::strref::JStr;
 
 pub use jdc_core::var::{VarInfo, VarTable};
 
@@ -277,7 +278,7 @@ pub fn build_var_table(
     let mut slot: u16 = 0;
     let mut param_slots: Vec<u16> = Vec::new();
     if !is_static {
-        add_var(&mut vt, slot, "this".into(), JavaType::Object(pc.internal_name.clone()).into(), true, 0, code_len, false);
+        add_var(&mut vt, slot, "this".into(), JavaType::Object((pc.internal_name.clone()).into()).into(), true, 0, code_len, false);
         param_slots.push(slot);
         slot += 1;
     }
@@ -347,7 +348,7 @@ pub fn build_var_table(
         // their receiver, 找不到符号 x2).
         fn concrete_ev(t: JavaType) -> Option<JavaType> {
             match &t {
-                JavaType::Object(n) if n != "java/lang/Object" => Some(t),
+                JavaType::Object(n) if (n).jstr() != ("java/lang/Object").jstr() => Some(t),
                 JavaType::Array(_) => Some(t),
                 _ => None,
             }
@@ -622,7 +623,7 @@ fn sig_matches_base(tr: &TypeRef, base: &JavaType) -> bool {
         // class), so any reference descriptor is compatible.
         GenericType::TypeVar(_) => matches!(base, JavaType::Object(_)),
         GenericType::Class(cs) => {
-            matches!(base, JavaType::Object(n) if *n == cs.internal_name())
+            matches!(base, JavaType::Object(n) if *n == (cs.internal_name()).into())
         }
         GenericType::Primitive(c) => base.primitive_char() == Some(*c),
         GenericType::Array(_) => matches!(base, JavaType::Array(_)),

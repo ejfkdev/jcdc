@@ -7,6 +7,7 @@
 use jcdc_jvm::{ClassPool, GenericType, JavaType, MethodDescriptor, PoolClass};
 
 use crate::expr::{ConstVal, Expr, LambdaExpr, TypeRef};
+use crate::strref::JStr;
 use crate::varalloc::VarTable;
 use crate::jvmctx::JvmCtx;
 
@@ -193,7 +194,7 @@ pub(crate) fn ctor_param_types_fn(
                 if let Some(md) = jcdc_jvm::parse_method_descriptor(d) {
                     if md.args.len() == extra + n + 1 {
                         let outer_first = match (&enclosing, md.args.first()) {
-                            (Some(enc), Some(JavaType::Object(nm))) => nm == enc,
+                            (Some(enc), Some(JavaType::Object(nm))) => (nm).jstr() == (enc).jstr(),
                             _ => false,
                         };
                         if has_this0 || outer_first {
@@ -219,7 +220,7 @@ pub(crate) fn ctor_param_types_fn(
                         (Expr::Const(ConstVal::Long(_)), J::Long | J::Float | J::Double) => true,
                         (Expr::Const(ConstVal::Float(_)), J::Float | J::Double) => true,
                         (Expr::Const(ConstVal::Double(_)), J::Double) => true,
-                        (Expr::Const(ConstVal::Str(_)), J::Object(nm)) => nm == "java/lang/String",
+                        (Expr::Const(ConstVal::Str(_)), J::Object(nm)) => (nm).jstr() == ("java/lang/String").jstr(),
                         (Expr::Const(ConstVal::Null), J::Object(_) | J::Array(_)) => true,
                         (Expr::Const(_), _) => false,
                         (other, p) => {
