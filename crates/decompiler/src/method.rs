@@ -26,19 +26,83 @@ pub struct MethodBody {
 /// Decompile one method. Returns Err only for malformed input; unsupported
 /// constructs degrade to comments inside the statement tree.
 #[track_caller]
-/// Drop the `super(...)` prologue a record's canonical constructor carries
-/// in bytecode (`invokespecial java/lang/Record.<init>`). Returns true when
-/// a statement was removed.
-fn strip_record_super_call(body: &mut Stmt) {
-    fn is_super_ctor(s: &Stmt) -> bool {
-        matches!(s, Stmt::ExprStmt(Expr::Method { name, is_super: true, .. })
-            if name.as_ref() == "<init>")
+/// Constructors whose supertype call is IMPLICIT in source: records
+/// (`java.lang.Record`) and value classes (JEP 401, `java.lang.Object`).
+///
+/// Value classes must initialize their fields BEFORE the supertype
+/// constructor runs, so javac emits `invokespecial Object.<init>` on every
+/// early-construction path — jcdc reproduces it as a `super()` statement
+/// inside each branch. A record with a branchy canonical constructor has the
+/// same shape (`invokespecial Record.<init>` before the per-path `return`).
+/// An explicit constructor invocation is only legal as a direct statement of
+/// the constructor body: `if (c) { this.x = 1; super(); return; }` is
+/// rejected with "此处不允许使用显式构造器调用" (and a bare `return;` before
+/// the implicit call with "在显式构造器调用之前不允许使用 'return'").
+/// Since the call is implicit in source, drop the super() statements and the
+/// redundant tail returns; javac re-inserts the call after the field
+/// initializations on every path. Non-Object superclasses (abstract value
+/// classes) keep their `super(args)` call untouched.
+fn strip_implicit_super_calls(body: &mut Stmt) {
+    fn is_empty_super_ctor(s: &Stmt) -> bool {
+        matches!(s, Stmt::ExprStmt(Expr::Method { name, is_super: true, args, .. })
+            if name.as_ref() == "<init>" && args.is_empty())
     }
-    if let Stmt::Block(v) = body {
-        v.retain(|x| !is_super_ctor(x));
-    } else if is_super_ctor(body) {
+    /// Returns true when the statement itself should be removed. `tail` is
+    /// true when the statement is the last thing the constructor executes.
+    fn walk(s: &mut Stmt, tail: bool) -> bool {
+        if is_empty_super_ctor(s) {
+            return true;
+        }
+        match s {
+            Stmt::Block(v) => {
+                let n = v.len();
+                let mut rm = vec![false; n];
+                for (i, x) in v.iter_mut().enumerate() {
+                    rm[i] = walk(x, tail && i + 1 == n);
+                }
+                let mut idx = 0;
+                v.retain(|_| {
+                    let r = rm[idx];
+                    idx += 1;
+                    !r
+                });
+                false
+            }
+            Stmt::If { then_stmt, else_stmt, .. } => {
+                if walk(then_stmt, tail) {
+                    *then_stmt = Box::new(Stmt::Block(Vec::new()));
+                }
+                if let Some(e) = else_stmt {
+                    if walk(e, tail) {
+                        *else_stmt = None;
+                    }
+                }
+                false
+            }
+            Stmt::Labeled { body: inner, .. } => {
+                let _ = walk(inner, tail);
+                false
+            }
+            Stmt::Return(None) if tail => true,
+            _ => false,
+        }
+    }
+    if walk(body, true) {
         *body = Stmt::Block(Vec::new());
     }
+}
+
+/// JEP 401 value class: preview class file without the ACC_SUPER/ACC_IDENTITY
+/// bit (interfaces never carried it, so exclude non-class kinds).
+fn is_preview_value_class(pc: &PoolClass) -> bool {
+    use jdc_core::types::ClassAccessFlags as A;
+    pc.cf.major_version >= 72
+        && pc.cf.minor_version == 0xFFFF
+        && !pc.cf.access_flags.contains(A::SUPER)
+        && !pc.cf.access_flags.contains(A::INTERFACE)
+        && !pc.cf.access_flags.contains(A::ANNOTATION)
+        && !pc.cf.access_flags.contains(A::ENUM)
+        && !pc.cf.access_flags.contains(A::MODULE)
 }
 
 pub fn decompile_method(
@@ -861,8 +925,17 @@ pub fn decompile_method(
     // constructor in record". Only EXPLICIT canonical constructors reach
     // this point (the implicit one is not emitted), and the call is the
     // constructor prologue, i.e. a top-level statement.
-    if pc.is_record() && pc.method_name(m_idx) == Some("<init>") {
-        strip_record_super_call(&mut body);
+    if pc.method_name(m_idx) == Some("<init>") {
+        // An EMPTY-argument super() is always implicit-equivalent: javac
+        // inserts the same call itself, after the early field assignments.
+        // Value classes may extend an abstract value class (jdk28 preview
+        // JapaneseDate extends ChronoLocalDateImpl); the branchy per-path
+        // super() there has no arguments either, so dropping it is sound.
+        // Non-empty super(args) is left untouched (it must stay explicit).
+        let implicit_super = pc.is_record() || is_preview_value_class(pc);
+        if implicit_super {
+            strip_implicit_super_calls(&mut body);
+        }
     }
     // Post-pipeline safety net for the matexit splices: the conversion-
     // time trial cannot see pathologies CREATED BY THE POST-CONVERT
