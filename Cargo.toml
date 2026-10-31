@@ -15,11 +15,11 @@ jcdc-jvm = { path = "crates/jvm", version = "0.1.3" }
 jcdc-decompiler = { path = "crates/decompiler", version = "0.1.3" }
 # Sibling path dep (the release job clones the tag this pin names). 0.2:
 # Arc<str> IR payloads, FxHash maps, borrowed group/dom APIs.
-jdc-core = { path = "../jdc-core", version = "0.2.17" }
+jdc-core = { path = "../jdc-core", version = "0.2.18" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1"
 
 [profile.release]
 debug = true

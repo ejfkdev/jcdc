@@ -4,6 +4,7 @@ use nom::{
     number::complete::{be_u16, be_u32, be_u8},
     IResult,
 };
+use nom::Parser;
 
 use crate::constant_pool::get_utf8;
 
@@ -13,7 +14,7 @@ use crate::types::*;
 pub(crate) fn parse_attribute(input: &[u8]) -> IResult<&[u8], AttributeInfo> {
     let (input, attribute_name_index) = be_u16(input)?;
     let (input, length) = be_u32(input)?;
-    let (input, info) = take(length as usize)(input)?;
+    let (input, info) = take(length as usize).parse(input)?;
     Ok((
         input,
         AttributeInfo {
@@ -26,7 +27,7 @@ pub(crate) fn parse_attribute(input: &[u8]) -> IResult<&[u8], AttributeInfo> {
 /// Parse multiple attributes.
 pub(crate) fn parse_attributes(input: &[u8]) -> IResult<&[u8], Vec<AttributeInfo>> {
     let (input, attributes_count) = be_u16(input)?;
-    let (input, attributes) = count(parse_attribute, attributes_count as usize)(input)?;
+    let (input, attributes) = count(parse_attribute, attributes_count as usize).parse(input)?;
     Ok((input, attributes))
 }
 
@@ -136,10 +137,10 @@ fn parse_code_attribute(input: &[u8]) -> IResult<&[u8], CodeAttribute> {
     let (input, max_stack) = be_u16(input)?;
     let (input, max_locals) = be_u16(input)?;
     let (input, code_length) = be_u32(input)?;
-    let (input, code) = take(code_length as usize)(input)?;
+    let (input, code) = take(code_length as usize).parse(input)?;
     let (input, exception_table_length) = be_u16(input)?;
     let (input, exception_table) =
-        count(parse_exception_table_entry, exception_table_length as usize)(input)?;
+        count(parse_exception_table_entry, exception_table_length as usize).parse(input)?;
     let (input, attributes) = parse_attributes(input)?;
     Ok((
         input,
@@ -181,7 +182,7 @@ fn parse_constant_value_attribute(input: &[u8]) -> IResult<&[u8], ConstantValueA
 
 fn parse_exceptions_attribute(input: &[u8]) -> IResult<&[u8], ExceptionsAttribute> {
     let (input, number_of_exceptions) = be_u16(input)?;
-    let (input, exception_index_table) = count(be_u16, number_of_exceptions as usize)(input)?;
+    let (input, exception_index_table) = count(be_u16, number_of_exceptions as usize).parse(input)?;
     Ok((
         input,
         ExceptionsAttribute {
@@ -193,14 +194,14 @@ fn parse_exceptions_attribute(input: &[u8]) -> IResult<&[u8], ExceptionsAttribut
 fn parse_bootstrap_methods_attribute(input: &[u8]) -> IResult<&[u8], BootstrapMethodsAttribute> {
     let (input, num_bootstrap_methods) = be_u16(input)?;
     let (input, bootstrap_methods) =
-        count(parse_bootstrap_method_entry, num_bootstrap_methods as usize)(input)?;
+        count(parse_bootstrap_method_entry, num_bootstrap_methods as usize).parse(input)?;
     Ok((input, BootstrapMethodsAttribute { bootstrap_methods }))
 }
 
 fn parse_bootstrap_method_entry(input: &[u8]) -> IResult<&[u8], BootstrapMethodEntry> {
     let (input, bootstrap_method_ref) = be_u16(input)?;
     let (input, num_bootstrap_arguments) = be_u16(input)?;
-    let (input, bootstrap_arguments) = count(be_u16, num_bootstrap_arguments as usize)(input)?;
+    let (input, bootstrap_arguments) = count(be_u16, num_bootstrap_arguments as usize).parse(input)?;
     Ok((
         input,
         BootstrapMethodEntry {
@@ -261,7 +262,7 @@ fn parse_stack_map_frame(input: &[u8]) -> IResult<&[u8], StackMapFrame> {
         252..=254 => {
             let (input, offset_delta) = be_u16(input)?;
             let num_locals = (frame_type - 251) as usize;
-            let (input, locals) = count(parse_verification_type_info, num_locals)(input)?;
+            let (input, locals) = count(parse_verification_type_info, num_locals).parse(input)?;
             Ok((
                 input,
                 StackMapFrame::AppendFrame {
@@ -275,10 +276,10 @@ fn parse_stack_map_frame(input: &[u8]) -> IResult<&[u8], StackMapFrame> {
             let (input, offset_delta) = be_u16(input)?;
             let (input, number_of_locals) = be_u16(input)?;
             let (input, locals) =
-                count(parse_verification_type_info, number_of_locals as usize)(input)?;
+                count(parse_verification_type_info, number_of_locals as usize).parse(input)?;
             let (input, number_of_stack_items) = be_u16(input)?;
             let (input, stack) =
-                count(parse_verification_type_info, number_of_stack_items as usize)(input)?;
+                count(parse_verification_type_info, number_of_stack_items as usize).parse(input)?;
             Ok((
                 input,
                 StackMapFrame::FullFrame {
@@ -323,7 +324,7 @@ fn parse_verification_type_info(input: &[u8]) -> IResult<&[u8], VerificationType
 
 fn parse_inner_classes_attribute(input: &[u8]) -> IResult<&[u8], InnerClassesAttribute> {
     let (input, number_of_classes) = be_u16(input)?;
-    let (input, classes) = count(parse_inner_class, number_of_classes as usize)(input)?;
+    let (input, classes) = count(parse_inner_class, number_of_classes as usize).parse(input)?;
     Ok((input, InnerClassesAttribute { classes }))
 }
 
@@ -351,7 +352,7 @@ fn parse_source_file_attribute(input: &[u8]) -> IResult<&[u8], SourceFileAttribu
 fn parse_line_number_table_attribute(input: &[u8]) -> IResult<&[u8], LineNumberTableAttribute> {
     let (input, line_number_table_length) = be_u16(input)?;
     let (input, line_number_table) =
-        count(parse_line_number_entry, line_number_table_length as usize)(input)?;
+        count(parse_line_number_entry, line_number_table_length as usize).parse(input)?;
     Ok((input, LineNumberTableAttribute { line_number_table }))
 }
 
@@ -374,7 +375,7 @@ fn parse_local_variable_table_attribute(
     let (input, local_variable_table) = count(
         parse_local_variable_entry,
         local_variable_table_length as usize,
-    )(input)?;
+    ).parse(input)?;
     Ok((
         input,
         LocalVariableTableAttribute {
@@ -408,7 +409,7 @@ fn parse_local_variable_type_table_attribute(
     let (input, local_variable_type_table) = count(
         parse_local_variable_type_entry,
         local_variable_type_table_length as usize,
-    )(input)?;
+    ).parse(input)?;
     Ok((
         input,
         LocalVariableTypeTableAttribute {
@@ -439,7 +440,7 @@ fn parse_runtime_annotations_attribute(
     input: &[u8],
 ) -> IResult<&[u8], RuntimeAnnotationsAttribute> {
     let (input, num_annotations) = be_u16(input)?;
-    let (input, annotations) = count(parse_annotation, num_annotations as usize)(input)?;
+    let (input, annotations) = count(parse_annotation, num_annotations as usize).parse(input)?;
     Ok((input, RuntimeAnnotationsAttribute { annotations }))
 }
 
@@ -447,7 +448,7 @@ fn parse_annotation(input: &[u8]) -> IResult<&[u8], Annotation> {
     let (input, type_index) = be_u16(input)?;
     let (input, num_element_value_pairs) = be_u16(input)?;
     let (input, element_value_pairs) =
-        count(parse_element_value_pair, num_element_value_pairs as usize)(input)?;
+        count(parse_element_value_pair, num_element_value_pairs as usize).parse(input)?;
     Ok((
         input,
         Annotation {
@@ -503,7 +504,7 @@ fn parse_element_value(input: &[u8]) -> IResult<&[u8], ElementValue> {
         }
         b'[' => {
             let (input, num_values) = be_u16(input)?;
-            let (input, values) = count(parse_element_value, num_values as usize)(input)?;
+            let (input, values) = count(parse_element_value, num_values as usize).parse(input)?;
             Ok((input, ElementValue::Array { values }))
         }
         _ => Err(nom::Err::Error(nom::error::Error::new(
@@ -520,13 +521,13 @@ fn parse_nest_host_attribute(input: &[u8]) -> IResult<&[u8], NestHostAttribute> 
 
 fn parse_nest_members_attribute(input: &[u8]) -> IResult<&[u8], NestMembersAttribute> {
     let (input, number_of_classes) = be_u16(input)?;
-    let (input, classes) = count(be_u16, number_of_classes as usize)(input)?;
+    let (input, classes) = count(be_u16, number_of_classes as usize).parse(input)?;
     Ok((input, NestMembersAttribute { classes }))
 }
 
 fn parse_record_attribute(input: &[u8]) -> IResult<&[u8], RecordAttribute> {
     let (input, number_of_components) = be_u16(input)?;
-    let (input, components) = count(parse_record_component, number_of_components as usize)(input)?;
+    let (input, components) = count(parse_record_component, number_of_components as usize).parse(input)?;
     Ok((input, RecordAttribute { components }))
 }
 
@@ -548,7 +549,7 @@ fn parse_permitted_subclasses_attribute(
     input: &[u8],
 ) -> IResult<&[u8], PermittedSubclassesAttribute> {
     let (input, number_of_classes) = be_u16(input)?;
-    let (input, classes) = count(be_u16, number_of_classes as usize)(input)?;
+    let (input, classes) = count(be_u16, number_of_classes as usize).parse(input)?;
     Ok((input, PermittedSubclassesAttribute { classes }))
 }
 
@@ -598,7 +599,7 @@ fn parse_type_annotation(input: &[u8]) -> IResult<&[u8], TypeAnnotation> {
     let (input, type_index) = be_u16(input)?;
     let (input, num_element_value_pairs) = be_u16(input)?;
     let (input, element_value_pairs) =
-        count(parse_element_value_pair, num_element_value_pairs as usize)(input)?;
+        count(parse_element_value_pair, num_element_value_pairs as usize).parse(input)?;
     Ok((
         input,
         TypeAnnotation {
@@ -653,7 +654,7 @@ fn parse_type_annotation_target(input: &[u8]) -> IResult<&[u8], TypeAnnotationTa
         }
         0x40 | 0x41 => {
             let (input, table_length) = be_u16(input)?;
-            let (input, table) = count(parse_local_var_target_entry, table_length as usize)(input)?;
+            let (input, table) = count(parse_local_var_target_entry, table_length as usize).parse(input)?;
             Ok((input, TypeAnnotationTarget::LocalVar { table }))
         }
         0x42 => {
@@ -703,7 +704,7 @@ fn parse_local_var_target_entry(input: &[u8]) -> IResult<&[u8], LocalVarTargetEn
 
 fn parse_type_path(input: &[u8]) -> IResult<&[u8], Vec<TypePathEntry>> {
     let (input, path_length) = be_u8(input)?;
-    let (input, entries) = count(parse_type_path_entry, path_length as usize)(input)?;
+    let (input, entries) = count(parse_type_path_entry, path_length as usize).parse(input)?;
     Ok((input, entries))
 }
 
@@ -738,7 +739,7 @@ fn parse_annotation_default_attribute(input: &[u8]) -> IResult<&[u8], Annotation
 
 fn parse_method_parameters_attribute(input: &[u8]) -> IResult<&[u8], MethodParametersAttribute> {
     let (input, parameters_count) = be_u8(input)?;
-    let (input, parameters) = count(parse_method_parameter, parameters_count as usize)(input)?;
+    let (input, parameters) = count(parse_method_parameter, parameters_count as usize).parse(input)?;
     Ok((input, MethodParametersAttribute { parameters }))
 }
 
@@ -759,15 +760,15 @@ fn parse_module_attribute(input: &[u8]) -> IResult<&[u8], ModuleAttribute> {
     let (input, module_flags) = be_u16(input)?;
     let (input, module_version_index) = be_u16(input)?;
     let (input, requires_count) = be_u16(input)?;
-    let (input, requires) = count(parse_module_requires, requires_count as usize)(input)?;
+    let (input, requires) = count(parse_module_requires, requires_count as usize).parse(input)?;
     let (input, exports_count) = be_u16(input)?;
-    let (input, exports) = count(parse_module_exports, exports_count as usize)(input)?;
+    let (input, exports) = count(parse_module_exports, exports_count as usize).parse(input)?;
     let (input, opens_count) = be_u16(input)?;
-    let (input, opens) = count(parse_module_opens, opens_count as usize)(input)?;
+    let (input, opens) = count(parse_module_opens, opens_count as usize).parse(input)?;
     let (input, uses_count) = be_u16(input)?;
-    let (input, uses_index) = count(be_u16, uses_count as usize)(input)?;
+    let (input, uses_index) = count(be_u16, uses_count as usize).parse(input)?;
     let (input, provides_count) = be_u16(input)?;
-    let (input, provides) = count(parse_module_provides, provides_count as usize)(input)?;
+    let (input, provides) = count(parse_module_provides, provides_count as usize).parse(input)?;
     Ok((
         input,
         ModuleAttribute {
@@ -801,7 +802,7 @@ fn parse_module_exports(input: &[u8]) -> IResult<&[u8], ModuleExports> {
     let (input, exports_index) = be_u16(input)?;
     let (input, exports_flags) = be_u16(input)?;
     let (input, exports_to_count) = be_u16(input)?;
-    let (input, exports_to_index) = count(be_u16, exports_to_count as usize)(input)?;
+    let (input, exports_to_index) = count(be_u16, exports_to_count as usize).parse(input)?;
     Ok((
         input,
         ModuleExports {
@@ -816,7 +817,7 @@ fn parse_module_opens(input: &[u8]) -> IResult<&[u8], ModuleOpens> {
     let (input, opens_index) = be_u16(input)?;
     let (input, opens_flags) = be_u16(input)?;
     let (input, opens_to_count) = be_u16(input)?;
-    let (input, opens_to_index) = count(be_u16, opens_to_count as usize)(input)?;
+    let (input, opens_to_index) = count(be_u16, opens_to_count as usize).parse(input)?;
     Ok((
         input,
         ModuleOpens {
@@ -830,7 +831,7 @@ fn parse_module_opens(input: &[u8]) -> IResult<&[u8], ModuleOpens> {
 fn parse_module_provides(input: &[u8]) -> IResult<&[u8], ModuleProvides> {
     let (input, provides_index) = be_u16(input)?;
     let (input, provides_with_count) = be_u16(input)?;
-    let (input, provides_with_index) = count(be_u16, provides_with_count as usize)(input)?;
+    let (input, provides_with_index) = count(be_u16, provides_with_count as usize).parse(input)?;
     Ok((
         input,
         ModuleProvides {
@@ -842,7 +843,7 @@ fn parse_module_provides(input: &[u8]) -> IResult<&[u8], ModuleProvides> {
 
 fn parse_module_packages_attribute(input: &[u8]) -> IResult<&[u8], ModulePackagesAttribute> {
     let (input, package_count) = be_u16(input)?;
-    let (input, package_index) = count(be_u16, package_count as usize)(input)?;
+    let (input, package_index) = count(be_u16, package_count as usize).parse(input)?;
     Ok((input, ModulePackagesAttribute { package_index }))
 }
 

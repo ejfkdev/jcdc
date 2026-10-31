@@ -960,6 +960,20 @@ fn emit_class(
     let is_interface = acc.contains(ClassAccessFlags::INTERFACE);
     let is_annotation = acc.contains(ClassAccessFlags::ANNOTATION);
     let is_record = pc.is_record();
+    // JEP 401 (JDK 28 preview): inside a preview class file the ACC_SUPER
+    // bit is redefined as ACC_IDENTITY — identity classes keep setting it,
+    // value classes do not. Interfaces historically never carried ACC_SUPER,
+    // so only non-interface preview class files can be value classes. The
+    // `value` modifier is not cosmetic: `a == b` on two value objects
+    // compares their field values, while an identity class compares
+    // references, so dropping it silently changes behaviour.
+    let is_value = major >= 72
+        && pc.cf.minor_version == 0xFFFF
+        && !is_interface
+        && !is_annotation
+        && !is_enum
+        && !pc.cf.access_flags.contains(ClassAccessFlags::MODULE)
+        && !pc.cf.access_flags.contains(ClassAccessFlags::SUPER);
 
     let annots = class_annotations(pc);
     if !annots.is_empty() {
@@ -995,6 +1009,9 @@ fn emit_class(
     }
     if acc.contains(ClassAccessFlags::FINAL) && !is_enum && !is_record {
         mods.push("final");
+    }
+    if is_value {
+        mods.push("value");
     }
     // javac emits PermittedSubclasses for enums with constant bodies and
     // for records' hierarchies; `sealed` is only source-visible on plain
@@ -9956,7 +9973,30 @@ fn restore_one_switch(
                                 // Render the pattern type through the
                                 // printer so array types (`[B` → `byte[]`)
                                 // and nested names come out as source.
-                                let ty = if cv.starts_with('[') {
+                                // A `.`-prefixed payload is a primitive
+                                // class from ConstantBootstraps
+                                // .primitiveClass (JEP 532) — internal
+                                // class names cannot contain '.'.
+                                let ty = if let Some(prim) = cv.strip_prefix('.') {
+                                    let jt = match prim {
+                                        "I" => Some(jcdc_jvm::JavaType::Int),
+                                        "J" => Some(jcdc_jvm::JavaType::Long),
+                                        "S" => Some(jcdc_jvm::JavaType::Short),
+                                        "B" => Some(jcdc_jvm::JavaType::Byte),
+                                        "C" => Some(jcdc_jvm::JavaType::Char),
+                                        "Z" => Some(jcdc_jvm::JavaType::Boolean),
+                                        "F" => Some(jcdc_jvm::JavaType::Float),
+                                        "D" => Some(jcdc_jvm::JavaType::Double),
+                                        _ => None,
+                                    };
+                                    match jt {
+                                        Some(t) => TypeRef::J(t),
+                                        None => {
+                                            ok = false;
+                                            continue;
+                                        }
+                                    }
+                                } else if cv.starts_with('[') {
                                     match jcdc_jvm::parse_field_descriptor(cv) {
                                         Some(t) => TypeRef::J(t),
                                         None => TypeRef::J(jcdc_jvm::JavaType::Object((cv.clone()).into())),

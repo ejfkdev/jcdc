@@ -4,6 +4,7 @@ use nom::{
     number::complete::{be_f32, be_f64, be_u16, be_u32, be_u64, be_u8},
     IResult,
 };
+use nom::Parser;
 
 use crate::types::*;
 
@@ -30,32 +31,32 @@ pub fn parse_constant_pool(input: &[u8], count: u16) -> IResult<&[u8], Vec<Const
 fn parse_constant_pool_entry(input: &[u8]) -> IResult<&[u8], ConstantPoolEntry> {
     let (input, tag) = be_u8(input)?;
     match tag {
-        cp_tag::UTF8 => map(parse_utf8_info, ConstantPoolEntry::Utf8)(input),
-        cp_tag::INTEGER => map(parse_integer_info, ConstantPoolEntry::Integer)(input),
-        cp_tag::FLOAT => map(parse_float_info, ConstantPoolEntry::Float)(input),
-        cp_tag::LONG => map(parse_long_info, ConstantPoolEntry::Long)(input),
-        cp_tag::DOUBLE => map(parse_double_info, ConstantPoolEntry::Double)(input),
-        cp_tag::CLASS => map(parse_class_info, ConstantPoolEntry::Class)(input),
-        cp_tag::STRING => map(parse_string_info, ConstantPoolEntry::String)(input),
-        cp_tag::FIELDREF => map(parse_fieldref_info, ConstantPoolEntry::Fieldref)(input),
-        cp_tag::METHODREF => map(parse_methodref_info, ConstantPoolEntry::Methodref)(input),
+        cp_tag::UTF8 => map(parse_utf8_info, ConstantPoolEntry::Utf8).parse(input),
+        cp_tag::INTEGER => map(parse_integer_info, ConstantPoolEntry::Integer).parse(input),
+        cp_tag::FLOAT => map(parse_float_info, ConstantPoolEntry::Float).parse(input),
+        cp_tag::LONG => map(parse_long_info, ConstantPoolEntry::Long).parse(input),
+        cp_tag::DOUBLE => map(parse_double_info, ConstantPoolEntry::Double).parse(input),
+        cp_tag::CLASS => map(parse_class_info, ConstantPoolEntry::Class).parse(input),
+        cp_tag::STRING => map(parse_string_info, ConstantPoolEntry::String).parse(input),
+        cp_tag::FIELDREF => map(parse_fieldref_info, ConstantPoolEntry::Fieldref).parse(input),
+        cp_tag::METHODREF => map(parse_methodref_info, ConstantPoolEntry::Methodref).parse(input),
         cp_tag::INTERFACE_METHODREF => map(
             parse_interface_methodref_info,
             ConstantPoolEntry::InterfaceMethodref,
-        )(input),
+        ).parse(input),
         cp_tag::NAME_AND_TYPE => {
-            map(parse_name_and_type_info, ConstantPoolEntry::NameAndType)(input)
+            map(parse_name_and_type_info, ConstantPoolEntry::NameAndType).parse(input)
         }
         cp_tag::METHOD_HANDLE => {
-            map(parse_method_handle_info, ConstantPoolEntry::MethodHandle)(input)
+            map(parse_method_handle_info, ConstantPoolEntry::MethodHandle).parse(input)
         }
-        cp_tag::METHOD_TYPE => map(parse_method_type_info, ConstantPoolEntry::MethodType)(input),
-        cp_tag::DYNAMIC => map(parse_dynamic_info, ConstantPoolEntry::Dynamic)(input),
+        cp_tag::METHOD_TYPE => map(parse_method_type_info, ConstantPoolEntry::MethodType).parse(input),
+        cp_tag::DYNAMIC => map(parse_dynamic_info, ConstantPoolEntry::Dynamic).parse(input),
         cp_tag::INVOKE_DYNAMIC => {
-            map(parse_invoke_dynamic_info, ConstantPoolEntry::InvokeDynamic)(input)
+            map(parse_invoke_dynamic_info, ConstantPoolEntry::InvokeDynamic).parse(input)
         }
-        cp_tag::MODULE => map(parse_module_info, ConstantPoolEntry::Module)(input),
-        cp_tag::PACKAGE => map(parse_package_info, ConstantPoolEntry::Package)(input),
+        cp_tag::MODULE => map(parse_module_info, ConstantPoolEntry::Module).parse(input),
+        cp_tag::PACKAGE => map(parse_package_info, ConstantPoolEntry::Package).parse(input),
         _ => Err(nom::Err::Error(nom::error::Error::new(
             input,
             nom::error::ErrorKind::Tag,
@@ -65,7 +66,7 @@ fn parse_constant_pool_entry(input: &[u8]) -> IResult<&[u8], ConstantPoolEntry> 
 
 fn parse_utf8_info(input: &[u8]) -> IResult<&[u8], Utf8Info> {
     let (input, length) = be_u16(input)?;
-    let (input, bytes) = take(length as usize)(input)?;
+    let (input, bytes) = take(length as usize).parse(input)?;
     // Modified UTF-8 decoding (CESU-8)
     let value = cesu8::from_java_cesu8(bytes)
         .map(|s| s.into_owned())

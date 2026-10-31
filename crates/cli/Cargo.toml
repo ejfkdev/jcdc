@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "jcdc — Java class file decompiler (Java 1.1-26 bytecode to recompilable source)"
+description = "jcdc — Java class file decompiler (Java 1.1-28 bytecode to recompilable source)"
 
 [[bin]]
 name = "jcdc"
@@ -19,4 +19,4 @@ jcdc-classfile = { workspace = true }
 jcdc-jvm = { workspace = true }
 jcdc-decompiler = { workspace = true }
 anyhow = { workspace = true }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }

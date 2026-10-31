@@ -16,9 +16,9 @@ Java 源码。设计参考了 fernflower/Vineflower、garlic、CFR、Procyon、K
 ## 特性
 
 - **全版本覆盖**——Java 1.1 → 28 字节码，含 `invokedynamic`（lambda /
-  字符串拼接 / switch-pattern 脱糖还原）、record、sealed、
-  try-with-resources、枚举、泛型见证还原、内部/局部/匿名类重建、
-  `synchronized` 域恢复。
+  字符串拼接 / switch-pattern 脱糖还原）、record、sealed、value class 与
+  基本类型模式（JDK 27/28 预览特性）、try-with-resources、枚举、泛型见证
+  还原、内部/局部/匿名类重建、`synchronized` 域恢复。
 - **大规模验证**——**JDK 6 → 28 的每个版本**都跑通「编译 → 反编译 →
   重编译 → 运行」输出全等；另有 630 个源码族的语料，**反编译产物
   100% 可重编译**、零 run-mismatch；完整 `rt.jar`（12,609 个类）在双结构化

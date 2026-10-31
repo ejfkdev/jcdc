@@ -18,8 +18,9 @@ fresh Rust implementation.
 
 - **Full-era coverage** — Java 1.1 → 28 bytecode, including `invokedynamic`
   (lambda / string-concat / switch-pattern desugaring), records, sealed
-  classes, try-with-resources, enums, generics re-witnessing, inner/local/
-  anonymous class reconstruction, and `synchronized` recovery.
+  classes, value classes and primitive type patterns (JDK 27/28 preview),
+  try-with-resources, enums, generics re-witnessing, inner/local/anonymous
+  class reconstruction, and `synchronized` recovery.
 - **Verified at scale** — compile → decompile → recompile → run equality on
   the features suite for **every JDK release from 6 to 28**, plus a 630-family
   source corpus in which **100% of decompiled families recompile** with zero

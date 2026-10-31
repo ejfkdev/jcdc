@@ -407,7 +407,7 @@ fn decompile_path(
         let mut jobs = Vec::with_capacity(zip.len());
         for i in 0..zip.len() {
             let mut e = zip.by_index(i)?;
-            let name = e.name().to_string();
+            let name = e.name()?.to_string();
             if !name.ends_with(".class") {
                 continue;
             }

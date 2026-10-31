@@ -1,4 +1,5 @@
 use nom::{bytes::complete::tag, multi::count, number::complete::be_u16, IResult};
+use nom::Parser;
 
 use crate::attribute::parse_attributes;
 use crate::constant_pool::parse_constant_pool;
@@ -12,7 +13,7 @@ use crate::types::*;
 /// Fails if the magic number (0xCAFEBABE) doesn't match or the data is malformed.
 pub fn parse_classfile(input: &[u8]) -> IResult<&[u8], ClassFile> {
     // Magic number: 0xCAFEBABE
-    let (input, _) = tag(&[0xCA, 0xFE, 0xBA, 0xBE])(input)?;
+    let (input, _) = tag(&[0xCAu8, 0xFE, 0xBA, 0xBE][..]).parse(input)?;
 
     let (input, minor_version) = be_u16(input)?;
     let (input, major_version) = be_u16(input)?;
@@ -25,13 +26,13 @@ pub fn parse_classfile(input: &[u8]) -> IResult<&[u8], ClassFile> {
     let (input, super_class) = be_u16(input)?;
 
     let (input, interfaces_count) = be_u16(input)?;
-    let (input, interfaces) = count(be_u16, interfaces_count as usize)(input)?;
+    let (input, interfaces) = count(be_u16, interfaces_count as usize).parse(input)?;
 
     let (input, fields_count) = be_u16(input)?;
-    let (input, fields) = count(parse_field, fields_count as usize)(input)?;
+    let (input, fields) = count(parse_field, fields_count as usize).parse(input)?;
 
     let (input, methods_count) = be_u16(input)?;
-    let (input, methods) = count(parse_method, methods_count as usize)(input)?;
+    let (input, methods) = count(parse_method, methods_count as usize).parse(input)?;
 
     let (input, attributes) = parse_attributes(input)?;
 

@@ -1001,6 +1001,13 @@ impl<'a> Builder<'a> {
                 let Ok(bs) = self.bootstrap_method(d.bootstrap_method_attr_index) else {
                     return BsmArg::Other;
                 };
+                // Condys reach their factory in two shapes:
+                //   * ConstantBootstraps.invoke wraps the real factory as a
+                //     method-handle ARGUMENT (Enum$EnumDesc.of /
+                //     ClassDesc.of — javac's enum/class constant labels);
+                //   * primitiveClass bootstraps DIRECTLY (JEP 532 primitive
+                //     pattern labels: int.class/long.class/…).
+                // Check the wrapped argument first, then the bootstrap ref.
                 let mut factory: Option<(&str, &str)> = None;
                 let mut str_arg: Option<String> = None;
                 for &a in &bs.bootstrap_arguments {
@@ -1016,12 +1023,40 @@ impl<'a> Builder<'a> {
                         _ => {}
                     }
                 }
+                if factory.is_none() {
+                    if let Some(E::MethodHandle(mh)) =
+                        jcdc_classfile::get_entry(&self.pc.cf.constant_pool, bs.bootstrap_method_ref)
+                    {
+                        if let Some((cls, name, _)) = self.pc.member_ref(mh.reference_index) {
+                            factory = Some((cls, name));
+                        }
+                    }
+                }
                 match factory {
                     Some(("java/lang/Enum$EnumDesc", "of")) => {
                         str_arg.map(|s| BsmArg::Str(s.into())).unwrap_or(BsmArg::Other)
                     }
                     Some(("java/lang/constant/ClassDesc", "of")) => {
                         str_arg.map(|n| BsmArg::Cls(n.replace('.', "/"))).unwrap_or(BsmArg::Other)
+                    }
+                    // JEP 532 primitive patterns: the typeSwitch bootstrap
+                    // carries `int.class`/`long.class`/… as a primitiveClass
+                    // condy (name = the one-letter descriptor, no static
+                    // string arg). Internal class names cannot contain '.',
+                    // so the `.` prefix unambiguously marks a primitive type
+                    // for the pattern-label renderer.
+                    Some(("java/lang/invoke/ConstantBootstraps", "primitiveClass")) => {
+                        match jcdc_classfile::get_entry(
+                            &self.pc.cf.constant_pool,
+                            d.name_and_type_index,
+                        ) {
+                            Some(E::NameAndType(nat)) => self
+                                .pc
+                                .utf8(nat.name_index)
+                                .map(|n| BsmArg::Cls(format!(".{n}")))
+                                .unwrap_or(BsmArg::Other),
+                            _ => BsmArg::Other,
+                        }
                     }
                     _ => BsmArg::Other,
                 }

@@ -732,10 +732,10 @@ fn index_jar(path: &Path, out: &mut HashMap<String, String>) {
     let Ok(file) = std::fs::File::open(path) else { return };
     let Ok(zip) = zip::ZipArchive::new(file) else { return };
     for i in 0..zip.len() {
-        let Some(name) = zip.name_for_index(i) else { continue };
+        let Some(Ok(name)) = zip.name_for_index(i) else { continue };
         if name.ends_with(".class") {
             // .jmod images nest everything under classes/.
-            let rel = name.strip_prefix("classes/").unwrap_or(name);
+            let rel = name.strip_prefix("classes/").unwrap_or(&name);
             let key = rel.trim_end_matches(".class").to_string();
             out.entry(key).or_insert_with(|| name.to_string());
         }

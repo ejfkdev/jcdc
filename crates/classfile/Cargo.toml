@@ -9,7 +9,7 @@ description = "Java class file format parser (vendored from java-class-rs by ejf
 
 [dependencies]
 jdc-core = { workspace = true }
-nom = "7"
+nom = "8"
 cesu8 = "1.1"
 serde = { version = "1", features = ["derive"], optional = true }
 
