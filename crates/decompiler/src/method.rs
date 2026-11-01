@@ -829,6 +829,7 @@ pub fn decompile_method(
     // Int type in the VarTable (PKCS12KeyStore.isPasswordless'
     // `return var6_581` under a boolean return).
     fix_int_locals_at_bool_sites(&mut body, &desc.ret, &vt);
+    fix_bool_arg_sites(&mut body);
     dbg_body!("post-infer");
     prune_dead_synth_stores(&mut body, &vt);
     dbg_body!("post-prune-dead");
@@ -1257,6 +1258,12 @@ fn prune_dead_synth_stores(s: &mut Stmt, vt: &VarTable) {
                 collect_stmt_reads(body, read);
             }
             Stmt::MonitorEnter(e) | Stmt::MonitorExit(e) => collect_expr_reads(e, read),
+            Stmt::Assert { cond, msg } => {
+                collect_expr_reads(cond, read);
+                if let Some(m) = msg {
+                    collect_expr_reads(m, read);
+                }
+            }
             Stmt::Labeled { body, .. } => collect_stmt_reads(body, read),
             _ => {}
         }
@@ -4738,11 +4745,22 @@ fn infer_var_types(
             && !has_int_wide
             && types.iter().all(|t| matches!(t, JavaType::Int))
             && !types.is_empty())
-            || (has_bool_ev && only_int_bool)
+            || (has_bool_ev && only_int_bool && !has_int_wide)
         {
             Some(JavaType::Boolean)
         } else {
             combine_types(&types)
+        };
+        // A numeric-context use is proof of non-boolean. Keep int even if
+        // some other evidence was Boolean: an int-typed variable renders
+        // boolean-valued stores as `c ? 1 : 0` and boolean positions as
+        // `v != 0` (ImageUtil slot 6 is an int bitmask in one switch arm
+        // and a boolean after the switch; declaring it boolean made every
+        // bitmask store `int无法转换为boolean`).
+        let inferred = if has_int_wide && matches!(inferred, Some(JavaType::Boolean)) {
+            Some(JavaType::Int)
+        } else {
+            inferred
         };
         if let Some(t) = inferred {
             if t != JavaType::Int || vt.vars[v].ty.erased() == JavaType::Int {
@@ -5484,6 +5502,17 @@ fn cond_branch_evidence(e: &Expr, var: u32, ev: &mut Vec<Vec<Evidence>>) {
 }
 
 fn gather_expr(e: &Expr, ev: &mut Vec<Vec<Evidence>>, assign_target: Option<u32>, bool_vars: &mut std::collections::HashSet<u32>) {
+    // A numeric-context USE proves the variable is not boolean: `<`/`>`
+    // comparisons, arithmetic/shifts, `~`/`-`, `++`/`--`, array indices and
+    // numeric method parameters are illegal on booleans. Without this a
+    // loop counter initialized to 0 and tested with `i != 0` (rendered
+    // `!i`) was declared boolean (jdk8 Debug.toString(byte[]):
+    // `boolean i = 0; while (i < len) { ... ++i; }`).
+    fn int_use(ev: &mut Vec<Vec<Evidence>>, e: &Expr) {
+        if let Expr::Local { var, .. } = e {
+            push_ev(ev, *var, Evidence::IntWide);
+        }
+    }
     match e {
         Expr::Raw(_) | Expr::RawT(..) => {}
         Expr::Local { var, .. } => {
@@ -5494,7 +5523,14 @@ fn gather_expr(e: &Expr, ev: &mut Vec<Vec<Evidence>>, assign_target: Option<u32>
                 }
             }
         }
-        Expr::Assign { target, value, .. } => {
+        Expr::Assign { target, value, op } => {
+            if !matches!(op, crate::expr::AssignOp::Plain
+                | crate::expr::AssignOp::And
+                | crate::expr::AssignOp::Or
+                | crate::expr::AssignOp::Xor)
+            {
+                int_use(ev, target);
+            }
             if let Expr::Local { var, .. } = &**target {
                 // RHS type is evidence for the variable; string concat is
                 // always String even though its parts look numeric.
@@ -5529,18 +5565,75 @@ fn gather_expr(e: &Expr, ev: &mut Vec<Vec<Evidence>>, assign_target: Option<u32>
             for (a, pt) in args.iter().zip(desc.args.iter()) {
                 if let Expr::Local { var, .. } = a {
                     push_ev(ev, *var, Evidence::T(pt.clone()));
+                    if matches!(
+                        pt,
+                        JavaType::Int
+                            | JavaType::Char
+                            | JavaType::Byte
+                            | JavaType::Short
+                            | JavaType::Long
+                            | JavaType::Float
+                            | JavaType::Double
+                    ) {
+                        push_ev(ev, *var, Evidence::IntWide);
+                    }
                 }
                 gather_expr(a, ev, None, bool_vars);
             }
         }
-        Expr::New { args, .. } | Expr::AnonNew { args, .. } => {
+        Expr::New { args, arg_tys, .. } => {
+            if arg_tys.len() == args.len() {
+                for (a, pt) in args.iter().zip(arg_tys.iter()) {
+                    if matches!(
+                        pt,
+                        JavaType::Int
+                            | JavaType::Char
+                            | JavaType::Byte
+                            | JavaType::Short
+                            | JavaType::Long
+                            | JavaType::Float
+                            | JavaType::Double
+                    ) {
+                        int_use(ev, a);
+                    }
+                }
+            }
             args.iter().for_each(|a| gather_expr(a, ev, None, bool_vars));
         }
-        Expr::Bin { l, r, .. } => {
+        Expr::AnonNew { args, .. } => {
+            args.iter().for_each(|a| gather_expr(a, ev, None, bool_vars));
+        }
+        Expr::Bin { op, l, r, .. } => {
+            // Comparisons (`<`,`>`,`<=`,`>=`) and arithmetic/shifts are
+            // numeric-only; `+` is skipped because it is also string
+            // concatenation, and `&`/`|`/`^` because booleans allow them.
+            if matches!(
+                op,
+                crate::expr::BinOp::Lt
+                    | crate::expr::BinOp::Ge
+                    | crate::expr::BinOp::Gt
+                    | crate::expr::BinOp::Le
+                    | crate::expr::BinOp::Sub
+                    | crate::expr::BinOp::Mul
+                    | crate::expr::BinOp::Div
+                    | crate::expr::BinOp::Rem
+                    | crate::expr::BinOp::Shl
+                    | crate::expr::BinOp::Shr
+                    | crate::expr::BinOp::Ushr
+            ) {
+                int_use(ev, l);
+                int_use(ev, r);
+            }
             gather_expr(l, ev, None, bool_vars);
             gather_expr(r, ev, None, bool_vars);
         }
-        Expr::Un { e: inner, .. } | Expr::Cast { e: inner, .. } | Expr::InstanceOf { e: inner, .. } => {
+        Expr::Un { op, e: inner, .. } => {
+            if matches!(op, crate::expr::UnOp::Neg | crate::expr::UnOp::BitNot) {
+                int_use(ev, inner);
+            }
+            gather_expr(inner, ev, None, bool_vars)
+        }
+        Expr::Cast { e: inner, .. } | Expr::InstanceOf { e: inner, .. } => {
             gather_expr(inner, ev, None, bool_vars)
         }
         Expr::Cond { c, t, f } => {
@@ -5549,11 +5642,24 @@ fn gather_expr(e: &Expr, ev: &mut Vec<Vec<Evidence>>, assign_target: Option<u32>
             gather_expr(f, ev, None, bool_vars);
         }
         Expr::ArrayIndex { array, index } => {
+            int_use(ev, index);
             gather_expr(array, ev, None, bool_vars);
             gather_expr(index, ev, None, bool_vars);
         }
+        Expr::NewArray { dims, init, .. } => {
+            dims.iter().for_each(|d| int_use(ev, d));
+            dims.iter().for_each(|d| gather_expr(d, ev, None, bool_vars));
+            if let Some(vals) = init {
+                vals.iter().for_each(|x| gather_expr(x, ev, None, bool_vars));
+            }
+        }
+        Expr::NewMultiArray { dims, .. } => {
+            dims.iter().for_each(|d| int_use(ev, d));
+            dims.iter().for_each(|d| gather_expr(d, ev, None, bool_vars));
+        }
         Expr::Field { owner: Some(o), .. } => gather_expr(o, ev, None, bool_vars),
         Expr::PreIncDec { e: inner, .. } | Expr::PostIncDec { e: inner, .. } => {
+            int_use(ev, inner);
             gather_expr(inner, ev, None, bool_vars)
         }
         Expr::StringConcat(parts) => parts.iter().for_each(|p| {
@@ -7486,23 +7592,179 @@ fn fold_dup_array_stores(s: &mut Stmt) {
     }
 }
 
-fn fix_int_locals_at_bool_sites(s: &mut Stmt, ret: &jcdc_jvm::JavaType, vt: &VarTable) {
+fn wrap_int_bool_local(v: &mut Expr) {
     use crate::expr::{BinOp, ConstVal, Expr};
+    if let Expr::Local { .. } = v {
+        if v.type_ref().erased() == jcdc_jvm::JavaType::Int {
+            let inner = std::mem::replace(v, Expr::This);
+            *v = Expr::Bin {
+                op: BinOp::Ne,
+                l: Box::new(inner),
+                r: Box::new(Expr::Const(ConstVal::Int(0))),
+                ty: Some(TypeRef::J(jcdc_jvm::JavaType::Boolean)),
+            };
+        }
+    }
+}
+
+/// A boolean parameter position receiving an int-typed local: `f(intLocal)`
+/// is illegal when `f` takes a boolean. The slot may hold an int lineage
+/// and a boolean lineage at different times (ImageUtil slot 6), so the
+/// declared int type is right for the int uses; the boolean CALL needs
+/// `v != 0`. Statement-local positions (assignments, LocalDef, return) are
+/// covered by `fix_int_locals_at_bool_sites`; this pass adds method and
+/// constructor arguments.
+fn fix_bool_arg_sites(s: &mut Stmt) {
+    use crate::expr::Expr;
+    fn ex(e: &mut Expr) {
+        match e {
+            Expr::Method { owner, args, desc, .. } => {
+                if let Some(o) = owner {
+                    ex(o);
+                }
+                for (i, a) in args.iter_mut().enumerate() {
+                    if matches!(desc.args.get(i), Some(jcdc_jvm::JavaType::Boolean)) {
+                        wrap_int_bool_local(a);
+                    }
+                    ex(a);
+                }
+            }
+            Expr::Invokedynamic { desc, args, .. } => {
+                for (i, a) in args.iter_mut().enumerate() {
+                    if matches!(desc.args.get(i), Some(jcdc_jvm::JavaType::Boolean)) {
+                        wrap_int_bool_local(a);
+                    }
+                    ex(a);
+                }
+            }
+            Expr::New { args, arg_tys, .. } => {
+                for (i, a) in args.iter_mut().enumerate() {
+                    if matches!(arg_tys.get(i), Some(jcdc_jvm::JavaType::Boolean)) {
+                        wrap_int_bool_local(a);
+                    }
+                    ex(a);
+                }
+            }
+            Expr::AnonNew { args, .. } => args.iter_mut().for_each(|a| ex(a)),
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter_mut().for_each(|d| ex(d));
+                if let Some(vals) = init {
+                    vals.iter_mut().for_each(|x| ex(x));
+                }
+            }
+            Expr::NewMultiArray { dims, .. } => dims.iter_mut().for_each(|d| ex(d)),
+            Expr::Field { owner: Some(o), .. } => ex(o),
+            Expr::ArrayIndex { array, index } => {
+                ex(array);
+                ex(index);
+            }
+            Expr::Cast { e, .. }
+            | Expr::InstanceOf { e, .. }
+            | Expr::Un { e, .. }
+            | Expr::PreIncDec { e, .. }
+            | Expr::PostIncDec { e, .. } => ex(e),
+            Expr::Bin { l, r, .. } => {
+                ex(l);
+                ex(r);
+            }
+            Expr::Cond { c, t, f } => {
+                ex(c);
+                ex(t);
+                ex(f);
+            }
+            Expr::Assign { target, value, .. } => {
+                ex(target);
+                ex(value);
+            }
+            Expr::StringConcat(parts) => {
+                for p in parts {
+                    if let crate::expr::ConcatPart::Str(x) = p {
+                        ex(x);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn st(s: &mut Stmt) {
+        match s {
+            Stmt::Block(v) => v.iter_mut().for_each(|x| st(x)),
+            Stmt::ExprStmt(e) => ex(e),
+            Stmt::LocalDef { init: Some(e), .. } => ex(e),
+            Stmt::Return(Some(e)) | Stmt::Throw(e) => ex(e),
+            Stmt::If { cond, then_stmt, else_stmt } => {
+                ex(cond);
+                st(then_stmt);
+                if let Some(x) = else_stmt {
+                    st(x);
+                }
+            }
+            Stmt::While { cond, body } => {
+                ex(cond);
+                st(body);
+            }
+            Stmt::DoWhile { body, cond } => {
+                st(body);
+                ex(cond);
+            }
+            Stmt::For { init, cond, update, body } => {
+                init.iter_mut().for_each(|i| st(i));
+                if let Some(c) = cond {
+                    ex(c);
+                }
+                update.iter_mut().for_each(|u| ex(u));
+                st(body);
+            }
+            Stmt::ForEach { iterable, body, .. } => {
+                ex(iterable);
+                st(body);
+            }
+            Stmt::Switch { selector, cases, default, .. } => {
+                ex(selector);
+                for c in cases {
+                    c.body.iter_mut().for_each(|x| st(x));
+                }
+                if let Some(d) = default {
+                    st(d);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                st(body);
+                for c in catches {
+                    st(&mut c.body);
+                }
+                if let Some(f) = finally {
+                    st(f);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter_mut().for_each(|r| st(r));
+                st(body);
+                for c in catches {
+                    st(&mut c.body);
+                }
+                if let Some(f) = finally {
+                    st(f);
+                }
+            }
+            Stmt::Synchronized { lock, body } => {
+                ex(lock);
+                st(body);
+            }
+            Stmt::Labeled { body, .. } => st(body),
+            _ => {}
+        }
+    }
+    st(s);
+}
+
+fn fix_int_locals_at_bool_sites(s: &mut Stmt, ret: &jcdc_jvm::JavaType, vt: &VarTable) {
+    use crate::expr::Expr;
     fn is_bool_ty(t: &TypeRef) -> bool {
         t.erased() == jcdc_jvm::JavaType::Boolean
     }
     fn wrap(v: &mut Expr) {
-        if let Expr::Local { .. } = v {
-            if v.type_ref().erased() == jcdc_jvm::JavaType::Int {
-                let inner = std::mem::replace(v, Expr::This);
-                *v = Expr::Bin {
-                    op: BinOp::Ne,
-                    l: Box::new(inner),
-                    r: Box::new(Expr::Const(ConstVal::Int(0))),
-                    ty: Some(TypeRef::J(jcdc_jvm::JavaType::Boolean)),
-                };
-            }
-        }
+        wrap_int_bool_local(v);
     }
     fn rec(s: &mut Stmt, ret: &jcdc_jvm::JavaType, vt: &VarTable) {
         match s {

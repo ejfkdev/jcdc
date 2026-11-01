@@ -353,7 +353,7 @@ pub fn build_var_table(
                 _ => None,
             }
         }
-        let mut gaps: Vec<(u16, u16, u16, JavaType, Option<JavaType>)> = Vec::new();
+        let mut gaps: Vec<(u16, u16, u16, JavaType, Option<JavaType>, bool)> = Vec::new();
         for (ii, ins) in all_ins.iter().enumerate() {
             let a = ins.a as u16;
             let (slot, ty, is_store) = match ins.op {
@@ -455,11 +455,21 @@ pub fn build_var_table(
                         | Some(Opcode::Invokestatic)
                         | Some(Opcode::Invokeinterface) => {
                             let p = prev.unwrap();
-                            pc.member_ref(p.a as u16)
-                                .and_then(|(_, _, d)| {
+                            pc.member_ref(p.a as u16).and_then(|(cls, name, d)| {
+                                if name == "<init>" {
+                                    // `new T(...)` leaves T on the stack;
+                                    // the <init> descriptor's return is
+                                    // void, so without this a constructed
+                                    // temp had no evidence and adopted a
+                                    // neighbouring array lineage
+                                    // (BasicOptionPaneUI slot 4:
+                                    // `Object[] v = new JComboBox<>()`).
+                                    Some(JavaType::Object(cls.into()))
+                                } else {
                                     jcdc_jvm::parse_method_descriptor(d)
-                                })
-                                .and_then(|md| concrete_ev(md.ret))
+                                        .and_then(|md| concrete_ev(md.ret))
+                                }
+                            })
                         }
                         Some(Opcode::Aload)
                         | Some(Opcode::Aload0)
@@ -477,6 +487,20 @@ pub fn build_var_table(
                             vt.at(pslot, pc0)
                                 .map(|id| vt.var(id).ty.erased())
                                 .and_then(concrete_ev)
+                                // rt.jar has no LVT: the copied source is
+                                // itself a gap temp built earlier in THIS
+                                // pass, so vt.at misses it. Reuse the most
+                                // recent gap access' type (Element[] copy
+                                // in Init: `aload 6; astore 7` — without
+                                // this slot 7 kept Object and a later
+                                // `new ArrayList` merged in and retyped
+                                // the element read).
+                                .or_else(|| {
+                                    gaps.iter()
+                                        .rev()
+                                        .filter(|g| g.0 == pslot && g.1 < pc0)
+                                        .find_map(|g| concrete_ev(g.3.clone()))
+                                })
                         }
                         Some(Opcode::Getfield) | Some(Opcode::Getstatic) => {
                             let p = prev.unwrap();
@@ -493,6 +517,37 @@ pub fn build_var_table(
                             // sanitized to `_Ljava.lang.Class_`).
                             pc.class_name(p.a as u16)
                                 .map(crate::builder::class_name_to_type)
+                        }
+                        // `byte[] t = new byte[n]`: the array type is on
+                        // the NEW opcode, not on the astore (whose stack
+                        // type is plain Object). Without this the temp
+                        // stayed Object, so `t[i]` typed as Object and
+                        // numeric uses failed (CipherHelper
+                        // `Object var13 = arr[len - 1]`).
+                        Some(Opcode::Newarray) => {
+                            let p = prev.unwrap();
+                            let elem = match p.a {
+                                4 => JavaType::Boolean,
+                                5 => JavaType::Char,
+                                6 => JavaType::Float,
+                                7 => JavaType::Double,
+                                8 => JavaType::Byte,
+                                9 => JavaType::Short,
+                                11 => JavaType::Long,
+                                _ => JavaType::Int,
+                            };
+                            Some(JavaType::Array(Box::new(elem)))
+                        }
+                        Some(Opcode::Anewarray) | Some(Opcode::Multianewarray) => {
+                            let p = prev.unwrap();
+                            pc.class_name(p.a as u16)
+                                .map(crate::builder::class_name_to_type)
+                                .map(|t| match p.op {
+                                    // Anewarray adds one reference level
+                                    // on top of the element class.
+                                    Opcode::Anewarray => JavaType::Array(Box::new(t)),
+                                    _ => t,
+                                })
                         }
                         _ => None,
                     }
@@ -518,10 +573,31 @@ pub fn build_var_table(
                     Some(e) => e.clone(),
                     None => ty,
                 };
-                gaps.push((slot, pc0, pc0.saturating_add(ins.size), ty, ev));
+                gaps.push((slot, pc0, pc0.saturating_add(ins.size), ty, ev, is_store));
             }
         }
-        gaps.sort_by_key(|(sl, p, _, _, _)| (*sl, *p));
+        gaps.sort_by_key(|(sl, p, _, _, _, _)| (*sl, *p));
+        // A store separated from the previous access by a BACKWARD jump
+        // starts a new variable: the slot's live range ended at the loop
+        // exit. rt.jar has no LocalVariableTable, so without this a slot
+        // reused by a later loop merges two unrelated variables and type
+        // inference LUBs them (Throwable.printStackTrace: the
+        // StackTraceElement[] walk and the suppressed-Throwable[] walk
+        // share slot 8 -> `Throwable var8 = stackTrace[i]`).
+        fn backward_jump_between(
+            ins: &[jcdc_classfile::instruction::Instruction],
+            from_pc: u16,
+            to_pc: u16,
+        ) -> bool {
+            // `from_pc` is the *end* of the previous access (exclusive), so
+            // the back-edge may sit exactly there: Vector.removeIf's loop
+            // tail is `iinc 6,1` (76..79) followed by `goto 31` at 79.
+            ins.iter().any(|x| {
+                x.pc >= from_pc
+                    && x.pc <= to_pc
+                    && x.targets().iter().any(|&t| t <= x.pc)
+            })
+        }
         // Gap accesses on the same slot belong to one temporary unless
         // a real LVT range starts between them.
         let seg_starts: Vec<(u16, Vec<u16>)> = vt
@@ -534,7 +610,8 @@ pub fn build_var_table(
                 (sl as u16, v)
             })
             .collect();
-        let mut merged_gaps: Vec<(u16, u16, u16, JavaType, Option<JavaType>)> = Vec::new();
+        let mut merged_gaps: Vec<(u16, u16, u16, JavaType, Option<JavaType>, bool)> =
+            Vec::new();
         for g in gaps {
             if let Some(m) = merged_gaps.last_mut() {
                 if m.0 == g.0 {
@@ -550,7 +627,11 @@ pub fn build_var_table(
                         (Some(a), Some(b)) => a != b,
                         _ => false,
                     };
-                    if !crosses && !conflict {
+                    // A store after a backward jump begins a fresh live
+                    // range (see the note above the helper).
+                    let new_range =
+                        g.5 && backward_jump_between(&all_ins, m.2, g.1);
+                    if !crosses && !conflict && !new_range {
                         m.2 = m.2.max(g.2);
                         if m.4.is_none() {
                             if let Some(e) = g.4.clone() {
@@ -564,14 +645,35 @@ pub fn build_var_table(
             }
             merged_gaps.push(g);
         }
-        for (sl, rs, re, ty, _) in merged_gaps {
+        // Each group owns [first_access, next_group_same_slot.first_access)
+        // so a store's `at(next_pc)` still resolves to its own group, but it
+        // must STOP at the next real LVT range: rt.jar keeps debug info for
+        // some classes, and a gap temp stretching to code_len shadowed the
+        // named variable that starts later in the same slot
+        // (SDDocumentImpl.create: the early-return SchemaImpl temp at 180
+        // swallowed `boolean hasService`'s range from 218 on).
+        let mut next_start: Vec<u16> = vec![code_len.max(1); merged_gaps.len()];
+        for i in 0..merged_gaps.len() {
+            if let Some(j) = (i + 1..merged_gaps.len())
+                .find(|&j| merged_gaps[j].0 == merged_gaps[i].0)
+            {
+                next_start[i] = merged_gaps[j].1;
+            }
+        }
+        for (i, (sl, rs, re, ty, _ev, _store)) in merged_gaps.iter().enumerate() {
+            let next_lvt = seg_starts
+                .iter()
+                .find(|(s, _)| *s == *sl)
+                .and_then(|(_, v)| v.iter().copied().filter(|s| *s > *rs).min())
+                .unwrap_or(code_len.max(1));
+            let end = next_start[i].min(next_lvt).max(*re).max(*rs + 1);
             add_var(&mut vt,
-                sl,
+                *sl,
                 format!("var{}_{}", sl, rs),
-                TypeRef::J(ty),
+                TypeRef::J(ty.clone()),
                 false,
-                rs,
-                re.max(rs + 1),
+                *rs,
+                end,
                 true,
             );
         }
