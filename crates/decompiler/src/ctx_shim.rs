@@ -410,6 +410,64 @@ let crate::method::MethodBody { mut body, mut vt, .. } = body_stmts?;
         }
         vt = snap_vt;
     }
+    // JLS 6.4: a lambda body may not shadow a local variable or
+    // parameter of an enclosing scope. The impl method is decompiled on
+    // its own, so a nameless `arg0` parameter collides with the outer
+    // method's own `arg0` and javac rejects the lambda ("variable arg0
+    // is already defined" — `filter(s -> ...)` beside `f(List xs)`).
+    // Captures are lexical references to outer variables and MUST keep
+    // their outer names; only the trailing SAM parameters and the
+    // lambda-local variables are renamed.
+    {
+        let outer_names: std::collections::HashSet<&str> =
+            outer_vt.vars.iter().map(|v| v.name.as_str()).collect();
+        let nsam = l.param_names.len();
+        let pvars: Vec<u32> = vt
+            .vars
+            .iter()
+            .filter(|v| v.is_param && v.name != "this")
+            .map(|v| v.id)
+            .collect();
+        let ncaps = pvars.len().saturating_sub(nsam);
+        let sam_ids: std::collections::HashSet<u32> =
+            pvars.iter().skip(ncaps).copied().collect();
+        let mut taken: std::collections::HashSet<String> =
+            vt.vars.iter().map(|v| v.name.clone()).collect();
+        let n = vt.vars.len();
+        for i in 0..n {
+            let is_param = vt.vars[i].is_param;
+            let name = vt.vars[i].name.clone();
+            if name == "this" || !outer_names.contains(name.as_str()) {
+                continue;
+            }
+            let is_sam = sam_ids.contains(&vt.vars[i].id);
+            if is_param && !is_sam {
+                continue; // capture: lexical outer reference
+            }
+            let base = if is_sam {
+                let k = pvars
+                    .iter()
+                    .skip(ncaps)
+                    .position(|&x| x == vt.vars[i].id)
+                    .unwrap_or(0);
+                l.param_names
+                    .get(k)
+                    .cloned()
+                    .unwrap_or_else(|| format!("x{}", k))
+            } else {
+                name.clone()
+            };
+            taken.remove(&name);
+            let mut cand = base.clone();
+            let mut k = 1;
+            while taken.contains(&cand) || outer_names.contains(cand.as_str()) {
+                cand = format!("{}${}", base, k);
+                k += 1;
+            }
+            taken.insert(cand.clone());
+            vt.vars[i].name = cand;
+        }
+    }
     // Pushdown-recipe repair (classdec::
     // push_witness_into_branches): the impl body is
     // decompiled fresh here, so registered branch
