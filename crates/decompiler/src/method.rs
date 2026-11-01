@@ -829,7 +829,7 @@ pub fn decompile_method(
     // Int type in the VarTable (PKCS12KeyStore.isPasswordless'
     // `return var6_581` under a boolean return).
     fix_int_locals_at_bool_sites(&mut body, &desc.ret, &vt);
-    fix_bool_arg_sites(&mut body);
+    fix_arg_sites(&mut body);
     dbg_body!("post-infer");
     prune_dead_synth_stores(&mut body, &vt);
     dbg_body!("post-prune-dead");
@@ -886,7 +886,7 @@ pub fn decompile_method(
         None
     };
     cast_object_returns(&mut body, &ret_ty, lambda_ret_wildcard.as_ref());
-    cast_narrowing_assigns(&vt, &mut body);
+    cast_narrowing_assigns(&vt, &ret_ty, &mut body);
     if pc.method_name(m_idx) != Some("<init>") {
         fold_merged_new_inits(&mut body, pc);
         cleanup(&mut body);
@@ -4896,7 +4896,7 @@ fn infer_var_types(
 /// `byte b = intExpr;` — the JVM computes byte/short/char values as ints;
 /// when the declared target is narrower, source needs an explicit
 /// narrowing cast (constants in range are already legal without one).
-fn cast_narrowing_assigns(vt: &VarTable, s: &mut Stmt) {
+fn cast_narrowing_assigns(vt: &VarTable, ret: &JavaType, s: &mut Stmt) {
     fn narrow(t: &JavaType) -> bool {
         matches!(t, JavaType::Byte | JavaType::Short | JavaType::Char)
     }
@@ -4907,7 +4907,18 @@ fn cast_narrowing_assigns(vt: &VarTable, s: &mut Stmt) {
         // (jdk17 MemberName `clazz.isInterface() ? REF_invokeInterface :
         // REF_invokeVirtual`); with the constants inlined the whole
         // conditional needs the narrowing cast.
-        if !matches!(value, Expr::Local { .. } | Expr::Method { .. } | Expr::Field { .. } | Expr::ArrayIndex { .. } | Expr::Cond { .. }) {
+        if !matches!(
+            value,
+            Expr::Local { .. }
+                | Expr::Method { .. }
+                | Expr::Field { .. }
+                | Expr::ArrayIndex { .. }
+                | Expr::Cond { .. }
+                // `char c = c + delta` — char + int promotes to int; the
+                // JVM truncates at the store, source needs the cast
+                // (TimeZone.getDisplayName `var6 = var6 + dstSavings`).
+                | Expr::Bin { .. }
+        ) {
             return;
         }
         if value.type_ref().erased() != JavaType::Int {
@@ -4919,13 +4930,29 @@ fn cast_narrowing_assigns(vt: &VarTable, s: &mut Stmt) {
         let inner = std::mem::replace(value, Expr::This);
         *value = Expr::Cast { ty: TypeRef::J(want.clone()), e: Box::new(inner) };
     }
-    fn rec(s: &mut Stmt, vt: &VarTable) {
+    fn rec(s: &mut Stmt, vt: &VarTable, ret: &JavaType) {
         match s {
-            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, vt)),
+            Stmt::Block(v) => v.iter_mut().for_each(|x| rec(x, vt, ret)),
             Stmt::LocalDef { var, init: Some(e), .. } => {
                 let t = vt.var(*var).ty.erased();
                 if narrow(&t) {
                     fix(e, &t);
+                }
+            }
+            Stmt::Return(Some(e)) => {
+                // `return var = intExpr;` where var is byte/short/char:
+                // the assignment target needs the cast, not the whole
+                // return expression (DecimalFormatSymbols.hashCode).
+                if let Expr::Assign { target, value, op: crate::expr::AssignOp::Plain } = &mut *e {
+                    if let Expr::Local { var, .. } = &**target {
+                        let t = vt.var(*var).ty.erased();
+                        if narrow(&t) {
+                            fix(value, &t);
+                        }
+                    }
+                }
+                if narrow(ret) {
+                    fix(e, ret);
                 }
             }
             Stmt::ExprStmt(Expr::Assign { target, value, .. }) => {
@@ -4942,51 +4969,51 @@ fn cast_narrowing_assigns(vt: &VarTable, s: &mut Stmt) {
                 }
             }
             Stmt::If { then_stmt, else_stmt, .. } => {
-                rec(then_stmt, vt);
+                rec(then_stmt, vt, ret);
                 if let Some(e) = else_stmt {
-                    rec(e, vt);
+                    rec(e, vt, ret);
                 }
             }
-            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => rec(body, vt),
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => rec(body, vt, ret),
             Stmt::For { init, body, .. } => {
-                init.iter_mut().for_each(|i| rec(i, vt));
-                rec(body, vt);
+                init.iter_mut().for_each(|i| rec(i, vt, ret));
+                rec(body, vt, ret);
             }
-            Stmt::ForEach { body, .. } => rec(body, vt),
+            Stmt::ForEach { body, .. } => rec(body, vt, ret),
             Stmt::Switch { cases, default, .. } => {
                 for c in cases.iter_mut() {
-                    c.body.iter_mut().for_each(|x| rec(x, vt));
+                    c.body.iter_mut().for_each(|x| rec(x, vt, ret));
                 }
                 if let Some(d) = default {
-                    rec(d, vt);
+                    rec(d, vt, ret);
                 }
             }
             Stmt::Try { body, catches, finally } => {
-                rec(body, vt);
+                rec(body, vt, ret);
                 for c in catches.iter_mut() {
-                    rec(&mut c.body, vt);
+                    rec(&mut c.body, vt, ret);
                 }
                 if let Some(f) = finally {
-                    rec(f, vt);
+                    rec(f, vt, ret);
                 }
             }
             Stmt::TryWithResources { resources, body, catches, finally } => {
                 for r in resources.iter_mut() {
-                    rec(r, vt);
+                    rec(r, vt, ret);
                 }
-                rec(body, vt);
+                rec(body, vt, ret);
                 for c in catches.iter_mut() {
-                    rec(&mut c.body, vt);
+                    rec(&mut c.body, vt, ret);
                 }
                 if let Some(f) = finally {
-                    rec(f, vt);
+                    rec(f, vt, ret);
                 }
             }
-            Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => rec(body, vt),
+            Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => rec(body, vt, ret),
             _ => {}
         }
     }
-    rec(s, vt);
+    rec(s, vt, ret);
 }
 
 /// `return stackN;` where the merge variable stayed wide Object but the
@@ -7607,14 +7634,42 @@ fn wrap_int_bool_local(v: &mut Expr) {
     }
 }
 
-/// A boolean parameter position receiving an int-typed local: `f(intLocal)`
-/// is illegal when `f` takes a boolean. The slot may hold an int lineage
-/// and a boolean lineage at different times (ImageUtil slot 6), so the
-/// declared int type is right for the int uses; the boolean CALL needs
-/// `v != 0`. Statement-local positions (assignments, LocalDef, return) are
-/// covered by `fix_int_locals_at_bool_sites`; this pass adds method and
-/// constructor arguments.
-fn fix_bool_arg_sites(s: &mut Stmt) {
+/// An int local passed where the descriptor says byte/short/char needs the
+/// narrowing cast: Java has no implicit int-to-narrow conversion for a
+/// non-constant argument (DecimalStyle `new DecimalStyle(intZeroDigit,
+/// 'C', ...)`; Formatter `append(intLocal)` against append(char)).
+fn wrap_int_narrow_local(v: &mut Expr, want: &jcdc_jvm::JavaType) {
+    use crate::expr::Expr;
+    if let Expr::Local { .. } = v {
+        if v.type_ref().erased() == jcdc_jvm::JavaType::Int {
+            let inner = std::mem::replace(v, Expr::This);
+            *v = Expr::Cast {
+                ty: TypeRef::J(want.clone()),
+                e: Box::new(inner),
+            };
+        }
+    }
+}
+
+fn wrap_arg_for_param(v: &mut Expr, pt: &jcdc_jvm::JavaType) {
+    use jcdc_jvm::JavaType;
+    match pt {
+        JavaType::Boolean => wrap_int_bool_local(v),
+        JavaType::Byte | JavaType::Short | JavaType::Char => wrap_int_narrow_local(v, pt),
+        _ => {}
+    }
+}
+
+/// Method/constructor argument positions whose descriptor expects boolean
+/// or a narrow integral type receive a cast from an int-typed local:
+/// `f(intLocal)` is illegal for a boolean or byte/short/char parameter.
+/// A slot may hold an int lineage and a boolean lineage at different times
+/// (ImageUtil slot 6), so the declared int type is right for the int uses;
+/// the boolean CALL needs `v != 0` and the narrow CALL needs `(char) v`.
+/// Statement-local positions are covered by `fix_int_locals_at_bool_sites`
+/// and `cast_narrowing_assigns`; array initializers (`new char[]{i}`) are
+/// handled here too.
+fn fix_arg_sites(s: &mut Stmt) {
     use crate::expr::Expr;
     fn ex(e: &mut Expr) {
         match e {
@@ -7623,33 +7678,44 @@ fn fix_bool_arg_sites(s: &mut Stmt) {
                     ex(o);
                 }
                 for (i, a) in args.iter_mut().enumerate() {
-                    if matches!(desc.args.get(i), Some(jcdc_jvm::JavaType::Boolean)) {
-                        wrap_int_bool_local(a);
+                    if let Some(pt) = desc.args.get(i) {
+                        wrap_arg_for_param(a, pt);
                     }
                     ex(a);
                 }
             }
             Expr::Invokedynamic { desc, args, .. } => {
                 for (i, a) in args.iter_mut().enumerate() {
-                    if matches!(desc.args.get(i), Some(jcdc_jvm::JavaType::Boolean)) {
-                        wrap_int_bool_local(a);
+                    if let Some(pt) = desc.args.get(i) {
+                        wrap_arg_for_param(a, pt);
                     }
                     ex(a);
                 }
             }
             Expr::New { args, arg_tys, .. } => {
                 for (i, a) in args.iter_mut().enumerate() {
-                    if matches!(arg_tys.get(i), Some(jcdc_jvm::JavaType::Boolean)) {
-                        wrap_int_bool_local(a);
+                    if let Some(pt) = arg_tys.get(i) {
+                        wrap_arg_for_param(a, pt);
                     }
                     ex(a);
                 }
             }
             Expr::AnonNew { args, .. } => args.iter_mut().for_each(|a| ex(a)),
-            Expr::NewArray { dims, init, .. } => {
+            Expr::NewArray { elem, dims, init, .. } => {
                 dims.iter_mut().for_each(|d| ex(d));
+                let narrow_elem = match elem.erased() {
+                    t @ (jcdc_jvm::JavaType::Byte
+                    | jcdc_jvm::JavaType::Short
+                    | jcdc_jvm::JavaType::Char) => Some(t),
+                    _ => None,
+                };
                 if let Some(vals) = init {
-                    vals.iter_mut().for_each(|x| ex(x));
+                    for x in vals {
+                        if let Some(t) = &narrow_elem {
+                            wrap_int_narrow_local(x, t);
+                        }
+                        ex(x);
+                    }
                 }
             }
             Expr::NewMultiArray { dims, .. } => dims.iter_mut().for_each(|d| ex(d)),
