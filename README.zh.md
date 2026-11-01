@@ -26,6 +26,9 @@ Java 源码。设计参考了 fernflower/Vineflower、garlic、CFR、Procyon、K
 - **快**——18 核机器上整包 `rt.jar` 约 2.4 秒、Java 28 完整运行时镜像
   （27,766 个类）约 4.7 秒，峰值内存低于 1GB（424–978MB）；默认并行且输出
   与调度无关（确定性）。
+- **可选 `--cure` 后处理**——对每个产出单元运行
+  [cure](https://github.com/ejfkdev/cure) 的 Java 简化/格式化器：常量折叠、
+  冗余分支/cast 清理、统一排版。纯后处理——不加该开关时输出不变。
 - **控制流忠实**——循环/条件/switch/try-catch-finally 结构化 + per-arrival
   共享尾拷贝；短路（`&&`/`||`）与 `assert` 习语源码级还原。
 
@@ -121,11 +124,13 @@ jcdc -cp rt.jar pkg/ -o out/         # 整目录树，保持包结构
 jcdc -o out/ app.jar                 # 整 jar
 jcdc classes/                        # 缺省输出到平级 classes-dec/ 目录
 jcdc --synthetic Foo.class           # 包含 synthetic/bridge 成员
+jcdc --cure -o out/ app.jar          # 追加 cure 简化/格式化
 ```
 
 | 选项 | 说明 |
 |---|---|
 | `-o, --output <path>` | 输出文件、目录（保持包结构）、或 `-` 强制 stdout |
+| `--cure` | 对产出源码运行 [cure](https://github.com/ejfkdev/cure)（简化 + 格式化） |
 | `-cp, --classpath <p>` | 冒号分隔的 class/jar/目录列表，用于跨类型解析（泛型、varargs、嵌套判定） |
 | `--synthetic` | 输出 synthetic/bridge 成员（默认隐藏） |
 | `-h, --help` / `-V, --version` | 帮助 / 版本（也支持 `help`、`version` 子命令） |

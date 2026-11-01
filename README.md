@@ -29,6 +29,10 @@ fresh Rust implementation.
 - **Fast** — whole `rt.jar` in ~2.3 s and the entire Java 28 runtime image
   (27,766 classes) in ~4.7 s on 18 cores, under 1 GB peak RSS (424–978 MB);
   parallel by default with deterministic, schedule-independent output.
+- **Optional `--cure` post-pass** — pipe every emitted unit through
+  [cure](https://github.com/ejfkdev/cure)'s Java simplifier/formatter
+  (constant folding, redundant branch/cast cleanup, consistent formatting).
+  Pure post-processing: without the flag the output is unchanged.
 - **Faithful control flow** — loops/conditions/switch/try-catch-finally
   structuring with per-arrival shared-tail copies; source-exact
   short-circuit (`&&`/`||`) and `assert` idiom recovery.
@@ -133,11 +137,13 @@ jcdc -cp rt.jar pkg/ -o out/         # whole directory tree, structure kept
 jcdc -o out/ app.jar                 # whole jar
 jcdc classes/                        # default: sibling "classes-dec/" dir
 jcdc --synthetic Foo.class           # include synthetic/bridge members
+jcdc --cure -o out/ app.jar          # + cure simplification/formatting pass
 ```
 
 | Option | Description |
 |---|---|
 | `-o, --output <path>` | output file, directory (package structure preserved), or `-` to force stdout |
+| `--cure` | post-process the emitted source with [cure](https://github.com/ejfkdev/cure) (simplify + format) |
 | `-cp, --classpath <p>` | colon-separated class/jar/dir list for cross-type resolution (generics, varargs, nesting) |
 | `--synthetic` | emit synthetic/bridge members (hidden by default) |
 | `-h, --help` / `-V, --version` | help / version (`help` and `version` subcommands also work) |

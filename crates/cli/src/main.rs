@@ -48,6 +48,8 @@ fn print_help() {
     println!("                         sibling directory \"<input-name>-dec\".");
     println!("  -cp, --classpath <p>   colon-separated classpath for type resolution");
     println!("  --synthetic            include synthetic/bridge members");
+    println!("  --cure                 simplify/format the emitted source with cure");
+    println!("                         (constant folding, redundant branch/cast cleanup)");
     println!("  -h, --help             print this help");
     println!("  -V, --version          print version");
     println!();
@@ -85,6 +87,7 @@ fn run() -> anyhow::Result<()> {
     let mut classpath: Vec<PathBuf> = Vec::new();
     let mut out: Option<String> = None;
     let mut show_synthetic = false;
+    let mut cure = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -139,6 +142,7 @@ fn run() -> anyhow::Result<()> {
                 classpath.extend(v.split(':').map(PathBuf::from));
             }
             "--synthetic" => show_synthetic = true,
+            "--cure" => cure = true,
             other => {
                 if other.starts_with('-') {
                     anyhow::bail!("unknown option {} (try --help)", other);
@@ -167,7 +171,7 @@ fn run() -> anyhow::Result<()> {
     let mut total = 0usize;
     for input in &inputs {
         let target = resolve_target(input, out.as_deref(), inputs.len() > 1)?;
-        let n = decompile_path(input, &pool, &opts, &target)?;
+        let n = decompile_path(input, &pool, &opts, &target, cure)?;
         total += n;
         if let OutTarget::Dir(d) = &target {
             eprintln!("jcdc: wrote {} file(s) to {}", n, d.display());
@@ -249,10 +253,11 @@ fn process_job(
     pool: &ClassPool,
     opts: &ClassOptions,
     target: &OutTarget,
+    cure: bool,
 ) -> anyhow::Result<usize> {
     match job {
         Job::File { path, root } => {
-            decompile_class_file(path, pool, opts, target, root.as_deref())
+            decompile_class_file(path, pool, opts, target, root.as_deref(), cure)
         }
         Job::Bytes { name, data } => {
             let stem = name.trim_end_matches(".class");
@@ -260,7 +265,7 @@ fn process_job(
                 return Ok(0);
             }
             let java_name = format!("{}.java", stem);
-            match decompile_one(data, pool, opts, stem) {
+            match decompile_one(data, pool, opts, stem, cure) {
                 Ok(source) => Ok(usize::from(write_source(target, &java_name, &source))),
                 Err(e) => {
                     eprintln!("jcdc: failed to decompile {}: {}", name, e);
@@ -281,6 +286,7 @@ fn run_jobs(
     pool: &ClassPool,
     opts: &ClassOptions,
     target: &OutTarget,
+    cure: bool,
 ) -> usize {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -311,7 +317,7 @@ fn run_jobs(
                     }
                     let job = &jobs[i];
                     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        process_job(job, &pool, &opts, &target)
+                        process_job(job, &pool, &opts, &target, cure)
                     }));
                     match res {
                         Ok(Ok(n)) => {
@@ -353,7 +359,7 @@ fn run_jobs(
                                 }
                                 let job = &jobs[i];
                                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    process_job(job, &pool, &opts, &target)
+                                    process_job(job, &pool, &opts, &target, cure)
                                 }));
                                 match res {
                                     Ok(Ok(n)) => {
@@ -386,6 +392,7 @@ fn decompile_path(
     pool: &ClassPool,
     opts: &ClassOptions,
     target: &OutTarget,
+    cure: bool,
 ) -> anyhow::Result<usize> {
     if path.is_dir() {
         // every .class file, rendered in parallel
@@ -396,7 +403,7 @@ fn decompile_path(
                 root: Some(path.to_path_buf()),
             })
             .collect();
-        return Ok(run_jobs(jobs, pool, opts, target));
+        return Ok(run_jobs(jobs, pool, opts, target, cure));
     }
     if is_zip_like(path) {
         if let OutTarget::File(_) = target {
@@ -415,7 +422,7 @@ fn decompile_path(
             std::io::Read::read_to_end(&mut e, &mut buf)?;
             jobs.push(Job::Bytes { name, data: buf });
         }
-        return Ok(run_jobs(jobs, pool, opts, target));
+        return Ok(run_jobs(jobs, pool, opts, target, cure));
     }
     // Single class file: still via the worker pool so it gets the 512MB
     // stack + panic isolation the main thread cannot provide.
@@ -427,6 +434,7 @@ fn decompile_path(
         pool,
         opts,
         target,
+        cure,
     ))
 }
 
@@ -436,6 +444,7 @@ fn decompile_class_file(
     opts: &ClassOptions,
     target: &OutTarget,
     root: Option<&Path>,
+    cure: bool,
 ) -> anyhow::Result<usize> {
     if jcdc_decompiler::dbg_flag!("JCDC_TRACE_FILES") {
         eprintln!("jcdc-file: {}", path.display());
@@ -456,7 +465,7 @@ fn decompile_class_file(
     if jcdc_decompiler::classdec::is_nested_in_pool(&nesting, pool) {
         return Ok(0);
     }
-    let source = match decompile_one(&data, pool, opts, &stem) {
+    let source = match decompile_one(&data, pool, opts, &stem, cure) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("jcdc: failed to decompile {:?}: {}", path, e);
@@ -498,15 +507,35 @@ fn decompile_one(
     pool: &ClassPool,
     opts: &ClassOptions,
     fallback_name: &str,
+    cure: bool,
 ) -> anyhow::Result<String> {
     // Use pool-based path so that the class itself is resolvable during
     // decompilation (self references); fall back to standalone bytes.
     match decompile_with_pool(data, pool, opts) {
-        Ok(s) => Ok(s),
+        Ok(s) => Ok(if cure { cure_source(&s) } else { s }),
         Err(e) => {
             let _ = fallback_name;
             Err(e)
         }
+    }
+}
+
+/// Post-process one decompiled unit with cure's Java backend:
+/// parse -> simplify to a fixed point -> print. The parser is
+/// fault-tolerant (a malformed region is preserved verbatim), but a
+/// rule panic must never lose jcdc's output: fall back to the
+/// original text instead.
+fn cure_source(source: &str) -> String {
+    let src = source.to_string();
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut outcome = cure_java_parser::parse(&src);
+        let cfg = cure_engine::Config::default();
+        let _ = cure_java_simplify::simplify_unit(&mut outcome.ast, &mut outcome.unit, &cfg);
+        cure_java_print::print_unit(&outcome.ast, &outcome.unit)
+    }));
+    match out {
+        Ok(s) => s,
+        Err(_) => source.to_string(),
     }
 }
 

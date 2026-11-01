@@ -20,3 +20,9 @@ jcdc-jvm = { workspace = true }
 jcdc-decompiler = { workspace = true }
 anyhow = { workspace = true }
 zip = { version = "9", default-features = false, features = ["deflate"] }
+# `--cure`: post-process the emitted source with cure's Java backend
+# (decompiled-code simplifier/formatter).
+cure-engine = "0.4.3"
+cure-java-parser = "0.4.3"
+cure-java-simplify = "0.4.3"
+cure-java-print = "0.4.3"
