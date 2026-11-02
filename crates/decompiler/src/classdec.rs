@@ -16695,7 +16695,7 @@ fn method_ref_type_args(
     Some((out, mapping))
 }
 
-fn method_signature_of(pc: &PoolClass, mi: usize) -> Option<jcdc_jvm::MethodSignature> {
+pub(crate) fn method_signature_of(pc: &PoolClass, mi: usize) -> Option<jcdc_jvm::MethodSignature> {
     let sig_bytes = pc.cf.methods[mi].attributes.iter().find_map(|a| {
         if pc.utf8(a.attribute_name_index) == Some("Signature") {
             Some(a.info.as_slice())

@@ -856,7 +856,7 @@ pub fn decompile_method(
     // Int type in the VarTable (PKCS12KeyStore.isPasswordless'
     // `return var6_581` under a boolean return).
     fix_int_locals_at_bool_sites(&mut body, &desc.ret, &vt);
-    fix_arg_sites(&mut body, &vt, false, pool);
+    fix_arg_sites(&mut body, &vt, false, pool, &std::collections::HashSet::new());
     dbg_body!("post-infer");
     prune_dead_synth_stores(&mut body, &vt);
     dbg_body!("post-prune-dead");
@@ -1001,7 +1001,31 @@ pub fn decompile_method(
     propagate_copy_types(&mut vt, &mut body);
     let final_types: Vec<TypeRef> = vt.vars.iter().map(|vi| vi.ty.clone()).collect();
     rewrite_local_types(&mut body, &final_types);
-    fix_arg_sites(&mut body, &vt, true, pool);
+    // Parameters whose DECLARED generic type contains a wildcard; the
+    // VarTable only holds the erasure, so calls through them otherwise
+    // reject Object-typed arguments as CAP#1.
+    let wild_params: std::collections::HashSet<u32> = if pc.method_name(m_idx) != Some("<init>") {
+        crate::classdec::method_signature_of(pc, m_idx)
+            .map(|sig| {
+                let mut ps: Vec<&crate::varalloc::VarInfo> = vt
+                    .vars
+                    .iter()
+                    .filter(|v| v.is_param && v.name != "this")
+                    .collect();
+                ps.sort_by_key(|v| v.slot);
+                let off = ps.len().saturating_sub(sig.args.len());
+                ps[off..]
+                    .iter()
+                    .zip(sig.args.iter())
+                    .filter(|(_, g)| generic_has_wildcard(g))
+                    .map(|(v, _)| v.id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        std::collections::HashSet::new()
+    };
+    fix_arg_sites(&mut body, &vt, true, pool, &wild_params);
     cast_narrowing_assigns(&vt, &desc.ret, &mut body);
     Ok(Some(MethodBody { body, vt, desc }))
 }
@@ -8013,6 +8037,27 @@ fn wrap_arg_for_param(v: &mut Expr, pt: &jcdc_jvm::JavaType, ref_casts: bool, vt
     }
 }
 
+/// Does this generic type mention a wildcard type argument anywhere?
+fn generic_has_wildcard(x: &jcdc_jvm::GenericType) -> bool {
+    use jcdc_jvm::GenericType as G;
+    match x {
+        G::Wildcard(_) => true,
+        G::Array(i) => generic_has_wildcard(i),
+        G::Class(cs) => cs
+            .parts
+            .iter()
+            .any(|p| p.args.iter().any(generic_has_wildcard)),
+        _ => false,
+    }
+}
+
+fn type_has_wildcard(t: &TypeRef) -> bool {
+    match t {
+        TypeRef::G(x) => generic_has_wildcard(x),
+        _ => false,
+    }
+}
+
 /// Method/constructor argument positions whose descriptor expects boolean
 /// or a narrow integral type receive a cast from an int-typed local:
 /// `f(intLocal)` is illegal for a boolean or byte/short/char parameter.
@@ -8022,19 +8067,90 @@ fn wrap_arg_for_param(v: &mut Expr, pt: &jcdc_jvm::JavaType, ref_casts: bool, vt
 /// Statement-local positions are covered by `fix_int_locals_at_bool_sites`
 /// and `cast_narrowing_assigns`; array initializers (`new char[]{i}`) are
 /// handled here too.
-fn fix_arg_sites(s: &mut Stmt, vt: &VarTable, ref_casts: bool, pool: &jcdc_jvm::ClassPool) {
+fn fix_arg_sites(
+    s: &mut Stmt,
+    vt: &VarTable,
+    ref_casts: bool,
+    pool: &jcdc_jvm::ClassPool,
+    wild_params: &std::collections::HashSet<u32>,
+) {
     use crate::expr::Expr;
-    fn ex(e: &mut Expr, vt: &VarTable, ref_casts: bool, pool: &jcdc_jvm::ClassPool) {
+    fn ex(
+        e: &mut Expr,
+        vt: &VarTable,
+        ref_casts: bool,
+        pool: &jcdc_jvm::ClassPool,
+        wild_params: &std::collections::HashSet<u32>,
+    ) {
         match e {
-            Expr::Method { owner, args, desc, .. } => {
+            Expr::Method { owner, cls, args, desc, .. } => {
+                // A call through a WILDCARD-typed receiver cannot take an
+                // Object where the captured type `? super K` is expected
+                // (Map.forEach: `arg0.accept(k, v)` with arg0
+                // BiConsumer<? super K,? super V> — Object无法转换为CAP#1).
+                // A raw receiver cast erases the capture and accepts the
+                // Object-typed locals exactly as the bytecode did. The
+                // receiver's wildcard is in its DECLARED generic signature,
+                // not the VarTable's erasure (wild_params).
+                let owner_wild = ref_casts
+                    && owner
+                        .as_ref()
+                        .map(|o| {
+                            type_has_wildcard(&o.type_ref())
+                                || match &**o {
+                                    Expr::Local { var, .. } => wild_params.contains(var),
+                                    _ => false,
+                                }
+                        })
+                        .unwrap_or(false);
+                // Restrict to calls whose result is void/primitive: a raw
+                // receiver also erases the instantiated RETURN type
+                // (Optional<U>.map -> Object, 无法转换为Optional<U>;
+                // Adapter<TypeT,...>). Lambda arguments are excluded — the
+                // raw parameter erases their target type (ObjectInputFilter
+                // `filters.add(x0 -> ..)` -> Object 不是函数接口).
+                let ret_simple = matches!(
+                    desc.ret,
+                    JavaType::Void
+                        | JavaType::Boolean
+                        | JavaType::Byte
+                        | JavaType::Char
+                        | JavaType::Short
+                        | JavaType::Int
+                        | JavaType::Long
+                        | JavaType::Float
+                        | JavaType::Double
+                );
+                if owner_wild
+                    && ret_simple
+                    && args.iter().zip(desc.args.iter()).any(|(a, _)| {
+                        matches!(
+                            a,
+                            Expr::Local { .. }
+                                | Expr::Method { .. }
+                                | Expr::Field { .. }
+                                | Expr::ArrayIndex { .. }
+                                | Expr::Cond { .. }
+                        ) && matches!(
+                            a.type_ref().erased(),
+                            JavaType::Object(n) if (n).jstr() == ("java/lang/Object").jstr()
+                        )
+                    })
+                {
+                    if let Some(o) = owner {
+                        let raw = TypeRef::J(JavaType::Object(cls.as_ref().into()));
+                        let inner = std::mem::replace(&mut **o, Expr::This);
+                        **o = Expr::Cast { ty: raw, e: Box::new(inner) };
+                    }
+                }
                 if let Some(o) = owner {
-                    ex(o, vt, ref_casts, pool);
+                    ex(o, vt, ref_casts, pool, wild_params);
                 }
                 for (i, a) in args.iter_mut().enumerate() {
                     if let Some(pt) = desc.args.get(i) {
                         wrap_arg_for_param(a, pt, ref_casts, vt, pool);
                     }
-                    ex(a, vt, ref_casts, pool);
+                    ex(a, vt, ref_casts, pool, wild_params);
                 }
             }
             Expr::Invokedynamic { desc, args, .. } => {
@@ -8042,7 +8158,7 @@ fn fix_arg_sites(s: &mut Stmt, vt: &VarTable, ref_casts: bool, pool: &jcdc_jvm::
                     if let Some(pt) = desc.args.get(i) {
                         wrap_arg_for_param(a, pt, ref_casts, vt, pool);
                     }
-                    ex(a, vt, ref_casts, pool);
+                    ex(a, vt, ref_casts, pool, wild_params);
                 }
             }
             Expr::New { args, arg_tys, .. } => {
@@ -8050,12 +8166,12 @@ fn fix_arg_sites(s: &mut Stmt, vt: &VarTable, ref_casts: bool, pool: &jcdc_jvm::
                     if let Some(pt) = arg_tys.get(i) {
                         wrap_arg_for_param(a, pt, ref_casts, vt, pool);
                     }
-                    ex(a, vt, ref_casts, pool);
+                    ex(a, vt, ref_casts, pool, wild_params);
                 }
             }
-            Expr::AnonNew { args, .. } => args.iter_mut().for_each(|a| ex(a, vt, ref_casts, pool)),
+            Expr::AnonNew { args, .. } => args.iter_mut().for_each(|a| ex(a, vt, ref_casts, pool, wild_params)),
             Expr::NewArray { elem, dims, init, .. } => {
-                dims.iter_mut().for_each(|d| ex(d, vt, ref_casts, pool));
+                dims.iter_mut().for_each(|d| ex(d, vt, ref_casts, pool, wild_params));
                 let narrow_elem = match elem.erased() {
                     t @ (jcdc_jvm::JavaType::Byte
                     | jcdc_jvm::JavaType::Short
@@ -8067,114 +8183,120 @@ fn fix_arg_sites(s: &mut Stmt, vt: &VarTable, ref_casts: bool, pool: &jcdc_jvm::
                         if let Some(t) = &narrow_elem {
                             wrap_int_narrow_local(x, t);
                         }
-                        ex(x, vt, ref_casts, pool);
+                        ex(x, vt, ref_casts, pool, wild_params);
                     }
                 }
             }
-            Expr::NewMultiArray { dims, .. } => dims.iter_mut().for_each(|d| ex(d, vt, ref_casts, pool)),
-            Expr::Field { owner: Some(o), .. } => ex(o, vt, ref_casts, pool),
+            Expr::NewMultiArray { dims, .. } => dims.iter_mut().for_each(|d| ex(d, vt, ref_casts, pool, wild_params)),
+            Expr::Field { owner: Some(o), .. } => ex(o, vt, ref_casts, pool, wild_params),
             Expr::ArrayIndex { array, index } => {
-                ex(array, vt, ref_casts, pool);
-                ex(index, vt, ref_casts, pool);
+                ex(array, vt, ref_casts, pool, wild_params);
+                ex(index, vt, ref_casts, pool, wild_params);
             }
             Expr::Cast { e, .. }
             | Expr::InstanceOf { e, .. }
             | Expr::Un { e, .. }
             | Expr::PreIncDec { e, .. }
-            | Expr::PostIncDec { e, .. } => ex(e, vt, ref_casts, pool),
+            | Expr::PostIncDec { e, .. } => ex(e, vt, ref_casts, pool, wild_params),
             Expr::Bin { l, r, .. } => {
-                ex(l, vt, ref_casts, pool);
-                ex(r, vt, ref_casts, pool);
+                ex(l, vt, ref_casts, pool, wild_params);
+                ex(r, vt, ref_casts, pool, wild_params);
             }
             Expr::Cond { c, t, f } => {
-                ex(c, vt, ref_casts, pool);
-                ex(t, vt, ref_casts, pool);
-                ex(f, vt, ref_casts, pool);
+                ex(c, vt, ref_casts, pool, wild_params);
+                ex(t, vt, ref_casts, pool, wild_params);
+                ex(f, vt, ref_casts, pool, wild_params);
             }
             Expr::Assign { target, value, .. } => {
-                ex(target, vt, ref_casts, pool);
-                ex(value, vt, ref_casts, pool);
+                ex(target, vt, ref_casts, pool, wild_params);
+                ex(value, vt, ref_casts, pool, wild_params);
             }
             Expr::StringConcat(parts) => {
                 for p in parts {
                     if let crate::expr::ConcatPart::Str(x) = p {
-                        ex(x, vt, ref_casts, pool);
+                        ex(x, vt, ref_casts, pool, wild_params);
                     }
                 }
             }
             _ => {}
         }
     }
-    fn st(s: &mut Stmt, vt: &VarTable, ref_casts: bool, pool: &jcdc_jvm::ClassPool) {
+    fn st(
+        s: &mut Stmt,
+        vt: &VarTable,
+        ref_casts: bool,
+        pool: &jcdc_jvm::ClassPool,
+        wild_params: &std::collections::HashSet<u32>,
+    ) {
         match s {
-            Stmt::Block(v) => v.iter_mut().for_each(|x| st(x, vt, ref_casts, pool)),
-            Stmt::ExprStmt(e) => ex(e, vt, ref_casts, pool),
-            Stmt::LocalDef { init: Some(e), .. } => ex(e, vt, ref_casts, pool),
-            Stmt::Return(Some(e)) | Stmt::Throw(e) => ex(e, vt, ref_casts, pool),
+            Stmt::Block(v) => v.iter_mut().for_each(|x| st(x, vt, ref_casts, pool, wild_params)),
+            Stmt::ExprStmt(e) => ex(e, vt, ref_casts, pool, wild_params),
+            Stmt::LocalDef { init: Some(e), .. } => ex(e, vt, ref_casts, pool, wild_params),
+            Stmt::Return(Some(e)) | Stmt::Throw(e) => ex(e, vt, ref_casts, pool, wild_params),
             Stmt::If { cond, then_stmt, else_stmt } => {
-                ex(cond, vt, ref_casts, pool);
-                st(then_stmt, vt, ref_casts, pool);
+                ex(cond, vt, ref_casts, pool, wild_params);
+                st(then_stmt, vt, ref_casts, pool, wild_params);
                 if let Some(x) = else_stmt {
-                    st(x, vt, ref_casts, pool);
+                    st(x, vt, ref_casts, pool, wild_params);
                 }
             }
             Stmt::While { cond, body } => {
-                ex(cond, vt, ref_casts, pool);
-                st(body, vt, ref_casts, pool);
+                ex(cond, vt, ref_casts, pool, wild_params);
+                st(body, vt, ref_casts, pool, wild_params);
             }
             Stmt::DoWhile { body, cond } => {
-                st(body, vt, ref_casts, pool);
-                ex(cond, vt, ref_casts, pool);
+                st(body, vt, ref_casts, pool, wild_params);
+                ex(cond, vt, ref_casts, pool, wild_params);
             }
             Stmt::For { init, cond, update, body } => {
-                init.iter_mut().for_each(|i| st(i, vt, ref_casts, pool));
+                init.iter_mut().for_each(|i| st(i, vt, ref_casts, pool, wild_params));
                 if let Some(c) = cond {
-                    ex(c, vt, ref_casts, pool);
+                    ex(c, vt, ref_casts, pool, wild_params);
                 }
-                update.iter_mut().for_each(|u| ex(u, vt, ref_casts, pool));
-                st(body, vt, ref_casts, pool);
+                update.iter_mut().for_each(|u| ex(u, vt, ref_casts, pool, wild_params));
+                st(body, vt, ref_casts, pool, wild_params);
             }
             Stmt::ForEach { iterable, body, .. } => {
-                ex(iterable, vt, ref_casts, pool);
-                st(body, vt, ref_casts, pool);
+                ex(iterable, vt, ref_casts, pool, wild_params);
+                st(body, vt, ref_casts, pool, wild_params);
             }
             Stmt::Switch { selector, cases, default, .. } => {
-                ex(selector, vt, ref_casts, pool);
+                ex(selector, vt, ref_casts, pool, wild_params);
                 for c in cases {
-                    c.body.iter_mut().for_each(|x| st(x, vt, ref_casts, pool));
+                    c.body.iter_mut().for_each(|x| st(x, vt, ref_casts, pool, wild_params));
                 }
                 if let Some(d) = default {
-                    st(d, vt, ref_casts, pool);
+                    st(d, vt, ref_casts, pool, wild_params);
                 }
             }
             Stmt::Try { body, catches, finally } => {
-                st(body, vt, ref_casts, pool);
+                st(body, vt, ref_casts, pool, wild_params);
                 for c in catches {
-                    st(&mut c.body, vt, ref_casts, pool);
+                    st(&mut c.body, vt, ref_casts, pool, wild_params);
                 }
                 if let Some(f) = finally {
-                    st(f, vt, ref_casts, pool);
+                    st(f, vt, ref_casts, pool, wild_params);
                 }
             }
             Stmt::TryWithResources { resources, body, catches, finally } => {
-                resources.iter_mut().for_each(|r| st(r, vt, ref_casts, pool));
-                st(body, vt, ref_casts, pool);
+                resources.iter_mut().for_each(|r| st(r, vt, ref_casts, pool, wild_params));
+                st(body, vt, ref_casts, pool, wild_params);
                 for c in catches {
-                    st(&mut c.body, vt, ref_casts, pool);
+                    st(&mut c.body, vt, ref_casts, pool, wild_params);
                 }
                 if let Some(f) = finally {
-                    st(f, vt, ref_casts, pool);
+                    st(f, vt, ref_casts, pool, wild_params);
                 }
             }
             Stmt::Synchronized { lock, body } => {
-                ex(lock, vt, ref_casts, pool);
-                st(body, vt, ref_casts, pool);
+                ex(lock, vt, ref_casts, pool, wild_params);
+                st(body, vt, ref_casts, pool, wild_params);
             }
-            Stmt::Labeled { body, .. } => st(body, vt, ref_casts, pool),
+            Stmt::Labeled { body, .. } => st(body, vt, ref_casts, pool, wild_params),
             _ => {}
         }
     }
-    st(s, vt, ref_casts, pool);
+    st(s, vt, ref_casts, pool, wild_params);
 }
 
 fn fix_int_locals_at_bool_sites(s: &mut Stmt, ret: &jcdc_jvm::JavaType, vt: &VarTable) {
