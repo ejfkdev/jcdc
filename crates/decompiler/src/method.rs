@@ -816,7 +816,7 @@ pub fn decompile_method(
     cleanup(&mut body);
     twr_j11(&mut body);
     cleanup(&mut body);
-    twr_j7(&mut body);
+    twr_j7(&mut body, &vt, pool);
     cleanup(&mut body);
     dedupe_finally(&mut body);
     cleanup(&mut body);
@@ -8778,12 +8778,64 @@ fn booleanize_deep_stmt_r(s: &mut Stmt, numeric_ret: bool, ret_ty: &jcdc_jvm::Ja
 /// <normal-path close scaffolding on in / $p>
 /// ```
 /// becomes `try (R in = new R(...)) { body }`.
-fn twr_j7(s: &mut Stmt) {
+/// Does the TWR resource's declared type implement AutoCloseable or
+/// Closeable? Unknown classes (not in the pool) keep the historical
+/// behaviour: jcdc cannot disprove assignability.
+fn twr_resource_autocloseable(res: &Stmt, vt: &VarTable, pool: &ClassPool) -> bool {
+    let (var, init_ty) = match res {
+        Stmt::LocalDef { var, init, .. } => (
+            *var,
+            init.as_ref().map(|e| e.type_ref().erased()),
+        ),
+        Stmt::ExprStmt(Expr::Assign { target, value, .. }) => match &**target {
+            Expr::Local { var, .. } => (*var, Some(value.type_ref().erased())),
+            _ => return true,
+        },
+        _ => return true,
+    };
+    // Prefer the INITIALIZER's type: the var may have been merged with a
+    // catch parameter sharing its slot (Socket temp declared IOException),
+    // and the initializer's return type is the accurate resource class.
+    let ty = match init_ty {
+        Some(JavaType::Object(n)) if (n).jstr() != ("java/lang/Object").jstr() => {
+            JavaType::Object(n)
+        }
+        Some(t @ JavaType::Array(_)) => t,
+        _ => vt.var(var).ty.erased(),
+    };
+    let JavaType::Object(name) = ty else {
+        return true;
+    };
+    let mut stack = vec![name.to_string()];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(n) = stack.pop() {
+        if n == "java/lang/AutoCloseable" || n == "java/io/Closeable" {
+            return true;
+        }
+        if !seen.insert(n.clone()) {
+            continue;
+        }
+        let Some(pc) = pool.get(&n) else {
+            return true;
+        };
+        if let Some(sup) = pc.super_name() {
+            stack.push(sup.to_string());
+        }
+        for &i in &pc.cf.interfaces {
+            if let Some(c) = pc.class_name(i) {
+                stack.push(c.to_string());
+            }
+        }
+    }
+    false
+}
+
+fn twr_j7(s: &mut Stmt, vt: &VarTable, pool: &ClassPool) {
     match s {
         Stmt::Block(v) => {
             let mut i = 0;
             while i < v.len() {
-                twr_j7(&mut v[i]);
+                twr_j7(&mut v[i], vt, pool);
                 if crate::dbg_flag!("JCDC_DBG_TWR") {
                     if let Stmt::Try { catches, finally, .. } = &v[i] {
                         eprintln!("TWR scan i={} catches={} excs={:?} finally={}", i, catches.len(),
@@ -8795,6 +8847,17 @@ fn twr_j7(s: &mut Stmt) {
                     _ => None,
                 };
                 if let Some(plan) = plan {
+                    // Only a resource whose type implements AutoCloseable
+                    // (or Closeable) may be written as try-with-resources.
+                    // jcdc also recognizes javac-7 try/finally close
+                    // scaffolding, which is valid for ANY type with a
+                    // close() method: XMLStreamReader in jdk8 does not
+                    // implement AutoCloseable (try-with-resources 不适用
+                    // 于变量类型).
+                    if !twr_resource_autocloseable(&v[plan.res_idx], vt, pool) {
+                        i += 1;
+                        continue;
+                    }
                     apply_j7(v, i, &plan);
                     // Drop the consumed resource/primary-init statements and
                     // the trailing normal-path close scaffolding.
@@ -8912,45 +8975,45 @@ fn twr_j7(s: &mut Stmt) {
             }
         }
         Stmt::Try { body, catches, finally } => {
-            twr_j7(body);
+            twr_j7(body, vt, pool);
             for c in catches.iter_mut() {
-                twr_j7(&mut c.body);
+                twr_j7(&mut c.body, vt, pool);
             }
             if let Some(f) = finally {
-                twr_j7(f);
+                twr_j7(f, vt, pool);
             }
         }
         Stmt::TryWithResources { resources, body, catches, finally } => {
-            for res in resources.iter_mut() { twr_j7(res); }
-            twr_j7(body);
+            for res in resources.iter_mut() { twr_j7(res, vt, pool); }
+            twr_j7(body, vt, pool);
             for c in catches.iter_mut() {
-                twr_j7(&mut c.body);
+                twr_j7(&mut c.body, vt, pool);
             }
             if let Some(f) = finally {
-                twr_j7(f);
+                twr_j7(f, vt, pool);
             }
         }
         Stmt::If { then_stmt, else_stmt, .. } => {
-            twr_j7(then_stmt);
+            twr_j7(then_stmt, vt, pool);
             if let Some(e) = else_stmt {
-                twr_j7(e);
+                twr_j7(e, vt, pool);
             }
         }
-        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => twr_j7(body),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => twr_j7(body, vt, pool),
         Stmt::For { init, body, .. } => {
-            init.iter_mut().for_each(twr_j7);
-            twr_j7(body);
+            init.iter_mut().for_each(|x| twr_j7(x, vt, pool));
+            twr_j7(body, vt, pool);
         }
-        Stmt::ForEach { body, .. } => twr_j7(body),
+        Stmt::ForEach { body, .. } => twr_j7(body, vt, pool),
         Stmt::Switch { cases, default, .. } => {
             for c in cases {
-                c.body.iter_mut().for_each(twr_j7);
+                c.body.iter_mut().for_each(|x| twr_j7(x, vt, pool));
             }
             if let Some(d) = default {
-                twr_j7(d);
+                twr_j7(d, vt, pool);
             }
         }
-        Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => twr_j7(body),
+        Stmt::Synchronized { body, .. } | Stmt::Labeled { body, .. } => twr_j7(body, vt, pool),
         _ => {}
     }
 }
