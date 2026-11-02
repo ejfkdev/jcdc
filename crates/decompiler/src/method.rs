@@ -8067,6 +8067,70 @@ fn type_has_wildcard(t: &TypeRef) -> bool {
 /// Statement-local positions are covered by `fix_int_locals_at_bool_sites`
 /// and `cast_narrowing_assigns`; array initializers (`new char[]{i}`) are
 /// handled here too.
+/// Raw-cast a wildcard-typed receiver when an Object-typed argument would
+/// otherwise be captured as CAP#1 (`arg0.accept(k, v)` with
+/// BiConsumer<? super K,? super V> -> `((BiConsumer) arg0).accept(..)`).
+/// `allow_ref_ret` permits reference-returning calls where the erased
+/// result is harmless (discarded statement, or assigned to a plain-Object
+/// variable); otherwise only void/primitive returns are cast because a raw
+/// receiver also erases the instantiated return type.
+fn raw_cast_wild_receiver(
+    e: &mut Expr,
+    wild_params: &std::collections::HashSet<u32>,
+    allow_ref_ret: bool,
+) {
+    let Expr::Method { owner, cls, args, desc, .. } = e else {
+        return;
+    };
+    let owner_wild = owner
+        .as_ref()
+        .map(|o| {
+            type_has_wildcard(&o.type_ref())
+                || match &**o {
+                    Expr::Local { var, .. } => wild_params.contains(var),
+                    _ => false,
+                }
+        })
+        .unwrap_or(false);
+    let ret_simple = matches!(
+        desc.ret,
+        JavaType::Void
+            | JavaType::Boolean
+            | JavaType::Byte
+            | JavaType::Char
+            | JavaType::Short
+            | JavaType::Int
+            | JavaType::Long
+            | JavaType::Float
+            | JavaType::Double
+    );
+    if !owner_wild || !(ret_simple || allow_ref_ret) {
+        return;
+    }
+    // Lambda arguments are excluded — the raw parameter erases their
+    // target type (ObjectInputFilter filters.add(x0 -> ..)).
+    if !args.iter().zip(desc.args.iter()).any(|(a, _)| {
+        matches!(
+            a,
+            Expr::Local { .. }
+                | Expr::Method { .. }
+                | Expr::Field { .. }
+                | Expr::ArrayIndex { .. }
+                | Expr::Cond { .. }
+        ) && matches!(
+            a.type_ref().erased(),
+            JavaType::Object(n) if (n).jstr() == ("java/lang/Object").jstr()
+        )
+    }) {
+        return;
+    }
+    if let Some(o) = owner {
+        let raw = TypeRef::J(JavaType::Object(cls.as_ref().into()));
+        let inner = std::mem::replace(&mut **o, Expr::This);
+        **o = Expr::Cast { ty: raw, e: Box::new(inner) };
+    }
+}
+
 fn fix_arg_sites(
     s: &mut Stmt,
     vt: &VarTable,
@@ -8082,67 +8146,11 @@ fn fix_arg_sites(
         pool: &jcdc_jvm::ClassPool,
         wild_params: &std::collections::HashSet<u32>,
     ) {
+        if ref_casts {
+            raw_cast_wild_receiver(e, wild_params, false);
+        }
         match e {
-            Expr::Method { owner, cls, args, desc, .. } => {
-                // A call through a WILDCARD-typed receiver cannot take an
-                // Object where the captured type `? super K` is expected
-                // (Map.forEach: `arg0.accept(k, v)` with arg0
-                // BiConsumer<? super K,? super V> — Object无法转换为CAP#1).
-                // A raw receiver cast erases the capture and accepts the
-                // Object-typed locals exactly as the bytecode did. The
-                // receiver's wildcard is in its DECLARED generic signature,
-                // not the VarTable's erasure (wild_params).
-                let owner_wild = ref_casts
-                    && owner
-                        .as_ref()
-                        .map(|o| {
-                            type_has_wildcard(&o.type_ref())
-                                || match &**o {
-                                    Expr::Local { var, .. } => wild_params.contains(var),
-                                    _ => false,
-                                }
-                        })
-                        .unwrap_or(false);
-                // Restrict to calls whose result is void/primitive: a raw
-                // receiver also erases the instantiated RETURN type
-                // (Optional<U>.map -> Object, 无法转换为Optional<U>;
-                // Adapter<TypeT,...>). Lambda arguments are excluded — the
-                // raw parameter erases their target type (ObjectInputFilter
-                // `filters.add(x0 -> ..)` -> Object 不是函数接口).
-                let ret_simple = matches!(
-                    desc.ret,
-                    JavaType::Void
-                        | JavaType::Boolean
-                        | JavaType::Byte
-                        | JavaType::Char
-                        | JavaType::Short
-                        | JavaType::Int
-                        | JavaType::Long
-                        | JavaType::Float
-                        | JavaType::Double
-                );
-                if owner_wild
-                    && ret_simple
-                    && args.iter().zip(desc.args.iter()).any(|(a, _)| {
-                        matches!(
-                            a,
-                            Expr::Local { .. }
-                                | Expr::Method { .. }
-                                | Expr::Field { .. }
-                                | Expr::ArrayIndex { .. }
-                                | Expr::Cond { .. }
-                        ) && matches!(
-                            a.type_ref().erased(),
-                            JavaType::Object(n) if (n).jstr() == ("java/lang/Object").jstr()
-                        )
-                    })
-                {
-                    if let Some(o) = owner {
-                        let raw = TypeRef::J(JavaType::Object(cls.as_ref().into()));
-                        let inner = std::mem::replace(&mut **o, Expr::This);
-                        **o = Expr::Cast { ty: raw, e: Box::new(inner) };
-                    }
-                }
+            Expr::Method { owner, args, desc, .. } => {
                 if let Some(o) = owner {
                     ex(o, vt, ref_casts, pool, wild_params);
                 }
@@ -8230,8 +8238,31 @@ fn fix_arg_sites(
     ) {
         match s {
             Stmt::Block(v) => v.iter_mut().for_each(|x| st(x, vt, ref_casts, pool, wild_params)),
-            Stmt::ExprStmt(e) => ex(e, vt, ref_casts, pool, wild_params),
-            Stmt::LocalDef { init: Some(e), .. } => ex(e, vt, ref_casts, pool, wild_params),
+            Stmt::ExprStmt(e) => {
+                if ref_casts {
+                    let plain_obj = |t: &TypeRef| {
+                        matches!(t.erased(), JavaType::Object(n) if (n).jstr() == ("java/lang/Object").jstr())
+                    };
+                    if let Expr::Assign { target, value, op: crate::expr::AssignOp::Plain } = &mut *e {
+                        if let Expr::Local { var, .. } = &**target {
+                            if plain_obj(&vt.var(*var).ty) {
+                                raw_cast_wild_receiver(value, wild_params, true);
+                            }
+                        }
+                    } else {
+                        raw_cast_wild_receiver(e, wild_params, true);
+                    }
+                }
+                ex(e, vt, ref_casts, pool, wild_params)
+            }
+            Stmt::LocalDef { var, init: Some(e), .. } => {
+                if ref_casts
+                    && matches!(vt.var(*var).ty.erased(), JavaType::Object(n) if (n).jstr() == ("java/lang/Object").jstr())
+                {
+                    raw_cast_wild_receiver(e, wild_params, true);
+                }
+                ex(e, vt, ref_casts, pool, wild_params)
+            }
             Stmt::Return(Some(e)) | Stmt::Throw(e) => ex(e, vt, ref_casts, pool, wild_params),
             Stmt::If { cond, then_stmt, else_stmt } => {
                 ex(cond, vt, ref_casts, pool, wild_params);
