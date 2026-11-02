@@ -605,10 +605,37 @@ pub fn decompile_method(
                         results[bid] = r;
                     }
                     Err(BuildError(msg)) => {
+                        // A failed block in a NON-VOID method cannot end
+                        // with a bare `return;` (javac: 缺少返回值). The
+                        // block is already marked BLOCK-ERROR and its real
+                        // code was not recovered (jsr/ret RMI stubs), so
+                        // terminate with the type's default value to keep
+                        // the unit compilable.
+                        use crate::expr::{ConstVal, Expr as E};
+                        let term = match &desc.ret {
+                            jcdc_jvm::JavaType::Void => crate::builder::Term::Return(None),
+                            jcdc_jvm::JavaType::Boolean
+                            | jcdc_jvm::JavaType::Byte
+                            | jcdc_jvm::JavaType::Char
+                            | jcdc_jvm::JavaType::Short
+                            | jcdc_jvm::JavaType::Int => {
+                                crate::builder::Term::Return(Some(E::Const(ConstVal::Int(0))))
+                            }
+                            jcdc_jvm::JavaType::Long => {
+                                crate::builder::Term::Return(Some(E::Const(ConstVal::Long(0))))
+                            }
+                            jcdc_jvm::JavaType::Float => {
+                                crate::builder::Term::Return(Some(E::Const(ConstVal::Float(0.0))))
+                            }
+                            jcdc_jvm::JavaType::Double => {
+                                crate::builder::Term::Return(Some(E::Const(ConstVal::Double(0.0))))
+                            }
+                            _ => crate::builder::Term::Return(Some(E::Const(ConstVal::Null))),
+                        };
                         results[bid] = BlockResult {
                             stmts: vec![Stmt::Comment(format!("$JCDC-BLOCK-ERROR: {}", msg))],
                             out_stack: vec![],
-                            term: crate::builder::Term::Return(None),
+                            term,
                         };
                         out_stacks[bid] = Some(vec![]);
                         errors.insert(bid, msg.clone());
@@ -829,7 +856,7 @@ pub fn decompile_method(
     // Int type in the VarTable (PKCS12KeyStore.isPasswordless'
     // `return var6_581` under a boolean return).
     fix_int_locals_at_bool_sites(&mut body, &desc.ret, &vt);
-    fix_arg_sites(&mut body);
+    fix_arg_sites(&mut body, &vt, false, pool);
     dbg_body!("post-infer");
     prune_dead_synth_stores(&mut body, &vt);
     dbg_body!("post-prune-dead");
@@ -963,6 +990,19 @@ pub fn decompile_method(
         crate::sese::MATEXIT_DISABLED.with(|d| d.set(false));
         return retry;
     }
+    // Late passes (return/assignment folding, ensure_declared) can create
+    // narrow-typed return shapes the early cast pass never saw:
+    // `return var1 = read_short();` in the CORBA *Helper.read stubs.
+    // Reference-argument downcasts also run here so they see final types;
+    // re-sync embedded Local types first, or a late-created Local still says
+    // Object for a type-variable parameter and gets an illegal cast
+    // (HandlerProcessor `(MessageUpdatableContext) context` where C extends
+    // MessageUpdatableContext).
+    propagate_copy_types(&mut vt, &mut body);
+    let final_types: Vec<TypeRef> = vt.vars.iter().map(|vi| vi.ty.clone()).collect();
+    rewrite_local_types(&mut body, &final_types);
+    fix_arg_sites(&mut body, &vt, true, pool);
+    cast_narrowing_assigns(&vt, &desc.ret, &mut body);
     Ok(Some(MethodBody { body, vt, desc }))
 }
 
@@ -4952,7 +4992,33 @@ fn cast_narrowing_assigns(vt: &VarTable, ret: &JavaType, s: &mut Stmt) {
                     }
                 }
                 if narrow(ret) {
-                    fix(e, ret);
+                    // An assignment expression's Java type is its TARGET's
+                    // type, not the RHS': `return (short) (v = read_short())`
+                    // is needed when v is int even though read_short() is
+                    // already short (CORBA *Helper.read). `fix` looks at the
+                    // value type, so handle the Assign shape here.
+                    let assign_int = match &*e {
+                        Expr::Assign { target, .. } => match &**target {
+                            Expr::Local { var, .. } => {
+                                vt.var(*var).ty.erased() == JavaType::Int
+                            }
+                            Expr::ArrayIndex { array, .. } => matches!(
+                                array.type_ref().erased(),
+                                JavaType::Array(b) if *b == JavaType::Int
+                            ),
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                    if assign_int {
+                        let inner = std::mem::replace(&mut *e, Expr::This);
+                        *e = Expr::Cast {
+                            ty: TypeRef::J(ret.clone()),
+                            e: Box::new(inner),
+                        };
+                    } else {
+                        fix(e, ret);
+                    }
                 }
             }
             Stmt::ExprStmt(Expr::Assign { target, value, .. }) => {
@@ -5100,6 +5166,206 @@ fn cast_object_returns(s: &mut Stmt, ret_ty: &JavaType, wildcard: Option<&TypeRe
         }
     }
     rec(s, &want, wildcard);
+}
+
+/// Propagate a concrete type through a single plain copy assignment
+/// (`Object t = arr;` / `Object e = arr[i];`). Inference gathers evidence
+/// once, before the source variable's own type is finalized, so a copy of
+/// a gap array temp stayed Object even though the source resolved to
+/// String[][] (LanguageTag `Object var1 = var0; var1[i]` — 需要数组, 但找到
+/// Object). Only variables with exactly one plain assignment are touched.
+fn propagate_copy_types(vt: &mut VarTable, body: &mut Stmt) {
+    use std::collections::HashMap;
+    struct Copies {
+        count: HashMap<u32, usize>,
+        rhs: HashMap<u32, u32>,
+        elem: HashMap<u32, u32>,
+    }
+    fn walk_e(e: &Expr, c: &mut Copies) {
+        match e {
+            Expr::Method { owner, args, .. } => {
+                if let Some(o) = owner {
+                    walk_e(o, c);
+                }
+                args.iter().for_each(|a| walk_e(a, c));
+            }
+            Expr::New { args, .. } | Expr::AnonNew { args, .. } | Expr::Invokedynamic { args, .. } => {
+                args.iter().for_each(|a| walk_e(a, c));
+            }
+            Expr::NewArray { dims, init, .. } => {
+                dims.iter().for_each(|d| walk_e(d, c));
+                if let Some(vals) = init {
+                    vals.iter().for_each(|x| walk_e(x, c));
+                }
+            }
+            Expr::NewMultiArray { dims, .. } => dims.iter().for_each(|d| walk_e(d, c)),
+            Expr::Field { owner: Some(o), .. } => walk_e(o, c),
+            Expr::ArrayIndex { array, index } => {
+                walk_e(array, c);
+                walk_e(index, c);
+            }
+            Expr::Cast { e, .. } | Expr::InstanceOf { e, .. } | Expr::Un { e, .. }
+            | Expr::PreIncDec { e, .. } | Expr::PostIncDec { e, .. } => walk_e(e, c),
+            Expr::Bin { l, r, .. } => {
+                walk_e(l, c);
+                walk_e(r, c);
+            }
+            Expr::Cond { c: cond, t, f } => {
+                walk_e(cond, c);
+                walk_e(t, c);
+                walk_e(f, c);
+            }
+            Expr::Assign { target, value, op } => {
+                if *op == crate::expr::AssignOp::Plain {
+                    if let Expr::Local { var, .. } = &**target {
+                        *c.count.entry(*var).or_insert(0) += 1;
+                        match &**value {
+                            Expr::Local { var: src, .. } => {
+                                c.rhs.insert(*var, *src);
+                            }
+                            Expr::ArrayIndex { array, .. } => {
+                                if let Expr::Local { var: arr, .. } = &**array {
+                                    c.elem.insert(*var, *arr);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                walk_e(target, c);
+                walk_e(value, c);
+            }
+            Expr::StringConcat(parts) => {
+                for p in parts {
+                    if let crate::expr::ConcatPart::Str(x) = p {
+                        walk_e(x, c);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk(s: &Stmt, c: &mut Copies) {
+        match s {
+            Stmt::Block(v) => v.iter().for_each(|x| walk(x, c)),
+            Stmt::ExprStmt(e) => walk_e(e, c),
+            Stmt::LocalDef { var, init: Some(e), .. } => {
+                match e {
+                    Expr::Local { var: src, .. } => {
+                        *c.count.entry(*var).or_insert(0) += 1;
+                        c.rhs.insert(*var, *src);
+                    }
+                    Expr::ArrayIndex { array, .. } => {
+                        if let Expr::Local { var: arr, .. } = &**array {
+                            *c.count.entry(*var).or_insert(0) += 1;
+                            c.elem.insert(*var, *arr);
+                        }
+                    }
+                    _ => {}
+                }
+                walk_e(e, c);
+            }
+            Stmt::Return(Some(e)) | Stmt::Throw(e) => walk_e(e, c),
+            Stmt::If { cond, then_stmt, else_stmt } => {
+                walk_e(cond, c);
+                walk(then_stmt, c);
+                if let Some(x) = else_stmt {
+                    walk(x, c);
+                }
+            }
+            Stmt::While { cond, body } => {
+                walk_e(cond, c);
+                walk(body, c);
+            }
+            Stmt::DoWhile { body, cond } => {
+                walk(body, c);
+                walk_e(cond, c);
+            }
+            Stmt::For { init, cond, update, body } => {
+                init.iter().for_each(|x| walk(x, c));
+                if let Some(x) = cond {
+                    walk_e(x, c);
+                }
+                update.iter().for_each(|x| walk_e(x, c));
+                walk(body, c);
+            }
+            Stmt::ForEach { iterable, body, .. } => {
+                walk_e(iterable, c);
+                walk(body, c);
+            }
+            Stmt::Switch { selector, cases, default, .. } => {
+                walk_e(selector, c);
+                for ca in cases {
+                    ca.body.iter().for_each(|x| walk(x, c));
+                }
+                if let Some(d) = default {
+                    walk(d, c);
+                }
+            }
+            Stmt::Try { body, catches, finally } => {
+                walk(body, c);
+                for ca in catches {
+                    walk(&ca.body, c);
+                }
+                if let Some(f) = finally {
+                    walk(f, c);
+                }
+            }
+            Stmt::TryWithResources { resources, body, catches, finally } => {
+                resources.iter().for_each(|x| walk(x, c));
+                walk(body, c);
+                for ca in catches {
+                    walk(&ca.body, c);
+                }
+                if let Some(f) = finally {
+                    walk(f, c);
+                }
+            }
+            Stmt::Synchronized { lock, body } => {
+                walk_e(lock, c);
+                walk(body, c);
+            }
+            Stmt::Labeled { body, .. } => walk(body, c),
+            _ => {}
+        }
+    }
+    let unknown = |t: &JavaType| matches!(t, JavaType::Object(n) if (n).jstr() == ("java/lang/Object").jstr());
+    let mut c = Copies { count: HashMap::new(), rhs: HashMap::new(), elem: HashMap::new() };
+    walk(body, &mut c);
+    for _ in 0..4 {
+        let mut changed = false;
+        for (&dst, &src) in &c.rhs {
+            if c.count.get(&dst).copied().unwrap_or(0) != 1 || vt.var(dst).is_param {
+                continue;
+            }
+            if !unknown(&vt.var(dst).ty.erased()) {
+                continue;
+            }
+            let src_ty = vt.var(src).ty.erased();
+            if unknown(&src_ty) || matches!(src_ty, JavaType::Void) {
+                continue;
+            }
+            vt.vars[dst as usize].ty = TypeRef::J(src_ty);
+            changed = true;
+        }
+        for (&dst, &arr) in &c.elem {
+            if c.count.get(&dst).copied().unwrap_or(0) != 1 || vt.var(dst).is_param {
+                continue;
+            }
+            if !unknown(&vt.var(dst).ty.erased()) {
+                continue;
+            }
+            if let JavaType::Array(inner) = vt.var(arr).ty.erased() {
+                if !unknown(&inner) {
+                    vt.vars[dst as usize].ty = TypeRef::J((*inner).clone());
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 }
 
 fn propagate_bool_copies(s: &Stmt, vt: &mut VarTable, changed: &mut bool) {
@@ -5630,24 +5896,48 @@ fn gather_expr(e: &Expr, ev: &mut Vec<Vec<Evidence>>, assign_target: Option<u32>
         Expr::AnonNew { args, .. } => {
             args.iter().for_each(|a| gather_expr(a, ev, None, bool_vars));
         }
-        Expr::Bin { op, l, r, .. } => {
+        Expr::Bin { op, l, r, ty } => {
             // Comparisons (`<`,`>`,`<=`,`>=`) and arithmetic/shifts are
-            // numeric-only; `+` is skipped because it is also string
+            // numeric-only; bare `+` is skipped because it is also string
             // concatenation, and `&`/`|`/`^` because booleans allow them.
-            if matches!(
-                op,
-                crate::expr::BinOp::Lt
-                    | crate::expr::BinOp::Ge
-                    | crate::expr::BinOp::Gt
-                    | crate::expr::BinOp::Le
-                    | crate::expr::BinOp::Sub
-                    | crate::expr::BinOp::Mul
-                    | crate::expr::BinOp::Div
-                    | crate::expr::BinOp::Rem
-                    | crate::expr::BinOp::Shl
-                    | crate::expr::BinOp::Shr
-                    | crate::expr::BinOp::Ushr
-            ) {
+            // The IR records a `+`'s disambiguated type: a numeric ty means
+            // both operands were ints (BigInteger `+ 3 >>> 2`, Month
+            // `60 + var`), so a slot used that way is never boolean.
+            let is_num = |t: &JavaType| {
+                matches!(
+                    t,
+                    JavaType::Byte
+                        | JavaType::Char
+                        | JavaType::Short
+                        | JavaType::Int
+                        | JavaType::Long
+                        | JavaType::Float
+                        | JavaType::Double
+                )
+            };
+            let add_numeric = matches!(op, crate::expr::BinOp::Add)
+                && (matches!(ty.as_ref().map(|t| t.erased()), Some(t) if is_num(&t))
+                    // No resolved ty: a literal/numeric CALL on one side
+                    // still proves the other operand numeric
+                    // (`60 + var`, `f() + var`); a String const/call does not.
+                    || (!matches!(&**l, Expr::Local { .. }) && is_num(&l.type_ref().erased()))
+                    || (!matches!(&**r, Expr::Local { .. }) && is_num(&r.type_ref().erased())));
+            if add_numeric
+                || matches!(
+                    op,
+                    crate::expr::BinOp::Lt
+                        | crate::expr::BinOp::Ge
+                        | crate::expr::BinOp::Gt
+                        | crate::expr::BinOp::Le
+                        | crate::expr::BinOp::Sub
+                        | crate::expr::BinOp::Mul
+                        | crate::expr::BinOp::Div
+                        | crate::expr::BinOp::Rem
+                        | crate::expr::BinOp::Shl
+                        | crate::expr::BinOp::Shr
+                        | crate::expr::BinOp::Ushr
+                )
+            {
                 int_use(ev, l);
                 int_use(ev, r);
             }
@@ -7651,11 +7941,74 @@ fn wrap_int_narrow_local(v: &mut Expr, want: &jcdc_jvm::JavaType) {
     }
 }
 
-fn wrap_arg_for_param(v: &mut Expr, pt: &jcdc_jvm::JavaType) {
+fn wrap_arg_for_param(v: &mut Expr, pt: &jcdc_jvm::JavaType, ref_casts: bool, vt: &VarTable, pool: &jcdc_jvm::ClassPool) {
+    use crate::expr::{ConstVal, Expr};
     use jcdc_jvm::JavaType;
+    // A lambda / method reference passed to an Object parameter has no
+    // target type (`Hashtable.put(Object.class, arg0 -> ..)`): cast it to
+    // its SAM interface, which is what the indy descriptor recorded
+    // (JTable defaultRenderersByColumnClass — Object 不是函数接口).
+    // Only NON-GENERIC SAMs: a raw cast of `Function` erases the lambda's
+    // own parameter types and breaks the body (ObjectInputFilter
+    // `filters.add((Function) x0 -> x0.getName()..)` — getName on Object).
+    // A non-generic SAM (UIDefaults.LazyValue) loses nothing.
+    if let Expr::Lambda(l) = v {
+        if ref_casts
+            && matches!(pt, JavaType::Object(n) if (n).jstr() == ("java/lang/Object").jstr())
+            && pool
+                .get(&l.sam_cls)
+                .map(|pc| crate::classdec::class_typevar_names(&pc).is_empty())
+                .unwrap_or(false)
+        {
+            let sam = l.sam_cls.clone();
+            let inner = std::mem::replace(v, Expr::This);
+            *v = Expr::Cast {
+                ty: TypeRef::J(JavaType::Object(sam.as_str().into())),
+                e: Box::new(inner),
+            };
+        }
+        return;
+    }
     match pt {
         JavaType::Boolean => wrap_int_bool_local(v),
         JavaType::Byte | JavaType::Short | JavaType::Char => wrap_int_narrow_local(v, pt),
+        // A plain-Object value passed to a concrete reference parameter
+        // needs the downcast in Java. The bytecode verifier guaranteed the
+        // real value was assignable to the parameter, so the cast only
+        // restores the type the decompiler lost (Provider
+        // `attributes.put((String) entry.getKey(), (String) entry.getValue())`).
+        // Restricted to value shapes with a settled static type: casting a
+        // lambda / method reference kills the target typing of a diamond
+        // call (`new CollectorImpl<>((Supplier) Foo::new, ...)` degraded
+        // every lambda parameter to Object in Collectors).
+        JavaType::Object(name)
+            if ref_casts
+                && (name).jstr() != ("java/lang/Object").jstr()
+                // A generic type VARIABLE parameter arrives as a bare name
+                // (`C`, `T`, `ResultT`): casting a concrete value to it is
+                // illegal, and it also defeats the diamond's inference.
+                && (name).jstr().contains('/')
+                && !matches!(v, Expr::Const(ConstVal::Null))
+                // Only a call expression. A Local may carry a generic
+                // lineage whose ERASED parameter is a type-variable BOUND:
+                // EnumMap.readObject `put((Enum) key, value)` — the cast
+                // result Enum is not assignable to K (Enum无法转换为K).
+                // Field/ArrayIndex can be stale (`D date` reads Object) and
+                // a Cond of lambdas loses its target type (LambdaTest2b).
+                && matches!(v, Expr::Method { .. })
+                // A parameter typed `C`/`T` carries its erased Object type
+                // in the VarTable: casting it to a concrete overload target
+                // is illegal (HandlerProcessor's C extends
+                // MessageUpdatableContext). Leave parameters alone.
+                && match v {
+                    Expr::Local { var, .. } => !vt.var(*var).is_param,
+                    _ => true,
+                }
+                && matches!(v.type_ref().erased(), JavaType::Object(n) if (n).jstr() == ("java/lang/Object").jstr()) =>
+        {
+            let inner = std::mem::replace(v, Expr::This);
+            *v = Expr::Cast { ty: TypeRef::J(pt.clone()), e: Box::new(inner) };
+        }
         _ => {}
     }
 }
@@ -7669,40 +8022,40 @@ fn wrap_arg_for_param(v: &mut Expr, pt: &jcdc_jvm::JavaType) {
 /// Statement-local positions are covered by `fix_int_locals_at_bool_sites`
 /// and `cast_narrowing_assigns`; array initializers (`new char[]{i}`) are
 /// handled here too.
-fn fix_arg_sites(s: &mut Stmt) {
+fn fix_arg_sites(s: &mut Stmt, vt: &VarTable, ref_casts: bool, pool: &jcdc_jvm::ClassPool) {
     use crate::expr::Expr;
-    fn ex(e: &mut Expr) {
+    fn ex(e: &mut Expr, vt: &VarTable, ref_casts: bool, pool: &jcdc_jvm::ClassPool) {
         match e {
             Expr::Method { owner, args, desc, .. } => {
                 if let Some(o) = owner {
-                    ex(o);
+                    ex(o, vt, ref_casts, pool);
                 }
                 for (i, a) in args.iter_mut().enumerate() {
                     if let Some(pt) = desc.args.get(i) {
-                        wrap_arg_for_param(a, pt);
+                        wrap_arg_for_param(a, pt, ref_casts, vt, pool);
                     }
-                    ex(a);
+                    ex(a, vt, ref_casts, pool);
                 }
             }
             Expr::Invokedynamic { desc, args, .. } => {
                 for (i, a) in args.iter_mut().enumerate() {
                     if let Some(pt) = desc.args.get(i) {
-                        wrap_arg_for_param(a, pt);
+                        wrap_arg_for_param(a, pt, ref_casts, vt, pool);
                     }
-                    ex(a);
+                    ex(a, vt, ref_casts, pool);
                 }
             }
             Expr::New { args, arg_tys, .. } => {
                 for (i, a) in args.iter_mut().enumerate() {
                     if let Some(pt) = arg_tys.get(i) {
-                        wrap_arg_for_param(a, pt);
+                        wrap_arg_for_param(a, pt, ref_casts, vt, pool);
                     }
-                    ex(a);
+                    ex(a, vt, ref_casts, pool);
                 }
             }
-            Expr::AnonNew { args, .. } => args.iter_mut().for_each(|a| ex(a)),
+            Expr::AnonNew { args, .. } => args.iter_mut().for_each(|a| ex(a, vt, ref_casts, pool)),
             Expr::NewArray { elem, dims, init, .. } => {
-                dims.iter_mut().for_each(|d| ex(d));
+                dims.iter_mut().for_each(|d| ex(d, vt, ref_casts, pool));
                 let narrow_elem = match elem.erased() {
                     t @ (jcdc_jvm::JavaType::Byte
                     | jcdc_jvm::JavaType::Short
@@ -7714,114 +8067,114 @@ fn fix_arg_sites(s: &mut Stmt) {
                         if let Some(t) = &narrow_elem {
                             wrap_int_narrow_local(x, t);
                         }
-                        ex(x);
+                        ex(x, vt, ref_casts, pool);
                     }
                 }
             }
-            Expr::NewMultiArray { dims, .. } => dims.iter_mut().for_each(|d| ex(d)),
-            Expr::Field { owner: Some(o), .. } => ex(o),
+            Expr::NewMultiArray { dims, .. } => dims.iter_mut().for_each(|d| ex(d, vt, ref_casts, pool)),
+            Expr::Field { owner: Some(o), .. } => ex(o, vt, ref_casts, pool),
             Expr::ArrayIndex { array, index } => {
-                ex(array);
-                ex(index);
+                ex(array, vt, ref_casts, pool);
+                ex(index, vt, ref_casts, pool);
             }
             Expr::Cast { e, .. }
             | Expr::InstanceOf { e, .. }
             | Expr::Un { e, .. }
             | Expr::PreIncDec { e, .. }
-            | Expr::PostIncDec { e, .. } => ex(e),
+            | Expr::PostIncDec { e, .. } => ex(e, vt, ref_casts, pool),
             Expr::Bin { l, r, .. } => {
-                ex(l);
-                ex(r);
+                ex(l, vt, ref_casts, pool);
+                ex(r, vt, ref_casts, pool);
             }
             Expr::Cond { c, t, f } => {
-                ex(c);
-                ex(t);
-                ex(f);
+                ex(c, vt, ref_casts, pool);
+                ex(t, vt, ref_casts, pool);
+                ex(f, vt, ref_casts, pool);
             }
             Expr::Assign { target, value, .. } => {
-                ex(target);
-                ex(value);
+                ex(target, vt, ref_casts, pool);
+                ex(value, vt, ref_casts, pool);
             }
             Expr::StringConcat(parts) => {
                 for p in parts {
                     if let crate::expr::ConcatPart::Str(x) = p {
-                        ex(x);
+                        ex(x, vt, ref_casts, pool);
                     }
                 }
             }
             _ => {}
         }
     }
-    fn st(s: &mut Stmt) {
+    fn st(s: &mut Stmt, vt: &VarTable, ref_casts: bool, pool: &jcdc_jvm::ClassPool) {
         match s {
-            Stmt::Block(v) => v.iter_mut().for_each(|x| st(x)),
-            Stmt::ExprStmt(e) => ex(e),
-            Stmt::LocalDef { init: Some(e), .. } => ex(e),
-            Stmt::Return(Some(e)) | Stmt::Throw(e) => ex(e),
+            Stmt::Block(v) => v.iter_mut().for_each(|x| st(x, vt, ref_casts, pool)),
+            Stmt::ExprStmt(e) => ex(e, vt, ref_casts, pool),
+            Stmt::LocalDef { init: Some(e), .. } => ex(e, vt, ref_casts, pool),
+            Stmt::Return(Some(e)) | Stmt::Throw(e) => ex(e, vt, ref_casts, pool),
             Stmt::If { cond, then_stmt, else_stmt } => {
-                ex(cond);
-                st(then_stmt);
+                ex(cond, vt, ref_casts, pool);
+                st(then_stmt, vt, ref_casts, pool);
                 if let Some(x) = else_stmt {
-                    st(x);
+                    st(x, vt, ref_casts, pool);
                 }
             }
             Stmt::While { cond, body } => {
-                ex(cond);
-                st(body);
+                ex(cond, vt, ref_casts, pool);
+                st(body, vt, ref_casts, pool);
             }
             Stmt::DoWhile { body, cond } => {
-                st(body);
-                ex(cond);
+                st(body, vt, ref_casts, pool);
+                ex(cond, vt, ref_casts, pool);
             }
             Stmt::For { init, cond, update, body } => {
-                init.iter_mut().for_each(|i| st(i));
+                init.iter_mut().for_each(|i| st(i, vt, ref_casts, pool));
                 if let Some(c) = cond {
-                    ex(c);
+                    ex(c, vt, ref_casts, pool);
                 }
-                update.iter_mut().for_each(|u| ex(u));
-                st(body);
+                update.iter_mut().for_each(|u| ex(u, vt, ref_casts, pool));
+                st(body, vt, ref_casts, pool);
             }
             Stmt::ForEach { iterable, body, .. } => {
-                ex(iterable);
-                st(body);
+                ex(iterable, vt, ref_casts, pool);
+                st(body, vt, ref_casts, pool);
             }
             Stmt::Switch { selector, cases, default, .. } => {
-                ex(selector);
+                ex(selector, vt, ref_casts, pool);
                 for c in cases {
-                    c.body.iter_mut().for_each(|x| st(x));
+                    c.body.iter_mut().for_each(|x| st(x, vt, ref_casts, pool));
                 }
                 if let Some(d) = default {
-                    st(d);
+                    st(d, vt, ref_casts, pool);
                 }
             }
             Stmt::Try { body, catches, finally } => {
-                st(body);
+                st(body, vt, ref_casts, pool);
                 for c in catches {
-                    st(&mut c.body);
+                    st(&mut c.body, vt, ref_casts, pool);
                 }
                 if let Some(f) = finally {
-                    st(f);
+                    st(f, vt, ref_casts, pool);
                 }
             }
             Stmt::TryWithResources { resources, body, catches, finally } => {
-                resources.iter_mut().for_each(|r| st(r));
-                st(body);
+                resources.iter_mut().for_each(|r| st(r, vt, ref_casts, pool));
+                st(body, vt, ref_casts, pool);
                 for c in catches {
-                    st(&mut c.body);
+                    st(&mut c.body, vt, ref_casts, pool);
                 }
                 if let Some(f) = finally {
-                    st(f);
+                    st(f, vt, ref_casts, pool);
                 }
             }
             Stmt::Synchronized { lock, body } => {
-                ex(lock);
-                st(body);
+                ex(lock, vt, ref_casts, pool);
+                st(body, vt, ref_casts, pool);
             }
-            Stmt::Labeled { body, .. } => st(body),
+            Stmt::Labeled { body, .. } => st(body, vt, ref_casts, pool),
             _ => {}
         }
     }
-    st(s);
+    st(s, vt, ref_casts, pool);
 }
 
 fn fix_int_locals_at_bool_sites(s: &mut Stmt, ret: &jcdc_jvm::JavaType, vt: &VarTable) {

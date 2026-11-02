@@ -786,7 +786,7 @@ fn g_mentions_tvar_named(g: &jcdc_jvm::GenericType, names: &[String]) -> bool {
     }
 }
 
-fn class_typevar_names(pc: &PoolClass) -> Vec<String> {
+pub(crate) fn class_typevar_names(pc: &PoolClass) -> Vec<String> {
     pc.class_attr("Signature")
         .and_then(|b| {
             if b.len() >= 2 {
@@ -2128,10 +2128,49 @@ fn render_element_value(pc: &PoolClass, v: &jcdc_classfile::ElementValue) -> Str
             let c = pc.utf8(*const_name_index).unwrap_or("?");
             format!("{}.{}", crate::ctx_shim::ctx_shorten(pc, empty_pool(), t), c)
         }
-        EV::Class { class_info_index } => pc
-            .class_name(*class_info_index)
-            .map(|n| format!("{}.class", crate::ctx_shim::ctx_shorten(pc, empty_pool(), n)))
-            .unwrap_or_else(|| "void.class".into()),
+        // JVMS: tag 'c' indexes a CONSTANT_Utf8 holding a FIELD DESCRIPTOR
+        // (`Lpkg/Cls;`, `[I`, `V`), not a CONSTANT_Class — XmlAnyElement's
+        // `Class<? extends DomHandler> value() default W3CDomHandler.class`
+        // used to render as `void.class` and fail every generated override.
+        EV::Class { class_info_index } => {
+            let desc = pc.utf8(*class_info_index);
+            let from_desc = desc.and_then(|d| {
+                let mut dims = 0;
+                let mut rest = d;
+                while let Some(r) = rest.strip_prefix('[') {
+                    dims += 1;
+                    rest = r;
+                }
+                let base = match rest {
+                    "V" => "void".to_string(),
+                    "I" => "int".to_string(),
+                    "J" => "long".to_string(),
+                    "F" => "float".to_string(),
+                    "D" => "double".to_string(),
+                    "Z" => "boolean".to_string(),
+                    "B" => "byte".to_string(),
+                    "C" => "char".to_string(),
+                    "S" => "short".to_string(),
+                    _ => {
+                        let name = rest.strip_prefix('L')?.strip_suffix(';')?;
+                        crate::ctx_shim::ctx_shorten(pc, empty_pool(), name)
+                    }
+                };
+                let mut out = base;
+                for _ in 0..dims {
+                    out.push_str("[]");
+                }
+                Some(out)
+            });
+            from_desc
+                .or_else(|| {
+                    pc.class_name(*class_info_index).map(|n| {
+                        crate::ctx_shim::ctx_shorten(pc, empty_pool(), n)
+                    })
+                })
+                .map(|n| format!("{}.class", n))
+                .unwrap_or_else(|| "void.class".into())
+        }
         EV::AnnotationType { annotation } => render_annotation(pc, annotation).unwrap_or_else(|| "@?".into()),
         EV::Array { values } => {
             let inner: Vec<String> = values.iter().map(|v| render_element_value(pc, v)).collect();
@@ -3281,7 +3320,29 @@ let p0 =  Printer::new(&__ctx, empty_vt());
     }
 
     line.push('(');
-    let param_names = method_param_names(pc, mi, &desc);
+    let mut param_names = method_param_names(pc, mi, &desc);
+    // Captures substituted into the body (below) may carry the same bare
+    // name as one of this method's parameters; rename the parameters so
+    // the substituted expression keeps referring to the OUTER variable.
+    let cap_idents = capture_identifiers(captures);
+    let mut cap_renames: Vec<(String, String)> = Vec::new();
+    if !cap_idents.is_empty() {
+        let mut used: HashSet<String> = param_names.iter().cloned().collect();
+        used.extend(cap_idents.iter().cloned());
+        for n in param_names.iter_mut() {
+            if cap_idents.contains(n) {
+                let mut cand = format!("{}_c", n);
+                let mut k = 1;
+                while used.contains(&cand) || cap_idents.contains(&cand) {
+                    cand = format!("{}_c{}", n, k);
+                    k += 1;
+                }
+                used.insert(cand.clone());
+                cap_renames.push((n.clone(), cand.clone()));
+                *n = cand;
+            }
+        }
+    }
     let mut arg_types: Vec<TypeRef> = match &msig {
         Some(sig) => sig.args.iter().map(|g| TypeRef::G(g.clone())).collect(),
         None => mdesc
@@ -3536,6 +3597,11 @@ let p0 =  Printer::new(&__ctx, empty_vt());
                 collapse_ctor_delegation_multi(&mut body, pc);
                 if is_local_class {
                     prune_local_ctor_delegation(&mut body, pc, mi);
+                }
+            }
+            for v in mb.vt.vars.iter_mut() {
+                if let Some((_, new)) = cap_renames.iter().find(|(old, _)| *old == v.name) {
+                    v.name = new.clone();
                 }
             }
             substitute_captures(&mut body, captures, pool);
@@ -4626,6 +4692,33 @@ fn prune_local_ctor_delegation(body: &mut Stmt, pc: &PoolClass, mi_self: usize) 
         keep
     });
     *desc = std::sync::Arc::new(pruned_desc);
+}
+
+/// Bare identifiers among the capture expressions. An anonymous/local
+/// class body that substitutes `val$arg0` with `arg0` collides with its
+/// OWN parameter of the same name: Pattern.union's anon
+/// `isSatisfiedBy(int arg0)` printed `arg0.isSatisfiedBy(arg0)` for
+/// `capturedArg0.isSatisfiedBy(arg0)`, and DateTimePrintContext's anon
+/// collapsed both operands to arg0. Those names must be renamed in the
+/// body and in its signature.
+fn capture_identifiers(captures: &HashMap<String, Expr>) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for v in captures.values() {
+        let text = match v {
+            Expr::Raw(t) | Expr::RawT(t, _) => t,
+            _ => continue,
+        };
+        let mut ch = text.chars();
+        let ok = ch
+            .next()
+            .map(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+            .unwrap_or(false)
+            && ch.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+        if ok {
+            set.insert(text.clone());
+        }
+    }
+    set
 }
 
 fn method_param_names(pc: &PoolClass, mi: usize, desc: &str) -> Vec<String> {

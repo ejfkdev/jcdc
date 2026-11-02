@@ -353,7 +353,7 @@ pub fn build_var_table(
                 _ => None,
             }
         }
-        let mut gaps: Vec<(u16, u16, u16, JavaType, Option<JavaType>, bool)> = Vec::new();
+        let mut gaps: Vec<(u16, u16, u16, JavaType, Option<JavaType>, bool, bool)> = Vec::new();
         for (ii, ins) in all_ins.iter().enumerate() {
             let a = ins.a as u16;
             let (slot, ty, is_store) = match ins.op {
@@ -411,6 +411,14 @@ pub fn build_var_table(
                 _ => continue,
             };
             let pc0 = ins.pc;
+            // A `null` store cannot share a live range with a PRIMITIVE
+            // lineage: the slot held an int/long/... until here, so the
+            // null belongs to the next reference temp
+            // (WritableRaster.setPixels `int[] pixels = null` merged into
+            // an int slot temp; URL.parseURL `int var = null`).
+            let is_null = is_store
+                && ii > 0
+                && all_ins[ii - 1].op == Opcode::AconstNull;
             let covered = vt
                 .by_slot
                 .get(slot as usize)
@@ -573,10 +581,10 @@ pub fn build_var_table(
                     Some(e) => e.clone(),
                     None => ty,
                 };
-                gaps.push((slot, pc0, pc0.saturating_add(ins.size), ty, ev, is_store));
+                gaps.push((slot, pc0, pc0.saturating_add(ins.size), ty, ev, is_store, is_null));
             }
         }
-        gaps.sort_by_key(|(sl, p, _, _, _, _)| (*sl, *p));
+        gaps.sort_by_key(|(sl, p, _, _, _, _, _)| (*sl, *p));
         // A store separated from the previous access by a BACKWARD jump
         // starts a new variable: the slot's live range ended at the loop
         // exit. rt.jar has no LocalVariableTable, so without this a slot
@@ -610,7 +618,7 @@ pub fn build_var_table(
                 (sl as u16, v)
             })
             .collect();
-        let mut merged_gaps: Vec<(u16, u16, u16, JavaType, Option<JavaType>, bool)> =
+        let mut merged_gaps: Vec<(u16, u16, u16, JavaType, Option<JavaType>, bool, bool)> =
             Vec::new();
         for g in gaps {
             if let Some(m) = merged_gaps.last_mut() {
@@ -626,7 +634,18 @@ pub fn build_var_table(
                     let conflict = match (&m.4, &g.4) {
                         (Some(a), Some(b)) => a != b,
                         _ => false,
-                    };
+                    } || (g.6
+                        && matches!(
+                            m.3,
+                            JavaType::Boolean
+                                | JavaType::Byte
+                                | JavaType::Char
+                                | JavaType::Short
+                                | JavaType::Int
+                                | JavaType::Long
+                                | JavaType::Float
+                                | JavaType::Double
+                        ));
                     // A store after a backward jump begins a fresh live
                     // range (see the note above the helper).
                     let new_range =
@@ -660,7 +679,7 @@ pub fn build_var_table(
                 next_start[i] = merged_gaps[j].1;
             }
         }
-        for (i, (sl, rs, re, ty, _ev, _store)) in merged_gaps.iter().enumerate() {
+        for (i, (sl, rs, re, ty, _ev, _store, _null)) in merged_gaps.iter().enumerate() {
             let next_lvt = seg_starts
                 .iter()
                 .find(|(s, _)| *s == *sl)
