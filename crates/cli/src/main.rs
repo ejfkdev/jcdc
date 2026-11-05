@@ -1,5 +1,6 @@
 //! jcdc — Java class file decompiler CLI.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -21,6 +22,130 @@ enum OutTarget {
     Dir(PathBuf),
     /// One explicit .java file (single-class inputs only).
     File(PathBuf),
+}
+
+/// Precomputed output path for one job: (chosen relative path, optional
+/// rename note). Plans are assigned in job order BEFORE the worker pool
+/// starts, so case-insensitive collision suffixes are deterministic
+/// regardless of thread scheduling.
+type OutPlan = (String, Option<String>);
+
+/// Sanitize one path segment (Windows-invalid chars, overlong names).
+/// A class name of thousands of spaces used to fail with os error 123 and
+/// drop the class; sanitizing keeps the output.
+fn sanitize_segment(seg: &str) -> String {
+    fn hash(s: &str) -> u32 {
+        let mut h: u32 = 0x811c9dc5;
+        for b in s.bytes() {
+            h ^= b as u32;
+            h = h.wrapping_mul(0x01000193);
+        }
+        h
+    }
+    let mut out = String::with_capacity(seg.len());
+    for c in seg.chars() {
+        let bad = c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '\\' | '|' | '?' | '*');
+        if bad {
+            out.push('_');
+        } else {
+            out.push(c);
+        }
+    }
+    // Windows forbids trailing dots/spaces; an all-space name is unusable.
+    let trimmed = out.trim_end_matches([' ', '.']);
+    let mut seg = if trimmed.is_empty() { "_" } else { trimmed }.to_string();
+    if seg.chars().count() > 120 {
+        let keep: String = seg.chars().take(100).collect();
+        seg = format!("{keep}~{:08x}", hash(seg.as_str()));
+    }
+    seg
+}
+
+/// Sanitize a `/`-separated relative path (keeping `.java`).
+fn sanitize_rel(rel: &str) -> String {
+    let mut parts: Vec<String> = rel
+        .split('/')
+        .map(|p| {
+            if let Some(stem) = p.strip_suffix(".java") {
+                format!("{}.java", sanitize_segment(stem))
+            } else {
+                sanitize_segment(p)
+            }
+        })
+        .collect();
+    if parts.is_empty() {
+        parts.push("Unknown.java".to_string());
+    }
+    parts.join("/")
+}
+
+/// Does the output filesystem fold case? A case-only collision can only be
+/// resolved by renaming on such filesystems; on case-sensitive ones the
+/// two names coexist and a rename would needlessly break the public
+/// class/file-name match.
+fn fs_is_case_insensitive(dir: &Path) -> bool {
+    let mut d = dir.to_path_buf();
+    while !d.exists() {
+        if !d.pop() {
+            return cfg!(any(windows, target_os = "macos"));
+        }
+    }
+    let probe = d.join(format!(".jcdc_case_{}", std::process::id()));
+    if std::fs::write(&probe, b"").is_err() {
+        return cfg!(windows);
+    }
+    let upper = d.join(format!(".JCDC_CASE_{}", std::process::id()));
+    let ins = upper.exists();
+    let _ = std::fs::remove_file(&probe);
+    ins
+}
+
+/// Assign deterministic, collision-free output paths for `rels` in order.
+/// Two classes whose paths differ only by case land on the same file on
+/// NTFS/APFS; the later one gets `_0`, `_1`, ... (issue #1).
+fn plan_rels(rels: Vec<String>, case_insensitive: bool) -> Vec<OutPlan> {
+    let mut used: HashMap<String, ()> = HashMap::new();
+    let mut out = Vec::with_capacity(rels.len());
+    for rel in rels {
+        let sanitized = sanitize_rel(&rel);
+        let mut note: Option<String> = None;
+        if sanitized != rel {
+            note = Some(format!(
+                "// jcdc: output path `{}` sanitized to a filesystem-safe `{}`\n",
+                rel, sanitized
+            ));
+        }
+        let key = if case_insensitive {
+            sanitized.to_lowercase()
+        } else {
+            sanitized.clone()
+        };
+        let mut chosen = sanitized.clone();
+        if used.contains_key(&key) {
+            let (stem, ext) = match sanitized.strip_suffix(".java") {
+                Some(s) => (s.to_string(), ".java"),
+                None => (sanitized.clone(), ""),
+            };
+            let mut n = 0usize;
+            loop {
+                let cand = format!("{}_{}{}", stem, n, ext);
+                let ck = if case_insensitive { cand.to_lowercase() } else { cand.clone() };
+                if !used.contains_key(&ck) {
+                    chosen = cand;
+                    break;
+                }
+                n += 1;
+            }
+            note = Some(format!(
+                "// jcdc: output path `{}` collided case-insensitively with an earlier class; written as `{}`\n",
+                rel, chosen
+            ));
+        }
+        let ck = if case_insensitive { chosen.to_lowercase() } else { chosen.clone() };
+        used.insert(ck, ());
+        out.push((chosen, note));
+    }
+    out
 }
 
 fn print_help() {
@@ -47,7 +172,8 @@ fn print_help() {
     println!("                         Defaults: single .class → stdout; dir/jar →");
     println!("                         sibling directory \"<input-name>-dec\".");
     println!("  -cp, --classpath <p>   colon-separated classpath for type resolution");
-    println!("  --synthetic            include synthetic/bridge members");
+    println!("  --synthetic            include synthetic/bridge members (default: hidden,");
+    println!("                         with a per-class comment giving the count)");
     println!("  --cure                 simplify/format the emitted source with cure");
     println!("                         (constant folding, redundant branch/cast cleanup)");
     println!("  -h, --help             print this help");
@@ -254,19 +380,28 @@ fn process_job(
     opts: &ClassOptions,
     target: &OutTarget,
     cure: bool,
+    plan: Option<&OutPlan>,
 ) -> anyhow::Result<usize> {
     match job {
         Job::File { path, root } => {
-            decompile_class_file(path, pool, opts, target, root.as_deref(), cure)
+            decompile_class_file(path, pool, opts, target, root.as_deref(), cure, plan)
         }
         Job::Bytes { name, data } => {
-            let stem = name.trim_end_matches(".class");
-            if jcdc_decompiler::classdec::is_nested_in_pool(stem, pool) {
+            // Name jar output by the class's OWN internal name, not the zip
+            // entry path: obfuscated jars can have duplicate/differently
+            // cased entry names that disagree with the class declared
+            // inside (issue #1).
+            let internal = class_rel_name(data)
+                .map(|n| n.trim_end_matches(".java").to_string())
+                .unwrap_or_else(|| name.trim_end_matches(".class").to_string());
+            if jcdc_decompiler::classdec::is_nested_in_pool(&internal, pool) {
                 return Ok(0);
             }
-            let java_name = format!("{}.java", stem);
-            match decompile_one(data, pool, opts, stem, cure) {
-                Ok(source) => Ok(usize::from(write_source(target, &java_name, &source))),
+            let java_name = format!("{}.java", internal);
+            match decompile_one(data, pool, opts, &internal, cure) {
+                Ok(source) => Ok(usize::from(emit_to_target(
+                    target, plan, &java_name, &source,
+                ))),
                 Err(e) => {
                     eprintln!("jcdc: failed to decompile {}: {}", name, e);
                     Ok(0)
@@ -287,6 +422,7 @@ fn run_jobs(
     opts: &ClassOptions,
     target: &OutTarget,
     cure: bool,
+    plans: &[OutPlan],
 ) -> usize {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -299,6 +435,7 @@ fn run_jobs(
         .clamp(1, 64)
         .min(n_jobs.max(1));
     let jobs = Arc::new(jobs);
+    let plans = Arc::new(plans.to_vec());
     let next = Arc::new(AtomicUsize::new(0));
     let written = Arc::new(AtomicUsize::new(0));
     let mut handles: Vec<std::thread::JoinHandle<bool>> = Vec::new();
@@ -307,6 +444,7 @@ fn run_jobs(
         let pool = pool.clone();
         let opts = opts.clone();
         let target = target.clone();
+        let plans = plans.clone();
         let h = std::thread::Builder::new()
             .stack_size(512 * 1024 * 1024)
             .spawn(move || {
@@ -317,7 +455,7 @@ fn run_jobs(
                     }
                     let job = &jobs[i];
                     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        process_job(job, &pool, &opts, &target, cure)
+                        process_job(job, &pool, &opts, &target, cure, plans.get(i))
                     }));
                     match res {
                         Ok(Ok(n)) => {
@@ -349,6 +487,7 @@ fn run_jobs(
                     let pool = pool.clone();
                     let opts = opts.clone();
                     let target = target.clone();
+                    let plans = plans.clone();
                     if let Ok(nh) = std::thread::Builder::new()
                         .stack_size(512 * 1024 * 1024)
                         .spawn(move || {
@@ -359,7 +498,7 @@ fn run_jobs(
                                 }
                                 let job = &jobs[i];
                                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    process_job(job, &pool, &opts, &target, cure)
+                                    process_job(job, &pool, &opts, &target, cure, plans.get(i))
                                 }));
                                 match res {
                                     Ok(Ok(n)) => {
@@ -394,16 +533,34 @@ fn decompile_path(
     target: &OutTarget,
     cure: bool,
 ) -> anyhow::Result<usize> {
+    let dir_target = matches!(target, OutTarget::Dir(_));
     if path.is_dir() {
-        // every .class file, rendered in parallel
-        let jobs = walkdir(path)?
+        // every .class file, rendered in parallel. Sorted so the collision
+        // plan (and therefore output names) is deterministic.
+        let mut entries = walkdir(path)?;
+        entries.sort();
+        let mut rels = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let internal = internal_name_of(entry, Some(path));
+            rels.push(format!("{}.java", internal));
+        }
+        let plans = if dir_target {
+            let d = match target {
+                OutTarget::Dir(d) => d.clone(),
+                _ => PathBuf::new(),
+            };
+            plan_rels(rels, fs_is_case_insensitive(&d))
+        } else {
+            Vec::new()
+        };
+        let jobs = entries
             .into_iter()
             .map(|entry| Job::File {
                 path: entry,
                 root: Some(path.to_path_buf()),
             })
             .collect();
-        return Ok(run_jobs(jobs, pool, opts, target, cure));
+        return Ok(run_jobs(jobs, pool, opts, target, cure, &plans));
     }
     if is_zip_like(path) {
         if let OutTarget::File(_) = target {
@@ -412,6 +569,7 @@ fn decompile_path(
         let file = std::fs::File::open(path)?;
         let mut zip = zip::ZipArchive::new(file)?;
         let mut jobs = Vec::with_capacity(zip.len());
+        let mut rels: Vec<String> = Vec::with_capacity(zip.len());
         for i in 0..zip.len() {
             let mut e = zip.by_index(i)?;
             let name = e.name()?.to_string();
@@ -420,9 +578,43 @@ fn decompile_path(
             }
             let mut buf = Vec::with_capacity(e.size() as usize);
             std::io::Read::read_to_end(&mut e, &mut buf)?;
+            // Output by the class's OWN internal name, not the zip entry
+            // path: obfuscated jars can carry duplicate or differently
+            // cased entry names that disagree with the class inside.
+            let internal = class_rel_name(&buf)
+                .map(|n| n.trim_end_matches(".java").to_string())
+                .unwrap_or_else(|| name.trim_end_matches(".class").to_string());
+            // Escape identifier-unsafe characters exactly as the class
+            // DECLARATION does (`sanitize_source_name`), so a public
+            // class's file name matches its printed name. `package-info`
+            // and `module-info` are MANDATED file names (javac rejects a
+            // package annotation anywhere else) — keep their hyphen.
+            let parts: Vec<&str> = internal.split('/').collect();
+            let last = parts.len().saturating_sub(1);
+            let rel_internal: Vec<String> = parts
+                .iter()
+                .enumerate()
+                .map(|(i, seg)| {
+                    if i == last && (*seg == "package-info" || *seg == "module-info") {
+                        seg.to_string()
+                    } else {
+                        jcdc_decompiler::emit::sanitize_source_name(seg)
+                    }
+                })
+                .collect();
+            rels.push(format!("{}.java", rel_internal.join("/")));
             jobs.push(Job::Bytes { name, data: buf });
         }
-        return Ok(run_jobs(jobs, pool, opts, target, cure));
+        let plans = if dir_target {
+            let d = match target {
+                OutTarget::Dir(d) => d.clone(),
+                _ => PathBuf::new(),
+            };
+            plan_rels(rels, fs_is_case_insensitive(&d))
+        } else {
+            Vec::new()
+        };
+        return Ok(run_jobs(jobs, pool, opts, target, cure, &plans));
     }
     // Single class file: still via the worker pool so it gets the 512MB
     // stack + panic isolation the main thread cannot provide.
@@ -435,6 +627,7 @@ fn decompile_path(
         opts,
         target,
         cure,
+        &[],
     ))
 }
 
@@ -445,6 +638,7 @@ fn decompile_class_file(
     target: &OutTarget,
     root: Option<&Path>,
     cure: bool,
+    plan: Option<&OutPlan>,
 ) -> anyhow::Result<usize> {
     if jcdc_decompiler::dbg_flag!("JCDC_TRACE_FILES") {
         eprintln!("jcdc-file: {}", path.display());
@@ -488,7 +682,7 @@ fn decompile_class_file(
                 Some(_) => format!("{}.java", internal),
                 None => class_rel_name(&data).unwrap_or_else(|| format!("{}.java", stem)),
             };
-            usize::from(write_source(target, &rel, &source))
+            usize::from(emit_to_target(target, plan, &rel, &source))
         }
     };
     Ok(written)
@@ -565,6 +759,43 @@ fn decompile_with_pool(data: &[u8], pool: &ClassPool, opts: &ClassOptions) -> an
         }
     }
     res
+}
+
+/// Write one class through the collision-safe naming pipeline. `plan` is
+/// the pre-assigned (chosen path, note) for pooled inputs; single-class
+/// outputs have none and are sanitized here.
+fn emit_to_target(
+    target: &OutTarget,
+    plan: Option<&OutPlan>,
+    rel: &str,
+    source: &str,
+) -> bool {
+    match target {
+        OutTarget::Dir(_) => {
+            let (chosen, note) = match plan {
+                Some((c, n)) => (c.clone(), n.clone()),
+                None => {
+                    let san = sanitize_rel(rel);
+                    let n = (san != rel).then(|| {
+                        format!(
+                            "// jcdc: output path `{}` sanitized to a filesystem-safe `{}`\n",
+                            rel, san
+                        )
+                    });
+                    (san, n)
+                }
+            };
+            if let Some(note) = note {
+                let mut s = String::with_capacity(source.len() + note.len());
+                s.push_str(&note);
+                s.push_str(source);
+                write_source(target, &chosen, &s)
+            } else {
+                write_source(target, &chosen, source)
+            }
+        }
+        _ => write_source(target, rel, source),
+    }
 }
 
 /// Send one rendered source to its target: stdout (with a separator header

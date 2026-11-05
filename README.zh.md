@@ -123,7 +123,8 @@ jcdc -o out/ Foo.class               # out/<包路径>/Foo.java
 jcdc -cp rt.jar pkg/ -o out/         # 整目录树，保持包结构
 jcdc -o out/ app.jar                 # 整 jar
 jcdc classes/                        # 缺省输出到平级 classes-dec/ 目录
-jcdc --synthetic Foo.class           # 包含 synthetic/bridge 成员
+jcdc --synthetic Foo.class           # 包含 synthetic/bridge 成员（默认隐藏，
+                                     # 受影响的类会带一行隐藏数量注释）
 jcdc --cure -o out/ app.jar          # 追加 cure 简化/格式化
 ```
 
@@ -132,7 +133,7 @@ jcdc --cure -o out/ app.jar          # 追加 cure 简化/格式化
 | `-o, --output <path>` | 输出文件、目录（保持包结构）、或 `-` 强制 stdout |
 | `--cure` | 对产出源码运行 [cure](https://github.com/ejfkdev/cure)（简化 + 格式化） |
 | `-cp, --classpath <p>` | 冒号分隔的 class/jar/目录列表，用于跨类型解析（泛型、varargs、嵌套判定） |
-| `--synthetic` | 输出 synthetic/bridge 成员（默认隐藏） |
+| `--synthetic` | 输出 synthetic/bridge 成员（默认隐藏；受影响的类带隐藏数量注释） |
 | `-h, --help` / `-V, --version` | 帮助 / 版本（也支持 `help`、`version` 子命令） |
 
 非法调用会先打印错误、再输出完整帮助，退出码 2。

@@ -914,11 +914,12 @@ fn emit_class(
         return Ok(());
     }
     let _emit_guard = EmitGuard(internal.clone());
-    let simple = fam
-        .nested
-        .get(&internal)
-        .map(|n| n.simple.clone())
-        .unwrap_or_else(|| source_simple_name(pc, pool));
+    let simple = crate::emit::sanitize_source_name(
+        &fam.nested
+            .get(&internal)
+            .map(|n| n.simple.clone())
+            .unwrap_or_else(|| source_simple_name(pc, pool)),
+    );
 
     let class_sig = pc.class_attr("Signature").and_then(|b| {
         if b.len() >= 2 {
@@ -1109,6 +1110,81 @@ fn emit_class(
     }
 
     header.push_str(" {");
+    // Visibility notes for information the emitted source no longer shows.
+    // Obfuscators mark REAL members synthetic/bridge, and javac hides them
+    // by default (issue #1): say how many vanished instead of dropping them
+    // silently. Illegal member names are sanitized to Java identifiers at
+    // the declaration sites (references already were), so note the renames.
+    let comp_names = record_component_names(pc);
+    let hidden_synth_fields: usize = if opts.show_synthetic {
+        0
+    } else {
+        pc.cf.fields
+            .iter()
+            .filter(|f| f.access_flags.contains(FieldAccessFlags::SYNTHETIC))
+            .filter(|f| {
+                let n = pc.utf8(f.name_index).unwrap_or("");
+                n != "$assertionsDisabled"
+                    && n != "$VALUES"
+                    && !(is_enum && f.access_flags.contains(FieldAccessFlags::ENUM))
+                    && !(is_record && comp_names.iter().any(|c| c == n))
+            })
+            .count()
+    };
+    let skip = methods_to_skip(pc, pool, is_enum, is_record, opts);
+    let hidden_synth_methods: usize = if opts.show_synthetic {
+        0
+    } else {
+        skip.iter()
+            .filter(|&&mi| {
+                let m = &pc.cf.methods[mi];
+                let n = pc.method_name(mi).unwrap_or("");
+                (m.access_flags.contains(MethodAccessFlags::SYNTHETIC)
+                    || m.access_flags.contains(MethodAccessFlags::BRIDGE))
+                    && n != "<clinit>"
+                    // lambda bodies are INLINED into the output, and
+                    // access$/lambda$ helpers are rewritten at call sites:
+                    // not data loss.
+                    && !n.starts_with("lambda$")
+                    && !n.starts_with("access$")
+                    && !n.starts_with("$deserializeLambda$")
+                    && !n.contains("$lambda$")
+            })
+            .count()
+    };
+    let hidden_synth = hidden_synth_fields + hidden_synth_methods;
+    if hidden_synth > 0 {
+        out.push_str(&format!(
+            "{}// jcdc: {} synthetic/bridge member(s) hidden; rerun with --synthetic to include them\n",
+            pad, hidden_synth
+        ));
+    }
+    let mut illegal: Vec<String> = Vec::new();
+    let mut note_name = |raw: &str| {
+        let clean = crate::emit::java_ident(raw);
+        if clean != raw && illegal.len() < 3 {
+            illegal.push(format!("`{}` -> `{}`", raw, clean));
+        }
+    };
+    for f in &pc.cf.fields {
+        note_name(pc.utf8(f.name_index).unwrap_or(""));
+    }
+    for m in &pc.cf.methods {
+        let n = pc.utf8(m.name_index).unwrap_or("");
+        if n != "<init>" && n != "<clinit>" {
+            note_name(n);
+        }
+    }
+    for n in &comp_names {
+        note_name(n);
+    }
+    if !illegal.is_empty() {
+        out.push_str(&format!(
+            "{}// jcdc: illegal identifier(s) renamed to Java identifiers (e.g. {}); names may collide after mapping\n",
+            pad,
+            illegal.join(", ")
+        ));
+    }
     out.push_str(&header);
     out.push('\n');
 
@@ -1285,7 +1361,6 @@ fn emit_class(
         }
     }
 
-    let comp_names = record_component_names(pc);
     let mut has_assert_field = false;
     for (fi, f) in pc.cf.fields.iter().enumerate() {
         let fname0 = pc.utf8(f.name_index).unwrap_or("").to_string();
@@ -1811,9 +1886,9 @@ fn source_simple_name(pc: &PoolClass, pool: &ClassPool) -> String {
     let internal = &pc.internal_name;
     let last = internal.rsplit('/').next().unwrap_or(internal);
     if last.contains('$') && find_outer(pc, pool).is_none() {
-        return last.to_string();
+        return crate::emit::sanitize_source_name(last);
     }
-    simple_name(internal)
+    crate::emit::sanitize_source_name(&simple_name(internal))
 }
 
 fn simple_name(internal: &str) -> String {
@@ -1856,7 +1931,7 @@ fn record_components(pc: &PoolClass, pool: &ClassPool) -> String {
             .unwrap_or(TypeRef::J(JavaType::Object("java/lang/Object".into())));
         out.push_str(&crate::ctx_shim::ctx_type_name(pc, pool, &ty));
         out.push(' ');
-        out.push_str(n);
+        out.push_str(&crate::emit::java_ident(n));
     }
     out.push(')');
     out
@@ -2095,7 +2170,7 @@ let p =  Printer::new(&__ctx, empty_vt());
             s.push_str(", ");
         }
         if !single {
-            s.push_str(pc.utf8(*name_idx).unwrap_or("?"));
+            s.push_str(&crate::emit::java_ident(pc.utf8(*name_idx).unwrap_or("?")));
             s.push_str(" = ");
         }
         s.push_str(&render_element_value(pc, v));
@@ -2536,7 +2611,7 @@ fn emit_field_impl(pc: &PoolClass, pool: &ClassPool, fi: usize, out: &mut String
     let ty = field_type_of(pc, fi, desc);
     line.push_str(&crate::ctx_shim::ctx_type_name(pc, pool, &ty));
     line.push(' ');
-    line.push_str(name);
+    line.push_str(&crate::emit::java_ident(name));
     for attr in &f.attributes {
         if let ParsedAttribute::ConstantValue(cv) = parse_specialized_attribute(attr, &pc.cf.constant_pool) {
             let base = parse_field_descriptor(desc).unwrap_or(JavaType::Int);
@@ -3289,7 +3364,7 @@ let p0 =  Printer::new(&__ctx, empty_vt());
         };
         line.push_str(&ret);
         line.push(' ');
-        line.push_str(&name);
+        line.push_str(&crate::emit::java_ident(&name));
     } else {
         // Anonymous class constructors take the base type's name; LOCAL
         // classes ($1Splitr) take their stripped source name.
@@ -3400,7 +3475,7 @@ let p0 =  Printer::new(&__ctx, empty_vt());
         }
         line.push_str(&ts);
         line.push(' ');
-        line.push_str(param_names.get(i).map(|s| s.as_str()).unwrap_or("arg"));
+        line.push_str(&crate::emit::java_ident(param_names.get(i).map(|s| s.as_str()).unwrap_or("arg")));
     }
     line.push(')');
 
@@ -4781,7 +4856,7 @@ fn emit_enum_constants(
     let inits = enum_ctor_inits(pc, pool);
     for (i, n) in names.iter().enumerate() {
         out.push_str(&pad);
-        out.push_str(n);
+        out.push_str(&crate::emit::java_ident(n));
         if let Some(init) = inits.get(n) {
             if !init.args.is_empty() {
                 out.push('(');

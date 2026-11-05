@@ -137,6 +137,8 @@ jcdc -cp rt.jar pkg/ -o out/         # whole directory tree, structure kept
 jcdc -o out/ app.jar                 # whole jar
 jcdc classes/                        # default: sibling "classes-dec/" dir
 jcdc --synthetic Foo.class           # include synthetic/bridge members
+                                     # (hidden by default; each affected class
+                                     #  gets a `// jcdc: N ... hidden` comment)
 jcdc --cure -o out/ app.jar          # + cure simplification/formatting pass
 ```
 
@@ -145,7 +147,7 @@ jcdc --cure -o out/ app.jar          # + cure simplification/formatting pass
 | `-o, --output <path>` | output file, directory (package structure preserved), or `-` to force stdout |
 | `--cure` | post-process the emitted source with [cure](https://github.com/ejfkdev/cure) (simplify + format) |
 | `-cp, --classpath <p>` | colon-separated class/jar/dir list for cross-type resolution (generics, varargs, nesting) |
-| `--synthetic` | emit synthetic/bridge members (hidden by default) |
+| `--synthetic` | emit synthetic/bridge members (hidden by default; affected classes carry a count comment) |
 | `-h, --help` / `-V, --version` | help / version (`help` and `version` subcommands also work) |
 
 Invalid invocations print the error followed by the full help and exit 2.

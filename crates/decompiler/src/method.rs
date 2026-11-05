@@ -3085,6 +3085,12 @@ fn assign_catch_names_rec(
                 } else {
                     base.clone()
                 };
+                // Sanitize here too: the catch clause prints var_name
+                // directly (the body's Local references go through
+                // java_ident), so an obfuscated/illegal LVT name would
+                // otherwise leave the declaration unspeakable while every
+                // use was renamed.
+                let name = crate::emit::java_ident(&name).into_owned();
                 used.insert(name.clone());
                 open.push(name.clone());
                 // The catch variable is exclusively ours (freshly split in
@@ -3123,6 +3129,12 @@ fn assign_catch_names_rec(
                 } else {
                     base.clone()
                 };
+                // Sanitize here too: the catch clause prints var_name
+                // directly (the body's Local references go through
+                // java_ident), so an obfuscated/illegal LVT name would
+                // otherwise leave the declaration unspeakable while every
+                // use was renamed.
+                let name = crate::emit::java_ident(&name).into_owned();
                 used.insert(name.clone());
                 open.push(name.clone());
                 // The catch variable is exclusively ours (freshly split in

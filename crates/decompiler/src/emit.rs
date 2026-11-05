@@ -6,5 +6,7 @@
 //! by [`crate::jvmctx::JvmCtx`].
 
 pub use jdc_core::analysis::dead_end_infinite_while;
-pub use jdc_core::emit::{escape_char, escape_string, format_float, Printer};
+pub use jdc_core::emit::{
+    escape_char, escape_string, format_float, java_ident, sanitize_source_name, Printer,
+};
 pub use crate::jvmctx::JvmCtx;
