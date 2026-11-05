@@ -3,8 +3,13 @@
 **English** | [简体中文](README.zh.md)
 
 [![CI](https://github.com/ejfkdev/jcdc/actions/workflows/ci.yml/badge.svg)](https://github.com/ejfkdev/jcdc/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/ejfkdev/jcdc)](https://github.com/ejfkdev/jcdc/releases)
+[![Release](https://img.shields.io/github/v/release/ejfkdev/jcdc?label=release)](https://github.com/ejfkdev/jcdc/releases)
+[![Release downloads](https://img.shields.io/github/downloads/ejfkdev/jcdc/total?label=release%20downloads&color=brightgreen)](https://github.com/ejfkdev/jcdc/releases)
+[![Stars](https://img.shields.io/github/stars/ejfkdev/jcdc?logo=github)](https://github.com/ejfkdev/jcdc/stargazers)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Java 1.1–28](https://img.shields.io/badge/Java-1.1%20--%2028-orange)](https://github.com/ejfkdev/jcdc#readme)
+[![Platforms](https://img.shields.io/badge/platforms-linux%20%7C%20macOS%20%7C%20Windows-blue)](https://github.com/ejfkdev/jcdc/releases)
+[![Rust](https://img.shields.io/badge/rust-stable-dea584?logo=rust)](https://www.rust-lang.org/)
 [![Built with ZCode](https://img.shields.io/badge/Built%20with%20ZCode-000000.svg?style=flat&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMTgiIGhlaWdodD0iMTAwIiB2aWV3Qm94PSIwIDAgMjU2IDIxOCI+PHBhdGggZmlsbD0iI2ZmZmZmZiIgZD0iTTEzNC40IDAuMTMwMTUyTDExNi40OCAyNS42MDIyQzExMy42NjUgMjkuNTY5OSAxMDkuMDU0IDMyLjAwMTkgMTA0LjA2NCAzMi4wMDE5SDYuMzk5OVYwQzYuMzk5OSAwLjEzMDE0OSAxMzQuNCAwLjEzMDE1MiAxMzQuNCAwLjEzMDE1MloiLz48cGF0aCBmaWxsPSIjZmZmZmZmIiBkPSJNMjU2IDAuMTMwMTI3TDEwMi40MDEgMjE3LjczMkgwTDE1My41OTkgMC4xMzAxMjdIMjU2WiIvPjxwYXRoIGZpbGw9IiNmZmZmZmYiIGQ9Ik0xMjEuNjAxIDIxNy43MzJMMTM5LjY1IDE5Mi4xMzRDMTQyLjQ2NSAxODguMTY2IDE0Ny4wNzYgMTg1LjczNCAxNTIuMDY3IDE4NS43MzRIMjQ5LjYwNFYyMTcuNzM2SDEyMS42MDFWMjE3LjczMloiLz48L3N2Zz4=)](https://zcode.z.ai/)
 
 A Java class file decompiler written in Rust — turns `.class` files from any
