@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 use jcdc_decompiler::{ClassOptions, ClassPool};
@@ -12,6 +13,10 @@ use jcdc_decompiler::{ClassOptions, ClassPool};
 /// back more eagerly, which also lowers the peak.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Any failed output write makes the process exit non-zero: a partial tree
+/// must not look like a successful run.
+static WRITE_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// Where the decompiled source goes for one input.
 #[derive(Debug, Clone)]
@@ -54,11 +59,97 @@ fn sanitize_segment(seg: &str) -> String {
     // Windows forbids trailing dots/spaces; an all-space name is unusable.
     let trimmed = out.trim_end_matches([' ', '.']);
     let mut seg = if trimmed.is_empty() { "_" } else { trimmed }.to_string();
-    if seg.chars().count() > 120 {
-        let keep: String = seg.chars().take(100).collect();
+    // Cap BOTH chars and UTF-8 bytes: a 120-char CJK name is 360 bytes and
+    // still exceeds the per-component filesystem limit.
+    if seg.chars().count() > 120 || seg.len() > 200 {
+        let mut keep = String::new();
+        for c in seg.chars() {
+            if keep.chars().count() >= 100 || keep.len() + c.len_utf8() > 160 {
+                break;
+            }
+            keep.push(c);
+        }
         seg = format!("{keep}~{:08x}", hash(seg.as_str()));
     }
     seg
+}
+
+/// Stable 64-bit FNV-1a, used to fold over-long directory chains without
+/// relying on any external hasher.
+fn fnv64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Path-length budget for the RELATIVE output path, after the root prefix.
+/// Windows still enforces MAX_PATH (~260) for relative paths unless long
+/// paths are enabled; macOS/Linux have much larger limits but not
+/// unlimited ones. Keep a margin for the separator and `_N` suffixes.
+fn path_budget(root: &Path) -> usize {
+    // Debug override (also used by the test matrix to emulate the Windows
+    // MAX_PATH budget on other platforms).
+    if let Ok(v) = std::env::var("JCDC_PATH_BUDGET") {
+        if let Ok(n) = v.parse::<usize>() {
+            return n;
+        }
+    }
+    let max: usize = if cfg!(windows) {
+        250
+    } else if cfg!(target_os = "macos") {
+        1000
+    } else {
+        4000
+    };
+    let root_len = root.as_os_str().to_string_lossy().chars().count();
+    max.saturating_sub(root_len + 8)
+}
+
+/// A path of thousands of `nmsl/` segments fits no filesystem. Keep the
+/// first directory segment and the class file name, folding the rest into
+/// one stable hashed directory: `xx/_jcdc_<16 hex>/Class.java` (issue #2).
+/// The PACKAGE declaration keeps its full name (identifier-escaped, but
+/// every segment); only the on-disk location is compacted.
+fn fit_path_budget(rel: &str, budget: usize) -> (String, bool) {
+    if rel.chars().count() <= budget {
+        return (rel.to_string(), false);
+    }
+    let (dirs, file) = match rel.rsplit_once('/') {
+        Some((d, f)) => (d, f),
+        None => ("", rel),
+    };
+    let folded = if dirs.is_empty() {
+        file.to_string()
+    } else {
+        let first = dirs.split('/').next().unwrap_or("");
+        let h = fnv64(dirs);
+        if !first.is_empty() && first != dirs {
+            format!("{first}/_jcdc_{h:016x}/{file}")
+        } else {
+            format!("_jcdc_{h:016x}/{file}")
+        }
+    };
+    if folded.chars().count() <= budget {
+        (folded, true)
+    } else {
+        // Even the first segment + hash + file do not fit: the file name
+        // alone is the last resort; dedupe suffixes still apply.
+        (file.to_string(), true)
+    }
+}
+
+/// Shorten an obfuscated path for the in-file comment; hundreds of
+/// segments would otherwise bloat every affected file.
+fn short_path(rel: &str) -> String {
+    const MAX: usize = 120;
+    if rel.chars().count() <= MAX {
+        return rel.to_string();
+    }
+    let head: String = rel.chars().take(MAX - 20).collect();
+    format!("{head}...({} chars)", rel.chars().count())
 }
 
 /// Sanitize a `/`-separated relative path (keeping `.java`).
@@ -103,28 +194,32 @@ fn fs_is_case_insensitive(dir: &Path) -> bool {
 /// Assign deterministic, collision-free output paths for `rels` in order.
 /// Two classes whose paths differ only by case land on the same file on
 /// NTFS/APFS; the later one gets `_0`, `_1`, ... (issue #1).
-fn plan_rels(rels: Vec<String>, case_insensitive: bool) -> Vec<OutPlan> {
+fn plan_rels(rels: Vec<String>, case_insensitive: bool, budget: usize) -> Vec<OutPlan> {
     let mut used: HashMap<String, ()> = HashMap::new();
     let mut out = Vec::with_capacity(rels.len());
     for rel in rels {
         let sanitized = sanitize_rel(&rel);
-        let mut note: Option<String> = None;
+        let mut notes: Vec<String> = Vec::new();
         if sanitized != rel {
-            note = Some(format!(
-                "// jcdc: output path `{}` sanitized to a filesystem-safe `{}`\n",
-                rel, sanitized
+            notes.push(format!("sanitized to `{}`", short_path(&sanitized)));
+        }
+        let (fitted, folded) = fit_path_budget(&sanitized, budget);
+        if folded {
+            notes.push(format!(
+                "directory chain folded to `{}` to fit the filesystem path limit",
+                fitted
             ));
         }
         let key = if case_insensitive {
-            sanitized.to_lowercase()
+            fitted.to_lowercase()
         } else {
-            sanitized.clone()
+            fitted.clone()
         };
-        let mut chosen = sanitized.clone();
+        let mut chosen = fitted.clone();
         if used.contains_key(&key) {
-            let (stem, ext) = match sanitized.strip_suffix(".java") {
+            let (stem, ext) = match fitted.strip_suffix(".java") {
                 Some(s) => (s.to_string(), ".java"),
-                None => (sanitized.clone(), ""),
+                None => (fitted.clone(), ""),
             };
             let mut n = 0usize;
             loop {
@@ -136,13 +231,22 @@ fn plan_rels(rels: Vec<String>, case_insensitive: bool) -> Vec<OutPlan> {
                 }
                 n += 1;
             }
-            note = Some(format!(
-                "// jcdc: output path `{}` collided case-insensitively with an earlier class; written as `{}`\n",
-                rel, chosen
+            notes.push(format!(
+                "collided with an earlier class; written as `{}`",
+                chosen
             ));
         }
         let ck = if case_insensitive { chosen.to_lowercase() } else { chosen.clone() };
         used.insert(ck, ());
+        let note = if notes.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "// jcdc: output path `{}`: {}\n",
+                short_path(&rel),
+                notes.join("; ")
+            ))
+        };
         out.push((chosen, note));
     }
     out
@@ -306,6 +410,9 @@ fn run() -> anyhow::Result<()> {
     if total == 0 && inputs.len() == 1 {
         eprintln!("jcdc: no classes decompiled from {}", inputs[0].display());
     }
+    if WRITE_FAILED.load(Ordering::Relaxed) {
+        anyhow::bail!("one or more output files could not be written");
+    }
     Ok(())
 }
 
@@ -395,6 +502,9 @@ fn process_job(
                 .map(|n| n.trim_end_matches(".java").to_string())
                 .unwrap_or_else(|| name.trim_end_matches(".class").to_string());
             if jcdc_decompiler::classdec::is_nested_in_pool(&internal, pool) {
+                if std::env::var("JCDC_TRACE_FILES").is_ok() {
+                    eprintln!("jcdc-skip-nested: {}", internal);
+                }
                 return Ok(0);
             }
             let java_name = format!("{}.java", internal);
@@ -549,7 +659,7 @@ fn decompile_path(
                 OutTarget::Dir(d) => d.clone(),
                 _ => PathBuf::new(),
             };
-            plan_rels(rels, fs_is_case_insensitive(&d))
+            plan_rels(rels, fs_is_case_insensitive(&d), path_budget(&d))
         } else {
             Vec::new()
         };
@@ -598,7 +708,14 @@ fn decompile_path(
                     if i == last && (*seg == "package-info" || *seg == "module-info") {
                         seg.to_string()
                     } else {
-                        jcdc_decompiler::emit::sanitize_source_name(seg)
+                        let s = jcdc_decompiler::emit::sanitize_source_name(seg);
+                        if s.is_empty() {
+                            // Empty class name: `__` (the escape for the
+                            // reserved lone `_`), matching the declaration.
+                            "__".to_string()
+                        } else {
+                            s
+                        }
                     }
                 })
                 .collect();
@@ -610,7 +727,7 @@ fn decompile_path(
                 OutTarget::Dir(d) => d.clone(),
                 _ => PathBuf::new(),
             };
-            plan_rels(rels, fs_is_case_insensitive(&d))
+            plan_rels(rels, fs_is_case_insensitive(&d), path_budget(&d))
         } else {
             Vec::new()
         };
@@ -817,6 +934,7 @@ fn write_source(target: &OutTarget, rel: &str, source: &str) -> bool {
             if let Some(parent) = p.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
                     eprintln!("jcdc: cannot create {}: {}", parent.display(), e);
+                    WRITE_FAILED.store(true, Ordering::Relaxed);
                     return false;
                 }
             }
@@ -824,6 +942,7 @@ fn write_source(target: &OutTarget, rel: &str, source: &str) -> bool {
                 Ok(()) => true,
                 Err(e) => {
                     eprintln!("jcdc: cannot write {}: {}", p.display(), e);
+                    WRITE_FAILED.store(true, Ordering::Relaxed);
                     false
                 }
             }
@@ -833,6 +952,7 @@ fn write_source(target: &OutTarget, rel: &str, source: &str) -> bool {
                 if !parent.as_os_str().is_empty() {
                     if let Err(e) = std::fs::create_dir_all(parent) {
                         eprintln!("jcdc: cannot create {}: {}", parent.display(), e);
+                        WRITE_FAILED.store(true, Ordering::Relaxed);
                         return false;
                     }
                 }
@@ -841,6 +961,7 @@ fn write_source(target: &OutTarget, rel: &str, source: &str) -> bool {
                 Ok(()) => true,
                 Err(e) => {
                     eprintln!("jcdc: cannot write {}: {}", f.display(), e);
+                    WRITE_FAILED.store(true, Ordering::Relaxed);
                     false
                 }
             }

@@ -627,7 +627,16 @@ pub fn decompile_class(pc: &PoolClass, pool: &ClassPool, opts: &ClassOptions) ->
     let mut out = String::new();
     let internal = pc.internal_name.clone();
     if let Some(slash) = internal.rfind('/') {
-        out.push_str(&format!("package {};\n\n", internal[..slash].replace('/', ".")));
+        // Package segments obey the same identifier rules as class names
+        // (obfuscators use `1nmsl`/keywords): escape them exactly like
+        // every reference does (Printer::shorten sanitizes the dotted
+        // form), otherwise the declaration cannot parse while its
+        // directory and references are legal.
+        let pkg: Vec<String> = internal[..slash]
+            .split('/')
+            .map(crate::emit::sanitize_source_name)
+            .collect();
+        out.push_str(&format!("package {};\n\n", pkg.join(".")));
     }
     emit_class(pc, pool, opts, &fam, &mut out, 0, true)?;
     Ok(out)
@@ -914,12 +923,13 @@ fn emit_class(
         return Ok(());
     }
     let _emit_guard = EmitGuard(internal.clone());
-    let simple = crate::emit::sanitize_source_name(
-        &fam.nested
-            .get(&internal)
-            .map(|n| n.simple.clone())
-            .unwrap_or_else(|| source_simple_name(pc, pool)),
-    );
+    // source_simple_name already applies sanitize_class_name; sanitize
+    // only the InnerClasses-derived simple here (a second application is
+    // not idempotent for the reserved lone `_`).
+    let simple = match fam.nested.get(&internal) {
+        Some(n) => sanitize_class_name(&n.simple),
+        None => source_simple_name(pc, pool),
+    };
 
     let class_sig = pc.class_attr("Signature").and_then(|b| {
         if b.len() >= 2 {
@@ -1877,6 +1887,20 @@ fn collect_lambda_methods(pc: &PoolClass) -> HashSet<usize> {
     set
 }
 
+/// Class-name escaping shared by declarations and references, plus a
+/// fallback for the empty simple name some obfuscators emit (`class ""`
+/// is unspeakable). The file-name side escapes an empty class segment to
+/// `__` (the lone `_` is reserved since Java 9), so the declaration must
+/// use the same token.
+fn sanitize_class_name(name: &str) -> String {
+    let s = crate::emit::sanitize_source_name(name);
+    if s.is_empty() {
+        "__".to_string()
+    } else {
+        s
+    }
+}
+
 /// Source-level simple name of a class: nested classes take their
 /// InnerClasses-derived simple name; a literal-$ top-level class (jextract
 /// FFI headers, errno_h$shared) keeps the FULL $-bearing last segment —
@@ -1886,9 +1910,9 @@ fn source_simple_name(pc: &PoolClass, pool: &ClassPool) -> String {
     let internal = &pc.internal_name;
     let last = internal.rsplit('/').next().unwrap_or(internal);
     if last.contains('$') && find_outer(pc, pool).is_none() {
-        return crate::emit::sanitize_source_name(last);
+        return sanitize_class_name(last);
     }
-    crate::emit::sanitize_source_name(&simple_name(internal))
+    sanitize_class_name(&simple_name(internal))
 }
 
 fn simple_name(internal: &str) -> String {
